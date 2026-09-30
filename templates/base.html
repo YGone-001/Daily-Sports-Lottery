@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>每日体彩预测终端</title>
+    <meta name="description" content="每日竞彩足球/篮球量化预测 - 基于Elo与泊松分布的价值投注分析">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;800&family=Noto+Sans+SC:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+    (function() {
+        var stored = localStorage.getItem('theme');
+        document.documentElement.setAttribute('data-theme', stored || 'light');
+    })();
+    function toggleTheme() {
+        var cur = document.documentElement.getAttribute('data-theme');
+        var next = cur === 'light' ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', next);
+        localStorage.setItem('theme', next);
+    }
+    </script>
+</head>
+<body>
+    <nav class="top-nav">
+        <div class="nav-inner">
+            <a href="/" class="nav-brand">
+                <span class="brand-mark">◈</span>
+                <span class="brand-text">体彩预测终端</span>
+                <span class="brand-badge">LIVE</span>
+            </a>
+            <div class="nav-links">
+                <a href="/" class="nav-link {% if active_page == 'index' %}active{% endif %}">今日赛事</a>
+                <a href="/strategy" class="nav-link {% if active_page == 'strategy' %}active{% endif %}">智能策略</a>
+                <a href="/history" class="nav-link {% if active_page == 'history' %}active{% endif %}">历史复盘</a>
+            </div>
+            <div class="nav-right">
+                {% if meta and meta.last_refresh %}
+                <span class="sync-badge" title="最近同步时间">
+                    <span class="sync-dot"></span>
+                    {{ meta.last_refresh[11:16] }}
+                </span>
+                {% endif %}
+                <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">
+                    <span class="icon-sun">☀</span>
+                    <span class="icon-moon">☾</span>
+                </button>
+            </div>
+        </div>
+    </nav>
+    <main class="main-content">
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="site-footer">
+        <p class="footer-main">概率 ≠ 结果。系统输出为模型视角，不构成投注建议。</p>
+        <p class="footer-sub">数据来源 500.com · 模型基于 Elo 强度 + 泊松分布 + 赔率对撞 · 仅供研究参考</p>
+    </footer>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

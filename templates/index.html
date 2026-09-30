@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+{% block content %}
+
+<!-- 顶部：日期 + 类别筛选 -->
+<section class="terminal-header">
+    <div class="th-left">
+        <h1 class="th-title">
+            {% if current_sport == 'basketball' %}篮球{% elif current_sport == 'football' %}足球{% else %}全量{% endif %}
+            赛事预测
+        </h1>
+        <p class="th-sub">
+            <span class="mono">{{ beijing_now }}</span>
+            <span class="sep">/</span>
+            <span>{{ display_date }}</span>
+        </p>
+    </div>
+    <div class="th-right">
+        <div class="stat-cluster">
+            <div class="stat-pod">
+                <span class="sp-val">{{ stats.total }}</span>
+                <span class="sp-lbl">赛事</span>
+            </div>
+            <div class="stat-pod">
+                <span class="sp-val c-live">{{ stats.live }}</span>
+                <span class="sp-lbl">进行中</span>
+            </div>
+            <div class="stat-pod">
+                <span class="sp-val c-up">{{ stats.upcoming }}</span>
+                <span class="sp-lbl">待开赛</span>
+            </div>
+            <div class="stat-pod">
+                <span class="sp-val c-odds">{{ stats.with_odds }}</span>
+                <span class="sp-lbl">有赔率</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- 筛选栏 -->
+<div class="filter-bar">
+    <div class="filter-group">
+        <span class="fg-label">类别</span>
+        <div class="chip-row">
+            <a href="/?date={{ display_date }}&sport=all" class="chip {% if current_sport == 'all' %}chip-on{% endif %}">全部</a>
+            <a href="/?date={{ display_date }}&sport=football" class="chip {% if current_sport == 'football' %}chip-on{% endif %}">⚽ 足球</a>
+            <a href="/?date={{ display_date }}&sport=basketball" class="chip {% if current_sport == 'basketball' %}chip-on{% endif %}">🏀 篮球</a>
+        </div>
+    </div>
+    {% if dates %}
+    <div class="filter-group">
+        <span class="fg-label">日期</span>
+        <div class="chip-row">
+            {% for d in dates[:8] %}
+            <a href="/?date={{ d }}&sport={{ current_sport }}" class="chip {% if d == display_date %}chip-on{% endif %}">{{ d[5:] }}</a>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+    <div class="filter-group filter-actions">
+        <button class="btn-refresh" onclick="triggerRefresh(this)">⟳ 同步数据</button>
+    </div>
+</div>
+
+{% if groups %}
+<div class="league-stream">
+    {% for g in groups %}
+    <section class="league-block">
+        <div class="lb-header">
+            <div class="lb-left">
+                <span class="lb-sport">{{ '⚽' if g.sport == 'football' else '🏀' }}</span>
+                <h2 class="lb-name">{{ g.league }}</h2>
+                <span class="lb-count">{{ g.matches | length }} 场</span>
+            </div>
+        </div>
+
+        <div class="match-grid">
+            {% for m in g.matches %}
+            {% set p = m.prediction if m.prediction is defined else None %}
+            <a href="/match/{{ m.id }}" class="match-card-link">
+                {% set has_value = m.prediction and m.prediction.ev_analysis and (m.prediction.ev_analysis.home.is_value or m.prediction.ev_analysis.draw.is_value or m.prediction.ev_analysis.away.is_value) %}
+                <div class="match-card{% if m.status == 'finished' %} is-finished{% endif %}{% if has_value %} has-value{% endif %}{% if m.status == 'live' %} is-live{% endif %}">
+
+                    <div class="mc-top">
+                        <span class="mc-time mono">{{ m.time }}</span>
+                        {% if m.round %}<span class="mc-round">{{ m.round }}</span>{% endif %}
+                        {% if m.status == 'live' %}
+                        <span class="tag tag-live"><span class="pulse"></span>进行中</span>
+                        {% elif m.status == 'finished' %}
+                        <span class="tag tag-done">完赛</span>
+                        {% else %}
+                        <span class="tag tag-up">待赛</span>
+                        {% endif %}
+                        {% if has_value %}<span class="tag tag-value">🔥 价值</span>{% endif %}
+                    </div>
+
+                    <div class="mc-teams">
+                        <div class="mc-team">
+                            <span class="mc-tname">{{ m.home }}</span>
+                            {% if m.home_rank %}<span class="mc-rank">#{{ m.home_rank }}</span>{% endif %}
+                        </div>
+                        <div class="mc-center">
+                            {% if m.score and m.score.ft %}
+                            <span class="mc-score mono">{{ m.score.ft[0] }}-{{ m.score.ft[1] }}</span>
+                            {% if m.score.ht %}<span class="mc-ht mono">半 {{ m.score.ht[0] }}-{{ m.score.ht[1] }}</span>{% endif %}
+                            {% else %}
+                            <span class="mc-vs">VS</span>
+                            {% endif %}
+                        </div>
+                        <div class="mc-team mc-team-away">
+                            <span class="mc-tname">{{ m.away }}</span>
+                            {% if m.away_rank %}<span class="mc-rank">#{{ m.away_rank }}</span>{% endif %}
+                        </div>
+                    </div>
+
+                    {% if m.prediction and m.status != 'finished' %}
+                    {% set pp = m.prediction %}
+                    <div class="mc-probs">
+                        <div class="mc-prob {% if pp.ev_analysis.home.is_value %}pv-on{% endif %}">
+                            <span class="pv-num">{{ pp.probabilities.home_win }}<em>%</em></span>
+                            <span class="pv-lbl">主胜</span>
+                            {% if pp.ev_analysis.home.is_value %}<span class="pv-ev">+{{ pp.ev_analysis.home.ev }}%</span>{% endif %}
+                        </div>
+                        {% if m.sport == 'football' %}
+                        <div class="mc-prob mc-prob-draw {% if pp.ev_analysis.draw.is_value %}pv-on{% endif %}">
+                            <span class="pv-num">{{ pp.probabilities.draw }}<em>%</em></span>
+                            <span class="pv-lbl">平局</span>
+                            {% if pp.ev_analysis.draw.is_value %}<span class="pv-ev">+{{ pp.ev_analysis.draw.ev }}%</span>{% endif %}
+                        </div>
+                        {% endif %}
+                        <div class="mc-prob {% if pp.ev_analysis.away.is_value %}pv-on{% endif %}">
+                            <span class="pv-num">{{ pp.probabilities.away_win }}<em>%</em></span>
+                            <span class="pv-lbl">客胜</span>
+                            {% if pp.ev_analysis.away.is_value %}<span class="pv-ev">+{{ pp.ev_analysis.away.ev }}%</span>{% endif %}
+                        </div>
+                    </div>
+
+                    <div class="mc-bar">
+                        <div class="mc-bar-seg seg-home" style="width: {{ pp.probabilities.home_win }}%"></div>
+                        <div class="mc-bar-seg seg-draw" style="width: {{ pp.probabilities.draw }}%"></div>
+                        <div class="mc-bar-seg seg-away" style="width: {{ pp.probabilities.away_win }}%"></div>
+                    </div>
+
+                    <div class="mc-foot">
+                        <span class="mc-suspense">
+                            {% for i in range(pp.suspense.stars) %}<span class="s-on">★</span>{% endfor %}{% for i in range(5 - pp.suspense.stars) %}<span class="s-off">★</span>{% endfor %}
+                            <span class="s-txt">{{ pp.suspense.label }}</span>
+                        </span>
+                        {% if m.odds %}
+                        <span class="mc-odds mono">
+                            {{ m.odds.home_win }} / {% if m.sport == 'football' %}{{ m.odds.draw }} / {% endif %}{{ m.odds.away_win }}
+                        </span>
+                        {% endif %}
+                    </div>
+                    {% elif m.status == 'finished' and m.score %}
+                    <div class="mc-result-line">
+                        {% set ft = m.score.ft %}
+                        <span>{% if ft[0] > ft[1] %}主胜{% elif ft[0] < ft[1] %}客胜{% else %}平局{% endif %}</span>
+                    </div>
+                    {% elif not m.odds %}
+                    <div class="mc-noodds">暂无赔率</div>
+                    {% endif %}
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+    </section>
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+    <div class="es-icon">◈</div>
+    <p class="es-title">当前日期暂无赛事数据</p>
+    <p class="es-sub">点击上方「同步数据」抓取最新赛程，或切换其他日期</p>
+</div>
+{% endif %}
+
+{% endblock %}

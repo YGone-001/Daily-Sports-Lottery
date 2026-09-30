@@ -1,0 +1,254 @@
+"""
+抓取调度器
+==========
+负责：
+1. 调用 fetcher_500 抓取赛事
+2. 合并进 daily_matches.json（去重 + 增量更新）
+3. 用完赛结果滚动校准球队 Elo
+4. 定时任务入口
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+from utils import fetcher_500
+from utils.daily_loader import get_beijing_now, load_json, save_json
+from utils.team_strength import update_from_result
+
+DAILY_FILE = "daily_matches.json"
+
+
+def _norm_no(value: str) -> str:
+    """归一化竞彩编号：'周三302' / '302' / 302 -> '302'"""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits.lstrip("0") or digits
+
+
+def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> int:
+    """
+    把竞彩赔率按「竞彩编号」挂到已有赛程上。
+    编号缺失时退化为按 (日期, 主队) 匹配。
+    返回成功挂载的场次数。
+    """
+    by_no: dict[str, dict] = {}
+    by_home: dict[tuple, dict] = {}
+    for r in odds_rows:
+        no = _norm_no(r.get("jczq_no") or r.get("round") or "")
+        if no:
+            by_no.setdefault(no, r)
+        by_home.setdefault((r.get("date", ""), r.get("home", "")), r)
+
+    count = 0
+    for m in matches:
+        if m.get("odds"):
+            continue
+        no = _norm_no(m.get("jczq_no") or "")
+        src = by_no.get(no) if no else None
+        if src is None:
+            src = by_home.get((m.get("date", ""), m.get("home", "")))
+        if src and src.get("odds"):
+            m["odds"] = dict(src["odds"])
+            count += 1
+            # 用赔率源的联赛名补全（更规范）
+            if src.get("league") and not m.get("league"):
+                m["league"] = src["league"]
+    return count
+
+
+def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int, int]:
+    """
+    合并新旧赛事。
+    匹配键: sport|date|time|home|away
+    返回 (merged, added, updated)
+    """
+    index = {}
+    for m in existing:
+        key = f"{m.get('sport')}|{m.get('date')}|{m.get('time')}|{m.get('home')}|{m.get('away')}"
+        index[key] = m
+
+    added = updated = 0
+    for m in incoming:
+        key = f"{m.get('sport')}|{m.get('date')}|{m.get('time')}|{m.get('home')}|{m.get('away')}"
+        if key in index:
+            old = index[key]
+            # 更新比分/赔率/状态
+            changed = False
+            if m.get("score") and m["score"] != old.get("score"):
+                old["score"] = m["score"]
+                changed = True
+            if m.get("odds") and m["odds"] != old.get("odds"):
+                old["odds"] = m["odds"]
+                old["odds_updated_at"] = get_beijing_now().isoformat()
+                changed = True
+            if m.get("status") != old.get("status"):
+                old["status"] = m["status"]
+                changed = True
+            if m.get("home_rank") is not None:
+                old["home_rank"] = m["home_rank"]
+            if m.get("away_rank") is not None:
+                old["away_rank"] = m["away_rank"]
+            if changed:
+                updated += 1
+        else:
+            # 保留原 id
+            if not m.get("id"):
+                m["id"] = f"{m.get('sport','f')}-{m.get('date')}-{added}"
+            index[key] = m
+            added += 1
+
+    merged = list(index.values())
+    merged.sort(key=lambda x: (x.get("date", ""), x.get("time", "00:00")))
+    return merged, added, updated
+
+
+def _calibrate_from_finished(matches: list[dict]) -> int:
+    """用新完赛的比赛校准 Elo（跳过已校准的）"""
+    from utils.daily_loader import load_json as _load
+
+    calibrated_file = "calibrated.json"
+    done = set((_load(calibrated_file) or {}).get("ids", []))
+
+    count = 0
+    for m in matches:
+        if m.get("status") != "finished" or not m.get("score"):
+            continue
+        mid = m.get("id")
+        if not mid or mid in done:
+            continue
+        ft = m["score"].get("ft")
+        if not (isinstance(ft, list) and len(ft) >= 2):
+            continue
+        try:
+            update_from_result(
+                m.get("home", ""),
+                m.get("away", ""),
+                int(ft[0]),
+                int(ft[1]),
+                m.get("league", ""),
+                m.get("sport", "football"),
+            )
+            done.add(mid)
+            count += 1
+        except Exception:  # noqa: BLE001
+            continue
+
+    if count:
+        save_json(calibrated_file, {"ids": sorted(done)})
+    return count
+
+
+def refresh(verbose: bool = True) -> dict:
+    """
+    执行一次完整抓取刷新。
+    返回统计信息。
+    """
+    now = get_beijing_now()
+    result = {
+        "started_at": now.isoformat(),
+        "sources": {},
+        "added": 0,
+        "updated": 0,
+        "calibrated": 0,
+        "total": 0,
+    }
+
+    incoming: list[dict] = []
+
+    # 1. 即时比分（含开赛时间 + 竞彩编号）★权威赛程
+    for sport in ("football", "basketball"):
+        try:
+            if sport == "basketball":
+                rows = fetcher_500.fetch_live_basketball()
+            else:
+                rows = fetcher_500.fetch_live_matches(sport)
+            incoming.extend(rows)
+            result["sources"][f"live_{sport}"] = len(rows)
+            if verbose:
+                print(f"  [即时比分{sport}] {len(rows)} 场")
+        except Exception as exc:  # noqa: BLE001
+            result["sources"][f"live_{sport}"] = f"error: {exc}"
+
+    # 2. 竞彩赔率（XML）—— 按「竞彩编号」合并到赛程上
+    for sport in ("football", "basketball"):
+        try:
+            rows = fetcher_500.fetch_jczq_xml(sport)
+            merged = _attach_odds(incoming, rows)
+            result["sources"][f"jczq_odds_{sport}"] = len(rows)
+            if verbose:
+                print(f"  [竞彩赔率{sport}] {merged}/{len(rows)} 场已挂载盘口")
+        except Exception as exc:  # noqa: BLE001
+            result["sources"][f"jczq_odds_{sport}"] = f"error: {exc}"
+
+    # 2b. 兜底：若赛程源无数据，直接用赔率源自成赛程
+    if not any(k.startswith("live_") and isinstance(v, int) and v for k, v in result["sources"].items()):
+        for sport in ("football", "basketball"):
+            try:
+                rows = fetcher_500.fetch_jczq_xml(sport)
+                incoming.extend(rows)
+                result["sources"][f"jczq_only_{sport}"] = len(rows)
+                if verbose and rows:
+                    print(f"  [竞彩独立{sport}] {len(rows)} 场")
+            except Exception as exc:  # noqa: BLE001
+                result["sources"][f"jczq_only_{sport}"] = f"error: {exc}"
+
+    # 2. 500 完场（SSR，含赛果与历史）
+    try:
+        finished = fetcher_500.fetch_finished_matches()
+        incoming.extend(finished)
+        result["sources"]["wanchang"] = len(finished)
+        if verbose:
+            print(f"  [完场] {len(finished)} 场")
+    except Exception as exc:  # noqa: BLE001
+        result["sources"]["wanchang"] = f"error: {exc}"
+
+    if not incoming:
+        if verbose:
+            print("  [警告] 未获取到任何数据")
+        result["total"] = len(load_json(DAILY_FILE).get("matches", []))
+        return result
+
+    # 3. 合并
+    data = load_json(DAILY_FILE) or {}
+    existing = data.get("matches", [])
+    merged, added, updated = _merge(existing, incoming)
+
+    # 4. 校准 Elo
+    calibrated = _calibrate_from_finished(merged)
+
+    # 5. 落盘
+    save_json(
+        DAILY_FILE,
+        {
+            "meta": {
+                "last_refresh": now.isoformat(),
+                "sources": result["sources"],
+                "total": len(merged),
+            },
+            "matches": merged,
+        },
+    )
+
+    result.update(
+        {
+            "added": added,
+            "updated": updated,
+            "calibrated": calibrated,
+            "total": len(merged),
+            "finished_at": get_beijing_now().isoformat(),
+        }
+    )
+
+    if verbose:
+        print(
+            f"  ✅ 新增 {added} | 更新 {updated} | Elo校准 {calibrated} | 库内共 {len(merged)} 场"
+        )
+    return result
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  每日体彩数据抓取")
+    print("=" * 60)
+    stats = refresh()
+    print()
+    print("结果:", stats)

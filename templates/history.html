@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="terminal-header">
+    <div class="th-left">
+        <h1 class="th-title">历史复盘</h1>
+        <p class="th-sub">模型预测 vs 真实赛果 · 共 {{ total }} 场完赛记录</p>
+    </div>
+    <div class="th-right">
+        <div class="chip-row">
+            <a href="/history?sport=all" class="chip {% if current_sport == 'all' %}chip-on{% endif %}">全部</a>
+            <a href="/history?sport=football" class="chip {% if current_sport == 'football' %}chip-on{% endif %}">⚽ 足球</a>
+            <a href="/history?sport=basketball" class="chip {% if current_sport == 'basketball' %}chip-on{% endif %}">🏀 篮球</a>
+        </div>
+    </div>
+</section>
+
+{% if matches %}
+{% set ns = namespace(hit=0, total=0, score_hit=0) %}
+{% for m in matches %}
+    {% if m.comparison and m.comparison.correct is defined %}
+        {% set ns.total = ns.total + 1 %}
+        {% if m.comparison.correct %}{% set ns.hit = ns.hit + 1 %}{% endif %}
+        {% if m.comparison.score_hit %}{% set ns.score_hit = ns.score_hit + 1 %}{% endif %}
+    {% endif %}
+{% endfor %}
+
+<div class="calib-bar">
+    <div class="calib-pod">
+        <span class="cb-val">{{ ns.total }}</span>
+        <span class="cb-lbl">已复盘场次</span>
+    </div>
+    <div class="calib-pod">
+        <span class="cb-val" style="color:var(--loss);">
+            {{ (ns.hit / ns.total * 100) | round(1) if ns.total else 0 }}%
+        </span>
+        <span class="cb-lbl">胜负命中率 ({{ ns.hit }}/{{ ns.total }})</span>
+    </div>
+    <div class="calib-pod">
+        <span class="cb-val" style="color:var(--accent);">
+            {{ (ns.score_hit / ns.total * 100) | round(1) if ns.total else 0 }}%
+        </span>
+        <span class="cb-lbl">比分命中率 ({{ ns.score_hit }}/{{ ns.total }})</span>
+    </div>
+</div>
+
+<div>
+    {% for m in matches %}
+    {% if m.comparison and m.comparison.actual_score %}
+    <a href="/match/{{ m.id }}" class="history-row" style="display:grid;">
+        <div class="hr-date mono">{{ m.date }} {{ m.time }}</div>
+        <div class="hr-match">
+            {{ m.home }} <span style="color:var(--text-faint);">vs</span> {{ m.away }}
+            <span style="font-size:.68rem;color:var(--text-faint);margin-left:6px;">{{ m.league }}</span>
+        </div>
+        <div class="hr-score">{{ m.comparison.actual_score }}</div>
+        <div class="hr-verdict {% if m.comparison.correct %}ok{% else %}bad{% endif %}">
+            {% if m.comparison.correct %}✓ 命中{% else %}✗ 偏差{% endif %}
+            <em>预测{{ m.comparison.predicted_label }} · 置信{{ m.comparison.confidence }}%</em>
+        </div>
+    </a>
+    {% endif %}
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+    <div class="es-icon">◈</div>
+    <p class="es-title">暂无历史赛果</p>
+    <p class="es-sub">等待赛事完赛后自动归档</p>
+</div>
+{% endif %}
+
+{% endblock %}

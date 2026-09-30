@@ -1,0 +1,374 @@
+{% extends "base.html" %}
+{% block content %}
+{% if match and match.prediction %}
+{% set p = match.prediction %}
+{% set is_bb = match.sport == 'basketball' %}
+
+<!-- 头部 -->
+<div class="detail-header">
+    <div class="dh-meta">
+        <span class="dh-league">{{ match.league }}</span>
+        {% if match.round %}<span>{{ match.round }}</span>{% endif %}
+        <span class="mono">{{ match.date }} {{ match.time }}</span>
+        {% if match.status == 'live' %}<span class="tag tag-live"><span class="pulse"></span>进行中</span>
+        {% elif match.status == 'finished' %}<span class="tag tag-done">已完赛</span>
+        {% else %}<span class="tag tag-up">未开赛</span>{% endif %}
+    </div>
+
+    <div class="dh-matchup">
+        <div class="dh-team">
+            <div class="dh-tname">{{ match.home }}</div>
+            <div class="dh-tmeta">
+                Elo {{ p.home_team.strength }}
+                {% if match.home_rank %} · 排名 #{{ match.home_rank }}{% endif %}
+            </div>
+        </div>
+        <div class="dh-center">
+            {% if match.score and match.score.ft %}
+            <div class="dh-score">{{ match.score.ft[0] }}-{{ match.score.ft[1] }}</div>
+            <div class="dh-status">
+                终场{% if match.score.ht %} · 半场 {{ match.score.ht[0] }}-{{ match.score.ht[1] }}{% endif %}
+            </div>
+            {% else %}
+            <div class="dh-vs">VS</div>
+            {% endif %}
+        </div>
+        <div class="dh-team">
+            <div class="dh-tname">{{ match.away }}</div>
+            <div class="dh-tmeta">
+                Elo {{ p.away_team.strength }}
+                {% if match.away_rank %} · 排名 #{{ match.away_rank }}{% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 概率三卡 -->
+<div class="prob-cards">
+    <div class="prob-card {% if p.ev_analysis.home.is_value %}is-value{% endif %}">
+        {% if p.ev_analysis.home.is_value %}
+        <div class="pc-badge">🔥 价值 +{{ p.ev_analysis.home.ev }}%</div>
+        {% endif %}
+        <div class="pc-val c-home">{{ p.probabilities.home_win }}%</div>
+        <div class="pc-lbl">主胜 · {{ match.home }}</div>
+        {% if p.ev_analysis.home.is_value %}
+        <div class="pc-ev">建议仓位 {{ p.ev_analysis.home.kelly_pct }}%</div>
+        {% endif %}
+    </div>
+
+    {% if not is_bb %}
+    <div class="prob-card {% if p.ev_analysis.draw.is_value %}is-value{% endif %}">
+        {% if p.ev_analysis.draw.is_value %}
+        <div class="pc-badge">🔥 价值 +{{ p.ev_analysis.draw.ev }}%</div>
+        {% endif %}
+        <div class="pc-val c-draw">{{ p.probabilities.draw }}%</div>
+        <div class="pc-lbl">平局</div>
+        {% if p.ev_analysis.draw.is_value %}
+        <div class="pc-ev">建议仓位 {{ p.ev_analysis.draw.kelly_pct }}%</div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    <div class="prob-card {% if p.ev_analysis.away.is_value %}is-value{% endif %}">
+        {% if p.ev_analysis.away.is_value %}
+        <div class="pc-badge">🔥 价值 +{{ p.ev_analysis.away.ev }}%</div>
+        {% endif %}
+        <div class="pc-val c-away">{{ p.probabilities.away_win }}%</div>
+        <div class="pc-lbl">客胜 · {{ match.away }}</div>
+        {% if p.ev_analysis.away.is_value %}
+        <div class="pc-ev">建议仓位 {{ p.ev_analysis.away.kelly_pct }}%</div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- 概率条 -->
+<div class="mc-bar" style="height:6px;border-radius:3px;margin-bottom:20px;">
+    <div class="mc-bar-seg seg-home" data-width="{{ p.probabilities.home_win }}"></div>
+    <div class="mc-bar-seg seg-draw" data-width="{{ p.probabilities.draw }}"></div>
+    <div class="mc-bar-seg seg-away" data-width="{{ p.probabilities.away_win }}"></div>
+</div>
+
+<div class="data-grid">
+
+    {% if is_bb and p.basketball %}
+    <!-- 篮球专属面板 -->
+    <div class="data-card span-2">
+        <h3 class="dc-title">🏀 篮球盘口分析</h3>
+        <div class="bb-grid" style="grid-template-columns: repeat(4, 1fr);">
+            <div class="bb-cell">
+                <span class="bb-val">{{ p.basketball.expected_home_points }}</span>
+                <span class="bb-lbl">{{ match.home }} 预期得分</span>
+            </div>
+            <div class="bb-cell">
+                <span class="bb-val">{{ p.basketball.expected_away_points }}</span>
+                <span class="bb-lbl">{{ match.away }} 预期得分</span>
+            </div>
+            <div class="bb-cell">
+                <span class="bb-val">{{ p.basketball.expected_total }}</span>
+                <span class="bb-lbl">预期总分</span>
+            </div>
+            <div class="bb-cell">
+                <span class="bb-val">{{ p.basketball.spread }}</span>
+                <span class="bb-lbl">让分 (主队视角)</span>
+            </div>
+        </div>
+        <div class="bb-grid" style="grid-template-columns: repeat(2, 1fr); margin-top: 10px;">
+            <div class="bb-cell">
+                <span class="bb-val c-home">{{ p.basketball.over_prob }}%</span>
+                <span class="bb-lbl">大分 (>&nbsp;{{ p.basketball.over_line }})</span>
+            </div>
+            <div class="bb-cell">
+                <span class="bb-val c-away">{{ p.basketball.under_prob }}%</span>
+                <span class="bb-lbl">小分 (<&nbsp;{{ p.basketball.over_line }})</span>
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <!-- 足球：最可能比分 -->
+    <div class="data-card">
+        <h3 class="dc-title">🎯 最可能比分</h3>
+        <div class="score-pills">
+            {% for s in p.top_scores %}
+            <div class="score-pill {% if match.score and match.score.ft and s.score == (match.score.ft[0]|string ~ '-' ~ match.score.ft[1]|string) %}hit{% endif %}">
+                <span class="sp-val-s">{{ s.score }}</span>
+                <span class="sp-prob">{{ s.probability }}%</span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- 足球：进球数 -->
+    <div class="data-card">
+        <h3 class="dc-title">⚽ 进球数分布</h3>
+        <div class="bb-grid">
+            <div class="bb-cell">
+                <span class="bb-val">{{ p.goals_prediction.most_likely }}</span>
+                <span class="bb-lbl">最可能总进球</span>
+            </div>
+            <div class="bb-cell">
+                <span class="bb-val c-home">{{ (p.goals_prediction.over_2_5 * 100) | round(1) }}%</span>
+                <span class="bb-lbl">大球 (>2.5)</span>
+            </div>
+            <div class="bb-cell">
+                <span class="bb-val c-away">{{ (p.goals_prediction.under_2_5 * 100) | round(1) }}%</span>
+                <span class="bb-lbl">小球 (<2.5)</span>
+            </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:.72rem;color:var(--text-muted);margin-top:10px;font-family:var(--mono);">
+            <span>预期进球 {{ p.expected_goals.home }} : {{ p.expected_goals.away }}</span>
+            <span>悬念 {{ p.suspense.stars }}★ {{ p.suspense.label }}</span>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 赔率对比 -->
+    {% if p.market.odds and p.market.implied_probabilities and p.market.implied_probabilities.home_win != None %}
+    <div class="data-card span-2">
+        <h3 class="dc-title">⚖️ 市场赔率 vs 模型概率</h3>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>选项</th>
+                    <th>赔率</th>
+                    <th>隐含概率</th>
+                    <th>模型概率</th>
+                    <th>EV</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr class="{% if p.ev_analysis.home.is_value %}is-value-row{% endif %}">
+                    <td>主胜</td>
+                    <td>{{ p.market.odds.home_win }}</td>
+                    <td>{{ p.market.implied_probabilities.home_win }}%</td>
+                    <td>{{ p.model_probabilities.home_win }}%</td>
+                    <td>{{ p.ev_analysis.home.ev }}%</td>
+                </tr>
+                {% if not is_bb %}
+                <tr class="{% if p.ev_analysis.draw.is_value %}is-value-row{% endif %}">
+                    <td>平局</td>
+                    <td>{{ p.market.odds.draw }}</td>
+                    <td>{{ p.market.implied_probabilities.draw }}%</td>
+                    <td>{{ p.model_probabilities.draw }}%</td>
+                    <td>{{ p.ev_analysis.draw.ev }}%</td>
+                </tr>
+                {% endif %}
+                <tr class="{% if p.ev_analysis.away.is_value %}is-value-row{% endif %}">
+                    <td>客胜</td>
+                    <td>{{ p.market.odds.away_win }}</td>
+                    <td>{{ p.market.implied_probabilities.away_win }}%</td>
+                    <td>{{ p.model_probabilities.away_win }}%</td>
+                    <td>{{ p.ev_analysis.away.ev }}%</td>
+                </tr>
+            </tbody>
+        </table>
+        <p style="font-size:.7rem;color:var(--text-faint);margin-top:10px;">
+            赔率融合权重 {{ (p.market.weight * 100) | round(0) | int }}% · 数据来源 500.com
+        </p>
+    </div>
+    {% endif %}
+
+    <!-- 凯利计算器 -->
+    {% set has_value = p.ev_analysis and (p.ev_analysis.home.is_value or p.ev_analysis.draw.is_value or p.ev_analysis.away.is_value) %}
+    {% if has_value %}
+    <div class="data-card span-2">
+        <h3 class="dc-title">💰 凯利仓位计算器</h3>
+        <div class="kelly-box">
+            <div class="kelly-slider-row">
+                <span style="font-size:.8rem;font-weight:600;color:var(--text-secondary);white-space:nowrap;">模拟本金</span>
+                <input type="range" id="bankroll" min="1000" max="200000" step="1000" value="10000">
+                <span class="kelly-amount" id="bankrollVal">10,000</span>
+            </div>
+            <div id="kellyRows">
+                {% if p.ev_analysis.home.is_value %}
+                <div class="kelly-row" data-kelly="{{ p.ev_analysis.home.kelly_pct }}" data-odds="{{ p.market.odds.home_win }}">
+                    <span class="kr-label">主胜 · 仓位 {{ p.ev_analysis.home.kelly_pct }}%</span>
+                    <span class="kr-bet">—</span>
+                    <span class="kr-ret">回报 —</span>
+                </div>
+                {% endif %}
+                {% if not is_bb and p.ev_analysis.draw.is_value %}
+                <div class="kelly-row" data-kelly="{{ p.ev_analysis.draw.kelly_pct }}" data-odds="{{ p.market.odds.draw }}">
+                    <span class="kr-label">平局 · 仓位 {{ p.ev_analysis.draw.kelly_pct }}%</span>
+                    <span class="kr-bet">—</span>
+                    <span class="kr-ret">回报 —</span>
+                </div>
+                {% endif %}
+                {% if p.ev_analysis.away.is_value %}
+                <div class="kelly-row" data-kelly="{{ p.ev_analysis.away.kelly_pct }}" data-odds="{{ p.market.odds.away_win }}">
+                    <span class="kr-label">客胜 · 仓位 {{ p.ev_analysis.away.kelly_pct }}%</span>
+                    <span class="kr-bet">—</span>
+                    <span class="kr-ret">回报 —</span>
+                </div>
+                {% endif %}
+            </div>
+            <p style="font-size:.7rem;color:var(--text-faint);margin-top:10px;">
+                采用 1/4 分数凯利，仅对正 EV 选项给出建议。博彩有风险，请理性对待。
+            </p>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 战力雷达 -->
+    <div class="data-card span-2">
+        <h3 class="dc-title">🕸️ 六维战力对比</h3>
+        <div class="radar-wrap">
+            <canvas id="radarChart"></canvas>
+        </div>
+    </div>
+
+    <!-- 实力情报 -->
+    <div class="data-card span-2">
+        <h3 class="dc-title">📋 模型输入</h3>
+        <div class="intel-list">
+            <div class="intel-item">
+                <span class="intel-name">{{ match.home }}</span>
+                <span>{{ p.key_info.home_notes | join(' · ') }}</span>
+            </div>
+            <div class="intel-item">
+                <span class="intel-name">{{ match.away }}</span>
+                <span>{{ p.key_info.away_notes | join(' · ') }}</span>
+            </div>
+            <div class="intel-item">
+                <span class="intel-name">综合悬念</span>
+                <span>{{ p.suspense.stars }} 星 · {{ p.suspense.label }}</span>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<div class="back-nav">
+    <a href="/" class="back-link">← 返回赛事列表</a>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    // 概率条动画
+    document.querySelectorAll('.mc-bar-seg[data-width]').forEach(function (seg, i) {
+        var w = seg.dataset.width;
+        seg.style.width = '0%';
+        setTimeout(function () { seg.style.width = w + '%'; }, 200 + i * 80);
+    });
+
+    // 雷达图
+    var radarData = {{ p.radar | tojson | safe }};
+    var ctx = document.getElementById('radarChart');
+    if (ctx) {
+        var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+        var gridColor = dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+        var labelColor = dark ? 'rgba(255,255,255,0.75)' : 'rgba(0,0,0,0.7)';
+        new Chart(ctx.getContext('2d'), {
+            type: 'radar',
+            data: {
+                labels: radarData.labels,
+                datasets: [
+                    {
+                        label: '{{ match.home }}',
+                        data: radarData.home,
+                        backgroundColor: 'rgba(225, 29, 72, 0.18)',
+                        borderColor: '#e11d48',
+                        pointBackgroundColor: '#e11d48',
+                        borderWidth: 2,
+                        fill: true
+                    },
+                    {
+                        label: '{{ match.away }}',
+                        data: radarData.away,
+                        backgroundColor: 'rgba(5, 150, 105, 0.18)',
+                        borderColor: '#059669',
+                        pointBackgroundColor: '#059669',
+                        borderWidth: 2,
+                        fill: true
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { position: 'bottom', labels: { color: labelColor, font: { size: 12 } } }
+                },
+                scales: {
+                    r: {
+                        angleLines: { color: gridColor },
+                        grid: { color: gridColor },
+                        pointLabels: { color: labelColor, font: { size: 11 } },
+                        ticks: { display: false, min: 0, max: 100 }
+                    }
+                }
+            }
+        });
+    }
+
+    // 凯利
+    var slider = document.getElementById('bankroll');
+    var valEl = document.getElementById('bankrollVal');
+    var rows = document.querySelectorAll('#kellyRows .kelly-row');
+
+    function fmt(n) { return n.toLocaleString(undefined, { maximumFractionDigits: 0 }); }
+
+    function update() {
+        var br = parseFloat(slider.value);
+        valEl.innerText = fmt(br);
+        rows.forEach(function (row) {
+            var k = parseFloat(row.dataset.kelly) / 100;
+            var o = parseFloat(row.dataset.odds);
+            var bet = br * k;
+            var ret = bet * o;
+            row.querySelector('.kr-bet').innerText = '¥' + fmt(bet);
+            row.querySelector('.kr-ret').innerText = '回报 ¥' + fmt(ret);
+        });
+    }
+    if (slider) { slider.addEventListener('input', update); update(); }
+});
+</script>
+
+{% else %}
+<div class="empty-state">
+    <div class="es-icon">◈</div>
+    <p class="es-title">未找到该比赛</p>
+    <p class="es-sub">可能已被清理或 ID 有误</p>
+</div>
+<div class="back-nav"><a href="/" class="back-link">← 返回列表</a></div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="strategy-head">
+    <h1 class="sh-title">智能策略舱</h1>
+    <p class="sh-sub">扫描当日全部盘口 · 定位正 EV 价值 · 计算最优串关与仓位</p>
+</div>
+
+<div class="bankroll-card">
+    <div class="bc-title">资金管理</div>
+    <div class="kelly-slider-row">
+        <span style="font-size:.82rem;font-weight:600;color:var(--text-secondary);white-space:nowrap;">模拟本金</span>
+        <input type="range" id="bankroll" min="1000" max="200000" step="1000" value="10000">
+        <span class="kelly-amount" id="bankrollVal">10,000</span>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <span class="chip chip-on" data-sport="football">⚽ 足球</span>
+        <span class="chip" data-sport="basketball">🏀 篮球</span>
+        <span class="chip" data-sport="all">全部</span>
+    </div>
+</div>
+
+<div id="loading" class="loading-state">
+    <div class="spinner"></div>
+    <p>正在扫描盘口并计算价值...</p>
+</div>
+
+<div id="content" style="display:none;">
+    <!-- 单个价值选项 -->
+    <div class="value-table">
+        <div class="data-card">
+            <h3 class="dc-title">🔥 正 EV 价值选项 <span id="vbCount" style="color:var(--value);"></span></h3>
+            <div id="valueBets"></div>
+        </div>
+    </div>
+
+    <!-- 串关 -->
+    <div class="combo-list" id="comboList"></div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    var slider = document.getElementById('bankroll');
+    var valEl = document.getElementById('bankrollVal');
+    var sportChips = document.querySelectorAll('[data-sport]');
+    var currentSport = 'football';
+    var data = null;
+
+    function fmt(n) { return n.toLocaleString(undefined, { maximumFractionDigits: 0 }); }
+
+    function updateBankroll() {
+        var br = parseFloat(slider.value);
+        valEl.innerText = fmt(br);
+        document.querySelectorAll('[data-kelly]').forEach(function (row) {
+            var k = parseFloat(row.dataset.kelly) / 100;
+            var o = parseFloat(row.dataset.odds);
+            var bet = br * k;
+            var ret = bet * o;
+            var betEl = row.querySelector('.bet-out');
+            var retEl = row.querySelector('.ret-out');
+            if (betEl) betEl.innerText = '¥' + fmt(bet);
+            if (retEl) retEl.innerText = '¥' + fmt(ret);
+        });
+    }
+
+    function renderLegs(legs) {
+        return legs.map(function (l) {
+            return '<div class="cc-leg">' +
+                '<span class="cc-leg-name">' + l.match_name + '</span>' +
+                '<span class="cc-leg-right">' +
+                    '<span class="cc-leg-outcome">' + l.outcome + '</span>' +
+                    '<span class="cc-leg-odds">@' + l.odds.toFixed(2) + '</span>' +
+                '</span></div>';
+        }).join('');
+    }
+
+    function renderCombo(key, cls, title, note) {
+        var c = data[key];
+        if (!c) {
+            return '<div class="combo-card ' + cls + '">' +
+                '<div class="cc-head"><div class="cc-title">' + title + '</div></div>' +
+                '<p style="font-size:.8rem;color:var(--text-muted);">当前盘口未找到符合条件的组合</p></div>';
+        }
+        return '<div class="combo-card ' + cls + '">' +
+            '<div class="cc-head">' +
+                '<div class="cc-title">' + title + '<span class="cc-note">' + note + '</span></div>' +
+                '<div class="cc-metrics">' +
+                    '<div class="cc-metric">联合胜率 <strong style="color:var(--loss)">' + c.combined_prob + '%</strong></div>' +
+                    '<div class="cc-metric">复合赔率 <strong>@' + c.combined_odds + '</strong></div>' +
+                    '<div class="cc-metric">期望值 <strong style="color:var(--value)">+' + c.ev + '%</strong></div>' +
+                '</div>' +
+            '</div>' +
+            '<div class="cc-legs">' + renderLegs(c.legs) + '</div>' +
+            '<div class="kelly-row" data-kelly="' + c.kelly_pct + '" data-odds="' + c.combined_odds + '">' +
+                '<span class="kr-label">建议仓位 ' + c.kelly_pct + '%</span>' +
+                '<span class="kr-bet bet-out">—</span>' +
+                '<span class="kr-ret">回报 <span class="ret-out">—</span></span>' +
+            '</div>' +
+        '</div>';
+    }
+
+    function render() {
+        // 价值选项
+        var bets = data.single_bets || [];
+        document.getElementById('vbCount').innerText = '(' + bets.length + ' 项)';
+        if (bets.length) {
+            var rows = bets.map(function (b) {
+                return '<div class="cc-leg">' +
+                    '<span class="cc-leg-name">' + b.league + ' · ' + b.match_name + '</span>' +
+                    '<span class="cc-leg-right">' +
+                        '<span class="cc-leg-outcome">' + b.outcome + '</span>' +
+                        '<span class="cc-leg-odds">@' + b.odds + '</span>' +
+                        '<span style="font-family:var(--mono);color:var(--value);font-weight:800;">+' + b.ev + '%</span>' +
+                        '<span style="font-size:.72rem;color:var(--text-muted);">仓位 ' + b.kelly_pct + '%</span>' +
+                    '</span></div>';
+            }).join('');
+            document.getElementById('valueBets').innerHTML = rows;
+        } else {
+            document.getElementById('valueBets').innerHTML =
+                '<p style="font-size:.82rem;color:var(--text-muted);">当前盘口未发现正 EV 机会。这通常意味着市场定价有效。</p>';
+        }
+
+        // 串关
+        document.getElementById('comboList').innerHTML =
+            renderCombo('best_double', 'double', '二串一', '最稳组合') +
+            renderCombo('best_treble', 'treble', '三串一', '平衡组合') +
+            renderCombo('best_four', 'four', '四串一', '高赔组合');
+
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('content').style.display = 'block';
+        updateBankroll();
+    }
+
+    function load(sport) {
+        document.getElementById('loading').style.display = 'block';
+        document.getElementById('content').style.display = 'none';
+        fetch('/api/strategy?sport=' + sport)
+            .then(function (r) { return r.json(); })
+            .then(function (d) { data = d; render(); })
+            .catch(function () {
+                document.getElementById('loading').innerHTML =
+                    '<p style="color:var(--live);">加载失败，请稍后重试</p>';
+            });
+    }
+
+    slider.addEventListener('input', updateBankroll);
+
+    sportChips.forEach(function (chip) {
+        chip.addEventListener('click', function () {
+            sportChips.forEach(function (c) { c.classList.remove('chip-on'); });
+            chip.classList.add('chip-on');
+            currentSport = chip.dataset.sport;
+            load(currentSport);
+        });
+    });
+
+    load(currentSport);
+});
+</script>
+{% endblock %}
