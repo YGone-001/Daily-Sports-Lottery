@@ -194,6 +194,7 @@ def _parse_live(html: str, prefix: str, sport: str) -> list[dict]:
                 "round": round_name,
                 "date": mdate,
                 "time": hhmm,
+                "kickoff_time_known": True,
                 "status": status,
                 "home": home,
                 "away": away,
@@ -356,6 +357,7 @@ def _parse_lq(html: str) -> list[dict]:
                 "round": str(_at(row, _LQ_ROUND)).strip(),
                 "date": mdate,
                 "time": hhmm,
+                "kickoff_time_known": True,
                 "status": status,
                 "home": home,
                 "away": away,
@@ -528,6 +530,7 @@ def _parse_wanchang(html: str) -> list[dict]:
                 "round": round_name,
                 "date": mdate,
                 "time": hhmm,
+                "kickoff_time_known": True,
                 "status": status,
                 "home": home,
                 "away": away,
@@ -623,6 +626,7 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
                         "round": attrs.get("matchnum", ""),
                         "date": attrs.get("date", ""),
                         "time": "00:00",
+                        "kickoff_time_known": False,
                         "status": "upcoming",
                         "home": attrs.get("home", "").strip(),
                         "away": attrs.get("away", "").strip(),
@@ -630,6 +634,7 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
                         "away_rank": None,
                         "score": None,
                         "odds": {},
+                        "jczq_no": attrs.get("matchnum", ""),
                     }
                     by_id[mid] = entry
 
@@ -736,6 +741,7 @@ def _parse_jczq_html(html: str) -> list[dict]:
                 "round": "",
                 "date": today,
                 "time": time_m.group(1) if time_m else "00:00",
+                "kickoff_time_known": bool(time_m),
                 "status": "upcoming",
                 "home": home_m.group(1).strip(),
                 "away": away_m.group(1).strip(),

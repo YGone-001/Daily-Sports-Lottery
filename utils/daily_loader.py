@@ -16,6 +16,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import config
+from utils.match_identity import is_kickoff_time_known
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 DAILY_FILE = "daily_matches.json"
@@ -61,7 +62,9 @@ def get_logical_matchday(now: datetime | None = None) -> str:
 
 
 def get_match_datetime(match: dict) -> datetime | None:
-    """解析比赛开赛时间（北京时间）"""
+    """解析比赛开赛时间（北京时间）。开赛时间未知时返回 None。"""
+    if not is_kickoff_time_known(match):
+        return None
     try:
         date_str = match.get("date", "")
         time_str = match.get("time", "00:00") or "00:00"

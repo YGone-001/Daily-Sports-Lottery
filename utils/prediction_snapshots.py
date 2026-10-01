@@ -289,6 +289,10 @@ def _create_or_get(
     if status != "upcoming":
         return get_snapshot(snapshot_id), False
 
+    # 权威开赛时间门禁：开赛时间未知时禁止新建快照（历史已有快照仍可读）
+    if get_match_datetime(match) is None:
+        return get_snapshot(snapshot_id), False
+
     if prediction is None:
         from models.predictor import predict_match
 

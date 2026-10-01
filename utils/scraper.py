@@ -24,6 +24,7 @@ from utils.daily_loader import (
 )
 from utils.evaluation_rows import EvaluationIntegrityError, capture_evaluation_row
 from utils.market_coverage import has_usable_market_odds
+from utils.match_identity import is_kickoff_time_known, same_event
 from utils.odds_snapshots import record_odds_snapshot
 from utils.prediction_snapshots import capture_snapshot, get_snapshot, get_snapshots_for_match
 from utils.settlements import (
@@ -56,36 +57,40 @@ def _match_key(match: dict) -> str:
 
 def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[dict]]:
     """
-    把竞彩赔率按「竞彩编号」挂到已有赛程上。
-    编号缺失时退化为按 (日期, 主队) 匹配。
+    把竞彩赔率挂到已有赛程上。
+    优先级：
+    1. 强赛事编号 (sport + date + 归一化编号)
+    2. 主客队对 fallback (sport + date + home + away)
+    不使用开赛时间，不单独使用 (date, home)。
 
     返回 (成功挂载的场次数, 被消费的赔率源行列表)。
     被消费的行不再作为兜底候选，避免同一市场事件重复入册。
     """
-    by_no: dict[str, dict] = {}
-    by_home: dict[tuple, dict] = {}
-    for r in odds_rows:
-        no = _norm_no(r.get("jczq_no") or r.get("round") or "")
-        if no:
-            by_no.setdefault(no, r)
-        by_home.setdefault((r.get("date", ""), r.get("home", "")), r)
-
     count = 0
     used: list[dict] = []
+    used_ids: set[int] = set()
+
     for m in matches:
         if m.get("odds"):
             continue
-        no = _norm_no(m.get("jczq_no") or "")
-        src = by_no.get(no) if no else None
-        if src is None:
-            src = by_home.get((m.get("date", ""), m.get("home", "")))
-        if src and src.get("odds"):
-            m["odds"] = dict(src["odds"])
+        matched_row = None
+        for r in odds_rows:
+            if id(r) in used_ids:
+                continue
+            if same_event(m, r):
+                matched_row = r
+                break
+
+        if matched_row and matched_row.get("odds"):
+            m["odds"] = dict(matched_row["odds"])
             count += 1
-            used.append(src)
+            used.append(matched_row)
+            used_ids.add(id(matched_row))
             # 用赔率源的联赛名补全（更规范）
-            if src.get("league") and not m.get("league"):
-                m["league"] = src["league"]
+            if matched_row.get("league") and not m.get("league"):
+                m["league"] = matched_row["league"]
+            if matched_row.get("jczq_no") and not m.get("jczq_no"):
+                m["jczq_no"] = matched_row["jczq_no"]
     return count, used
 
 
@@ -95,35 +100,20 @@ def _append_unmatched_market_candidates(
     used_market_rows: list[dict],
 ) -> int:
     """
-    把「未被挂载」但自带**可用盘口**的赔率行作为兜底候选追加进 `incoming`，返回追加条数。
+    把「未被挂载」但自带可用盘口的赔率行作为兜底候选追加进 incoming，返回追加条数。
 
-    赔率源本身是独立于即时比分源的市场事件流：某行只是没挂上 live 行
-    （编号不一致 / live 源暂时缺漏 / 队名写法不同）时，不应直接丢弃这个有效市场事件。
-
-    同时必须防止重复：与既有 live 行同竞彩编号、或同 (日期, 主队) 的一律跳过，
-    避免同一市场事件同时产生「live 行 + 00:00 兜底行」两条 canonical 记录。
+    必须防止重复：与既有 incoming 行（含 live 行）属于 same_event 的一律跳过，
+    同一真实事件至多产生一条 incoming 候选。
     """
     used_ids = {id(row) for row in used_market_rows}
-    live_nos = {_norm_no(m.get("jczq_no") or "") for m in incoming}
-    live_nos.discard("")
-    live_home = {(m.get("date", ""), m.get("home", "")) for m in incoming}
-
-    appended_keys: set[str] = set()
     added = 0
     for row in market_rows:
         if id(row) in used_ids:
             continue
         if not has_usable_market_odds(row):
             continue
-        no = _norm_no(row.get("jczq_no") or row.get("round") or "")
-        if no and no in live_nos:
+        if any(same_event(row, inc) for inc in incoming):
             continue
-        if (row.get("date", ""), row.get("home", "")) in live_home:
-            continue
-        key = _match_key(row)
-        if key in appended_keys:
-            continue
-        appended_keys.add(key)
         incoming.append(dict(row))
         added += 1
     return added
@@ -154,22 +144,22 @@ def _prepare_existing_market_universe(existing: list[dict]) -> tuple[list[dict],
 
 def _admit_market_candidates(
     candidates: list[dict],
-    tracked_keys: set[str],
+    existing: list[dict],
 ) -> tuple[list[dict], int]:
     """
     市场准入：决定哪些候选可以进入 canonical 跟踪集合。
 
-    - 已在跟踪集合中（键命中）-> 准入：接受状态 / 比分更新，
-      即使本轮没有盘口（盘口源临时不可用时也必须保持连续性）。
-    - 首次出现的候选 -> 只有具备可用盘口覆盖才准入，并打上 `market_tracked = true`。
+    - 已在跟踪集合中（same_event 命中已跟踪事件）-> 准入：接受状态 / 比分 / 开赛时间更新，
+      即使本轮没有盘口（盘口源临时不可用时也必须保持生命周期连续性）。
+    - 首次出现的全新候选 -> 只有具备可用盘口覆盖才准入，并打上 market_tracked = True。
     - 其余 -> 拒绝（不进入 canonical 集合，也不写入任何下游历史）。
 
-    返回 (准入列表, 拒绝条数)。不会写入 `market_tracked = false`。
+    返回 (准入列表, 拒绝条数)。
     """
     admitted: list[dict] = []
     rejected = 0
     for m in candidates:
-        if _match_key(m) in tracked_keys:
+        if any(same_event(m, ex) for ex in existing):
             admitted.append(m)
             continue
         if has_usable_market_odds(m):
@@ -183,46 +173,89 @@ def _admit_market_candidates(
 def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int, int]:
     """
     合并新旧赛事。
-    匹配键: sport|date|time|home|away
-    返回 (merged, added, updated)
+    使用 same_event 跨源对账，严格保持旧 canonical id。
+    返回 (merged, added, updated)。
     """
-    index = {}
-    for m in existing:
-        index[_match_key(m)] = m
-
+    result: list[dict] = [dict(m) for m in existing]
     added = updated = 0
-    for m in incoming:
-        key = _match_key(m)
-        if key in index:
-            old = index[key]
-            # 更新比分/赔率/状态
+
+    for inc in incoming:
+        match_idx = -1
+        for i, old in enumerate(result):
+            if same_event(old, inc):
+                match_idx = i
+                break
+
+        if match_idx >= 0:
+            old = result[match_idx]
             changed = False
-            if m.get("score") and m["score"] != old.get("score"):
-                old["score"] = m["score"]
+
+            # 1. 保持 canonical id 不变（old["id"] 永远胜出，禁止被 inc 替换）
+
+            # 2. 开赛时间更新规则：
+            # incoming 开赛时间已知时升级
+            if is_kickoff_time_known(inc):
+                inc_time = inc.get("time") or "00:00"
+                if inc_time != old.get("time") or not old.get("kickoff_time_known"):
+                    old["time"] = inc_time
+                    old["kickoff_time_known"] = True
+                    changed = True
+            # incoming 开赛时间未知时，绝不覆盖已有已知时间，绝不降级
+
+            # 3. 比分更新
+            if inc.get("score") and inc["score"] != old.get("score"):
+                old["score"] = inc["score"]
                 changed = True
-            if m.get("odds") and m["odds"] != old.get("odds"):
-                old["odds"] = m["odds"]
-                old["odds_updated_at"] = get_beijing_now().isoformat()
-                changed = True
-            if m.get("status") != old.get("status"):
-                old["status"] = m["status"]
-                changed = True
-            if m.get("home_rank") is not None:
-                old["home_rank"] = m["home_rank"]
-            if m.get("away_rank") is not None:
-                old["away_rank"] = m["away_rank"]
+
+            # 状态更新
+            inc_status = inc.get("status")
+            if inc_status and inc_status != old.get("status"):
+                if not (
+                    old.get("status") in ("live", "finished")
+                    and not is_kickoff_time_known(inc)
+                    and inc_status == "upcoming"
+                ):
+                    old["status"] = inc_status
+                    changed = True
+
+            # 4. 盘口更新：若有新盘口则更新，无新盘口则保留旧盘口
+            if inc.get("odds"):
+                if inc["odds"] != old.get("odds"):
+                    old["odds"] = inc["odds"]
+                    old["odds_updated_at"] = get_beijing_now().isoformat()
+                    changed = True
+
+            # 5. 排期元数据升级
+            if is_kickoff_time_known(inc):
+                if inc.get("league") and inc["league"] != "竞彩":
+                    old["league"] = inc["league"]
+                if inc.get("home") and inc["home"] != old.get("home"):
+                    old["home"] = inc["home"]
+                if inc.get("away") and inc["away"] != old.get("away"):
+                    old["away"] = inc["away"]
+
+            if inc.get("jczq_no") and not old.get("jczq_no"):
+                old["jczq_no"] = inc["jczq_no"]
+            if inc.get("round") and not old.get("round"):
+                old["round"] = inc["round"]
+            if inc.get("home_rank") is not None and old.get("home_rank") is None:
+                old["home_rank"] = inc["home_rank"]
+            if inc.get("away_rank") is not None and old.get("away_rank") is None:
+                old["away_rank"] = inc["away_rank"]
+
+            old["market_tracked"] = True
             if changed:
                 updated += 1
         else:
-            # 保留原 id
+            m = dict(inc)
             if not m.get("id"):
-                m["id"] = f"{m.get('sport','f')}-{m.get('date')}-{added}"
-            index[key] = m
+                m["id"] = f"{m.get('sport','f')}-{m.get('date')}-{len(result) + added}"
+            m["market_tracked"] = True
+            result.append(m)
             added += 1
 
-    merged = list(index.values())
-    merged.sort(key=lambda x: (x.get("date", ""), x.get("time", "00:00")))
-    return merged, added, updated
+    result.sort(key=lambda x: (x.get("date", ""), x.get("time", "00:00")))
+    return result, added, updated
 
 
 def _calibrate_from_finished(matches: list[dict]) -> int:
@@ -474,8 +507,7 @@ def refresh(verbose: bool = True) -> dict:
     existing, legacy_removed = _prepare_existing_market_universe(data.get("matches", []))
 
     # 6. 市场准入：已跟踪比赛接受更新；新候选必须具备可用盘口覆盖
-    tracked_keys = {_match_key(m) for m in existing}
-    admitted, rejected = _admit_market_candidates(incoming, tracked_keys)
+    admitted, rejected = _admit_market_candidates(incoming, existing)
     result["sources"]["market_tracked_removed"] = legacy_removed
     result["sources"]["market_rejected"] = rejected
 
