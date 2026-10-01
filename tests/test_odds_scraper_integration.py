@@ -5,8 +5,10 @@
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 from utils import fetcher_500, scraper
-from utils.daily_loader import load_json
+from utils.daily_loader import get_match_datetime, load_json
 from utils.odds_snapshots import get_odds_history_for_match
 
 MATCH_ID = "500j-2030-03-01-3001"
@@ -87,3 +89,30 @@ def test_refresh_without_odds_reports_zero(isolated_data_dir, monkeypatch):
     result = scraper.refresh(verbose=False)
     assert result["odds_snapshots_added"] == 0
     assert get_odds_history_for_match(MATCH_ID) == []
+
+
+# ---------------------------------------------------------------------------
+# 捕获统计的精确性（注入确定性 now，直接驱动窄接口）
+# ---------------------------------------------------------------------------
+
+def test_capture_helper_exact_replay_reports_zero(isolated_data_dir, make_match):
+    """
+    同一 match_id + 同一 odds + 同一 now（=> 同一 snapshot_id）：
+    首次计入 1，精确幂等重放计入 0，库中始终只有 1 条。
+    """
+    m = make_match(odds=dict(ODDS_A))
+    at = get_match_datetime(m) - timedelta(hours=2)
+
+    assert scraper._capture_odds_history([m], now=at) == 1
+    assert scraper._capture_odds_history([m], now=at) == 0
+    assert len(get_odds_history_for_match(m["id"])) == 1
+
+
+def test_capture_helper_consecutive_duplicate_still_zero(isolated_data_dir, make_match):
+    """A at T1 / A at T2：首次持久化，第二次作为连续重复被抑制。"""
+    m = make_match(odds=dict(ODDS_A))
+    at = get_match_datetime(m) - timedelta(hours=2)
+
+    assert scraper._capture_odds_history([m], now=at) == 1
+    assert scraper._capture_odds_history([m], now=at + timedelta(minutes=30)) == 0
+    assert len(get_odds_history_for_match(m["id"])) == 1

@@ -222,9 +222,12 @@ def record_odds_snapshot(
     - 无有效赔率（规范化后为空）-> 返回 None（无可记录内容）。
     - 比赛状态非 `upcoming`（即 live / finished）-> 返回 None，不写入。
     - 与「该场最新一条」规范化赔率相同（连续重复）-> 返回 None，不写入。
+    - 该确定性 snapshot_id 已存在（精确幂等重放）-> 返回 None，不写入。
     - 否则追加一条不可变记录并原子落盘，返回该记录。
 
-    返回值即「本次是否产生了新的历史观察」，便于调用方统计。
+    返回契约（调用方可据此精确计数）：
+        dict = 本次调用确实新增并持久化了一条记录
+        None = 本次调用未新增任何记录（含幂等重放、连续重复、时序拒绝等）
     """
     match_id = str(match.get("id") or "")
     if not match_id:
@@ -242,10 +245,10 @@ def record_odds_snapshot(
 
     with _LOCK:
         store = _load_store()
-        existing = store["snapshots"].get(snapshot["snapshot_id"])
-        if isinstance(existing, dict):
-            # 同一观察（同 captured_at + 同指纹）已存在，幂等返回。
-            return existing
+        if snapshot["snapshot_id"] in store["snapshots"]:
+            # 精确幂等重放：同 match_id + captured_at + 指纹 的观察已存在，
+            # 本次没有产生新的持久化，故返回 None（而非既有记录）。
+            return None
 
         latest = _latest_in_store(store, match_id)
         if latest is not None and latest.get("odds_fingerprint") == snapshot["odds_fingerprint"]:

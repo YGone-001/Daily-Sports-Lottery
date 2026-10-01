@@ -64,6 +64,24 @@ def test_unchanged_odds_suppressed(isolated_data_dir, make_match):
     assert len(get_odds_history_for_match(m["id"])) == 1
 
 
+def test_exact_idempotent_replay_returns_none(isolated_data_dir, make_match):
+    """
+    同一 match_id + 同一 captured_at + 同一赔率指纹 = 精确幂等重放。
+    首次调用新增并持久化（返回 dict）；重放未产生新记录（返回 None）。
+    """
+    m = make_match(odds=dict(ODDS_A))
+    at = _before_kickoff(m)
+
+    first = record_odds_snapshot(m, now=at)
+    second = record_odds_snapshot(m, now=at)
+
+    assert isinstance(first, dict)
+    assert second is None
+    assert len(get_odds_history_for_match(m["id"])) == 1
+    # 既有记录未被改写
+    assert get_odds_snapshot(first["snapshot_id"])["odds"] == ODDS_A
+
+
 def test_changed_odds_appended(isolated_data_dir, make_match):
     m = make_match(odds=dict(ODDS_A))
     base = _before_kickoff(m)
