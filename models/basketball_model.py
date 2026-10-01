@@ -31,21 +31,40 @@ def expected_points(
     """
     计算单队预期得分。
 
-    原理：
-    1. 联赛基准总分的一半 = 单队基准得分
-    2. Elo 差决定两队分差
-    3. 主场优势加成
+    采用**对称的分差（margin）表述**：
+
+        elo_margin   = (elo_self - elo_opp) / basketball_elo_scale * 10
+        venue_margin = +basketball_home_advantage  (主队)
+                       -basketball_home_advantage  (客队)
+        points       = base_total / 2 + (elo_margin + venue_margin) / 2
+
+    单位约定（重要）：
+    - `basketball_home_advantage` 的单位是**篮球比分差（points）**，
+      即「主队获得的预期净胜分加成」，不是 Elo 分数、不是百分比、
+      也不是任意乘数。默认 `2.5` 就表示主队 +2.5 分的预期分差。
+    - `basketball_elo_scale = 200` 的含义保持既有定义：
+      200 分 Elo 差 ≈ 10 分预期分差。
+
+    因此主客对的预期分差恒为：
+
+        margin = elo 分差项 + 主场优势
+               = (home_elo - away_elo) / basketball_elo_scale * 10
+                 + basketball_home_advantage
+
+    主场优势对称地把分数从客队移给主队（各 1/2），
+    因此在 `pace = 1.0` 且无外部总分线时，两队预期得分之和恰为 `base_total`。
     """
     cfg = config.MODEL_CONFIG
     half = base_total / 2.0
 
-    elo_diff = elo_self - elo_opp
-    home_adv = cfg["basketball_home_advantage"] if is_home else 0.0
+    elo_margin = (elo_self - elo_opp) / cfg["basketball_elo_scale"] * 10.0
+    venue_margin = (
+        cfg["basketball_home_advantage"]
+        if is_home
+        else -cfg["basketball_home_advantage"]
+    )
 
-    # Elo 差换算成分差（每 200 分约 10 分球差）
-    spread = (elo_diff + home_adv * 10.0) / cfg["basketball_elo_scale"] * 10.0
-
-    points = half + spread / 2.0
+    points = half + (elo_margin + venue_margin) / 2.0
     points *= pace
     return max(60.0, points)
 

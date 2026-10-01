@@ -25,7 +25,8 @@ from utils.prediction_snapshots import capture_snapshot, get_snapshots_for_match
 from utils.temporal_evaluation import build_temporal_summaries
 
 OLD_BASKETBALL_VERSION = "basketball-coldstart-1"
-NEW_BASKETBALL_VERSION = "basketball-modelprob-1"
+PREVIOUS_BASKETBALL_VERSION = "basketball-modelprob-1"
+NEW_BASKETBALL_VERSION = "basketball-margin-1"
 
 # 确定性球队档案（不使用运行时实力库）
 HOME = {
@@ -47,7 +48,7 @@ AWAY = {
 
 ODDS_HOME_FAV = {"home_win": 1.40, "away_win": 3.10}
 ODDS_AWAY_FAV = {"home_win": 3.10, "away_win": 1.40}
-ODDS_NEAR_THRESHOLD = {"home_win": 1.90, "away_win": 1.85}
+ODDS_NEAR_THRESHOLD = {"home_win": 1.75, "away_win": 2.03}
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -336,7 +337,7 @@ def test_historical_snapshot_immutability(isolated_data_dir, make_match):
     prediction = _predict_enriched(m)
 
     old, old_created = capture_snapshot(
-        m, prediction, model_version=OLD_BASKETBALL_VERSION
+        m, prediction, model_version=PREVIOUS_BASKETBALL_VERSION
     )
     assert old_created is True
     old_copy = copy.deepcopy(old)
@@ -348,7 +349,7 @@ def test_historical_snapshot_immutability(isolated_data_dir, make_match):
     snapshots = get_snapshots_for_match(m["id"])
     assert len(snapshots) == 2
     preserved = [
-        s for s in snapshots if s["model_version"] == OLD_BASKETBALL_VERSION
+        s for s in snapshots if s["model_version"] == PREVIOUS_BASKETBALL_VERSION
     ]
     assert len(preserved) == 1
     assert preserved[0] == old_copy

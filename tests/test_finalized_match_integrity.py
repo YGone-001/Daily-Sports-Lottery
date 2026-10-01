@@ -814,7 +814,7 @@ def test_market_admission_regression_unpriced_rejected(tmp_path, monkeypatch):
 
 def test_model_versions_remain_unchanged():
     assert config.MODEL_VERSIONS["football"] == "football-coldstart-1"
-    assert config.MODEL_VERSIONS["basketball"] == "basketball-modelprob-1"
+    assert config.MODEL_VERSIONS["basketball"] == "basketball-margin-1"
     assert config.MODEL_VERSION == "baseline-1"
 
 

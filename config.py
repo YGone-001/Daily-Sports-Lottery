@@ -62,8 +62,10 @@ MODEL_CONFIG = {
     # ---- 篮球 ----
     "basketball_base_total": 215.0,   # NBA/CBA 场均总分基准
     "basketball_base_total_cba": 205.0,
-    "basketball_home_advantage": 2.5,  # 主场让分
-    "basketball_elo_scale": 200.0,    # 篮球 Elo 尺度
+    # 主场优势单位：主队预期净胜分加成（篮球比分，非 Elo 分）。2.5 即主队 +2.5 分预期分差。
+    "basketball_home_advantage": 2.5,
+    # 篮球 Elo 尺度：200 分 Elo 差 ≈ 10 分预期分差。
+    "basketball_elo_scale": 200.0,
     "basketball_score_std": 11.5,     # 单队得分标准差
     "basketball_pace": 1.0,           # 节奏系数
 
@@ -82,7 +84,7 @@ MODEL_CONFIG = {
 # 版本号是人工维护的显式标识，不做任何自动推断（Git SHA / 文件哈希 / 时间戳等）。
 MODEL_VERSIONS = {
     "football": "football-coldstart-1",
-    "basketball": "basketball-modelprob-1",
+    "basketball": "basketball-margin-1",
 }
 
 # 全局回退版本：仅供**没有运动上下文**的调用方使用，属于兼容性兜底，

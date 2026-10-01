@@ -407,7 +407,7 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 ```python
 MODEL_VERSIONS = {
     "football": "football-coldstart-1",
-    "basketball": "basketball-modelprob-1",
+    "basketball": "basketball-margin-1",
 }
 
 MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
@@ -417,10 +417,14 @@ MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
   `hash()` 改为确定性 SHA-256（见「未知球队冷启动确定性」），
   **足球与篮球共用的 `_estimate_elo()` 都受影响**，因此两个运动的版本都必须提升，
   否则同一 `model_version` 会在改动前后对应不同的冷启动预测语义。
-- **篮球再次提升到 `basketball-modelprob-1`**：因为篮球 `model_probabilities` 的**语义**
+- **篮球曾提升到 `basketball-modelprob-1`**：因为篮球 `model_probabilities` 的**语义**
   被修正为「主客独赢盘融合前」的模型概率（见「篮球概率语义」）。
   同一 `model_version` 标签在改动前后含义不同会污染评估分组，
   因此必须提升版本；历史 `basketball-coldstart-1` 快照保持不可变、不被迁移。
+- **篮球再次提升到 `basketball-margin-1`**：因为 `basketball_home_advantage` 的**单位**
+  被修正为「篮球比分差」（见「篮球预期分差与主场优势」）——配置 `2.5` 原先只产生约
+  0.62 分预期分差，现在真正产生 2.5 分。预期分差公式变化同样必须提升版本。
+  历史 `basketball-coldstart-1` / `basketball-modelprob-1` 快照与评估样本均不可变、不迁移。
 - **按运动独立提升版本**：只改足球模型时只需提升 `football` 的版本，篮球保持不动，反之亦然。
   这样不会把未改动的那个运动的预测错误地归入新版本，避免污染按
   `(sport, model_name, model_version)` 分组的快照 / 结算 / 评估样本 /
@@ -466,13 +470,54 @@ MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
   `basketball_pace`、`basketball_score_std`、`basketball_home_advantage`、`basketball_elo_scale`、
   总分线处理、大小分与 20% 校准、`spread`、`top_scores`、`suspense` 全部保持原样。
 - **足球语义未变**：`predict_football` 的数学与上述分工均保持不变。
-- **模型版本**：篮球当前版本为 `basketball-modelprob-1`；足球仍为 `football-coldstart-1`；
+- **模型版本**：篮球当前版本为 `basketball-margin-1`；足球仍为 `football-coldstart-1`；
   全局回退仍为 `baseline-1`。
-- **历史兼容**：`basketball-coldstart-1` 快照与评估样本**不可变、不迁移**；
-  已开赛（`live` / `finished`）的比赛不会被追溯补建新版本快照。
+- **历史兼容**：`basketball-coldstart-1` / `basketball-modelprob-1` 的快照与评估样本
+  **不可变、不迁移**；已开赛（`live` / `finished`）的比赛不会被追溯补建新版本快照。
 - **评估分组**：分类评估、校准诊断与时序评估会自然把
-  `basketball-coldstart-1` 与 `basketball-modelprob-1` 作为**独立分组**处理，
-  两者不做自动对比、不产生胜者标签。
+  `basketball-coldstart-1` / `basketball-modelprob-1` / `basketball-margin-1`
+  作为**独立分组**处理，彼此不做自动对比、不产生胜者标签。
+
+## 篮球预期分差与主场优势
+
+`MODEL_CONFIG["basketball_home_advantage"]` 的单位是 **篮球比分差（points）**，
+表示「主队相对客队获得的预期净胜分加成」——不是 Elo 分、不是百分比、不是任意乘数。
+
+```python
+"basketball_home_advantage": 2.5,   # 主队 +2.5 分预期分差
+"basketball_elo_scale": 200.0,      # 200 分 Elo 差 ≈ 10 分预期分差
+```
+
+单队预期得分按**对称分差**计算：
+
+```text
+elo_margin   = (elo_self - elo_opp) / basketball_elo_scale * 10
+venue_margin = +basketball_home_advantage   （主队）
+               -basketball_home_advantage   （客队）
+points       = base_total / 2 + (elo_margin + venue_margin) / 2
+```
+
+因此主客对的预期分差恒为：
+
+```text
+expected_margin
+    = (home_elo - away_elo) / basketball_elo_scale * 10
+      + basketball_home_advantage
+```
+
+- **默认值 `2.5` 就是 +2.5 分预期分差**（相等 Elo：主 108.75 / 客 106.25，总分 215）。
+  这是一个**配置基线假设**，并未从项目数据统计拟合，也不宣称最优或已被验证。
+- **Elo 尺度含义不变**：`basketball_elo_scale = 200` 仍表示 200 分 Elo 差 ≈ 10 分预期分差
+  （`+200 Elo / 0 主场优势 -> +10.0`；`+200 Elo + 2.5 -> +12.5`，`-200 Elo + 2.5 -> -7.5`）。
+- **总分基准保持**：`pace = 1.0` 且无外部总分线时，
+  `expected_home_points + expected_away_points == basketball_base_total`
+  （NBA `215.0` / CBA `205.0`）；主场优势只是对称地把分数从客队移给主队（各 `±1.25`）。
+- **总分线不改变分差**：`total_line` 只改变总分基准，主客预期分差仍由
+  「Elo 差 + 主场优势」决定（相同球队下 `210.5` 与 `230.5` 的总分线给出同样的 `+2.5` 分差）。
+- **`spread` 自然跟随**：`spread_line` 仍派生自 `diff = exp_home - exp_away`，
+  相等 Elo 默认结果为 `diff ≈ +2.5`、`spread ≈ -2.5`（负号＝主队让分）。
+- **胜负概率不变公式**：仍由既有正态 CDF 消费修正后的 `diff` 自然得出，未做概率重校准。
+- **`pace` 未改动**（仍为 `1.0`），本改动不涉及节奏模型重设计。
 
 ## 未知球队冷启动确定性
 
