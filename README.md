@@ -363,16 +363,18 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 
 ```python
 MODEL_VERSIONS = {
-    "football": "baseline-1",
+    "football": "football-ad-1",
     "basketball": "baseline-1",
 }
+
+MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
 ```
 
-- **默认两者都是 `baseline-1`**：本机制不改变任何当前预测的模型版本，
-  既有 `match_id + prematch + baseline-1` 快照的确定性 ID 与内容完全保持不变。
-- **未来按运动提升版本**：只改足球模型时只需把 `football` 的版本提升（例如 `football-v2`），
-  篮球保持 `baseline-1`，反之亦然。这样不会把未改动的那个运动的预测错误地归入新版本，
-  避免污染按 `(sport, model_name, model_version)` 分组的快照 / 结算 / 评估样本 /
+- **足球已提升到 `football-ad-1`**：因为足球的攻防输入发生了实质变化
+  （见「足球攻防独立化」）；篮球模型未改动，因此**保持 `baseline-1`**。
+- **按运动独立提升版本**：只改足球模型时只需提升 `football` 的版本，篮球保持不动，反之亦然。
+  这样不会把未改动的那个运动的预测错误地归入新版本，避免污染按
+  `(sport, model_name, model_version)` 分组的快照 / 结算 / 评估样本 /
   Accuracy / Brier / LogLoss / ECE 比较。
 - **解析优先级**：显式传入的 `model_version` > 该运动当前配置的版本 > 全局兼容回退
   `config.MODEL_VERSION`（仅在没有运动上下文时使用，且不臆造版本号）。
@@ -383,9 +385,33 @@ MODEL_VERSIONS = {
   可在保留旧版本快照不变的前提下新增一条新版本快照
   （同一场比赛 × 不同模型版本各自一条 canonical 快照，这是为将来受控的模型对比准备的）；
   已开赛（`live` / `finished`）的比赛不会被追溯补建新版本快照——赛前时间门禁仍然权威。
+- **历史 `baseline-1` 快照不可变**：它们仍是权威的历史基线预测，用于与新版本对比，
+  不会被改写或迁移。
 - **下游自动跟随**：结算、评估样本、分类评估、校准诊断都沿用快照中记录的
   `model_name` / `model_version`，因此新版本会自然成为独立分组，无需改动任何公式。
 - **版本号是人工维护的显式标识**：不从 Git SHA / 文件哈希 / 时间戳等自动推断。
+
+## 足球攻防独立化
+
+足球的 `attack_rating` 与 `defense_rating` 现在是**真正独立的两个维度**：
+
+- **Elo 只提供整体实力先验**（`elo_to_attack` / `elo_to_defense`）。
+- **历史场均进球**提供攻击证据；**历史场均失球**提供防守证据，两者互不依赖。
+  因此「强攻弱守」与「弱攻强守」可以在同一 Elo 下被区分表达。
+- **小样本向先验收缩**：`evidence_weight = N / (N + football_strength_prior_matches)`，
+  `N` 为累计场次。新球队（`N = 0`）尚无自身进失球证据，此时两个维度等于 Elo 先验（允许相等）。
+- **评分尺度不变**：仍为 `0.25 ~ 0.95`，`0.50` 近似中性；
+  进攻越强 `attack_rating` 越高，防守越强 `defense_rating` 越高。
+  既有 `expected_goals(attack, defense_opponent, base_rate)` 契约保持兼容。
+- **既有档案懒升级**：历史 `team_strength.json` 中由旧的「Elo 单一映射」生成的足球档案，
+  会在被 `get_team_profile(...)` 读取时按新公式从既有 Elo 与累计进失球重算并落盘；
+  只改攻防两个字段，`elo_rating` / 战绩 / 进失球累计等一律不动，重复读取幂等。
+- **结果更新顺序**：先更新 Elo → 再累计战绩与进失球 → **然后**由更新后的累计证据推导攻防，
+  因此本轮比赛会被反映到新维度里。
+- **未改动的部分**：泊松比分矩阵、Dixon-Coles `rho`、`max_goals`、赔率融合、EV / Kelly
+  全部保持原样；篮球行为与 `MODEL_VERSIONS["basketball"]` 均未变化。
+- **不做拟合**：这两个参数是显式的基础常量，尚未从历史数据拟合，也不做时间衰减 /
+  对手强度加权 / 主客场拆分——后续再单独处理。
 
 ## 赛前赔率历史
 
@@ -609,12 +635,15 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
 集中在 `config.py` 的 `MODEL_CONFIG`：
 
 - 足球：`base_goals_per_match`、`home_advantage_elo`、`attack_sensitivity`、`dixon_coles_rho`、`value_threshold`
+- 足球攻防：`football_strength_prior_matches`（先验收缩等效样本量，默认 5.0）、
+  `football_goal_signal_scale`（场均进/失球偏离基准时的评分灵敏度，默认 0.20）
 - 篮球：`basketball_base_total`、`basketball_home_advantage`、`basketball_elo_scale`、`basketball_score_std`
 - 资金：`kelly_fraction`（默认 1/4 Kelly）
 
 ## 模型说明
 
-**足球**：Elo 差 → 双方期望进球 λ → 泊松比分矩阵（含 Dixon-Coles 低比分修正 ρ=−0.15）
+**足球**：Elo 提供整体实力先验，攻防评分由历史场均进/失球**独立**推导
+（见「足球攻防独立化」）→ Elo 差 → 双方期望进球 λ → 泊松比分矩阵（含 Dixon-Coles 低比分修正 ρ=−0.15）
 → 胜平负概率 → 与市场隐含概率按 `ODDS_WEIGHT` 融合 → EV / Kelly。
 
 **篮球**：Elo 差 → 双方预期得分 → 分差正态分布 → 胜负概率；总分用正态分布建模，

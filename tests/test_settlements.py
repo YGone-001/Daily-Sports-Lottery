@@ -59,7 +59,7 @@ def test_basic_settlement(isolated_data_dir, make_match):
     assert settlement["match_id"] == m["id"]
     assert settlement["final_score"] == {"home": 2, "away": 1}
     assert settlement["actual_outcome"] == "home_win"
-    assert settlement["model_version"] == config.MODEL_VERSION
+    assert settlement["model_version"] == config.MODEL_VERSIONS["football"]
     assert settlement["model_name"] == snap["model_name"]
     assert settlement["prediction_generated_at"] == snap["generated_at"]
     assert settlement["kickoff_at"] == snap["kickoff_at"]

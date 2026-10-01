@@ -34,6 +34,10 @@ from utils.settlements import get_settlement, get_settlements_for_match, settle_
 FOOTBALL_1X2 = {"home_win": 1.90, "draw": 3.50, "away_win": 4.00}
 BASKETBALL_ML = {"home_win": 1.80, "away_win": 2.00}
 
+# 当前配置的默认版本（足球已按攻防分离提升；篮球保持不变）
+FOOTBALL_CURRENT = config.MODEL_VERSIONS["football"]
+BASKETBALL_CURRENT = config.MODEL_VERSIONS["basketball"]
+
 # 身份哈希格式未变：sha256("<match_id>|prematch|baseline-1")
 BASELINE_ID_FOR_M1 = "5b113d02c28ee76e968555395d912882dedb5164eb3851333d93a4ff426c042d"
 
@@ -98,10 +102,12 @@ def _fake_sources(monkeypatch, upcoming) -> None:
 # ---------------------------------------------------------------------------
 
 def test_default_current_versions(isolated_data_dir):
-    assert config.MODEL_VERSIONS["football"] == "baseline-1"
+    assert config.MODEL_VERSIONS["football"] == "football-ad-1"
     assert config.MODEL_VERSIONS["basketball"] == "baseline-1"
-    assert current_model_version_for("football") == "baseline-1"
+    assert current_model_version_for("football") == "football-ad-1"
     assert current_model_version_for("basketball") == "baseline-1"
+    # 全局兼容回退保持 baseline-1，未随足球版本变化
+    assert config.MODEL_VERSION == "baseline-1"
 
 
 def test_baseline_snapshot_id_is_unchanged(isolated_data_dir):
@@ -114,8 +120,8 @@ def test_resolver_precedence(isolated_data_dir):
     # 1) 显式版本始终优先
     assert resolve_model_version("manual-v7", sport="football") == "manual-v7"
     # 2) 运动当前版本
-    assert resolve_model_version(None, sport="football") == "baseline-1"
-    assert resolve_model_version(sport="basketball") == "baseline-1"
+    assert resolve_model_version(None, sport="football") == FOOTBALL_CURRENT
+    assert resolve_model_version(sport="basketball") == BASKETBALL_CURRENT
     # 3) 全局兼容回退
     assert resolve_model_version() == config.MODEL_VERSION
     assert resolve_model_version(None, None) == config.MODEL_VERSION
@@ -148,7 +154,7 @@ def test_basketball_only_version_change(isolated_data_dir, make_match, monkeypat
     football, _c1 = capture_snapshot(enrich_match(make_match(id="m-fb")))
     basketball, _c2 = capture_snapshot(_basketball(make_match))
 
-    assert football["model_version"] == "baseline-1"
+    assert football["model_version"] == FOOTBALL_CURRENT
     assert basketball["model_version"] == "basketball-v2"
 
 
@@ -173,7 +179,7 @@ def test_baseline_idempotency_unchanged(isolated_data_dir, make_match):
 
     assert created1 is True
     assert created2 is False
-    assert first["snapshot_id"] == BASELINE_ID_FOR_M1
+    assert first["model_version"] == FOOTBALL_CURRENT
     assert second["generated_at"] == first["generated_at"]
     assert len(get_snapshots_for_match("m-1")) == 1
 
@@ -200,8 +206,8 @@ def test_version_bump_does_not_affect_other_sport(isolated_data_dir, make_match,
     football, fc = capture_snapshot(enrich_match(make_match(id="m-fb")))
     basketball, bc = capture_snapshot(_basketball(make_match))
     assert fc is True and bc is True
-    assert football["model_version"] == "baseline-1"
-    assert basketball["model_version"] == "baseline-1"
+    assert football["model_version"] == FOOTBALL_CURRENT
+    assert basketball["model_version"] == BASKETBALL_CURRENT
 
     _bump(monkeypatch, "football", "football-v2")
 
@@ -212,7 +218,7 @@ def test_version_bump_does_not_affect_other_sport(isolated_data_dir, make_match,
     assert football2["model_version"] == "football-v2"
     assert bc2 is False
     assert basketball2["snapshot_id"] == basketball["snapshot_id"]
-    assert basketball2["model_version"] == "baseline-1"
+    assert basketball2["model_version"] == BASKETBALL_CURRENT
     assert len(get_snapshots_for_match("m-fb")) == 2
     assert len(get_snapshots_for_match("m-bb")) == 1
 
@@ -238,20 +244,22 @@ def test_started_match_version_bump_rejected(isolated_data_dir, make_match, monk
 
 def test_snapshot_exists_semantics(isolated_data_dir, make_match, monkeypatch):
     capture_snapshot(enrich_match(make_match(id="m-1")))
+    capture_snapshot(enrich_match(make_match(id="m-legacy")), model_version="baseline-1")
 
     # 显式版本
-    assert snapshot_exists("m-1", "baseline-1") is True
-    assert snapshot_exists("m-1", "football-v2") is False
+    assert snapshot_exists("m-1", FOOTBALL_CURRENT) is True
+    assert snapshot_exists("m-1", "baseline-1") is False
     # 运动感知默认
     assert snapshot_exists("m-1", sport="football") is True
-    # 旧版无运动上下文 -> 全局回退
-    assert snapshot_exists("m-1") is True
+    # 无运动上下文 -> 全局兼容回退（baseline-1）
+    assert snapshot_exists("m-1") is False
+    assert snapshot_exists("m-legacy") is True
 
     _bump(monkeypatch, "football", "football-v2")
 
     assert snapshot_exists("m-1", sport="football") is False   # football-v2 尚未创建
-    assert snapshot_exists("m-1", "baseline-1") is True
-    assert snapshot_exists("m-1") is True                      # 全局回退仍是 baseline-1
+    assert snapshot_exists("m-1", FOOTBALL_CURRENT) is True    # 原版本快照仍在
+    assert snapshot_exists("m-legacy") is True                 # 全局回退仍指向 baseline-1
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +285,7 @@ def test_scraper_version_bump_metric(isolated_data_dir, monkeypatch):
     assert len(get_snapshots_for_match("m-bb")) == 1
 
     versions = sorted(s["model_version"] for s in get_snapshots_for_match("m-fb"))
-    assert versions == ["baseline-1", "football-v2"]
+    assert versions == sorted([FOOTBALL_CURRENT, "football-v2"])
 
 
 def test_market_admission_not_bypassed_by_version_change(isolated_data_dir, monkeypatch):

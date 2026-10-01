@@ -49,10 +49,10 @@ def test_snapshot_created_for_upcoming_match(isolated_data_dir, make_match):
 
     assert snap is not None
     assert snap["match_id"] == m["id"]
-    assert snap["model_version"] == config.MODEL_VERSION
+    assert snap["model_version"] == config.MODEL_VERSIONS["football"]
     assert os.path.exists(store_path())
     assert len(get_snapshots_for_match(m["id"])) == 1
-    assert snapshot_exists(m["id"]) is True
+    assert snapshot_exists(m["id"], sport="football") is True
 
 
 def test_snapshot_schema_fields(isolated_data_dir, make_match):

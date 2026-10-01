@@ -8,6 +8,12 @@
 2. 联赛 Elo 基准 + 排名调整 -> 生成合理初始实力
 3. 比赛结果反推（滚动更新 Elo）-> 越打越准
 
+足球攻防评分：
+    Elo 只提供整体实力先验；`attack_rating` 由历史场均**进球**独立推导，
+    `defense_rating` 由历史场均**失球**独立推导，样本量小时向 Elo 先验收缩。
+    因此「强攻弱守」与「弱攻强守」可以在同一 Elo 下被区分表达。
+    篮球仍沿用既有的 Elo 映射，行为不变。
+
 不依赖任何需要密钥的外部 API，完全自给自足。
 """
 from __future__ import annotations
@@ -110,6 +116,96 @@ def elo_to_defense(elo: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 足球攻防评分（Elo 先验 + 独立的进/失球证据）
+# ---------------------------------------------------------------------------
+
+RATING_MIN = 0.25
+RATING_MAX = 0.95
+
+
+def _clamp_rating(value: float) -> float:
+    return max(RATING_MIN, min(RATING_MAX, value))
+
+
+def derive_football_attack_defense(
+    elo_rating: float,
+    matches_played: int = 0,
+    goals_for: int = 0,
+    goals_against: int = 0,
+) -> tuple[float, float]:
+    """
+    由 Elo 先验 + **独立**的历史进/失球证据推导足球攻防评分。
+
+    - Elo 提供整体实力先验：`elo_to_attack(elo)` / `elo_to_defense(elo)`。
+    - 场均**进球**提供攻击证据；场均**失球**提供防守证据——两者互不依赖，
+      因此「强攻弱守」与「弱攻强守」可以在同一 Elo 下被区分表达。
+    - 样本量小时按 `evidence_weight = N / (N + prior_matches)` 向 Elo 先验收缩。
+
+    纯函数：无 I/O、无随机、与字典顺序无关；相同输入恒等输出。
+    返回 (attack_rating, defense_rating)，均在 [0.25, 0.95] 内。
+    """
+    cfg = config.MODEL_CONFIG
+    prior_attack = elo_to_attack(elo_rating)
+    prior_defense = elo_to_defense(elo_rating)
+
+    matches = int(matches_played or 0)
+    base = float(cfg["base_goals_per_match"])
+
+    # 无样本（或基准异常）：只有 Elo 先验，此时两个维度允许相等
+    if matches <= 0 or base <= 0:
+        return _clamp_rating(prior_attack), _clamp_rating(prior_defense)
+
+    scale = float(cfg["football_goal_signal_scale"])
+    prior_matches = float(cfg["football_strength_prior_matches"])
+
+    # 累计值不允许为负：负的累计进球不是有效证据
+    scored = max(0, int(goals_for or 0))
+    conceded = max(0, int(goals_against or 0))
+
+    gf_rate = scored / matches
+    ga_rate = conceded / matches
+
+    attack_deviation = (gf_rate / base) - 1.0
+    defense_deviation = 1.0 - (ga_rate / base)
+
+    observed_attack = _clamp_rating(0.5 + scale * attack_deviation)
+    observed_defense = _clamp_rating(0.5 + scale * defense_deviation)
+
+    weight = matches / (matches + prior_matches)
+    attack = prior_attack * (1.0 - weight) + observed_attack * weight
+    defense = prior_defense * (1.0 - weight) + observed_defense * weight
+
+    return _clamp_rating(attack), _clamp_rating(defense)
+
+
+def _refresh_football_ratings(profile: dict) -> bool:
+    """
+    按新公式重算足球档案的攻防评分，返回是否发生变更。
+
+    只改 `attack_rating` / `defense_rating`，其他字段一律不动。
+    非足球档案直接返回 False（篮球保持既有 Elo 映射行为）。
+    """
+    if profile.get("sport") != "football":
+        return False
+
+    attack, defense = derive_football_attack_defense(
+        profile.get("elo_rating", 1600),
+        profile.get("matches_played", 0),
+        profile.get("goals_for", 0),
+        profile.get("goals_against", 0),
+    )
+    attack = round(attack, 3)
+    defense = round(defense, 3)
+
+    if profile.get("attack_rating") == attack and profile.get("defense_rating") == defense:
+        return False
+
+    profile["attack_rating"] = attack
+    profile["defense_rating"] = defense
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 实力档案生成
 # ---------------------------------------------------------------------------
 
@@ -162,7 +258,13 @@ def get_team_profile(
     key = f"{sport}|{name}"
 
     if key in teams:
-        profile = dict(teams[key])
+        stored = teams[key]
+        # 懒升级：历史足球档案的攻防评分可能由旧的「Elo 单一映射」生成。
+        # 这里按新公式从既有的 Elo 与累计进/失球重算；仅在确有差异时落盘，
+        # 因此重复读取是幂等的，也不会在启动时做批量破坏性迁移。
+        if _refresh_football_ratings(stored):
+            _save()
+        profile = dict(stored)
         # 联赛可能已知，补全
         if league and not profile.get("league"):
             profile["league"] = league
@@ -170,13 +272,18 @@ def get_team_profile(
 
     # 新球队 -> 按联赛基准估算
     elo = _estimate_elo(league, rank, sport, name)
+    if sport == "football":
+        # 无历史样本时即 Elo 先验（两个维度允许相等）
+        attack, defense = derive_football_attack_defense(elo)
+    else:
+        attack, defense = elo_to_attack(elo), elo_to_defense(elo)
     profile = {
         "name": name,
         "league": league,
         "sport": sport,
         "elo_rating": round(elo, 1),
-        "attack_rating": round(elo_to_attack(elo), 3),
-        "defense_rating": round(elo_to_defense(elo), 3),
+        "attack_rating": round(attack, 3),
+        "defense_rating": round(defense, 3),
         "matches_played": 0,
         "wins": 0,
         "draws": 0,
@@ -210,6 +317,15 @@ def update_from_result(
 ) -> None:
     """
     用一场真实赛果更新双方 Elo（含进球数修正）。
+
+    顺序（足球）：
+        1. 读取球队档案
+        2. 更新 Elo
+        3. 累计战绩与进/失球（本轮证据必须先并入）
+        4. 由**更新后**的累计进/失球推导攻防评分
+        5. 落盘
+
+    攻防评分必须在累计进/失球更新**之后**推导，否则本轮比赛不会被反映到新维度里。
     """
     home = get_team_profile(home_name, league, sport)
     away = get_team_profile(away_name, league, sport)
@@ -238,15 +354,11 @@ def update_from_result(
     hk = f"{sport}|{home_name}"
     ak = f"{sport}|{away_name}"
 
+    # 1) Elo
     teams[hk]["elo_rating"] = round(elo_h + delta, 1)
     teams[ak]["elo_rating"] = round(elo_a - delta, 1)
 
-    # 更新攻防评分
-    for kk, elo in ((hk, teams[hk]["elo_rating"]), (ak, teams[ak]["elo_rating"])):
-        teams[kk]["attack_rating"] = round(elo_to_attack(elo), 3)
-        teams[kk]["defense_rating"] = round(elo_to_defense(elo), 3)
-
-    # 更新战绩
+    # 2) 累计战绩与进/失球（攻防评分要用到本轮证据，必须先更新）
     for kk, gf, ga in ((hk, home_goals, away_goals), (ak, away_goals, home_goals)):
         teams[kk]["matches_played"] = teams[kk].get("matches_played", 0) + 1
         teams[kk]["goals_for"] = teams[kk].get("goals_for", 0) + gf
@@ -258,6 +370,14 @@ def update_from_result(
         else:
             teams[kk]["losses"] = teams[kk].get("losses", 0) + 1
         teams[kk]["estimated"] = False
+
+    # 3) 攻防评分：足球由更新后的累计进/失球独立推导；篮球保持 Elo 映射
+    for kk in (hk, ak):
+        if sport == "football":
+            _refresh_football_ratings(teams[kk])
+        else:
+            teams[kk]["attack_rating"] = round(elo_to_attack(teams[kk]["elo_rating"]), 3)
+            teams[kk]["defense_rating"] = round(elo_to_defense(teams[kk]["elo_rating"]), 3)
 
     _save()
 

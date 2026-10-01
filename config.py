@@ -51,6 +51,10 @@ MODEL_CONFIG = {
     "away_attack_sensitivity": 0.30,  # 客队敏感度略低
     "max_lambda": 4.0,                # 单队期望进球上限
     "min_lambda": 0.35,               # 下限
+    # 足球攻防评分：Elo 提供整体先验，场均进/失球提供独立的攻/防证据。
+    # 样本量小（场次少）时按等效样本量向 Elo 先验收缩。
+    "football_strength_prior_matches": 5.0,  # 先验收缩的等效样本量
+    "football_goal_signal_scale": 0.20,      # 场均进/失球偏离基准时的评分灵敏度
     "dixon_coles_rho": -0.15,         # Dixon-Coles 低比分修正
     "odds_weight": float(os.environ.get("ODDS_WEIGHT", "0.20")),  # 赔率融合权重
     "value_threshold": 0.05,          # 正 EV 判定阈值 (5%)
@@ -77,7 +81,7 @@ MODEL_CONFIG = {
 # 不会污染按 (sport, model_name, model_version) 分组的评估比较。
 # 版本号是人工维护的显式标识，不做任何自动推断（Git SHA / 文件哈希 / 时间戳等）。
 MODEL_VERSIONS = {
-    "football": "baseline-1",
+    "football": "football-ad-1",
     "basketball": "baseline-1",
 }
 

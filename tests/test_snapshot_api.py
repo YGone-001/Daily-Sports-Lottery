@@ -33,7 +33,7 @@ def test_snapshot_api_returns_persisted_record(isolated_data_dir, make_match):
     assert len(data) == 1
     snap = data[0]
     assert snap["match_id"] == match["id"]
-    assert snap["model_version"] == config.MODEL_VERSION
+    assert snap["model_version"] == config.MODEL_VERSIONS["football"]
     assert snap["model_probabilities"]
     assert "expected_score_data" in snap
 
