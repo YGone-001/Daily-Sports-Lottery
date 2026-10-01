@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 
 from utils import fetcher_500
@@ -25,6 +26,7 @@ from utils.daily_loader import (
 from utils.evaluation_rows import EvaluationIntegrityError, capture_evaluation_row
 from utils.market_coverage import has_usable_market_odds
 from utils.match_identity import is_kickoff_time_known, same_event
+from utils.match_lifecycle import MatchLifecycleConflict, resolve_match_update
 from utils.odds_snapshots import record_odds_snapshot
 from utils.prediction_snapshots import capture_snapshot, get_snapshot, get_snapshots_for_match
 from utils.settlements import (
@@ -173,10 +175,10 @@ def _admit_market_candidates(
 def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int, int]:
     """
     合并新旧赛事。
-    使用 same_event 跨源对账，严格保持旧 canonical id。
+    使用 same_event 跨源对账，严格保持旧 canonical id，通过 resolve_match_update 实施终态保护。
     返回 (merged, added, updated)。
     """
-    result: list[dict] = [dict(m) for m in existing]
+    result: list[dict] = [copy.deepcopy(m) for m in existing]
     added = updated = 0
 
     for inc in incoming:
@@ -188,63 +190,22 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
 
         if match_idx >= 0:
             old = result[match_idx]
-            changed = False
+            before = copy.deepcopy(old)
+            try:
+                resolve_match_update(old, inc)
+            except MatchLifecycleConflict as exc:
+                h_e, a_e = exc.existing_score[0], exc.existing_score[1]
+                h_i, a_i = exc.incoming_score[0], exc.incoming_score[1]
+                print(
+                    f"[Auto-Sync] 完赛结果冲突 {exc.match_id}: "
+                    f"existing={h_e}-{a_e} incoming={h_i}-{a_i}; "
+                    f"canonical result preserved"
+                )
+                old.clear()
+                old.update(before)
+                continue
 
-            # 1. 保持 canonical id 不变（old["id"] 永远胜出，禁止被 inc 替换）
-
-            # 2. 开赛时间更新规则：
-            # incoming 开赛时间已知时升级
-            if is_kickoff_time_known(inc):
-                inc_time = inc.get("time") or "00:00"
-                if inc_time != old.get("time") or not old.get("kickoff_time_known"):
-                    old["time"] = inc_time
-                    old["kickoff_time_known"] = True
-                    changed = True
-            # incoming 开赛时间未知时，绝不覆盖已有已知时间，绝不降级
-
-            # 3. 比分更新
-            if inc.get("score") and inc["score"] != old.get("score"):
-                old["score"] = inc["score"]
-                changed = True
-
-            # 状态更新
-            inc_status = inc.get("status")
-            if inc_status and inc_status != old.get("status"):
-                if not (
-                    old.get("status") in ("live", "finished")
-                    and not is_kickoff_time_known(inc)
-                    and inc_status == "upcoming"
-                ):
-                    old["status"] = inc_status
-                    changed = True
-
-            # 4. 盘口更新：若有新盘口则更新，无新盘口则保留旧盘口
-            if inc.get("odds"):
-                if inc["odds"] != old.get("odds"):
-                    old["odds"] = inc["odds"]
-                    old["odds_updated_at"] = get_beijing_now().isoformat()
-                    changed = True
-
-            # 5. 排期元数据升级
-            if is_kickoff_time_known(inc):
-                if inc.get("league") and inc["league"] != "竞彩":
-                    old["league"] = inc["league"]
-                if inc.get("home") and inc["home"] != old.get("home"):
-                    old["home"] = inc["home"]
-                if inc.get("away") and inc["away"] != old.get("away"):
-                    old["away"] = inc["away"]
-
-            if inc.get("jczq_no") and not old.get("jczq_no"):
-                old["jczq_no"] = inc["jczq_no"]
-            if inc.get("round") and not old.get("round"):
-                old["round"] = inc["round"]
-            if inc.get("home_rank") is not None and old.get("home_rank") is None:
-                old["home_rank"] = inc["home_rank"]
-            if inc.get("away_rank") is not None and old.get("away_rank") is None:
-                old["away_rank"] = inc["away_rank"]
-
-            old["market_tracked"] = True
-            if changed:
+            if old != before:
                 updated += 1
         else:
             m = dict(inc)

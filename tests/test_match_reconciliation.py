@@ -727,10 +727,11 @@ def test_existing_historical_artifacts_preserved_on_reconciliation(tmp_path, mon
 
     merged, added, updated = scraper._merge([fin_match], incoming_update)
     assert len(merged) == 1
-    # mutable daily 获得升级
-    assert merged[0]["home_rank"] == 1
-    assert merged[0]["away_rank"] == 2
+    # 终态比赛保持不变，幂等无变更
+    assert updated == 0
     assert merged[0]["id"] == canon_id
+    assert merged[0]["score"] == {"ft": [2, 1]}
+    assert merged[0]["status"] == "finished"
 
     # 4. 验证不可变历史记录分毫未变
     snap_after = prediction_snapshots.get_snapshot(snap_id)
