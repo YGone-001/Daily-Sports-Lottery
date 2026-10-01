@@ -85,6 +85,9 @@ def resolve_match_update(existing: dict, incoming: dict) -> dict:
 
     2. 若 existing 尚未处于完赛终态：
        - 允许正常更新状态、开赛时间、比分、盘口与排期元数据。
+       - 比分更新额外遵循「有效性优先」：严格有效的 incoming 比分无条件替换
+         畸形/缺失的 existing 比分（不受 Python 数值相等影响，如 2.0 == 2、
+         True == 1、False == 0）；双方有效性同级时仍按值是否变化更新。
     """
     if is_finalized_match(existing):
         # 终态保护生效
@@ -113,8 +116,20 @@ def resolve_match_update(existing: dict, incoming: dict) -> dict:
             existing["kickoff_time_known"] = True
 
     # 2. 比分更新
-    if incoming.get("score") and incoming["score"] != existing.get("score"):
-        existing["score"] = incoming["score"]
+    #    不仅要看 Python 值相等，还要看「有效性质量」：
+    #    严格有效的 incoming 比分必须能够替换畸形（无效表示）的 existing 比分，
+    #    即使二者在普通相等语义下判定相等。例如 2.0 == 2、True == 1、False == 0，
+    #    若不按有效性升级，[2.0, 1] / [True, 1] / [2, False] 这类畸形表示将永远
+    #    无法被后续严格有效的整数表示修复，哨兵记录会永久停留在不可终态状态。
+    incoming_score = incoming.get("score")
+    existing_score = existing.get("score")
+    if incoming_score:
+        if valid_full_time_score(incoming_score) and not valid_full_time_score(existing_score):
+            # 有效表示优先：无条件升级畸形/缺失的既有表示（不做任何数值强转）
+            existing["score"] = incoming_score
+        elif incoming_score != existing_score:
+            # 双方有效性同级时，沿用既有语义：值不同即更新
+            existing["score"] = incoming_score
 
     # 3. 状态更新（未终态前允许权威源正常修正，如 live -> upcoming 延期；占位符 upcoming 不降级）
     inc_status = incoming.get("status")

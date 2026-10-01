@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import datetime
 
 from utils import fetcher_500
@@ -176,6 +177,24 @@ def _admit_market_candidates(
     return admitted, rejected
 
 
+def _record_changed(before: dict, after: dict) -> bool:
+    """
+    判定 canonical 记录是否真的发生变化（用于 updated 计数）。
+
+    不能只用 Python 值相等：JSON 中 `2.0` / `true` / `false` 与 `2` / `1` / `0`
+    是不同的持久化表示，但 Python 判定它们相等（`2.0 == 2`、`True == 1`、`False == 0`）。
+    因此畸形浮点/布尔比分被严格有效的整数表示修复时（如 `[2.0, 1]` -> `[2, 1]`），
+    `before != after` 会误判为「无变化」，导致 updated 少计。
+
+    记录最终以 JSON 落盘，故以 JSON 规范化序列化结果作为判据。
+    """
+    if before is after:
+        return False
+    return json.dumps(before, sort_keys=True, default=str) != json.dumps(
+        after, sort_keys=True, default=str
+    )
+
+
 def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int, int]:
     """
     合并新旧赛事。
@@ -209,7 +228,7 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
                 old.update(before)
                 continue
 
-            if old != before:
+            if _record_changed(before, old):
                 updated += 1
         else:
             m = dict(inc)

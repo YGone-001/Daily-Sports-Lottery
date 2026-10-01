@@ -1019,8 +1019,12 @@ def test_malformed_result_then_valid_final_repair_pipeline(
     assert res_repeat["updated"] == 0
 
 
-def test_float_score_rejected_downstream(isolated_data_dir, monkeypatch):
-    """浮点比分 [2.0, 1]：不归一化为 2，Elo 校准 / 结算 / 评估全部拒绝。"""
+def test_float_repair_pipeline(isolated_data_dir, monkeypatch):
+    """
+    强制端到端：finished [2.0, 1] 被下游拒绝（不归一化为 2）；
+    随后 finished [2, 1] 修复 canonical 表示并完成 校准 / 结算 / 评估 各一次；
+    再次 [2, 1] 完全幂等（updated = 0）。
+    """
     assert valid_full_time_score({"ft": [2.0, 1]}) is False
 
     canon_id = "500j-2030-05-01-009"
@@ -1029,12 +1033,13 @@ def test_float_score_rejected_downstream(isolated_data_dir, monkeypatch):
 
     before_team = _team_state_snapshot()
 
+    # 首次：畸形浮点表示（Python 中 2.0 == 2）
     _push_finished(monkeypatch, jczq_no, {"ft": [2.0, 1]})
-    res = scraper.refresh(verbose=False)
+    res_bad = scraper.refresh(verbose=False)
 
-    assert res["calibrated"] == 0
-    assert res["settlements_added"] == 0
-    assert res["evaluation_rows_added"] == 0
+    assert res_bad["calibrated"] == 0
+    assert res_bad["settlements_added"] == 0
+    assert res_bad["evaluation_rows_added"] == 0
     assert canon_id not in (load_json("calibrated.json") or {}).get("ids", [])
     assert _team_state_snapshot() == before_team
     assert get_settlements_for_match(canon_id) == []
@@ -1042,4 +1047,143 @@ def test_float_score_rejected_downstream(isolated_data_dir, monkeypatch):
 
     matches = daily_loader.get_all_matches()
     assert matches[0]["status"] == "finished"
+    assert valid_full_time_score(matches[0]["score"]) is False
     assert is_finalized_match(matches[0]) is False
+
+    # 随后：严格有效的整数表示 -> 必须修复（尽管 [2,1] == [2.0,1]）
+    _push_finished(monkeypatch, jczq_no, {"ft": [2, 1]})
+    res_good = scraper.refresh(verbose=False)
+
+    assert res_good["updated"] == 1
+    assert res_good["calibrated"] == 1
+    assert res_good["settlements_added"] == 1
+    assert res_good["evaluation_rows_added"] == 1
+
+    matches_after = daily_loader.get_all_matches()
+    assert matches_after[0]["score"] == {"ft": [2, 1]}
+    assert type(matches_after[0]["score"]["ft"][0]) is int
+    assert type(matches_after[0]["score"]["ft"][1]) is int
+    assert is_finalized_match(matches_after[0]) is True
+    assert len(get_settlements_for_match(canon_id)) == 1
+    assert len(get_all_evaluation_rows()) == 1
+
+    # 重复合法结果：完全幂等
+    res_repeat = scraper.refresh(verbose=False)
+    assert res_repeat["updated"] == 0
+    assert res_repeat["calibrated"] == 0
+    assert res_repeat["settlements_added"] == 0
+    assert res_repeat["evaluation_rows_added"] == 0
+
+
+def test_bool_repair_pipeline(isolated_data_dir, monkeypatch):
+    """
+    强制端到端：finished [True, 1] 被下游拒绝；
+    随后 finished [1, 1] 修复 canonical 表示（Python 中 True == 1）并建立终态。
+    """
+    assert valid_full_time_score({"ft": [True, 1]}) is False
+
+    canon_id = "500j-2030-05-01-010"
+    jczq_no = "010"
+    _seed_tracked_upcoming(monkeypatch, canon_id, jczq_no)
+
+    before_team = _team_state_snapshot()
+
+    _push_finished(monkeypatch, jczq_no, {"ft": [True, 1]})
+    res_bad = scraper.refresh(verbose=False)
+
+    assert res_bad["calibrated"] == 0
+    assert res_bad["settlements_added"] == 0
+    assert res_bad["evaluation_rows_added"] == 0
+    assert _team_state_snapshot() == before_team
+    assert get_settlements_for_match(canon_id) == []
+    assert get_all_evaluation_rows() == []
+
+    matches = daily_loader.get_all_matches()
+    assert valid_full_time_score(matches[0]["score"]) is False
+    assert is_finalized_match(matches[0]) is False
+
+    _push_finished(monkeypatch, jczq_no, {"ft": [1, 1]})
+    res_good = scraper.refresh(verbose=False)
+
+    assert res_good["calibrated"] == 1
+    assert res_good["settlements_added"] == 1
+    assert res_good["evaluation_rows_added"] == 1
+
+    matches_after = daily_loader.get_all_matches()
+    assert matches_after[0]["score"] == {"ft": [1, 1]}
+    assert type(matches_after[0]["score"]["ft"][0]) is int
+    assert type(matches_after[0]["score"]["ft"][1]) is int
+    assert is_finalized_match(matches_after[0]) is True
+
+
+# ---------------------------------------------------------------------------
+# 12. 畸形表示 -> 严格有效表示的 canonical 修复（Python 数值相等缺陷）
+# ---------------------------------------------------------------------------
+
+def _finished_record(score) -> dict:
+    return {
+        "id": "m-repair",
+        "sport": "football",
+        "date": "2030-05-01",
+        "time": "20:00",
+        "kickoff_time_known": True,
+        "status": "finished",
+        "home": "皇马",
+        "away": "巴萨",
+        "score": score,
+        "market_tracked": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "malformed, valid, expected",
+    [
+        ({"ft": [2.0, 1]}, {"ft": [2, 1]}, {"ft": [2, 1]}),    # 2.0 == 2
+        ({"ft": [True, 1]}, {"ft": [1, 1]}, {"ft": [1, 1]}),   # True == 1
+        ({"ft": [2, False]}, {"ft": [2, 0]}, {"ft": [2, 0]}),  # False == 0
+        ({"ft": ["2", 1]}, {"ft": [2, 1]}, {"ft": [2, 1]}),    # 字符串回归
+        ({"ft": [-1, 0]}, {"ft": [2, 1]}, {"ft": [2, 1]}),     # 负数回归
+    ],
+)
+def test_resolve_match_update_repairs_malformed_representation(malformed, valid, expected):
+    """有效整数表示必须替换畸形表示，即使 Python 相等语义判定二者相等。"""
+    assert valid_full_time_score(malformed) is False
+    assert valid_full_time_score(valid) is True
+
+    existing = _finished_record(malformed)
+    incoming = _finished_record(valid)
+
+    resolve_match_update(existing, incoming)
+
+    assert existing["score"] == expected
+    assert type(existing["score"]["ft"][0]) is int
+    assert type(existing["score"]["ft"][1]) is int
+    assert is_finalized_match(existing) is True
+
+
+def test_repair_does_not_alter_finalized_terminal_semantics():
+    """修复规则只作用于未终态分支；已终态的幂等 / 冲突语义不变。"""
+    finalized = _finished_record({"ft": [2, 1]})
+    same = _finished_record({"ft": [2, 1]})
+    assert resolve_match_update(finalized, same) is finalized
+    assert finalized["score"] == {"ft": [2, 1]}
+
+    conflicting = _finished_record({"ft": [2, 2]})
+    with pytest.raises(MatchLifecycleConflict) as exc_info:
+        resolve_match_update(_finished_record({"ft": [2, 1]}), conflicting)
+    assert exc_info.value.reason == "conflicting_final_score"
+
+
+def test_invalid_to_invalid_keeps_normal_merge_semantics():
+    """existing 与 incoming 同为畸形时，沿用普通合并语义（仅按值是否变化更新）。"""
+    existing = _finished_record({"ft": ["2", 1]})
+    incoming = _finished_record({"ft": ["3", 1]})
+
+    resolve_match_update(existing, incoming)
+    assert existing["score"] == {"ft": ["3", 1]}
+    assert is_finalized_match(existing) is False
+
+    # 值相同（畸形表示）时不动
+    existing_same = _finished_record({"ft": ["2", 1]})
+    resolve_match_update(existing_same, _finished_record({"ft": ["2", 1]}))
+    assert existing_same["score"] == {"ft": ["2", 1]}
