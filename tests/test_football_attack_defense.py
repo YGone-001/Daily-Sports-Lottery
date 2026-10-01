@@ -300,7 +300,7 @@ def test_basketball_keeps_elo_mapping(isolated_data_dir):
         # 篮球不使用进球证据
         assert profile["attack_rating"] == profile["defense_rating"]
 
-    assert config.MODEL_VERSIONS["basketball"] == "baseline-1"
+    assert config.MODEL_VERSIONS["basketball"] == "basketball-coldstart-1"
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +347,8 @@ def test_football_version_bump(isolated_data_dir, make_match):
                                 odds={"home_win": 1.80, "away_win": 2.00}))
     )
 
-    assert football["model_version"] == "football-ad-1"
-    assert basketball["model_version"] == "baseline-1"
+    assert football["model_version"] == config.MODEL_VERSIONS["football"]
+    assert basketball["model_version"] == config.MODEL_VERSIONS["basketball"]
 
 
 def test_existing_baseline_snapshot_preserved(isolated_data_dir, make_match):
@@ -360,7 +360,7 @@ def test_existing_baseline_snapshot_preserved(isolated_data_dir, make_match):
     current, created2 = capture_snapshot(enrich_match(make_match(id="m-1")))
 
     assert created2 is True
-    assert current["model_version"] == "football-ad-1"
+    assert current["model_version"] == config.MODEL_VERSIONS["football"]
     assert current["snapshot_id"] != baseline["snapshot_id"]
     assert get_snapshots_for_match("m-1")[0] == original
     assert len(get_snapshots_for_match("m-1")) == 2
@@ -389,19 +389,19 @@ def test_downstream_propagation_of_new_version(isolated_data_dir, make_match):
     match = enrich_match(make_match(id="m-down"))
     snapshot, created = capture_snapshot(match)
     assert created is True
-    assert snapshot["model_version"] == "football-ad-1"
+    assert snapshot["model_version"] == config.MODEL_VERSIONS["football"]
 
     settlement, settled = settle_snapshot(
         snapshot, dict(match, status="finished", date="2020-01-01", time="20:00",
                        score={"ft": [2, 1]})
     )
     assert settled is True
-    assert settlement["model_version"] == "football-ad-1"
+    assert settlement["model_version"] == config.MODEL_VERSIONS["football"]
 
     row, materialized = capture_evaluation_row(snapshot, settlement)
     assert materialized is True
-    assert row["model_version"] == "football-ad-1"
-    assert get_settlements_for_match("m-down")[0]["model_version"] == "football-ad-1"
+    assert row["model_version"] == config.MODEL_VERSIONS["football"]
+    assert get_settlements_for_match("m-down")[0]["model_version"] == config.MODEL_VERSIONS["football"]
 
 
 def test_analytics_group_new_version_separately(isolated_data_dir, make_match):

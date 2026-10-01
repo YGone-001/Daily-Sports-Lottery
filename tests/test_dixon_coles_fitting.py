@@ -6,6 +6,7 @@ import math
 
 import pytest
 
+import config
 from models.poisson_model import poisson_pmf
 from utils.dixon_coles_fitting import (
     DEFAULT_HALF_LIFE_DAYS,
@@ -512,4 +513,4 @@ def test_convenience_function_matches_direct_fit(isolated_data_dir, make_match):
     assert len(summaries) == 1
     assert summaries[0]["sport"] == "football"
     assert summaries[0]["sample_count"] == 1
-    assert summaries[0]["model_version"] == "football-ad-1"
+    assert summaries[0]["model_version"] == config.MODEL_VERSIONS["football"]

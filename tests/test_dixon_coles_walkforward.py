@@ -607,6 +607,6 @@ def test_convenience_function_matches_direct_builder(isolated_data_dir, make_mat
     )
     assert len(summaries) == 1
     assert summaries[0]["sport"] == "football"
-    assert summaries[0]["model_version"] == "football-ad-1"
+    assert summaries[0]["model_version"] == config.MODEL_VERSIONS["football"]
     assert summaries[0]["evaluation_count"] == 1
     assert summaries[0]["target_bucket_count"] == 1

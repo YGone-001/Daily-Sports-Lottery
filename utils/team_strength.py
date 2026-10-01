@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -209,6 +210,28 @@ def _refresh_football_ratings(profile: dict) -> bool:
 # 实力档案生成
 # ---------------------------------------------------------------------------
 
+def stable_team_name_offset(league: str, name: str) -> int:
+    """
+    未知球队冷启动 Elo 的**确定性**扰动，取值范围 [-60, 60]。
+
+    取代原先依赖 Python 内置字符串 `hash()` 的实现——后者默认按进程加盐，
+    同一输入在不同进程 / 不同 `PYTHONHASHSEED` 下会得到不同结果，
+    导致首次出现的球队可能拿到不同的初始 Elo 与后续预测内容。
+
+        raw    = f"{league}|{name}".encode("utf-8")
+        digest = hashlib.sha256(raw).digest()
+        bucket = int.from_bytes(digest[:8], "big") % 121
+        offset = bucket - 60
+
+    纯函数：不使用内置 `hash()` / random / uuid / 当前时间 / 进程 ID / 文件系统状态。
+    只替换哈希原语，不改变冷启动的身份语义（payload 仍为 `league|name`，不做任何归一化）。
+    """
+    raw = f"{league}|{name}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    bucket = int.from_bytes(digest[:8], "big") % 121
+    return bucket - 60
+
+
 def _estimate_elo(league: str, rank: int | None, sport: str, name: str = "") -> float:
     """
     估算球队初始 Elo。
@@ -234,10 +257,9 @@ def _estimate_elo(league: str, rank: int | None, sport: str, name: str = "") -> 
         adjust = max(-120.0, min(100.0, adjust))
         base += adjust
     elif name:
-        # 3. 无名次时用队名哈希产生 -60 ~ +60 的稳定微扰
-        #    保证同联赛球队之间有区分度，且同一队每次都一致
-        h = abs(hash(f"{league}|{name}")) % 121 - 60
-        base += h
+        # 3. 无名次时用确定性队名扰动产生 -60 ~ +60 的偏移
+        #    保证同联赛球队之间有区分度，且跨进程 / 跨重启完全一致
+        base += stable_team_name_offset(league, name)
 
     return base
 

@@ -350,8 +350,8 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 - **存储**：`data/prediction_snapshots.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建）。
 - **落盘**：原子写入（临时文件 + `fsync` + `os.replace`），并以进程内锁保护并发读改写；
   抓取线程与 HTTP 路由并发时仍只会落盘一条 canonical 快照。
-- **模型版本**：足球与篮球**各自独立**的当前版本，由 `config.MODEL_VERSIONS` 提供
-  （默认两者均为 `baseline-1`），随每条快照一同落盘。详见「运动专属模型版本」。
+- **模型版本**：足球与篮球**各自独立**的当前版本，取值见 `config.MODEL_VERSIONS`，
+  随每条快照一同落盘。详见「运动专属模型版本」。
 - **抓取统计**：`/api/refresh` 返回的 `prediction_snapshots_added` 表示该次刷新**实际新增**的
   快照条数（既有快照、live/finished 比赛、失败的预测都不计入）。
 
@@ -366,15 +366,17 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 
 ```python
 MODEL_VERSIONS = {
-    "football": "football-ad-1",
-    "basketball": "baseline-1",
+    "football": "football-coldstart-1",
+    "basketball": "basketball-coldstart-1",
 }
 
 MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
 ```
 
-- **足球已提升到 `football-ad-1`**：因为足球的攻防输入发生了实质变化
-  （见「足球攻防独立化」）；篮球模型未改动，因此**保持 `baseline-1`**。
+- **两个运动都已提升到 `*-coldstart-1`**：因为未知球队的冷启动 Elo 由内置
+  `hash()` 改为确定性 SHA-256（见「未知球队冷启动确定性」），
+  **足球与篮球共用的 `_estimate_elo()` 都受影响**，因此两个运动的版本都必须提升，
+  否则同一 `model_version` 会在改动前后对应不同的冷启动预测语义。
 - **按运动独立提升版本**：只改足球模型时只需提升 `football` 的版本，篮球保持不动，反之亦然。
   这样不会把未改动的那个运动的预测错误地归入新版本，避免污染按
   `(sport, model_name, model_version)` 分组的快照 / 结算 / 评估样本 /
@@ -393,6 +395,34 @@ MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
 - **下游自动跟随**：结算、评估样本、分类评估、校准诊断都沿用快照中记录的
   `model_name` / `model_version`，因此新版本会自然成为独立分组，无需改动任何公式。
 - **版本号是人工维护的显式标识**：不从 Git SHA / 文件哈希 / 时间戳等自动推断。
+
+## 未知球队冷启动确定性
+
+未知球队的初始 Elo 扰动已从 Python 内置 `hash()` 改为**确定性 SHA-256 映射**：
+
+```python
+raw    = f"{league}|{name}".encode("utf-8")
+digest = hashlib.sha256(raw).digest()
+bucket = int.from_bytes(digest[:8], "big") % 121
+offset = bucket - 60          # 范围 [-60, 60]
+```
+
+- **为什么必须改**：Python 的字符串 `hash()` 默认按进程加盐，同一输入在不同进程 /
+  不同 `PYTHONHASHSEED` 下会得到不同结果。那会让首次出现的球队拿到不同的初始 Elo、
+  攻防先验、期望进球、胜平负概率与预测快照内容——在开始积累不可变历史评估数据前不可接受。
+- **不变量**：同联赛 + 同队名 + 同代码配置 = 同冷启动 Elo，
+  跨进程重启、跨 `PYTHONHASHSEED`、跨机器、跨独立运行时存储都成立。
+- **只替换哈希原语**：payload 仍是 `league|name`，**未**加入 sport / rank / 日期 / 版本，
+  也**未**新增任何队名归一化（不做 Unicode 规范化、大小写折叠、繁简转换、别名解析）。
+- **冷启动优先级不变**：① 联赛锚点命中 → 直接用锚点 Elo（不叠加扰动）；
+  ② 提供了有效名次 → 沿用既有名次公式（不叠加扰动）；③ 两者都没有 → 才应用确定性扰动。
+- **既有档案不迁移**：`team_strength.json` 中已存在的球队**不重算**初始 Elo——
+  它们可能已经历过真实比赛更新，重建冷启动值会破坏状态。无批量迁移、无迁移脚本。
+  足球档案的攻防**懒刷新**（由既有 Elo 与累计进失球推导攻防）保持原样。
+- **新档案可复现**：两个干净的独立存储用相同参数创建同一未知球队，会得到完全一致的档案。
+- **版本影响**：因为 `_estimate_elo()` 由足球与篮球共用，两个运动的当前版本都提升为
+  `football-coldstart-1` / `basketball-coldstart-1`；历史 `football-ad-1` 与 `baseline-1`
+  产物保持不可变。本改动只影响首次出现的未知球队，不修改任何预测公式。
 
 ## 足球攻防独立化
 
@@ -648,8 +678,8 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
   `weighted_nll_improvement_vs_zero`。其中 `rho = 0` 即独立泊松基线。
 - **不落盘、不部署**：不生成任何拟合结果文件，不修改 `config.py`，
   **不把拟合结果应用到线上预测**。
-- **线上模型不变**：`config.MODEL_CONFIG["dixon_coles_rho"]` 仍为 `-0.15`，
-  足球版本仍为 `football-ad-1`，篮球仍为 `baseline-1`。
+- **线上模型不变**：`config.MODEL_CONFIG["dixon_coles_rho"]` 仍为 `-0.15`；
+  足球与篮球的模型版本由 `config.MODEL_VERSIONS` 决定，本层不做任何版本变更。
   如果运行期自动重拟合，同一个 `model_version` 的含义会随时间漂移，破坏既有的
   版本化历史对比体系——因此拟合与部署必须分离，后续由独立的部署任务决定是否采用。
 
@@ -683,8 +713,8 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
   三项总 / 平均 NLL 与 `nll_improvement_vs_fixed` / `nll_improvement_vs_zero`。
 - **只做分数似然诊断**：不计算反事实的胜平负 / Brier / 分类 LogLoss / Accuracy / ECE，
   不选生产 rho、不做排名、不落盘、不接入 refresh。
-- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`，足球仍为 `football-ad-1`，
-  篮球仍为 `baseline-1`。
+- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`；模型版本由
+  `config.MODEL_VERSIONS` 决定，本层不做任何版本变更。
 
 ## Dixon-Coles 反事实 W/D/L 验证
 
@@ -718,8 +748,8 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
   仅为描述性差值）。无合格目标时所有 total / mean / improvement 均为 `None`（不是 NaN）。
 - **不落盘、不排名、不部署**：不生成任何结果文件，不选生产 rho、不给评级、
   不接入 refresh、不改 `models/predictor.py`。
-- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`，足球仍为 `football-ad-1`，
-  篮球仍为 `baseline-1`。
+- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`；模型版本由
+  `config.MODEL_VERSIONS` 决定，本层不做任何版本变更。
 
 ## 配置说明
 

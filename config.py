@@ -81,8 +81,8 @@ MODEL_CONFIG = {
 # 不会污染按 (sport, model_name, model_version) 分组的评估比较。
 # 版本号是人工维护的显式标识，不做任何自动推断（Git SHA / 文件哈希 / 时间戳等）。
 MODEL_VERSIONS = {
-    "football": "football-ad-1",
-    "basketball": "baseline-1",
+    "football": "football-coldstart-1",
+    "basketball": "basketball-coldstart-1",
 }
 
 # 全局回退版本：仅供**没有运动上下文**的调用方使用，属于兼容性兜底，
