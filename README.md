@@ -347,7 +347,8 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 - **存储**：`data/prediction_snapshots.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建）。
 - **落盘**：原子写入（临时文件 + `fsync` + `os.replace`），并以进程内锁保护并发读改写；
   抓取线程与 HTTP 路由并发时仍只会落盘一条 canonical 快照。
-- **模型版本**：`config.MODEL_VERSION`（默认 `baseline-1`），随每条快照一同落盘。
+- **模型版本**：足球与篮球**各自独立**的当前版本，由 `config.MODEL_VERSIONS` 提供
+  （默认两者均为 `baseline-1`），随每条快照一同落盘。详见「运动专属模型版本」。
 - **抓取统计**：`/api/refresh` 返回的 `prediction_snapshots_added` 表示该次刷新**实际新增**的
   快照条数（既有快照、live/finished 比赛、失败的预测都不计入）。
 
@@ -355,6 +356,36 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 模型概率、展示概率、期望值（EV/Kelly）、市场赔率与隐含概率，以及按运动类型保留的比分/得分数据
 （足球 `expected_goals` / `top_scores` / `goals_prediction`；篮球 `expected_home_points` /
 `expected_away_points` / `expected_total` / `spread` / `over_line` / `over_prob` / `under_prob`）。
+
+## 运动专属模型版本
+
+足球与篮球拥有**各自独立**的当前模型版本，权威配置在 `config.py`：
+
+```python
+MODEL_VERSIONS = {
+    "football": "baseline-1",
+    "basketball": "baseline-1",
+}
+```
+
+- **默认两者都是 `baseline-1`**：本机制不改变任何当前预测的模型版本，
+  既有 `match_id + prematch + baseline-1` 快照的确定性 ID 与内容完全保持不变。
+- **未来按运动提升版本**：只改足球模型时只需把 `football` 的版本提升（例如 `football-v2`），
+  篮球保持 `baseline-1`，反之亦然。这样不会把未改动的那个运动的预测错误地归入新版本，
+  避免污染按 `(sport, model_name, model_version)` 分组的快照 / 结算 / 评估样本 /
+  Accuracy / Brier / LogLoss / ECE 比较。
+- **解析优先级**：显式传入的 `model_version` > 该运动当前配置的版本 > 全局兼容回退
+  `config.MODEL_VERSION`（仅在没有运动上下文时使用，且不臆造版本号）。
+  显式版本始终优先，历史版本 / 测试 / 多版本对比不受配置影响。
+- **快照身份不变**：`snapshot_id = sha256(match_id | prematch | model_version)` 未改动，
+  也没有把运动加入哈希；因此历史 ID 依然可复现。
+- **版本提升后的行为**：仍处于未开赛的比赛，若其当前版本已变化，
+  可在保留旧版本快照不变的前提下新增一条新版本快照
+  （同一场比赛 × 不同模型版本各自一条 canonical 快照，这是为将来受控的模型对比准备的）；
+  已开赛（`live` / `finished`）的比赛不会被追溯补建新版本快照——赛前时间门禁仍然权威。
+- **下游自动跟随**：结算、评估样本、分类评估、校准诊断都沿用快照中记录的
+  `model_name` / `model_version`，因此新版本会自然成为独立分组，无需改动任何公式。
+- **版本号是人工维护的显式标识**：不从 Git SHA / 文件哈希 / 时间戳等自动推断。
 
 ## 赛前赔率历史
 

@@ -17,6 +17,9 @@
 - 唯一性：每场（match_id）× 每模型版本仅一条 canonical 赛前快照。
   存储以 snapshot_id 为键，天然去重。
 - 不可变：一旦某 snapshot_id 已存在，后续调用只读返回，绝不覆盖。
+- 模型版本按运动独立：未显式指定版本时，由 `match["sport"]` 经
+  `config.MODEL_VERSIONS` 解析该运动的当前版本（足球与篮球各自版本化）；
+  显式传入的 `model_version` 始终优先。身份哈希格式保持不变。
 - 时序：仅 `upcoming` 允许新建；`live` / `finished` 一律拒绝新建，
   但已有快照仍可读取。
 - 并发：进程内 `threading.RLock` 保护「读-改-写」，配合原子落盘，
@@ -93,8 +96,40 @@ def snapshot_id_for(match_id: str, model_version: str, slot: str = SNAPSHOT_SLOT
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def resolve_model_version(model_version: str | None) -> str:
-    return model_version or config.MODEL_VERSION
+def current_model_version_for(sport: str | None) -> str:
+    """
+    返回该运动当前配置的模型版本（权威来源：`config.MODEL_VERSIONS`）。
+
+    足球与篮球各自独立版本化：只改其中一个运动的模型时，只需提升该运动的版本，
+    另一个运动的版本保持不变，从而不会把未改动的预测错误地归入新版本。
+
+    未配置的运动返回全局兼容回退版本 `config.MODEL_VERSION`——不臆造版本号，
+    也不新增报错（保持既有调用方在缺少运动上下文时的行为）。
+    """
+    versions = getattr(config, "MODEL_VERSIONS", None) or {}
+    if sport:
+        value = versions.get(sport)
+        if value:
+            return str(value)
+    return config.MODEL_VERSION
+
+
+def resolve_model_version(
+    model_version: str | None = None,
+    sport: str | None = None,
+) -> str:
+    """
+    解析生效的模型版本，优先级：
+
+        1. 显式传入的 `model_version`（历史快照 / 测试 / 多版本对比一律以它为准）
+        2. 该运动当前配置的版本（`config.MODEL_VERSIONS[sport]`）
+        3. 全局兼容回退版本（`config.MODEL_VERSION`，仅在没有运动上下文时使用）
+
+    因此 `resolve_model_version("manual-v7", sport="football")` 返回 `"manual-v7"`。
+    """
+    if model_version:
+        return model_version
+    return current_model_version_for(sport)
 
 
 def model_name_for(sport: str) -> str:
@@ -152,8 +187,10 @@ def build_snapshot(
 
     `match` 应为已富化的比赛（含 `home_team` / `away_team` 实力档案），
     `prediction` 为 `predict_match(...)` 的返回值。
+
+    未显式指定 `model_version` 时，按 `match["sport"]` 解析该运动当前的模型版本。
     """
-    model_version = resolve_model_version(model_version)
+    model_version = resolve_model_version(model_version, match.get("sport"))
     match_id = str(match.get("id") or "")
     if not match_id:
         raise ValueError("快照需要比赛 id（match_id）")
@@ -212,9 +249,18 @@ def get_snapshots_for_match(match_id: str) -> list[dict]:
     return found
 
 
-def snapshot_exists(match_id: str, model_version: str | None = None) -> bool:
-    """某场某模型版本的 canonical 赛前快照是否已存在。"""
-    sid = snapshot_id_for(str(match_id), resolve_model_version(model_version))
+def snapshot_exists(
+    match_id: str,
+    model_version: str | None = None,
+    sport: str | None = None,
+) -> bool:
+    """
+    某场某模型版本的 canonical 赛前快照是否已存在。
+
+    版本解析与快照创建一致：显式 `model_version` > `sport` 对应的当前版本
+    > 全局兼容回退。不根据 match_id 猜测运动。
+    """
+    sid = snapshot_id_for(str(match_id), resolve_model_version(model_version, sport))
     return get_snapshot(sid) is not None
 
 
@@ -288,7 +334,10 @@ def create_snapshot(
     - 返回值：该场该模型版本的快照记录（新建或既有），或在被拒绝时返回 None。
     """
     snapshot, _created = _create_or_get(
-        match, prediction, model_version=resolve_model_version(model_version), now=now
+        match,
+        prediction,
+        model_version=resolve_model_version(model_version, match.get("sport")),
+        now=now,
     )
     return snapshot
 
@@ -311,7 +360,10 @@ def capture_snapshot(
     同样会返回 dict。检查与写入由 `_create_or_get` 在同一把锁内完成。
     """
     return _create_or_get(
-        match, prediction, model_version=resolve_model_version(model_version), now=now
+        match,
+        prediction,
+        model_version=resolve_model_version(model_version, match.get("sport")),
+        now=now,
     )
 
 
