@@ -82,6 +82,7 @@ worldCup/
 │   ├── classification_evaluation.py  # 分类评估：accuracy / Brier / LogLoss（纯计算，不落盘）
 │   ├── calibration_evaluation.py  # 校准诊断：分箱可靠性 / ECE（纯计算，不落盘）
 │   ├── dixon_coles_fitting.py     # 离线 rho 拟合：时间加权 Dixon-Coles 诊断（纯计算，不落盘）
+│   ├── dixon_coles_walkforward.py # 走查验证：无泄漏的时序外样本 rho 检验（纯计算，不落盘）
 │   └── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
@@ -650,6 +651,39 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
   足球版本仍为 `football-ad-1`，篮球仍为 `baseline-1`。
   如果运行期自动重拟合，同一个 `model_version` 的含义会随时间漂移，破坏既有的
   版本化历史对比体系——因此拟合与部署必须分离，后续由独立的部署任务决定是否采用。
+
+## Dixon-Coles 走查验证（无泄漏时序检验）
+
+上面的拟合是**样本内**工具；它不能作为部署依据。本层补上无泄漏的时序检验，回答：
+
+> 如果 `rho` 只用「目标比赛开赛**之前**已经完赛」的比赛拟合，
+> 它给未来比赛打出的分数似然，与当前固定 `rho`、以及独立泊松相比如何？
+
+- **严格过去训练**：对开赛时间 `T` 的目标，训练集严格为 `kickoff_at < T`
+  （**严格小于**，不是 `<=`）。同一时刻开赛的多场比赛构成一个**目标桶**，
+  彼此不互相训练；桶内所有行共用同一个「仅由更早行」拟合出的 `rho`。
+- **扩张窗口**：每个桶的训练集 = 所有严格更早的行（不丢弃旧数据、不用固定滚动窗口）。
+  训练拟合仍沿用 `180` 天半衰期，由既有拟合器控制近期影响力。
+- **目标权重恒为 1.0**：时间衰减只属于训练拟合，未来测试观测不打折。
+- **三个对照**：每条目标观测都用「走查拟合 rho / 当前线上固定 rho / `rho = 0`」分别打分。
+  固定对照默认取 `config.MODEL_CONFIG["dixon_coles_rho"]`（当前 `-0.15`），
+  也可显式传参覆盖（仅测试用，不改配置）。
+- **预热**：`min_train_rows`（默认 `20`）以下的桶不拟合、不打分，计入 `warmup_skipped_count`。
+  这是透明的预热规则，不是置信度评级。预热后无可用目标的组返回
+  `evaluation_count = 0`、`target_bucket_count = 0`，聚合指标为 `None`（不是 NaN）。
+- **分组**：按 `(sport, model_name, model_version)` 独立验证；训练数据绝不跨版本。
+  仅支持足球，篮球不产生走查摘要。
+- **完整性**：分组之前先对**全部**输入行做 `evaluation_id` 全局重复检测，
+  同一 ID 即使篡改 `model_version` 也无法逃避检测；同一组内混用 aware / naive
+  时间戳会显式报 `inconsistent_kickoff_timezone`。
+- **输出**：每个目标桶的 `rho_path` 条目（`target_kickoff_at` / `train_count` /
+  `test_count` / `training_reference_kickoff_at` / `fitted_rho` /
+  三项 `*_test_nll`），以及聚合的样本数、预热跳过数、评估数、桶数、
+  三项总 / 平均 NLL 与 `nll_improvement_vs_fixed` / `nll_improvement_vs_zero`。
+- **只做分数似然诊断**：不计算反事实的胜平负 / Brier / 分类 LogLoss / Accuracy / ECE，
+  不选生产 rho、不做排名、不落盘、不接入 refresh。
+- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`，足球仍为 `football-ad-1`，
+  篮球仍为 `baseline-1`。
 
 ## 配置说明
 

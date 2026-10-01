@@ -268,8 +268,14 @@ def _extract_final_score(row: dict) -> tuple[int, int]:
     return int(home), int(away)
 
 
-def _extract_observation(row: dict) -> tuple[float, float, int, int, datetime]:
-    """从一条评估样本抽取拟合所需的历史字段（不含权重）。"""
+def extract_fitting_row(row: dict) -> tuple[float, float, int, int, datetime]:
+    """
+    从一条评估样本抽取拟合所需的权威历史字段（不含权重）。
+
+    返回 `(lambda_home, lambda_away, home_goals, away_goals, kickoff)`。
+    这是历史行校验的**唯一入口**：拟合与任何派生分析（如走查验证）都必须经由它，
+    避免出现第二套 expected_goals / final_score / kickoff 校验语义。
+    """
     if row.get("sport") != "football":
         raise DixonColesFittingError(
             "unsupported_sport", **_row_context(row), detail=f"sport={row.get('sport')!r}"
@@ -361,7 +367,7 @@ def fit_rho_group(
                     "duplicate_evaluation_id", **_row_context(row), detail=str(evaluation_id)
                 )
             seen_ids.add(evaluation_id)
-        extracted.append(_extract_observation(row))
+        extracted.append(extract_fitting_row(row))
 
     candidates = build_rho_candidates(rho_min, rho_max, rho_step)
 
