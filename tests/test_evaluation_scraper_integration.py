@@ -12,6 +12,9 @@ from utils.settlements import get_settlements_for_match, settle_snapshot
 
 LEAGUE = "英超"
 
+# 默认给比赛一个完整的足球 1X2 盘口：市场准入要求可用盘口覆盖。
+_DEFAULT_ODDS = {"home_win": 1.90, "draw": 3.50, "away_win": 4.00}
+
 
 def _match(
     match_id: str,
@@ -24,7 +27,7 @@ def _match(
     time: str = "20:00",
     status: str = "upcoming",
     score: dict | None = None,
-    odds: dict | None = None,
+    odds: dict | None = _DEFAULT_ODDS,
 ) -> dict:
     return {
         "id": match_id,
@@ -38,7 +41,7 @@ def _match(
         "home_rank": None,
         "away_rank": None,
         "score": score,
-        "odds": odds,
+        "odds": dict(odds) if isinstance(odds, dict) else None,
     }
 
 
@@ -98,8 +101,8 @@ def test_upcoming_to_finished_lifecycle(isolated_data_dir, monkeypatch):
 
 
 def test_first_seen_finished_creates_nothing(isolated_data_dir, monkeypatch):
-    """首次见到就已完赛的比赛：无快照 -> 无结算 -> 无评估样本。"""
-    _fake_sources(monkeypatch, [_match("m-hist", status="finished", score={"ft": [3, 1]})])
+    """首次见到就已完赛且无盘口覆盖：不进入跟踪集合 -> 无快照 -> 无结算 -> 无评估样本。"""
+    _fake_sources(monkeypatch, [_match("m-hist", status="finished", score={"ft": [3, 1]}, odds=None)])
 
     result = scraper.refresh(verbose=False)
 

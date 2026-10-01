@@ -79,7 +79,8 @@ worldCup/
 │   ├── odds_snapshots.py          # 赛前赔率历史：规范化、指纹、连续重复抑制
 │   ├── settlements.py             # 结算：快照×赛果关联、结果指纹、冲突保护
 │   ├── evaluation_rows.py         # 评估样本：快照×结算拼接、溯源校验、源指纹
-│   └── classification_evaluation.py  # 分类评估：accuracy / Brier / LogLoss（纯计算，不落盘）
+│   ├── classification_evaluation.py  # 分类评估：accuracy / Brier / LogLoss（纯计算，不落盘）
+│   └── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
 └── static/
@@ -286,6 +287,42 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 | GET/POST | `/api/refresh` | 手动触发一次抓取 |
 | GET | `/api/status` | 系统状态（元信息、日期、球队库、当日统计） |
 
+## 市场覆盖准入
+
+本应用是**体育盘口预测系统**，跟踪的是**有真实盘口覆盖**的比赛，
+而不是全球记分板上的每一场。准入判定发生在**数据入口 / canonical 集合边界**，
+不是模板层的装饰性过滤。
+
+- **判定依据是市场证据，不是名气**：小联赛只要真有完整盘口就是相关赛事；
+  知名联赛若当前集成的数据源给不出可用盘口，则尚未成为被跟踪的市场事件。
+  **没有**联赛白名单 / 黑名单 / 球队热度规则。
+- **完整盘口才算覆盖**：
+  - 足球：完整 1X2（`home_win` + `draw` + `away_win`），或完整大小球
+    （`total_line` + `over` + `under`，兼容 `over_2_5` + `under_2_5`）。
+  - 篮球：完整胜负（`home_win` + `away_win`），或完整大小分
+    （`total_line` + `over` + `under`）。
+- **价格校验**：价格必须是数值型（bool 不算）、有限（非 NaN / Infinity）且 **> 1.0**。
+  仅有 `matchnum` / `jczq_no` / `total_line` / `handicap_line`，或只有单边、
+  或空字典 / None 填充，都**不构成**覆盖。不做字符串到价格的静默转换。
+- **准入标记**：被准入的比赛会带上 `market_tracked = true`，
+  含义是「该比赛因观察到有效盘口覆盖而被纳入应用」。不会写入 `market_tracked = false`。
+- **一旦准入即持续跟踪**：已跟踪比赛后续即使盘口源临时缺供（`odds = None`），
+  仍保留在 canonical 集合中、保持 `market_tracked = true`、保留最后已知盘口，
+  并继续接受状态 / 比分更新，直到完赛、结算与评估。
+- **新比赛必须有覆盖**：首次观察到的比赛若没有可用盘口，则不进入 canonical 日常集合，
+  也不会产生任何下游历史（预测快照 / 赔率历史 / 结算 / 评估样本）。
+- **历史集合迁移**：既有 `daily_matches.json` 中无标记且无可用盘口的历史行会在下一次
+  正常刷新时被移出 canonical 集合；无标记但自带可用盘口的历史行会被升级为
+  `market_tracked = true` 并保留。**历史不可变存储**
+  （`prediction_snapshots.json` / `odds_snapshots.json` / `settlements.json` /
+  `evaluation_rows.json`）一律不受影响，不做追溯性清理。
+- **赔率源与 live 源对账**：广域即时比分源仍照常抓取（开赛时间 / 状态 / 比分），
+  但广域可见性不再等于准入。赔率行先按竞彩编号（缺失时按 日期 + 主队）挂载到 live 行；
+  未挂载但自带可用盘口的赔率行会作为**兜底候选**保留，不会因为一次匹配失败就丢弃有效市场事件。
+  挂载成功的事件不会再产生第二条 00:00 兜底记录。
+- **当前数据源不变**：仍然只使用仓库已集成的 500.com 派生数据源，未新增任何外部盘口提供方。
+  准入判定保持通用，未来接入其他赔率源时同一判据依然适用。
+
 ## 赛前预测快照
 
 应用页面的预测仍然是**实时重算**的；快照是一条**独立、不可变**的历史记录，用于
@@ -294,7 +331,8 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 - **自动捕获**：由后台抓取线程在每次 `refresh` 中自动固化，**不依赖用户打开任何页面或 API**
   （`/`、`/match/<id>`、`/api/today`、`/api/matches`、`/api/match/<id>` 都不需要被访问）。
   页面/API 路由同样会调用同一套幂等逻辑，但历史记录的存续不再依赖它们。
-- **捕获顺序**：抓取 → 合并 canonical 比赛 → 记录赔率历史 → **用本轮新完赛结果校准 Elo**
+- **捕获顺序**：抓取 → **市场准入（只保留有盘口覆盖的比赛）** → 合并 canonical 比赛
+  → 记录赔率历史 → **用本轮新完赛结果校准 Elo**
   → **捕获预测快照** → **结算已完赛比赛** → **物化评估样本** → 落盘 `daily_matches.json`。
   预测快照在 Elo 校准**之后**生成，因此使用的是当前刷新时刻已知的最新实力。
 - **资格**：只有**未开赛**（`upcoming`）的比赛才会获得新快照；

@@ -2,10 +2,13 @@
 抓取调度器
 ==========
 负责：
-1. 调用 fetcher_500 抓取赛事
-2. 合并进 daily_matches.json（去重 + 增量更新）
-3. 用完赛结果滚动校准球队 Elo
-4. 定时任务入口
+1. 调用 fetcher_500 抓取赛事（广域即时比分 + 竞彩赔率）
+2. 市场准入：只把**有可用盘口覆盖**的比赛纳入 canonical 跟踪集合
+3. 合并进 daily_matches.json（去重 + 增量更新）
+4. 用完赛结果滚动校准球队 Elo
+5. 定时任务入口
+
+准入依据是市场证据，不是联赛名气——本模块不含任何联赛白名单 / 黑名单。
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from utils.daily_loader import (
     save_json,
 )
 from utils.evaluation_rows import EvaluationIntegrityError, capture_evaluation_row
+from utils.market_coverage import has_usable_market_odds
 from utils.odds_snapshots import record_odds_snapshot
 from utils.prediction_snapshots import capture_snapshot, get_snapshot, get_snapshots_for_match
 from utils.settlements import (
@@ -38,11 +42,25 @@ def _norm_no(value: str) -> str:
     return digits.lstrip("0") or digits
 
 
-def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> int:
+def _match_key(match: dict) -> str:
+    """
+    canonical 比赛匹配键：`sport|date|time|home|away`。
+
+    合并与市场准入共用同一个键构造，避免在多处重复字符串拼接。
+    """
+    return (
+        f"{match.get('sport')}|{match.get('date')}|{match.get('time')}|"
+        f"{match.get('home')}|{match.get('away')}"
+    )
+
+
+def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[dict]]:
     """
     把竞彩赔率按「竞彩编号」挂到已有赛程上。
     编号缺失时退化为按 (日期, 主队) 匹配。
-    返回成功挂载的场次数。
+
+    返回 (成功挂载的场次数, 被消费的赔率源行列表)。
+    被消费的行不再作为兜底候选，避免同一市场事件重复入册。
     """
     by_no: dict[str, dict] = {}
     by_home: dict[tuple, dict] = {}
@@ -53,6 +71,7 @@ def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> int:
         by_home.setdefault((r.get("date", ""), r.get("home", "")), r)
 
     count = 0
+    used: list[dict] = []
     for m in matches:
         if m.get("odds"):
             continue
@@ -63,10 +82,102 @@ def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> int:
         if src and src.get("odds"):
             m["odds"] = dict(src["odds"])
             count += 1
+            used.append(src)
             # 用赔率源的联赛名补全（更规范）
             if src.get("league") and not m.get("league"):
                 m["league"] = src["league"]
-    return count
+    return count, used
+
+
+def _append_unmatched_market_candidates(
+    incoming: list[dict],
+    market_rows: list[dict],
+    used_market_rows: list[dict],
+) -> int:
+    """
+    把「未被挂载」但自带**可用盘口**的赔率行作为兜底候选追加进 `incoming`，返回追加条数。
+
+    赔率源本身是独立于即时比分源的市场事件流：某行只是没挂上 live 行
+    （编号不一致 / live 源暂时缺漏 / 队名写法不同）时，不应直接丢弃这个有效市场事件。
+
+    同时必须防止重复：与既有 live 行同竞彩编号、或同 (日期, 主队) 的一律跳过，
+    避免同一市场事件同时产生「live 行 + 00:00 兜底行」两条 canonical 记录。
+    """
+    used_ids = {id(row) for row in used_market_rows}
+    live_nos = {_norm_no(m.get("jczq_no") or "") for m in incoming}
+    live_nos.discard("")
+    live_home = {(m.get("date", ""), m.get("home", "")) for m in incoming}
+
+    appended_keys: set[str] = set()
+    added = 0
+    for row in market_rows:
+        if id(row) in used_ids:
+            continue
+        if not has_usable_market_odds(row):
+            continue
+        no = _norm_no(row.get("jczq_no") or row.get("round") or "")
+        if no and no in live_nos:
+            continue
+        if (row.get("date", ""), row.get("home", "")) in live_home:
+            continue
+        key = _match_key(row)
+        if key in appended_keys:
+            continue
+        appended_keys.add(key)
+        incoming.append(dict(row))
+        added += 1
+    return added
+
+
+def _prepare_existing_market_universe(existing: list[dict]) -> tuple[list[dict], int]:
+    """
+    迁移既有 canonical 集合，使其只保留被跟踪的比赛。
+
+    - `market_tracked` 为 true -> 保留（并保持标记）。
+    - 无标记但自身带可用盘口 -> 打上 `market_tracked = true` 后保留。
+    - 两者皆无（历史上被广泛抓取进来的无盘口赛事）-> 从 canonical 日常集合移除。
+
+    返回 (保留集合, 移除条数)。
+    只影响 `daily_matches.json`；历史不可变存储（预测快照 / 赔率历史 / 结算 /
+    评估样本）一律不动。
+    """
+    kept: list[dict] = []
+    removed = 0
+    for m in existing:
+        if m.get("market_tracked") is True or has_usable_market_odds(m):
+            m["market_tracked"] = True
+            kept.append(m)
+        else:
+            removed += 1
+    return kept, removed
+
+
+def _admit_market_candidates(
+    candidates: list[dict],
+    tracked_keys: set[str],
+) -> tuple[list[dict], int]:
+    """
+    市场准入：决定哪些候选可以进入 canonical 跟踪集合。
+
+    - 已在跟踪集合中（键命中）-> 准入：接受状态 / 比分更新，
+      即使本轮没有盘口（盘口源临时不可用时也必须保持连续性）。
+    - 首次出现的候选 -> 只有具备可用盘口覆盖才准入，并打上 `market_tracked = true`。
+    - 其余 -> 拒绝（不进入 canonical 集合，也不写入任何下游历史）。
+
+    返回 (准入列表, 拒绝条数)。不会写入 `market_tracked = false`。
+    """
+    admitted: list[dict] = []
+    rejected = 0
+    for m in candidates:
+        if _match_key(m) in tracked_keys:
+            admitted.append(m)
+            continue
+        if has_usable_market_odds(m):
+            m["market_tracked"] = True
+            admitted.append(m)
+            continue
+        rejected += 1
+    return admitted, rejected
 
 
 def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int, int]:
@@ -77,12 +188,11 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
     """
     index = {}
     for m in existing:
-        key = f"{m.get('sport')}|{m.get('date')}|{m.get('time')}|{m.get('home')}|{m.get('away')}"
-        index[key] = m
+        index[_match_key(m)] = m
 
     added = updated = 0
     for m in incoming:
-        key = f"{m.get('sport')}|{m.get('date')}|{m.get('time')}|{m.get('home')}|{m.get('away')}"
+        key = _match_key(m)
         if key in index:
             old = index[key]
             # 更新比分/赔率/状态
@@ -323,30 +433,27 @@ def refresh(verbose: bool = True) -> dict:
         except Exception as exc:  # noqa: BLE001
             result["sources"][f"live_{sport}"] = f"error: {exc}"
 
-    # 2. 竞彩赔率（XML）—— 按「竞彩编号」合并到赛程上
+    # 2. 竞彩赔率（XML）—— 按「竞彩编号」挂载到赛程上；未挂载的留作兜底候选
+    market_rows: list[dict] = []
+    used_market_rows: list[dict] = []
     for sport in ("football", "basketball"):
         try:
             rows = fetcher_500.fetch_jczq_xml(sport)
-            merged = _attach_odds(incoming, rows)
+            attached, used = _attach_odds(incoming, rows)
+            market_rows.extend(rows)
+            used_market_rows.extend(used)
             result["sources"][f"jczq_odds_{sport}"] = len(rows)
             if verbose:
-                print(f"  [竞彩赔率{sport}] {merged}/{len(rows)} 场已挂载盘口")
+                print(f"  [竞彩赔率{sport}] {attached}/{len(rows)} 场已挂载盘口")
         except Exception as exc:  # noqa: BLE001
             result["sources"][f"jczq_odds_{sport}"] = f"error: {exc}"
 
-    # 2b. 兜底：若赛程源无数据，直接用赔率源自成赛程
-    if not any(k.startswith("live_") and isinstance(v, int) and v for k, v in result["sources"].items()):
-        for sport in ("football", "basketball"):
-            try:
-                rows = fetcher_500.fetch_jczq_xml(sport)
-                incoming.extend(rows)
-                result["sources"][f"jczq_only_{sport}"] = len(rows)
-                if verbose and rows:
-                    print(f"  [竞彩独立{sport}] {len(rows)} 场")
-            except Exception as exc:  # noqa: BLE001
-                result["sources"][f"jczq_only_{sport}"] = f"error: {exc}"
+    # 3. 未被挂载但自带可用盘口的赔率行 -> 兜底候选（同一市场事件不重复入册）
+    result["sources"]["market_candidates"] = _append_unmatched_market_candidates(
+        incoming, market_rows, used_market_rows
+    )
 
-    # 2. 500 完场（SSR，含赛果与历史）
+    # 4. 500 完场（SSR，含赛果与历史）
     try:
         finished = fetcher_500.fetch_finished_matches()
         incoming.extend(finished)
@@ -362,28 +469,36 @@ def refresh(verbose: bool = True) -> dict:
         result["total"] = len(load_json(DAILY_FILE).get("matches", []))
         return result
 
-    # 3. 合并
+    # 5. 迁移既有 canonical 集合：剔除历史上被广泛抓取、且无盘口覆盖的赛事
     data = load_json(DAILY_FILE) or {}
-    existing = data.get("matches", [])
-    merged, added, updated = _merge(existing, incoming)
+    existing, legacy_removed = _prepare_existing_market_universe(data.get("matches", []))
 
-    # 3b. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准）
+    # 6. 市场准入：已跟踪比赛接受更新；新候选必须具备可用盘口覆盖
+    tracked_keys = {_match_key(m) for m in existing}
+    admitted, rejected = _admit_market_candidates(incoming, tracked_keys)
+    result["sources"]["market_tracked_removed"] = legacy_removed
+    result["sources"]["market_rejected"] = rejected
+
+    # 7. 合并为 canonical 跟踪集合
+    merged, added, updated = _merge(existing, admitted)
+
+    # 8. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准）
     odds_snapshots_added = _capture_odds_history(merged, now=now)
 
-    # 4. 校准 Elo（用本轮新完赛结果更新实力）
+    # 9. 校准 Elo（用本轮新完赛结果更新实力）
     calibrated = _calibrate_from_finished(merged)
 
-    # 5. 自动固化赛前预测快照
-    #    必须在 Elo 校准之后：快照应使用「当前刷新时刻已知」的最新实力。
+    # 10. 自动固化赛前预测快照
+    #     必须在 Elo 校准之后：快照应使用「当前刷新时刻已知」的最新实力。
     prediction_snapshots_added = _capture_prediction_snapshots(merged, now=now)
 
-    # 6. 结算已完赛比赛（只关联既有预测快照，不回溯生成预测）
+    # 11. 结算已完赛比赛（只关联既有预测快照，不回溯生成预测）
     settlements_added = _settle_finished_matches(merged, now=now)
 
-    # 7. 物化评估样本（消费权威历史记录：预测快照 × 结算）
+    # 12. 物化评估样本（消费权威历史记录：预测快照 × 结算）
     evaluation_rows_added = _materialize_evaluation_rows(merged, now=now)
 
-    # 8. 落盘
+    # 13. 落盘
     save_json(
         DAILY_FILE,
         {
@@ -415,7 +530,7 @@ def refresh(verbose: bool = True) -> dict:
             f"  ✅ 新增 {added} | 更新 {updated} | Elo校准 {calibrated} "
             f"| 赔率历史 +{odds_snapshots_added} | 预测快照 +{prediction_snapshots_added} "
             f"| 结算 +{settlements_added} | 评估样本 +{evaluation_rows_added} "
-            f"| 库内共 {len(merged)} 场"
+            f"| 无盘口剔除 {legacy_removed + rejected} | 库内共 {len(merged)} 场"
         )
     return result
 

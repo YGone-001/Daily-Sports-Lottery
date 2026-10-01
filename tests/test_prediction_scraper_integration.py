@@ -7,11 +7,15 @@ from __future__ import annotations
 from datetime import timedelta
 
 from utils import fetcher_500, scraper
-from utils.daily_loader import get_match_datetime
+from utils.daily_loader import get_match_datetime, load_json
 from utils.prediction_snapshots import get_snapshots_for_match
 from utils.team_strength import get_team_profile, update_from_result
 
 LEAGUE = "英超"
+
+# 默认给比赛一个完整的足球 1X2 盘口：市场准入要求可用盘口覆盖，
+# 因此「被跟踪的比赛」在测试夹具里默认就是有盘口的。
+_DEFAULT_ODDS = {"home_win": 1.90, "draw": 3.50, "away_win": 4.00}
 
 
 def _match(
@@ -25,7 +29,7 @@ def _match(
     time: str = "20:00",
     status: str = "upcoming",
     score: dict | None = None,
-    odds: dict | None = None,
+    odds: dict | None = _DEFAULT_ODDS,
 ) -> dict:
     return {
         "id": match_id,
@@ -39,7 +43,7 @@ def _match(
         "home_rank": None,
         "away_rank": None,
         "score": score,
-        "odds": odds,
+        "odds": dict(odds) if isinstance(odds, dict) else None,
     }
 
 
@@ -111,15 +115,25 @@ def test_multiple_upcoming_matches_captured(isolated_data_dir, monkeypatch):
     assert get_snapshots_for_match("up-c")[0]["sport"] == "basketball"
 
 
-def test_no_odds_match_still_captured(isolated_data_dir, monkeypatch):
-    _fake_sources(monkeypatch, [_match("up-noodds", odds=None)])
+def test_tracked_match_survives_odds_loss(isolated_data_dir, monkeypatch):
+    """
+    一旦通过市场准入，比赛在盘口源暂时缺供时仍保持跟踪：
+    留在 canonical 集合、保持 market_tracked、保留最后已知盘口，
+    并且已有的预测快照不被重复创建。
+    """
+    _fake_sources(monkeypatch, [_match("up-tracked")])
+    assert scraper.refresh(verbose=False)["prediction_snapshots_added"] == 1
 
+    # 本轮盘口源没有该场（odds = None）
+    _fake_sources(monkeypatch, [_match("up-tracked", odds=None)])
     result = scraper.refresh(verbose=False)
 
-    assert result["prediction_snapshots_added"] == 1
-    snap = get_snapshots_for_match("up-noodds")[0]
-    assert snap["market_odds"] == {}
-    assert snap["display_probabilities"]  # 无盘口也能产出预测
+    assert result["prediction_snapshots_added"] == 0
+    stored = {m["id"]: m for m in load_json("daily_matches.json")["matches"]}
+    assert "up-tracked" in stored
+    assert stored["up-tracked"]["market_tracked"] is True
+    assert stored["up-tracked"]["odds"]  # 保留最后已知盘口
+    assert len(get_snapshots_for_match("up-tracked")) == 1
 
 
 # ---------------------------------------------------------------------------
