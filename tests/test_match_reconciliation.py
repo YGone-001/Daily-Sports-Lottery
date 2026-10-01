@@ -753,6 +753,6 @@ def test_existing_historical_artifacts_preserved_on_reconciliation(tmp_path, mon
 
 def test_model_versions_remain_unchanged():
     assert config.MODEL_VERSIONS["football"] == "football-coldstart-1"
-    assert config.MODEL_VERSIONS["basketball"] == "basketball-coldstart-1"
+    assert config.MODEL_VERSIONS["basketball"] == "basketball-modelprob-1"
     assert config.MODEL_VERSION == "baseline-1"
 

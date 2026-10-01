@@ -100,6 +100,13 @@ def predict_basketball(
     p_draw = 0.0
     p_away = 1.0 - p_home
 
+    # 主客独赢盘「融合前」的模型胜负概率。
+    # 这是模型自身的判断，是 model_probabilities / EV / Kelly 的权威来源，
+    # 与下面的展示概率 p_home / p_away 解耦（对齐足球的 model_* 语义）。
+    model_home = p_home
+    model_draw = p_draw
+    model_away = p_away
+
     # 总分的离散分布（10 分一档）
     total_sigma = diff_sigma
     totals_dist = {}
@@ -149,6 +156,8 @@ def predict_basketball(
         except (KeyError, TypeError, ValueError):
             market_probs = None
 
+    # 只有「展示用」的 p_home / p_away 会被主客独赢盘融合；
+    # model_home / model_away 在此之后绝不再被修改。
     weight = cfg["odds_weight"]
     if market_probs and weight > 0:
         p_home = p_home * (1 - weight) + market_probs[0] * weight
@@ -177,18 +186,20 @@ def predict_basketball(
                 f = (model_p * b - q) / b
                 return max(0.0, f * cfg["kelly_fraction"])
 
-            ev_home = p_home * ho - 1
-            ev_away = p_away * ao - 1
+            # EV / Kelly 一律使用「融合前」的模型概率，与赔率比较。
+            # 若改用已含市场概率的展示概率，等价于拿市场与自身比较。
+            ev_home = model_home * ho - 1
+            ev_away = model_away * ao - 1
             thr = cfg["value_threshold"]
             ev_analysis["home"] = {
                 "ev": round(ev_home * 100, 1),
                 "is_value": ev_home > thr,
-                "kelly_pct": round(kelly(p_home, ho) * 100, 2),
+                "kelly_pct": round(kelly(model_home, ho) * 100, 2),
             }
             ev_analysis["away"] = {
                 "ev": round(ev_away * 100, 1),
                 "is_value": ev_away > thr,
-                "kelly_pct": round(kelly(p_away, ao) * 100, 2),
+                "kelly_pct": round(kelly(model_away, ao) * 100, 2),
             }
         except (ValueError, TypeError):
             pass
@@ -232,10 +243,11 @@ def predict_basketball(
             "draw": 0,
             "away_win": round(p_away * 100),
         },
+        # 融合前的主客独赢盘模型概率（历史评估的权威字段）
         "model_probabilities": {
-            "home_win": round(p_home * 100),
+            "home_win": round(model_home * 100),
             "draw": 0,
-            "away_win": round(p_away * 100),
+            "away_win": round(model_away * 100),
         },
         "market": {
             "odds": odds or {},

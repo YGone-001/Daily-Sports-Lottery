@@ -103,9 +103,9 @@ def _fake_sources(monkeypatch, upcoming) -> None:
 
 def test_default_current_versions(isolated_data_dir):
     assert config.MODEL_VERSIONS["football"] == "football-coldstart-1"
-    assert config.MODEL_VERSIONS["basketball"] == "basketball-coldstart-1"
+    assert config.MODEL_VERSIONS["basketball"] == "basketball-modelprob-1"
     assert current_model_version_for("football") == "football-coldstart-1"
-    assert current_model_version_for("basketball") == "basketball-coldstart-1"
+    assert current_model_version_for("basketball") == "basketball-modelprob-1"
     # 全局兼容回退保持 baseline-1，未随运动版本变化
     assert config.MODEL_VERSION == "baseline-1"
 

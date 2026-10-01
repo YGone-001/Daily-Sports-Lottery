@@ -407,16 +407,20 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 ```python
 MODEL_VERSIONS = {
     "football": "football-coldstart-1",
-    "basketball": "basketball-coldstart-1",
+    "basketball": "basketball-modelprob-1",
 }
 
 MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
 ```
 
-- **两个运动都已提升到 `*-coldstart-1`**：因为未知球队的冷启动 Elo 由内置
+- **两个运动都曾提升到 `*-coldstart-1`**：因为未知球队的冷启动 Elo 由内置
   `hash()` 改为确定性 SHA-256（见「未知球队冷启动确定性」），
   **足球与篮球共用的 `_estimate_elo()` 都受影响**，因此两个运动的版本都必须提升，
   否则同一 `model_version` 会在改动前后对应不同的冷启动预测语义。
+- **篮球再次提升到 `basketball-modelprob-1`**：因为篮球 `model_probabilities` 的**语义**
+  被修正为「主客独赢盘融合前」的模型概率（见「篮球概率语义」）。
+  同一 `model_version` 标签在改动前后含义不同会污染评估分组，
+  因此必须提升版本；历史 `basketball-coldstart-1` 快照保持不可变、不被迁移。
 - **按运动独立提升版本**：只改足球模型时只需提升 `football` 的版本，篮球保持不动，反之亦然。
   这样不会把未改动的那个运动的预测错误地归入新版本，避免污染按
   `(sport, model_name, model_version)` 分组的快照 / 结算 / 评估样本 /
@@ -435,6 +439,40 @@ MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
 - **下游自动跟随**：结算、评估样本、分类评估、校准诊断都沿用快照中记录的
   `model_name` / `model_version`，因此新版本会自然成为独立分组，无需改动任何公式。
 - **版本号是人工维护的显式标识**：不从 Git SHA / 文件哈希 / 时间戳等自动推断。
+
+## 篮球概率语义
+
+篮球的 `model_probabilities` 与 `probabilities` 现在与足球保持**同一语义分工**：
+
+| 字段 | 含义 |
+| --- | --- |
+| `model_probabilities` | 主客独赢盘融合**前**的模型胜负概率（`home_win` / `away_win`，`draw = 0`） |
+| `probabilities` | 融合**后**的展示概率 |
+| `market.implied_probabilities` | 主客独赢盘去水后的市场隐含概率 |
+
+- **模型概率绝不被融合改写**：`model_home` / `model_away` 在由得分差分布得出后即冻结，
+  只有展示用的 `p_home` / `p_away` 会被 `odds_weight` 加权融合。
+- **融合公式保持既有实现**：
+  `display = model * (1 - weight) + market * weight`，随后沿用既有归一化；
+  `weight = config.MODEL_CONFIG["odds_weight"]`（默认 `0.20`）**未改动**。
+- **无有效盘口时 `probabilities == model_probabilities`**（同一取整约定）。
+- **EV / Kelly 一律使用融合前的模型概率**与市场价格比较：
+  `EV = model_probability * odds - 1`，仓位用既有 Fractional Kelly。
+  若改用已含市场概率的展示概率，等于让市场与自身比较。
+  `value_threshold` 与 `kelly_fraction` 均**未改动**。
+- **篮球并非完全不依赖市场信息**：大小分（`total_line` / `over` / `under`）对
+  `base_total` 与 `p_over` 的既有条件化行为**保持不变**；本改动只隔离「主客独赢盘融合」。
+- **未改动的篮球行为**：`expected_points`、`basketball_base_total` / `basketball_base_total_cba`、
+  `basketball_pace`、`basketball_score_std`、`basketball_home_advantage`、`basketball_elo_scale`、
+  总分线处理、大小分与 20% 校准、`spread`、`top_scores`、`suspense` 全部保持原样。
+- **足球语义未变**：`predict_football` 的数学与上述分工均保持不变。
+- **模型版本**：篮球当前版本为 `basketball-modelprob-1`；足球仍为 `football-coldstart-1`；
+  全局回退仍为 `baseline-1`。
+- **历史兼容**：`basketball-coldstart-1` 快照与评估样本**不可变、不迁移**；
+  已开赛（`live` / `finished`）的比赛不会被追溯补建新版本快照。
+- **评估分组**：分类评估、校准诊断与时序评估会自然把
+  `basketball-coldstart-1` 与 `basketball-modelprob-1` 作为**独立分组**处理，
+  两者不做自动对比、不产生胜者标签。
 
 ## 未知球队冷启动确定性
 

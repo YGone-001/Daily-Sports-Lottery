@@ -300,7 +300,7 @@ def test_basketball_keeps_elo_mapping(isolated_data_dir):
         # 篮球不使用进球证据
         assert profile["attack_rating"] == profile["defense_rating"]
 
-    assert config.MODEL_VERSIONS["basketball"] == "basketball-coldstart-1"
+    assert config.MODEL_VERSIONS["basketball"] == "basketball-modelprob-1"
 
 
 # ---------------------------------------------------------------------------

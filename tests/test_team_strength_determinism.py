@@ -287,7 +287,7 @@ def test_result_update_regression(isolated_data_dir):
 
 def test_current_model_versions(isolated_data_dir):
     assert config.MODEL_VERSIONS["football"] == "football-coldstart-1"
-    assert config.MODEL_VERSIONS["basketball"] == "basketball-coldstart-1"
+    assert config.MODEL_VERSIONS["basketball"] == "basketball-modelprob-1"
     assert config.MODEL_VERSION == "baseline-1"
 
 
@@ -300,7 +300,7 @@ def test_snapshot_version_propagation(isolated_data_dir, make_match):
     )
 
     assert football["model_version"] == "football-coldstart-1"
-    assert basketball["model_version"] == "basketball-coldstart-1"
+    assert basketball["model_version"] == "basketball-modelprob-1"
 
 
 def test_historical_snapshots_preserved(isolated_data_dir, make_match):
