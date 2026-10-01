@@ -1,0 +1,3 @@
+# 开发 / 测试依赖（非运行时依赖）
+# 安装: pip install -r requirements-dev.txt
+pytest==9.1.1

@@ -53,11 +53,14 @@ worldCup/
 ├── start.bat                      # Windows 一键启动脚本
 ├── start.sh                       # Linux / macOS 一键启动脚本
 ├── requirements.txt
+├── requirements-dev.txt           # 开发/测试依赖（pytest）
+├── pytest.ini
 ├── .gitignore
 ├── data/                          # ⚠️ 运行时数据，不提交（可由抓取器重建）
 │   ├── daily_matches.json         #   每日赛事（抓取器写入）
 │   ├── team_strength.json         #   动态球队实力库（Elo）
-│   └── calibrated.json            #   已用于 Elo 校准的比赛 ID
+│   ├── calibrated.json            #   已用于 Elo 校准的比赛 ID
+│   └── prediction_snapshots.json  #   赛前预测快照（不可变历史记录）
 ├── models/
 │   ├── poisson_model.py           # 泊松 + Dixon-Coles 比分矩阵
 │   ├── predictor.py               # 预测主入口（足球）+ 赔率融合 + EV/Kelly
@@ -67,7 +70,10 @@ worldCup/
 │   ├── fetcher_500.py             # 500.com 抓取适配器（4 个数据源）
 │   ├── scraper.py                 # 抓取调度：多源合并 + Elo 校准 + 落盘
 │   ├── daily_loader.py            # 统一数据层 + 比赛日逻辑 + 查询
-│   └── team_strength.py           # 动态 Elo 实力库
+│   ├── team_strength.py           # 动态 Elo 实力库
+│   ├── atomic_json.py             # 原子 JSON 落盘（临时文件 + fsync + replace）
+│   └── prediction_snapshots.py    # 赛前快照：身份、时序门禁、幂等、不可变
+├── tests/                         # pytest 测试（快照行为 + 只读 API）
 ├── templates/                     # base / index / match / strategy / history
 └── static/
     ├── css/style.css              # 「数据终端 × 金融看板」风格，明暗双主题
@@ -227,10 +233,30 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 | GET | `/api/today?sport=` | 逻辑比赛日赛事（含预测） |
 | GET | `/api/matches?date=&sport=` | 按日期/类别查询赛事 |
 | GET | `/api/match/<id>` | 单场详情 |
+| GET | `/api/match/<id>/snapshots` | 该场已固化的赛前预测快照（只读，无记录返回空列表） |
 | GET | `/api/dates` | 可用日期与联赛列表 |
 | GET | `/api/strategy?sport=` | 策略推荐（价值盘口 + 串关） |
 | GET/POST | `/api/refresh` | 手动触发一次抓取 |
 | GET | `/api/status` | 系统状态（元信息、日期、球队库、当日统计） |
+
+## 赛前预测快照
+
+应用页面的预测仍然是**实时重算**的；快照是一条**独立、不可变**的历史记录，用于
+保留「开赛前模型此刻相信什么」，为后续无泄漏的结算与回测提供依据。
+
+- **触发时机**：当应用为一场**未开赛**（`upcoming`）比赛生成预测时自动固化一条快照。
+  进行中（`live`）与已完赛（`finished`）的比赛不会生成新的赛前快照，但**已有快照始终可读**。
+- **唯一性**：每场比赛 × 每个模型版本仅一条 canonical 赛前快照，重复渲染页面不会产生重复记录。
+- **身份**：`snapshot_id = sha256(match_id | slot | model_version)`，确定性且可复现。
+- **不可变性**：一旦写入，后续的 Elo 变化、重新预测或赛后信息都不会改写既有快照。
+- **存储**：`data/prediction_snapshots.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建）。
+- **落盘**：原子写入（临时文件 + `fsync` + `os.replace`），并以进程内锁保护并发读改写。
+- **模型版本**：`config.MODEL_VERSION`（默认 `baseline-1`），随每条快照一同落盘。
+
+快照字段涵盖比赛标识、开赛时间、生成时间、模型名称与版本、双方 Elo、
+模型概率、展示概率、期望值（EV/Kelly）、市场赔率与隐含概率，以及按运动类型保留的比分/得分数据
+（足球 `expected_goals` / `top_scores` / `goals_prediction`；篮球 `expected_home_points` /
+`expected_away_points` / `expected_total` / `spread` / `over_line` / `over_prob` / `under_prob`）。
 
 ## 配置说明
 
@@ -286,12 +312,22 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 | 虚拟环境 | `.venv/`、`venv/` | 体积大，可重建 |
 | 运行时数据 | `data/*.json` | 抓取器生成，每次刷新覆盖，可自动重建 |
 | 密钥配置 | `.env` | 含敏感信息 |
-| 日志临时 | `*.log`、`*.tmp`、`*.bak` | 运行时产物 |
+| 日志临时 | `*.log`、`*.tmp`、`*.bak`、`*.corrupt` | 运行时产物 |
 | 编辑器/系统 | `.idea/`、`.vscode/`、`.DS_Store` | 个人环境差异 |
 | AI 工作区 | `.workbuddy-ai/` | 本地助手记忆，与项目运行无关 |
 | 历史备份 | `_legacy_backup/` | 改造前旧文件 |
 
 克隆仓库后，`data/` 为空是正常的 —— 首次启动会自动抓取填充。
+
+## 测试
+
+```bash
+pip install -r requirements-dev.txt   # 安装 pytest
+python -m compileall .
+pytest -q
+```
+
+测试在临时目录中运行，不会读写真实的 `data/`。
 
 ## License
 

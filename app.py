@@ -13,6 +13,7 @@ API：
   /api/today                    今日赛事
   /api/matches?date=&sport=     按日期/类别查询
   /api/match/<id>               单场详情
+  /api/match/<id>/snapshots     该场赛前预测快照（只读）
   /api/dates                    可用日期
   /api/strategy                 策略推荐
   /api/refresh                  手动触发抓取
@@ -41,6 +42,7 @@ from utils.daily_loader import (
     get_matches_grouped,
     get_meta,
 )
+from utils.prediction_snapshots import ensure_snapshot, get_snapshots_for_match
 
 app = Flask(__name__)
 app.config.from_object(config)
@@ -61,6 +63,10 @@ def index():
     display_date = date or get_default_date()
 
     groups = get_matches_grouped(display_date, sport)
+    # 为列表中已生成预测的未开赛比赛固化赛前快照（幂等，不覆盖既有记录）
+    for group in groups:
+        for m in group["matches"]:
+            ensure_snapshot(m, m.get("prediction"))
     stats = get_daily_stats(display_date, sport)
     dates = get_available_dates()
     now = get_beijing_now()
@@ -93,6 +99,8 @@ def match_detail(match_id):
         league=m.get("league", ""),
     )
     m["prediction"] = pred
+    # 未开赛比赛：固化赛前快照（已存在则原样保留）
+    ensure_snapshot(m, pred)
     return render_template("match.html", match=m, active_page="index")
 
 
@@ -147,6 +155,7 @@ def api_today():
             m["home_team"], m["away_team"],
             odds=m.get("odds"), sport=m.get("sport", "football"), league=m.get("league", ""),
         )
+        ensure_snapshot(m, m["prediction"])
         out.append(m)
     return jsonify(out)
 
@@ -165,6 +174,7 @@ def api_matches():
             m["home_team"], m["away_team"],
             odds=m.get("odds"), sport=m.get("sport", "football"), league=m.get("league", ""),
         )
+        ensure_snapshot(m, m["prediction"])
         out.append(m)
     return jsonify(out)
 
@@ -179,7 +189,14 @@ def api_match(match_id):
         m["home_team"], m["away_team"],
         odds=m.get("odds"), sport=m.get("sport", "football"), league=m.get("league", ""),
     )
+    ensure_snapshot(m, m["prediction"])
     return jsonify(m)
+
+
+@app.route("/api/match/<match_id>/snapshots")
+def api_match_snapshots(match_id):
+    """只读：返回该场已固化的全部赛前预测快照（无记录时返回空列表）。"""
+    return jsonify(get_snapshots_for_match(match_id))
 
 
 @app.route("/api/dates")
