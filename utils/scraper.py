@@ -26,7 +26,11 @@ from utils.daily_loader import (
 from utils.evaluation_rows import EvaluationIntegrityError, capture_evaluation_row
 from utils.market_coverage import has_usable_market_odds
 from utils.match_identity import is_kickoff_time_known, same_event
-from utils.match_lifecycle import MatchLifecycleConflict, resolve_match_update
+from utils.match_lifecycle import (
+    MatchLifecycleConflict,
+    resolve_match_update,
+    valid_full_time_score,
+)
 from utils.odds_snapshots import record_odds_snapshot
 from utils.prediction_snapshots import capture_snapshot, get_snapshot, get_snapshots_for_match
 from utils.settlements import (
@@ -220,7 +224,17 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
 
 
 def _calibrate_from_finished(matches: list[dict]) -> int:
-    """用新完赛的比赛校准 Elo（跳过已校准的）"""
+    """
+    用新完赛的比赛校准 Elo（跳过已校准的）。
+
+    最终比分有效性由 `utils.match_lifecycle.valid_full_time_score` 统一裁决，
+    与该函数在 canonical 终态判定、结算、评估样本中使用的语义完全一致。
+
+    - 只有 `status == "finished"` 且比分通过严格校验的比赛才可校准。
+    - 畸形结果（字符串 / 浮点 / 布尔 / 负数）一律跳过：不写 calibrated.json、
+      不改动任何球队状态。
+    - 校验通过后**不**做数值强转，直接把已验证的整数传给 `update_from_result`。
+    """
     from utils.daily_loader import load_json as _load
 
     calibrated_file = "calibrated.json"
@@ -228,20 +242,20 @@ def _calibrate_from_finished(matches: list[dict]) -> int:
 
     count = 0
     for m in matches:
-        if m.get("status") != "finished" or not m.get("score"):
+        if m.get("status") != "finished":
+            continue
+        if not valid_full_time_score(m.get("score")):
             continue
         mid = m.get("id")
         if not mid or mid in done:
             continue
-        ft = m["score"].get("ft")
-        if not (isinstance(ft, list) and len(ft) >= 2):
-            continue
+        ft = m["score"]["ft"]
         try:
             update_from_result(
                 m.get("home", ""),
                 m.get("away", ""),
-                int(ft[0]),
-                int(ft[1]),
+                ft[0],
+                ft[1],
                 m.get("league", ""),
                 m.get("sport", "football"),
             )

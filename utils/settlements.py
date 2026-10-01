@@ -36,6 +36,7 @@ from datetime import datetime
 import config
 from utils.atomic_json import atomic_write_json, load_json_file
 from utils.daily_loader import add_time_status, get_beijing_now
+from utils.match_lifecycle import valid_full_time_score
 
 # 结算身份前缀：与「结果指纹」解耦，保证同一快照的结算 ID 与最终比分无关。
 SETTLEMENT_ID_PREFIX = "settlement"
@@ -112,28 +113,23 @@ def _save_store(store: dict) -> None:
 # 比分提取与结果指纹
 # ---------------------------------------------------------------------------
 
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 def extract_final_score(match: dict) -> dict | None:
     """
     从比赛记录中提取规范化的最终比分。
 
-    仅接受 `score["ft"] = [home, away]` 形式的**完整、数值型**最终比分。
-    半场比分、单个数值、缺失字段、非数值一律返回 None。
-    不虚构比分。
+    最终比分的有效性由 `utils.match_lifecycle.valid_full_time_score` **统一裁决**——
+    本模块不再独立定义一套「数值型（int 或 float）」的竞争性规则。
+
+    语义：
+    - `score["ft"]` 必须为 list / tuple 且长度 >= 2；
+    - 前两个元素必须为**非负的精确整数**（严格排除 bool / float / str 等可强转类型）；
+    - 半场比分、缺失字段、字符串、浮点、布尔、负数一律返回 None。不虚构比分，
+      也不做数值归一化（如把 `2.0` 归一为 `2`）。
     """
-    score = match.get("score")
-    if not isinstance(score, dict):
+    if not valid_full_time_score(match.get("score")):
         return None
-    ft = score.get("ft")
-    if not isinstance(ft, (list, tuple)) or len(ft) != 2:
-        return None
-    home, away = ft[0], ft[1]
-    if not _is_number(home) or not _is_number(away):
-        return None
-    return {"home": home, "away": away}
+    ft = match["score"]["ft"]
+    return {"home": ft[0], "away": ft[1]}
 
 
 def result_fingerprint(final_score: dict) -> str:

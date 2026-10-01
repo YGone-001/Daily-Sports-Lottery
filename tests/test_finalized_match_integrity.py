@@ -816,3 +816,230 @@ def test_model_versions_remain_unchanged():
     assert config.MODEL_VERSIONS["football"] == "football-coldstart-1"
     assert config.MODEL_VERSIONS["basketball"] == "basketball-coldstart-1"
     assert config.MODEL_VERSION == "baseline-1"
+
+
+# ---------------------------------------------------------------------------
+# 11. 严格最终比分语义：Elo 校准与直接结算
+# ---------------------------------------------------------------------------
+
+# 下游必须统一拒绝的畸形最终比分（字符串 / 浮点 / 布尔 / 负数）
+MALFORMED_SCORES = [
+    {"ft": ["2", 1]},
+    {"ft": [2.0, 1]},
+    {"ft": [True, 1]},
+    {"ft": [-1, 0]},
+]
+
+
+def _team_state_snapshot() -> dict:
+    """球队实力库的落盘快照（用于断言球队状态未被改动）。"""
+    return copy.deepcopy(load_json("team_strength.json"))
+
+
+@pytest.mark.parametrize("score", MALFORMED_SCORES)
+def test_calibrate_from_finished_rejects_malformed(isolated_data_dir, score):
+    """_calibrate_from_finished 直接拒绝畸形结果：不校准、不落盘、不改球队状态。"""
+    from utils.team_strength import get_team_profile
+
+    m = {
+        "id": "m-malformed",
+        "sport": "football",
+        "league": "西甲",
+        "date": "2030-05-01",
+        "time": "20:00",
+        "kickoff_time_known": True,
+        "status": "finished",
+        "home": "皇马",
+        "away": "巴萨",
+        "score": score,
+    }
+    # 先固化球队档案基线，避免把「首次建档」误判为「状态被改动」
+    get_team_profile("皇马", "西甲", "football")
+    get_team_profile("巴萨", "西甲", "football")
+    before = _team_state_snapshot()
+
+    count = scraper._calibrate_from_finished([m])
+
+    assert count == 0
+    assert "m-malformed" not in (load_json("calibrated.json") or {}).get("ids", [])
+    assert _team_state_snapshot() == before
+
+
+def test_calibrate_from_finished_accepts_valid(isolated_data_dir):
+    """合法最终比分正常校准一次，并使用前两位（len >= 2 语义），重复校准幂等。"""
+    m = {
+        "id": "m-valid",
+        "sport": "football",
+        "league": "西甲",
+        "date": "2030-05-01",
+        "time": "20:00",
+        "kickoff_time_known": True,
+        "status": "finished",
+        "home": "皇马",
+        "away": "巴萨",
+        "score": {"ft": [2, 1, 0]},
+    }
+
+    assert scraper._calibrate_from_finished([m]) == 1
+    assert "m-valid" in load_json("calibrated.json")["ids"]
+    # 幂等：同一比赛不会二次校准
+    assert scraper._calibrate_from_finished([m]) == 0
+
+
+def _seed_tracked_upcoming(monkeypatch, canon_id: str, jczq_no: str) -> None:
+    """建一场被跟踪的未开赛比赛：带盘口 + 权威开赛时间 + 赛前预测快照。"""
+    market_row = {
+        "id": canon_id,
+        "sport": "football",
+        "league": "西甲",
+        "date": "2030-05-01",
+        "time": "00:00",
+        "kickoff_time_known": False,
+        "status": "upcoming",
+        "home": "皇马",
+        "away": "巴萨",
+        "odds": {"home_win": 1.9, "draw": 3.4, "away_win": 3.8},
+        "jczq_no": jczq_no,
+    }
+    monkeypatch.setattr("utils.fetcher_500.fetch_live_matches", lambda sport: [])
+    monkeypatch.setattr("utils.fetcher_500.fetch_live_basketball", lambda: [])
+    monkeypatch.setattr(
+        "utils.fetcher_500.fetch_jczq_xml",
+        lambda sport: [dict(market_row)] if sport == "football" else [],
+    )
+    monkeypatch.setattr("utils.fetcher_500.fetch_finished_matches", lambda: [])
+    assert scraper.refresh(verbose=False)["added"] == 1
+
+    live_row = {
+        "id": f"500l-2030-05-01-{jczq_no}",
+        "sport": "football",
+        "league": "西甲",
+        "date": "2030-05-01",
+        "time": "20:00",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "皇马",
+        "away": "巴萨",
+        "score": None,
+        "odds": None,
+        "jczq_no": jczq_no,
+    }
+    monkeypatch.setattr(
+        "utils.fetcher_500.fetch_live_matches",
+        lambda sport: [dict(live_row)] if sport == "football" else [],
+    )
+    assert scraper.refresh(verbose=False)["prediction_snapshots_added"] == 1
+
+
+def _push_finished(monkeypatch, jczq_no: str, score) -> None:
+    """让完场源返回一场指定最终比分的 finished 记录。"""
+    finished_row = {
+        "id": f"500w-2030-05-01-{jczq_no}",
+        "sport": "football",
+        "league": "西甲",
+        "date": "2030-05-01",
+        "time": "20:00",
+        "kickoff_time_known": True,
+        "status": "finished",
+        "home": "皇马",
+        "away": "巴萨",
+        "score": score,
+        "odds": None,
+        "jczq_no": jczq_no,
+    }
+    monkeypatch.setattr("utils.fetcher_500.fetch_live_matches", lambda sport: [])
+    monkeypatch.setattr("utils.fetcher_500.fetch_jczq_xml", lambda sport: [])
+    monkeypatch.setattr(
+        "utils.fetcher_500.fetch_finished_matches", lambda: [dict(finished_row)]
+    )
+
+
+# 可被后续合法结果修复的畸形比分：与合法整数比分「不相等」，合并层会正常替换。
+# （浮点 [2.0, 1] 与 [2, 1] 在 Python 中判定相等，合并层不会替换；规格对浮点
+#   只要求下游拒绝、未要求修复，故单独测试。）
+REPAIRABLE_MALFORMED_SCORES = [
+    {"ft": ["2", 1]},
+    {"ft": [True, 1]},
+    {"ft": [-1, 0]},
+]
+
+
+@pytest.mark.parametrize("malformed", REPAIRABLE_MALFORMED_SCORES)
+def test_malformed_result_then_valid_final_repair_pipeline(
+    isolated_data_dir, monkeypatch, malformed
+):
+    """
+    畸形 finished 结果 -> 下游零变更，且保持可修复；
+    随后合法 finished 结果 -> 校准 / 结算 / 评估样本各恰好一次，重复刷新幂等。
+    """
+    canon_id = "500j-2030-05-01-008"
+    jczq_no = "008"
+    _seed_tracked_upcoming(monkeypatch, canon_id, jczq_no)
+
+    before_team = _team_state_snapshot()
+
+    # 畸形 finished
+    _push_finished(monkeypatch, jczq_no, malformed)
+    res_bad = scraper.refresh(verbose=False)
+
+    assert res_bad["calibrated"] == 0
+    assert res_bad["settlements_added"] == 0
+    assert res_bad["evaluation_rows_added"] == 0
+    assert canon_id not in (load_json("calibrated.json") or {}).get("ids", [])
+    assert _team_state_snapshot() == before_team
+    assert get_settlements_for_match(canon_id) == []
+    assert get_all_evaluation_rows() == []
+
+    matches = daily_loader.get_all_matches()
+    assert len(matches) == 1
+    assert matches[0]["status"] == "finished"
+    assert is_finalized_match(matches[0]) is False
+
+    # 合法 finished：正常修复并完成下游
+    _push_finished(monkeypatch, jczq_no, {"ft": [2, 1]})
+    res_good = scraper.refresh(verbose=False)
+
+    assert res_good["calibrated"] == 1
+    assert res_good["settlements_added"] == 1
+    assert res_good["evaluation_rows_added"] == 1
+    assert canon_id in load_json("calibrated.json")["ids"]
+
+    matches_after = daily_loader.get_all_matches()
+    assert matches_after[0]["id"] == canon_id
+    assert matches_after[0]["score"] == {"ft": [2, 1]}
+    assert is_finalized_match(matches_after[0]) is True
+    assert len(get_settlements_for_match(canon_id)) == 1
+    assert len(get_all_evaluation_rows()) == 1
+
+    # 重复合法结果：完全幂等
+    res_repeat = scraper.refresh(verbose=False)
+    assert res_repeat["calibrated"] == 0
+    assert res_repeat["settlements_added"] == 0
+    assert res_repeat["evaluation_rows_added"] == 0
+    assert res_repeat["updated"] == 0
+
+
+def test_float_score_rejected_downstream(isolated_data_dir, monkeypatch):
+    """浮点比分 [2.0, 1]：不归一化为 2，Elo 校准 / 结算 / 评估全部拒绝。"""
+    assert valid_full_time_score({"ft": [2.0, 1]}) is False
+
+    canon_id = "500j-2030-05-01-009"
+    jczq_no = "009"
+    _seed_tracked_upcoming(monkeypatch, canon_id, jczq_no)
+
+    before_team = _team_state_snapshot()
+
+    _push_finished(monkeypatch, jczq_no, {"ft": [2.0, 1]})
+    res = scraper.refresh(verbose=False)
+
+    assert res["calibrated"] == 0
+    assert res["settlements_added"] == 0
+    assert res["evaluation_rows_added"] == 0
+    assert canon_id not in (load_json("calibrated.json") or {}).get("ids", [])
+    assert _team_state_snapshot() == before_team
+    assert get_settlements_for_match(canon_id) == []
+    assert get_all_evaluation_rows() == []
+
+    matches = daily_loader.get_all_matches()
+    assert matches[0]["status"] == "finished"
+    assert is_finalized_match(matches[0]) is False

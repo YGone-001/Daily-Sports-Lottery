@@ -190,8 +190,13 @@ def test_live_rejected(isolated_data_dir, make_match):
     [
         None,
         {"ft": [2]},
-        {"ft": [2, 1, 0]},
         {"ft": ["2", "1"]},
+        {"ft": ["2", 1]},
+        {"ft": [2.0, 1]},
+        {"ft": [True, 1]},
+        {"ft": [2, False]},
+        {"ft": [-1, 0]},
+        {"ft": [2, -1]},
         {"ft": [None, 1]},
         {"ft": [2, None]},
         {"ht": [1, 0]},
@@ -207,6 +212,42 @@ def test_invalid_final_score_rejected(isolated_data_dir, make_match, score):
     assert settlement is None
     assert created is False
     assert get_settlements_for_match(m["id"]) == []
+
+
+@pytest.mark.parametrize(
+    "score",
+    [
+        {"ft": ["2", 1]},
+        {"ft": [2.0, 1]},
+        {"ft": [True, 1]},
+        {"ft": [2, False]},
+        {"ft": [-1, 0]},
+        {"ft": [2, -1]},
+    ],
+)
+def test_settle_snapshot_rejects_malformed_score_directly(isolated_data_dir, make_match, score):
+    """ settle_snapshot 自身必须拒绝畸形比分，不依赖 scraper 的保护。"""
+    m, snap = _snapshot(make_match)
+
+    settlement, created = settle_snapshot(snap, _finished(m, score))
+
+    assert settlement is None
+    assert created is False
+    assert get_settlements_for_match(m["id"]) == []
+    assert not os.path.exists(store_path())
+
+
+def test_length_ge_2_uses_first_two(isolated_data_dir, make_match):
+    """长度语义为 len(ft) >= 2，与 valid_full_time_score 一致；多余元素忽略。"""
+    m, snap = _snapshot(make_match)
+
+    settlement, created = settle_snapshot(snap, _finished(m, {"ft": [2, 1, 0]}))
+
+    assert created is True
+    assert settlement["final_score"] == {"home": 2, "away": 1}
+
+    assert extract_final_score({"score": {"ft": [3, 2, 1]}}) == {"home": 3, "away": 2}
+    assert extract_final_score({"score": {"ft": (3, 2, 1)}}) == {"home": 3, "away": 2}
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +319,17 @@ def test_deterministic_fingerprint_and_identity(isolated_data_dir):
 def test_extract_final_score(isolated_data_dir):
     assert extract_final_score({"score": {"ft": [2, 1]}}) == {"home": 2, "away": 1}
     assert extract_final_score({"score": {"ft": [108, 101]}}) == {"home": 108, "away": 101}
+    assert extract_final_score({"score": {"ft": [0, 0]}}) == {"home": 0, "away": 0}
+    assert extract_final_score({"score": {"ft": [105, 99]}}) == {"home": 105, "away": 99}
     assert extract_final_score({"score": None}) is None
     assert extract_final_score({}) is None
     assert extract_final_score({"score": {"ft": [2]}}) is None
     assert extract_final_score({"score": {"ft": ["2", "1"]}}) is None
+    assert extract_final_score({"score": {"ft": [2.0, 1]}}) is None
+    assert extract_final_score({"score": {"ft": [True, 1]}}) is None
+    assert extract_final_score({"score": {"ft": [2, False]}}) is None
+    assert extract_final_score({"score": {"ft": [-1, 0]}}) is None
+    assert extract_final_score({"score": {"ft": [2, -1]}}) is None
     assert extract_final_score({"score": {"ht": [1, 0]}}) is None
 
 
