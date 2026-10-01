@@ -62,7 +62,8 @@ worldCup/
 │   ├── calibrated.json            #   已用于 Elo 校准的比赛 ID
 │   ├── prediction_snapshots.json  #   赛前预测快照（不可变历史记录）
 │   ├── odds_snapshots.json        #   赛前赔率历史（时序观察记录）
-│   └── settlements.json           #   结算记录（预测快照 × 最终赛果）
+│   ├── settlements.json           #   结算记录（预测快照 × 最终赛果）
+│   └── evaluation_rows.json       #   评估样本（预测快照 × 结算）
 ├── models/
 │   ├── poisson_model.py           # 泊松 + Dixon-Coles 比分矩阵
 │   ├── predictor.py               # 预测主入口（足球）+ 赔率融合 + EV/Kelly
@@ -76,7 +77,8 @@ worldCup/
 │   ├── atomic_json.py             # 原子 JSON 落盘（临时文件 + fsync + replace）
 │   ├── prediction_snapshots.py    # 赛前快照：身份、时序门禁、幂等、不可变
 │   ├── odds_snapshots.py          # 赛前赔率历史：规范化、指纹、连续重复抑制
-│   └── settlements.py             # 结算：快照×赛果关联、结果指纹、冲突保护
+│   ├── settlements.py             # 结算：快照×赛果关联、结果指纹、冲突保护
+│   └── evaluation_rows.py         # 评估样本：快照×结算拼接、溯源校验、源指纹
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
 └── static/
@@ -104,28 +106,66 @@ worldCup/
 3. 首次运行自动抓取赛事数据
 4. 启动服务并输出访问地址
 
-**方式 B：手动（PowerShell / CMD）**
+**方式 B：手动**
+
+先在任意终端创建虚拟环境：
 
 ```powershell
 cd C:\path\to\worldCup
-
-# 1) 创建并激活虚拟环境
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1        # PowerShell
-:: .\.venv\Scripts\activate.bat    # CMD
+```
 
-# 2) 安装依赖
+然后**按你实际使用的终端**，选下面其中一种。
+
+#### PowerShell
+
+> ⚠️ **PowerShell 默认禁止运行 `.ps1` 脚本**（执行策略为 `Restricted`），直接激活会报：
+>
+> ```text
+> .\.venv\Scripts\Activate.ps1 : 无法加载文件 ...\Activate.ps1，因为在此系统上禁止运行脚本。
+> ```
+>
+> 这**不是本项目的问题**——任何 Python 项目在默认设置的 Windows 上用 PowerShell
+> 激活虚拟环境都会遇到同样的拦截。下面两种做法任选其一即可。
+
+**做法 ①：不激活，直接调用虚拟环境里的 `python`（最省事）**
+
+`python.exe` 是程序而非脚本，不受执行策略限制：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m utils.scraper
+.\.venv\Scripts\python.exe app.py
+```
+
+**做法 ②：先放行执行策略，再正常激活**
+
+```powershell
+# 仅对当前窗口生效，关掉窗口即自动恢复（推荐，不改系统设置）
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+# 或者：仅对当前用户永久放行。本地脚本可运行，从网上下载的脚本仍需签名
+# Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-# 3) 首次抓取数据
 python -m utils.scraper
-
-# 4) 启动服务
 python app.py
 ```
 
-> 若 PowerShell 报「禁止运行脚本」，先执行：
-> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
+#### CMD
+
+CMD 不受 PowerShell 执行策略限制，直接激活即可：
+
+```cmd
+.\.venv\Scripts\activate.bat
+pip install -r requirements.txt
+python -m utils.scraper
+python app.py
+```
+
+> 也可以直接运行方式 A 的 `start.bat`：它内部直接调用 `.venv\Scripts\python.exe`，
+> 完全跳过「激活」这一步，因此在 PowerShell 与 CMD 下都不会被拦截。
 
 ### Linux / macOS
 
@@ -254,7 +294,7 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
   （`/`、`/match/<id>`、`/api/today`、`/api/matches`、`/api/match/<id>` 都不需要被访问）。
   页面/API 路由同样会调用同一套幂等逻辑，但历史记录的存续不再依赖它们。
 - **捕获顺序**：抓取 → 合并 canonical 比赛 → 记录赔率历史 → **用本轮新完赛结果校准 Elo**
-  → **捕获预测快照** → **结算已完赛比赛** → 落盘 `daily_matches.json`。
+  → **捕获预测快照** → **结算已完赛比赛** → **物化评估样本** → 落盘 `daily_matches.json`。
   预测快照在 Elo 校准**之后**生成，因此使用的是当前刷新时刻已知的最新实力。
 - **资格**：只有**未开赛**（`upcoming`）的比赛才会获得新快照；
   进行中（`live`）与已完赛（`finished`）不会新建，但**已有快照始终可读**。
@@ -322,6 +362,49 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
   原子写入 + 进程内锁保护）。
 - **抓取统计**：`/api/refresh` 返回的 `settlements_added` 表示该次刷新**实际新增**的结算条数
   （既有结算、无快照的完赛比赛、live/upcoming、无效比分与冲突都不计入）。
+
+## 评估样本
+
+评估样本把两份**已存在的、不可变的**历史记录拼成一行确定性数据：
+
+```text
+预测快照（开赛前模型实际预测了什么）
+        +
+结算（最终实际发生了什么）
+        ↓
+评估样本行
+```
+
+它是后续模型表现计算的输入数据集，**本层只做数据装配，不计算任何指标**。
+
+- **只消费历史记录**：全部字段逐字复制自权威历史记录——预测类字段来自快照，
+  结果类字段来自结算。**不读当前球队实力、不读当前盘口、不读当前比赛状态、
+  不重跑模型**（不调用 `predict_match` / `enrich_match`）。
+- **不重建历史**：只有「一条预测快照 + 该快照对应的结算」同时存在才生成评估样本；
+  缺失任一方一律跳过。完赛但没有历史预测的比赛不会产生评估样本。
+- **自动物化**：由后台抓取线程在每次 `refresh` 中完成，
+  顺序为「… → 结算已完赛比赛 → **物化评估样本** → 落盘」。
+- **回填**：不限于本轮新建的结算。既有结算若缺少评估样本（例如本层上线前就已存在），
+  下一次正常刷新会补齐。
+- **唯一性**：一条 (快照, 结算) 组合至多一条评估样本；
+  `evaluation_id = sha256("evaluation|" + snapshot_id + "|" + settlement_id)`。
+- **溯源校验**：物化前校验结算与快照确实指向同一条历史预测
+  （`snapshot_id`、`match_id`、`model_name`、`model_version`、
+  `prediction_generated_at`、`kickoff_at` 必须一致），
+  并要求 `prediction_generated_at <= kickoff_at`。任一项不符则拒绝物化，不静默归一化。
+- **源指纹与完整性保护**：`source_fingerprint` 由该行源内容规范化后取 SHA-256。
+  同一 `evaluation_id` 且同一指纹 = 正常幂等重放（返回既有样本）；
+  同一 `evaluation_id` 但指纹变化 = 源内容完整性冲突，既有样本保持不变。
+- **不可变性**：重放不会改写 `materialized_at`、概率、Elo、盘口、比分或结果。
+- **不含结论与指标**：不写入 `predicted_outcome` / `correct` / `hit` /
+  `accuracy` / `Brier` / `LogLoss` / `ROI` / `CLV` 等任何字段。
+- **存储**：`data/evaluation_rows.json`（运行时生成，已被 `.gitignore` 忽略，
+  文件缺失时惰性创建，原子写入 + 进程内锁保护）。
+- **抓取统计**：`/api/refresh` 返回的 `evaluation_rows_added` 表示该次刷新**实际新增**的
+  评估样本条数（既有样本、无结算的快照、无历史预测的完赛比赛、无效拼接、完整性冲突与失败都不计入）。
+- **读取方式**：本层只提供服务层查询函数（`get_evaluation_row` /
+  `get_evaluation_row_for_snapshot` / `get_evaluation_rows_for_match` /
+  `get_all_evaluation_rows`），暂不暴露 HTTP 接口。
 
 ## 配置说明
 

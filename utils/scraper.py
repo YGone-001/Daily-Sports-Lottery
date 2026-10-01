@@ -19,9 +19,14 @@ from utils.daily_loader import (
     load_json,
     save_json,
 )
+from utils.evaluation_rows import EvaluationIntegrityError, capture_evaluation_row
 from utils.odds_snapshots import record_odds_snapshot
-from utils.prediction_snapshots import capture_snapshot, get_snapshots_for_match
-from utils.settlements import SettlementConflictError, settle_snapshot
+from utils.prediction_snapshots import capture_snapshot, get_snapshot, get_snapshots_for_match
+from utils.settlements import (
+    SettlementConflictError,
+    get_settlements_for_match,
+    settle_snapshot,
+)
 from utils.team_strength import update_from_result
 
 DAILY_FILE = "daily_matches.json"
@@ -243,6 +248,46 @@ def _settle_finished_matches(matches: list[dict], now=None) -> int:
     return added
 
 
+def _materialize_evaluation_rows(matches: list[dict], now=None) -> int:
+    """
+    把「既有预测快照 × 既有结算」物化为评估样本，返回本次**实际新增**的样本条数。
+
+    规则
+    ----
+    - 以 canonical 比赛 id 为线索，取该场全部结算，再取其精确引用的预测快照。
+    - 只有快照与结算**同时存在**才物化；缺任一方一律跳过，绝不重建历史数据。
+    - 不只是处理本轮新建的结算：既有结算若缺少评估样本，同样会被补齐（回填）。
+    - 拼接/溯源不一致或源内容冲突 -> 记录告警并跳过，既有样本不变，继续处理其他样本。
+    - 单条失败仅告警并继续，绝不阻断 daily_matches.json 的落盘。
+
+    本函数不跑预测模型、不读当前球队实力、不读当前盘口、不重新结算、不计算任何指标。
+    """
+    added = 0
+    visited: set[str] = set()
+    for m in matches:
+        match_id = m.get("id")
+        if not match_id or match_id in visited:
+            continue
+        visited.add(match_id)
+
+        for settlement in get_settlements_for_match(match_id):
+            snapshot_id = settlement.get("snapshot_id")
+            snapshot = get_snapshot(snapshot_id) if snapshot_id else None
+            if not snapshot:
+                continue
+            try:
+                _row, created = capture_evaluation_row(snapshot, settlement, now=now)
+            except EvaluationIntegrityError as exc:
+                print(f"[Auto-Sync] 评估样本完整性错误，已跳过: {exc}")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Auto-Sync] 评估样本写入失败 {match_id}/{snapshot_id}: {exc}")
+                continue
+            if created:
+                added += 1
+    return added
+
+
 def refresh(verbose: bool = True) -> dict:
     """
     执行一次完整抓取刷新。
@@ -258,6 +303,7 @@ def refresh(verbose: bool = True) -> dict:
         "odds_snapshots_added": 0,
         "prediction_snapshots_added": 0,
         "settlements_added": 0,
+        "evaluation_rows_added": 0,
         "total": 0,
     }
 
@@ -334,7 +380,10 @@ def refresh(verbose: bool = True) -> dict:
     # 6. 结算已完赛比赛（只关联既有预测快照，不回溯生成预测）
     settlements_added = _settle_finished_matches(merged, now=now)
 
-    # 7. 落盘
+    # 7. 物化评估样本（消费权威历史记录：预测快照 × 结算）
+    evaluation_rows_added = _materialize_evaluation_rows(merged, now=now)
+
+    # 8. 落盘
     save_json(
         DAILY_FILE,
         {
@@ -355,6 +404,7 @@ def refresh(verbose: bool = True) -> dict:
             "odds_snapshots_added": odds_snapshots_added,
             "prediction_snapshots_added": prediction_snapshots_added,
             "settlements_added": settlements_added,
+            "evaluation_rows_added": evaluation_rows_added,
             "total": len(merged),
             "finished_at": get_beijing_now().isoformat(),
         }
@@ -364,7 +414,8 @@ def refresh(verbose: bool = True) -> dict:
         print(
             f"  ✅ 新增 {added} | 更新 {updated} | Elo校准 {calibrated} "
             f"| 赔率历史 +{odds_snapshots_added} | 预测快照 +{prediction_snapshots_added} "
-            f"| 结算 +{settlements_added} | 库内共 {len(merged)} 场"
+            f"| 结算 +{settlements_added} | 评估样本 +{evaluation_rows_added} "
+            f"| 库内共 {len(merged)} 场"
         )
     return result
 
