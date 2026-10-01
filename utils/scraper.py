@@ -20,7 +20,8 @@ from utils.daily_loader import (
     save_json,
 )
 from utils.odds_snapshots import record_odds_snapshot
-from utils.prediction_snapshots import capture_snapshot
+from utils.prediction_snapshots import capture_snapshot, get_snapshots_for_match
+from utils.settlements import SettlementConflictError, settle_snapshot
 from utils.team_strength import update_from_result
 
 DAILY_FILE = "daily_matches.json"
@@ -201,6 +202,47 @@ def _capture_prediction_snapshots(matches: list[dict], now=None) -> int:
     return added
 
 
+def _settle_finished_matches(matches: list[dict], now=None) -> int:
+    """
+    为已完赛比赛关联既有赛前预测快照，返回本次**实际新增**的结算条数。
+
+    规则
+    ----
+    - 只处理 `finished` 且有有效最终比分的比赛（复用既有时间状态判定）。
+    - 只结算**已存在**的预测快照；完结比赛若没有预测快照则跳过，
+      **绝不**回溯生成预测或伪造历史快照。
+    - 一场比赛的全部快照各自独立结算（兼容未来多模型版本）。
+    - 上游结果与既有结算冲突时，记录告警并保持既有记录不变，继续处理其他比赛。
+    - 单场失败仅告警并继续，绝不阻断 daily_matches.json 的落盘。
+
+    本函数不更新 Elo、不跑预测模型、不计算任何模型指标。
+    """
+    added = 0
+    for m in matches:
+        match_id = m.get("id")
+        if not match_id:
+            continue
+        if add_time_status(m, now).get("status") != "finished":
+            continue
+
+        snapshots = get_snapshots_for_match(match_id)
+        if not snapshots:
+            continue
+
+        for snapshot in snapshots:
+            try:
+                _settlement, created = settle_snapshot(snapshot, m, now=now)
+            except SettlementConflictError as exc:
+                print(f"[Auto-Sync] 结算冲突，既有记录保持不变: {exc}")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Auto-Sync] 结算写入失败 {match_id}/{snapshot.get('snapshot_id')}: {exc}")
+                continue
+            if created:
+                added += 1
+    return added
+
+
 def refresh(verbose: bool = True) -> dict:
     """
     执行一次完整抓取刷新。
@@ -215,6 +257,7 @@ def refresh(verbose: bool = True) -> dict:
         "calibrated": 0,
         "odds_snapshots_added": 0,
         "prediction_snapshots_added": 0,
+        "settlements_added": 0,
         "total": 0,
     }
 
@@ -288,7 +331,10 @@ def refresh(verbose: bool = True) -> dict:
     #    必须在 Elo 校准之后：快照应使用「当前刷新时刻已知」的最新实力。
     prediction_snapshots_added = _capture_prediction_snapshots(merged, now=now)
 
-    # 6. 落盘
+    # 6. 结算已完赛比赛（只关联既有预测快照，不回溯生成预测）
+    settlements_added = _settle_finished_matches(merged, now=now)
+
+    # 7. 落盘
     save_json(
         DAILY_FILE,
         {
@@ -308,6 +354,7 @@ def refresh(verbose: bool = True) -> dict:
             "calibrated": calibrated,
             "odds_snapshots_added": odds_snapshots_added,
             "prediction_snapshots_added": prediction_snapshots_added,
+            "settlements_added": settlements_added,
             "total": len(merged),
             "finished_at": get_beijing_now().isoformat(),
         }
@@ -317,7 +364,7 @@ def refresh(verbose: bool = True) -> dict:
         print(
             f"  ✅ 新增 {added} | 更新 {updated} | Elo校准 {calibrated} "
             f"| 赔率历史 +{odds_snapshots_added} | 预测快照 +{prediction_snapshots_added} "
-            f"| 库内共 {len(merged)} 场"
+            f"| 结算 +{settlements_added} | 库内共 {len(merged)} 场"
         )
     return result
 

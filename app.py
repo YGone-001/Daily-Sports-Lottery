@@ -15,6 +15,7 @@ API：
   /api/match/<id>               单场详情
   /api/match/<id>/snapshots     该场赛前预测快照（只读）
   /api/match/<id>/odds-history  该场赛前赔率历史（只读）
+  /api/match/<id>/settlements   该场结算记录（只读）
   /api/dates                    可用日期
   /api/strategy                 策略推荐
   /api/refresh                  手动触发抓取
@@ -45,6 +46,7 @@ from utils.daily_loader import (
 )
 from utils.odds_snapshots import get_odds_history_for_match
 from utils.prediction_snapshots import ensure_snapshot, get_snapshots_for_match
+from utils.settlements import get_settlements_for_match
 
 app = Flask(__name__)
 app.config.from_object(config)
@@ -208,6 +210,15 @@ def api_match_odds_history(match_id):
     无记录时返回空列表；本接口不创建、不重算、不改写任何历史。
     """
     return jsonify(get_odds_history_for_match(match_id))
+
+
+@app.route("/api/match/<match_id>/settlements")
+def api_match_settlements(match_id):
+    """
+    只读：返回该场全部结算记录（按生成时间 / 模型版本 / 结算 ID 确定性排序）。
+    无记录时返回空列表；本接口不生成预测、不创建结算、不改写任何记录。
+    """
+    return jsonify(get_settlements_for_match(match_id))
 
 
 @app.route("/api/dates")

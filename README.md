@@ -61,7 +61,8 @@ worldCup/
 │   ├── team_strength.json         #   动态球队实力库（Elo）
 │   ├── calibrated.json            #   已用于 Elo 校准的比赛 ID
 │   ├── prediction_snapshots.json  #   赛前预测快照（不可变历史记录）
-│   └── odds_snapshots.json        #   赛前赔率历史（时序观察记录）
+│   ├── odds_snapshots.json        #   赛前赔率历史（时序观察记录）
+│   └── settlements.json           #   结算记录（预测快照 × 最终赛果）
 ├── models/
 │   ├── poisson_model.py           # 泊松 + Dixon-Coles 比分矩阵
 │   ├── predictor.py               # 预测主入口（足球）+ 赔率融合 + EV/Kelly
@@ -74,7 +75,8 @@ worldCup/
 │   ├── team_strength.py           # 动态 Elo 实力库
 │   ├── atomic_json.py             # 原子 JSON 落盘（临时文件 + fsync + replace）
 │   ├── prediction_snapshots.py    # 赛前快照：身份、时序门禁、幂等、不可变
-│   └── odds_snapshots.py          # 赛前赔率历史：规范化、指纹、连续重复抑制
+│   ├── odds_snapshots.py          # 赛前赔率历史：规范化、指纹、连续重复抑制
+│   └── settlements.py             # 结算：快照×赛果关联、结果指纹、冲突保护
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
 └── static/
@@ -237,6 +239,7 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 | GET | `/api/match/<id>` | 单场详情 |
 | GET | `/api/match/<id>/snapshots` | 该场已固化的赛前预测快照（只读，无记录返回空列表） |
 | GET | `/api/match/<id>/odds-history` | 该场已捕获的赛前赔率历史，最早在前（只读，无记录返回空列表） |
+| GET | `/api/match/<id>/settlements` | 该场结算记录（只读，无记录返回空列表） |
 | GET | `/api/dates` | 可用日期与联赛列表 |
 | GET | `/api/strategy?sport=` | 策略推荐（价值盘口 + 串关） |
 | GET/POST | `/api/refresh` | 手动触发一次抓取 |
@@ -251,7 +254,7 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
   （`/`、`/match/<id>`、`/api/today`、`/api/matches`、`/api/match/<id>` 都不需要被访问）。
   页面/API 路由同样会调用同一套幂等逻辑，但历史记录的存续不再依赖它们。
 - **捕获顺序**：抓取 → 合并 canonical 比赛 → 记录赔率历史 → **用本轮新完赛结果校准 Elo**
-  → **捕获预测快照** → 落盘 `daily_matches.json`。
+  → **捕获预测快照** → **结算已完赛比赛** → 落盘 `daily_matches.json`。
   预测快照在 Elo 校准**之后**生成，因此使用的是当前刷新时刻已知的最新实力。
 - **资格**：只有**未开赛**（`upcoming`）的比赛才会获得新快照；
   进行中（`live`）与已完赛（`finished`）不会新建，但**已有快照始终可读**。
@@ -295,6 +298,30 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
   （足球含 `draw`，篮球没有则不写入），不虚构缺失值。
 - **抓取统计**：`/api/refresh` 返回的 `odds_snapshots_added` 表示该次刷新**实际新增**的
   历史观察条数；盘口未变的一次刷新为 `0`。
+
+## 结算
+
+结算把一条**已存在的、不可变的赛前预测快照**与其**最终观测到的比赛结果**关联起来。
+它只回答「这条历史预测对应的最终结果是什么」，**不计算任何模型表现指标**
+（命中率 / Brier / LogLoss / ROI / CLV / 校准误差），也不是货币派彩结算。
+
+- **自动结算**：由后台抓取线程在每次 `refresh` 中自动完成，
+  顺序为「… → 捕获预测快照 → **结算已完赛比赛** → 落盘」。
+- **前提是快照已存在**：只有**开赛前确实存在**预测快照的比赛才会被结算。
+  完结比赛若没有历史预测快照则跳过，**绝不**回溯生成预测或伪造历史快照。
+- **资格**：仅 `finished` 且 `score.ft` 为完整双方比分时可结算；
+  `upcoming` / `live`、缺少比分、半场比分、非数值比分一律不结算。
+- **时间戳校验**：`prediction_generated_at <= kickoff_at` 才被视为有效的赛前证据。
+- **唯一性**：一条预测快照至多一条 canonical 结算。
+  结算身份只由 `snapshot_id` 决定（不含比分），因此上游结果变化会被识别为**冲突**，
+  而不会悄悄产生第二条结算。
+- **不可变性**：同一结果重复观测只返回既有记录（不重写 `settled_at` / 比分 / 结果指纹）。
+- **结果冲突保护**：上游若对同一快照给出不同最终比分，记录告警（含比赛 ID、快照 ID、
+  既有比分、新到比分）并保持既有结算不变；不自动判断哪个比分正确。
+- **存储**：`data/settlements.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建，
+  原子写入 + 进程内锁保护）。
+- **抓取统计**：`/api/refresh` 返回的 `settlements_added` 表示该次刷新**实际新增**的结算条数
+  （既有结算、无快照的完赛比赛、live/upcoming、无效比分与冲突都不计入）。
 
 ## 配置说明
 
