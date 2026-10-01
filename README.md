@@ -86,7 +86,8 @@ worldCup/
 │   ├── dixon_coles_fitting.py     # 离线 rho 拟合：时间加权 Dixon-Coles 诊断（纯计算，不落盘）
 │   ├── dixon_coles_walkforward.py # 走查验证：无泄漏的时序外样本 rho 检验（纯计算，不落盘）
 │   ├── dixon_coles_counterfactual.py # 反事实 W/D/L：三策略 Brier / LogLoss 验证（纯计算，不落盘）
-│   └── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
+│   ├── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
+│   └── temporal_evaluation.py     # 时序评估：固定回看窗口的分类/校准摘要（纯计算，不落盘）
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
 └── static/
@@ -789,6 +790,46 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
   不接入 refresh、不改 `models/predictor.py`。
 - **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`；模型版本由
   `config.MODEL_VERSIONS` 决定，本层不做任何版本变更。
+
+## 时序模型评估（Temporal Evaluation）
+
+在不可变评估样本之上，回答「**某一条精确的 `(sport, model_name, model_version)` 谱系，
+它在最近的固定回看时间窗内表现如何，与它的全部可用历史相比如何**」。
+
+- **只消费不可变评估样本**：输入是 `data/evaluation_rows.json`，经既有查询层读取；
+  不读 `daily_matches.json` / `prediction_snapshots.json` / `settlements.json` / 球队实力 /
+  当前盘口，也不调用 `predict_match` / `enrich_match` 重建历史概率。
+- **时间坐标是历史 `kickoff_at`**（比赛开球时刻），不是 `prediction_generated_at` /
+  `settled_at` / `materialized_at`。
+- **不使用系统时钟**：参考时间 `reference_kickoff_at` = 该组内**最大的 kickoff_at**。
+  因此同一批不可变样本，任何时候、任何机器上求值结果完全一致。
+- **默认回看窗口为 30 / 90 / 180 天，外加全部历史**；窗口有意重叠、相互嵌套，
+  是诊断而非统计上独立的队列。
+- **窗口下边界包含**：恰好 N 天前的比赛属于该窗口，再早一秒则不属于；
+  边界按绝对瞬时比较（不按时间戳字符串比较）。
+- **指标复用既有评估器**：`utils.classification_evaluation`（`sample_count` / `accuracy` /
+  多分类 Brier / 多分类 LogLoss）与 `utils.calibration_evaluation`（10 分箱 one-vs-rest，
+  `macro ECE` 与逐类别 ECE）。时序层只做**组合与打包**，不重新实现任何公式。
+- **概率来源仍是 `model_probabilities`**（历史 0..100 百分点）；不使用
+  `display_probabilities` / `market_implied_probabilities` / `market_odds` / `expected_values`。
+- **输出包含样本量**：`all_time` 与每个窗口都给出 `sample_count`、
+  `first_sample_kickoff_at` / `last_sample_kickoff_at`，以及上列指标；
+  不设最小样本门槛、不做置信度评级。
+- **不排名、不推荐**：不输出 best / worst / rank / winner，也不自动判定新版本更好；
+  不同模型版本往往覆盖不同历史区间，本层只并列事实摘要，不做跨版本增量比较。
+- **不落盘**：所有摘要在内存中派生，不生成 `temporal_evaluation.json` 之类文件。
+- **模型版本不变**：本层是只读诊断，不触碰预测模型、`config.MODEL_VERSIONS` 与
+  Dixon-Coles 诊断栈，也不接入抓取刷新流程。
+
+```python
+from utils.temporal_evaluation import evaluate_all_temporal
+
+summaries = evaluate_all_temporal()          # 默认 30 / 90 / 180 天 + all-time
+```
+
+数值一致性契约：指标在**规范时序**（先 `kickoff_at` 绝对瞬时、再 `evaluation_id`）上求值，
+因此 `all_time` 与每个窗口的结果，等于既有分类 / 校准评估器作用于**同一时序**的输出；
+且输出与调用方传入的行顺序无关。
 
 ## 配置说明
 
