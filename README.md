@@ -83,6 +83,7 @@ worldCup/
 │   ├── calibration_evaluation.py  # 校准诊断：分箱可靠性 / ECE（纯计算，不落盘）
 │   ├── dixon_coles_fitting.py     # 离线 rho 拟合：时间加权 Dixon-Coles 诊断（纯计算，不落盘）
 │   ├── dixon_coles_walkforward.py # 走查验证：无泄漏的时序外样本 rho 检验（纯计算，不落盘）
+│   ├── dixon_coles_counterfactual.py # 反事实 W/D/L：三策略 Brier / LogLoss 验证（纯计算，不落盘）
 │   └── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
@@ -682,6 +683,41 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
   三项总 / 平均 NLL 与 `nll_improvement_vs_fixed` / `nll_improvement_vs_zero`。
 - **只做分数似然诊断**：不计算反事实的胜平负 / Brier / 分类 LogLoss / Accuracy / ECE，
   不选生产 rho、不做排名、不落盘、不接入 refresh。
+- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`，足球仍为 `football-ad-1`，
+  篮球仍为 `baseline-1`。
+
+## Dixon-Coles 反事实 W/D/L 验证
+
+把上面的走查验证从「比分似然」扩展到「比赛结果概率质量」：对每场合格目标比赛，
+用**开赛前冻结的历史期望进球**重建胜平负概率，再用 **多分类 Brier** 与
+**多分类 LogLoss** 与真实结果比较。
+
+- **概率重建路径**（不重写模型数学）：
+  `历史 λ_home / λ_away` → `models.poisson_model.score_matrix(λh, λa, rho=rho)`
+  → `win_draw_loss(...)` → 未四舍五入的 `(home_win, draw, away_win)`。
+  `max_goals`、泊松 PMF、矩阵归一化、Dixon-Coles tau 全部沿用既有实现，未做任何改动。
+- **只比较 rho**：三种策略之间 λ、比分矩阵实现、比分上限、归一化、W/D/L 聚合、
+  实际结果完全一致 —— 因此隔离出的正是 Dixon-Coles 的 rho。
+  三种策略：**走查拟合 rho**（仅用严格更早比赛拟合）、**当前固定 rho**（默认 `-0.15`，
+  可显式覆盖，不改配置）、**rho = 0**（独立泊松）。
+- **不使用市场概率**：不读 `market_odds` / `market_implied_probabilities` /
+  `display_probabilities` / `expected_values`，也不做市场融合。
+- **不使用已存的四舍五入概率**：不从 `evaluation_row["model_probabilities"]` 反推替代
+  rho 的概率——那是整数百分点，只对应历史模型当时实际使用的那个 rho。
+- **时序完全复用**：合格目标集合、rho 路径、预热计数、版本隔离、同刻分桶、
+  严格 `kickoff < T`、全局重复 ID 检测全部来自同一套走查时序
+  （`build_walk_forward_plan` / `build_walk_forward_fits`），不存在第二套时序实现。
+- **实际结果一致性**：由比分推导 `home_win / draw / away_win`；若行内 `actual_outcome`
+  与比分冲突则显式报错，不静默偏向任一字段。
+- **指标定义**：Brier = `Σ_k (p_k - y_k)^2`（**不**再按类别数除一次）；
+  LogLoss = `-ln(p_actual)`（自然对数，仅在对数求值时用 `1e-15` 裁剪，与分类评估同一常数）。
+  **不含 Accuracy、不含 ECE**。
+- **输出**：每个合格桶的三策略 Brier / LogLoss 合计与 rho 路径；以及聚合的
+  样本数、预热跳过数、评估数、桶数、三策略总/平均 Brier 与 LogLoss，
+  以及 `brier_improvement_vs_*` / `log_loss_improvement_vs_*`（正 = 走查序列损失更低，
+  仅为描述性差值）。无合格目标时所有 total / mean / improvement 均为 `None`（不是 NaN）。
+- **不落盘、不排名、不部署**：不生成任何结果文件，不选生产 rho、不给评级、
+  不接入 refresh、不改 `models/predictor.py`。
 - **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`，足球仍为 `football-ad-1`，
   篮球仍为 `baseline-1`。
 

@@ -74,11 +74,12 @@ def _row_context(row: dict) -> dict:
     }
 
 
-def _resolve_fixed_rho(fixed_comparison_rho: float | None) -> float:
+def resolve_fixed_comparison_rho(fixed_comparison_rho: float | None) -> float:
     """
     解析对照用的固定 rho：显式参数优先，否则用线上配置值。
 
-    本函数只读取配置，不修改配置。
+    本函数只读取配置，不修改配置。分数似然验证与反事实 W/D/L 验证共用同一解析，
+    保证两者的固定对照 rho 语义完全一致。
     """
     value = (
         config.MODEL_CONFIG["dixon_coles_rho"]
@@ -104,7 +105,7 @@ def _validate_min_train_rows(min_train_rows: object) -> int:
     return int(min_train_rows)
 
 
-def _check_global_duplicates(rows: list[dict]) -> None:
+def check_global_duplicate_evaluation_ids(rows: list[dict]) -> None:
     """
     在分组之前扫描**全部**输入行，防止同一 evaluation_id 通过不同 model_version 逃避检测。
     """
@@ -135,7 +136,7 @@ def _check_timezone_consistency(kickoffs: list[datetime]) -> None:
         )
 
 
-def validate_rho_walk_forward_group(
+def build_walk_forward_plan(
     rows: Iterable[dict],
     *,
     min_train_rows: int = DEFAULT_MIN_TRAIN_ROWS,
@@ -143,26 +144,18 @@ def validate_rho_walk_forward_group(
     rho_min: float = DEFAULT_RHO_MIN,
     rho_max: float = DEFAULT_RHO_MAX,
     rho_step: float = DEFAULT_RHO_STEP,
-    fixed_comparison_rho: float | None = None,
 ) -> dict:
     """
-    对一组**同质**足球评估样本做时序走查验证。
+    构建**唯一权威**的走查时序计划（校验 + 排序 + 分桶），不做拟合、不打分。
 
-    流程：
-      1. 校验行（复用拟合核心的历史行校验）
-      2. 按 (kickoff_at, evaluation_id) 排序，构造精确开赛时刻桶
-      3. 对每个桶 T：训练集 = 所有 kickoff_at < T 的行（扩张窗口）
-      4. 训练行数 < min_train_rows -> 计入 warmup_skipped_count，不拟合、不打分
-      5. 否则用训练集拟合 rho，并用它 + 固定 rho + rho=0 给该桶的每一行打分
-
-    目标观测权重恒为 1.0（时间衰减只属于训练拟合）。返回纯内存摘要，不落盘。
+    任何派生分析（分数似然验证、反事实 W/D/L 验证）都必须经由本函数取得时序，
+    以免出现第二套「严格小于 / 同刻分桶 / 扩张窗口 / 预热 / 版本隔离」语义。
     """
     rows = list(rows)
     if not rows:
         raise DixonColesWalkForwardError("empty_group", detail="走查验证组为空")
 
     min_train_rows = _validate_min_train_rows(min_train_rows)
-    fixed_rho = _resolve_fixed_rho(fixed_comparison_rho)
 
     first = rows[0]
     key = (first.get("sport"), first.get("model_name"), first.get("model_version"))
@@ -189,6 +182,10 @@ def validate_rho_walk_forward_group(
                 "row": row,
                 "evaluation_id": evaluation_id,
                 "kickoff": kickoff,
+                "lambda_home": lambda_home,
+                "lambda_away": lambda_away,
+                "home_goals": home_goals,
+                "away_goals": away_goals,
                 "observation": (lambda_home, lambda_away, home_goals, away_goals, 1.0),
             }
         )
@@ -198,40 +195,116 @@ def validate_rho_walk_forward_group(
     # 排序保证与输入顺序无关；开赛时刻相同的行按 evaluation_id 稳定排序
     records.sort(key=lambda record: (record["kickoff"], str(record["evaluation_id"])))
 
-    # 精确开赛时刻桶
-    buckets: list[tuple[datetime, int, list[dict]]] = []
+    # 精确开赛时刻桶：start_index 即「严格更早的行数」，也就是该桶的训练行数
+    buckets: list[dict] = []
     for index, record in enumerate(records):
-        if buckets and buckets[-1][0] == record["kickoff"]:
-            buckets[-1][2].append(record)
+        if buckets and buckets[-1]["kickoff"] == record["kickoff"]:
+            buckets[-1]["records"].append(record)
         else:
-            buckets.append((record["kickoff"], index, [record]))
+            buckets.append(
+                {"kickoff": record["kickoff"], "start_index": index, "records": [record]}
+            )
 
-    warmup_skipped_count = 0
+    warmup_skipped_count = sum(
+        len(bucket["records"])
+        for bucket in buckets
+        if bucket["start_index"] < min_train_rows
+    )
+
+    return {
+        "sport": key[0],
+        "model_name": key[1],
+        "model_version": key[2],
+        "records": records,
+        "buckets": buckets,
+        "min_train_rows": min_train_rows,
+        "half_life_days": float(half_life_days),
+        "rho_min": float(rho_min),
+        "rho_max": float(rho_max),
+        "rho_step": float(rho_step),
+        "rho_grid": {
+            "minimum": float(rho_min),
+            "maximum": float(rho_max),
+            "step": float(rho_step),
+        },
+        "warmup_skipped_count": warmup_skipped_count,
+    }
+
+
+def build_walk_forward_fits(plan: dict) -> list[dict]:
+    """
+    对计划中每个**合格**目标桶拟合 rho（严格只用 kickoff_at < T 的行）。
+
+    这是 rho 路径的唯一来源；返回按时间升序，只包含通过预热的桶。
+    """
+    fits: list[dict] = []
+    for bucket in plan["buckets"]:
+        train_rows = [record["row"] for record in plan["records"][: bucket["start_index"]]]
+        if len(train_rows) < plan["min_train_rows"]:
+            continue
+
+        fit = fit_rho_group(
+            train_rows,
+            half_life_days=plan["half_life_days"],
+            rho_min=plan["rho_min"],
+            rho_max=plan["rho_max"],
+            rho_step=plan["rho_step"],
+        )
+        fits.append(
+            {
+                "kickoff": bucket["kickoff"],
+                "records": bucket["records"],
+                "train_count": len(train_rows),
+                "fitted_rho": fit["fitted_rho"],
+                "training_reference_kickoff_at": fit["reference_kickoff_at"],
+            }
+        )
+    return fits
+
+
+def validate_rho_walk_forward_group(
+    rows: Iterable[dict],
+    *,
+    min_train_rows: int = DEFAULT_MIN_TRAIN_ROWS,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+    rho_min: float = DEFAULT_RHO_MIN,
+    rho_max: float = DEFAULT_RHO_MAX,
+    rho_step: float = DEFAULT_RHO_STEP,
+    fixed_comparison_rho: float | None = None,
+) -> dict:
+    """
+    对一组**同质**足球评估样本做时序走查验证（分数似然层面）。
+
+    流程：
+      1. 构建权威时序计划（复用 `build_walk_forward_plan`）
+      2. 对每个合格桶拟合 rho（复用 `build_walk_forward_fits`）
+      3. 用该桶的 rho + 固定 rho + rho=0 给桶内每一行打分
+
+    目标观测权重恒为 1.0（时间衰减只属于训练拟合）。返回纯内存摘要，不落盘。
+    """
+    plan = build_walk_forward_plan(
+        rows,
+        min_train_rows=min_train_rows,
+        half_life_days=half_life_days,
+        rho_min=rho_min,
+        rho_max=rho_max,
+        rho_step=rho_step,
+    )
+    fixed_rho = resolve_fixed_comparison_rho(fixed_comparison_rho)
+    fits = build_walk_forward_fits(plan)
+
     evaluation_count = 0
     fitted_total = 0.0
     fixed_total = 0.0
     zero_total = 0.0
     rho_path: list[dict] = []
 
-    for kickoff, start_index, bucket_records in buckets:
-        train_rows = [record["row"] for record in records[:start_index]]
-        if len(train_rows) < min_train_rows:
-            warmup_skipped_count += len(bucket_records)
-            continue
-
-        fit = fit_rho_group(
-            train_rows,
-            half_life_days=half_life_days,
-            rho_min=rho_min,
-            rho_max=rho_max,
-            rho_step=rho_step,
-        )
+    for fit in fits:
         fitted_rho = fit["fitted_rho"]
-
         bucket_fitted = 0.0
         bucket_fixed = 0.0
         bucket_zero = 0.0
-        for record in bucket_records:
+        for record in fit["records"]:
             observation = record["observation"]
             if not is_valid_rho_for_observation(observation, fixed_rho):
                 raise DixonColesWalkForwardError(
@@ -243,17 +316,17 @@ def validate_rho_walk_forward_group(
             bucket_fixed += weighted_negative_log_likelihood([observation], fixed_rho)
             bucket_zero += weighted_negative_log_likelihood([observation], 0.0)
 
-        evaluation_count += len(bucket_records)
+        evaluation_count += len(fit["records"])
         fitted_total += bucket_fitted
         fixed_total += bucket_fixed
         zero_total += bucket_zero
 
         rho_path.append(
             {
-                "target_kickoff_at": kickoff.isoformat(),
-                "train_count": len(train_rows),
-                "test_count": len(bucket_records),
-                "training_reference_kickoff_at": fit["reference_kickoff_at"],
+                "target_kickoff_at": fit["kickoff"].isoformat(),
+                "train_count": fit["train_count"],
+                "test_count": len(fit["records"]),
+                "training_reference_kickoff_at": fit["training_reference_kickoff_at"],
                 "fitted_rho": fitted_rho,
                 "fitted_test_nll": bucket_fitted,
                 "fixed_rho_test_nll": bucket_fixed,
@@ -274,20 +347,16 @@ def validate_rho_walk_forward_group(
         improvement_vs_fixed = improvement_vs_zero = None
 
     return {
-        "sport": key[0],
-        "model_name": key[1],
-        "model_version": key[2],
-        "sample_count": len(records),
-        "min_train_rows": min_train_rows,
-        "warmup_skipped_count": warmup_skipped_count,
+        "sport": plan["sport"],
+        "model_name": plan["model_name"],
+        "model_version": plan["model_version"],
+        "sample_count": len(plan["records"]),
+        "min_train_rows": plan["min_train_rows"],
+        "warmup_skipped_count": plan["warmup_skipped_count"],
         "evaluation_count": evaluation_count,
         "target_bucket_count": target_bucket_count,
-        "half_life_days": float(half_life_days),
-        "rho_grid": {
-            "minimum": float(rho_min),
-            "maximum": float(rho_max),
-            "step": float(rho_step),
-        },
+        "half_life_days": plan["half_life_days"],
+        "rho_grid": plan["rho_grid"],
         "fixed_comparison_rho": fixed_rho,
         "walk_forward_fitted_total_nll": fitted_total if evaluation_count else None,
         "fixed_rho_total_nll": fixed_total if evaluation_count else None,
@@ -314,7 +383,7 @@ def build_rho_walk_forward_summaries(rows: Iterable[dict], **kwargs) -> list[dic
     if not rows:
         return []
 
-    _check_global_duplicates(rows)
+    check_global_duplicate_evaluation_ids(rows)
 
     groups: dict[tuple, list[dict]] = {}
     for row in rows:

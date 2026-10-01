@@ -126,18 +126,23 @@ def dixon_coles_tau(
     return 1.0
 
 
-def is_valid_rho_for_observation(observation: Observation, rho: float) -> bool:
+def is_valid_rho_for_lambdas(lambda_home: float, lambda_away: float, rho: float) -> bool:
     """
-    候选 rho 是否在该观测的 λ/μ 域上让**四个**低比分修正都为正且有限。
+    候选 rho 在给定 λ/μ 域上是否让**四个**低比分修正都为正且有限。
 
-    任一项 <= 0 或非有限 -> 该候选对该观测无效（不裁剪、不取 log(0)/log(负)）。
+    任一项 <= 0 或非有限 -> 该候选无效（不裁剪、不取 log(0)/log(负)）。
+    这是 rho 有效性的唯一权威判据，拟合与派生分析（如反事实概率重建）共用。
     """
-    lambda_home, lambda_away = observation[0], observation[1]
     for home_goals, away_goals in LOW_SCORE_CELLS:
         tau = dixon_coles_tau(home_goals, away_goals, lambda_home, lambda_away, rho)
         if not math.isfinite(tau) or tau <= 0.0:
             return False
     return True
+
+
+def is_valid_rho_for_observation(observation: Observation, rho: float) -> bool:
+    """观测层面的 rho 有效性（等价于对其 λ/μ 域的校验）。"""
+    return is_valid_rho_for_lambdas(observation[0], observation[1], rho)
 
 
 def observation_probability(observation: Observation, rho: float) -> float:
