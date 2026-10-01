@@ -60,7 +60,8 @@ worldCup/
 │   ├── daily_matches.json         #   每日赛事（抓取器写入）
 │   ├── team_strength.json         #   动态球队实力库（Elo）
 │   ├── calibrated.json            #   已用于 Elo 校准的比赛 ID
-│   └── prediction_snapshots.json  #   赛前预测快照（不可变历史记录）
+│   ├── prediction_snapshots.json  #   赛前预测快照（不可变历史记录）
+│   └── odds_snapshots.json        #   赛前赔率历史（时序观察记录）
 ├── models/
 │   ├── poisson_model.py           # 泊松 + Dixon-Coles 比分矩阵
 │   ├── predictor.py               # 预测主入口（足球）+ 赔率融合 + EV/Kelly
@@ -72,7 +73,8 @@ worldCup/
 │   ├── daily_loader.py            # 统一数据层 + 比赛日逻辑 + 查询
 │   ├── team_strength.py           # 动态 Elo 实力库
 │   ├── atomic_json.py             # 原子 JSON 落盘（临时文件 + fsync + replace）
-│   └── prediction_snapshots.py    # 赛前快照：身份、时序门禁、幂等、不可变
+│   ├── prediction_snapshots.py    # 赛前快照：身份、时序门禁、幂等、不可变
+│   └── odds_snapshots.py          # 赛前赔率历史：规范化、指纹、连续重复抑制
 ├── tests/                         # pytest 测试（快照行为 + 只读 API）
 ├── templates/                     # base / index / match / strategy / history
 └── static/
@@ -234,6 +236,7 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 | GET | `/api/matches?date=&sport=` | 按日期/类别查询赛事 |
 | GET | `/api/match/<id>` | 单场详情 |
 | GET | `/api/match/<id>/snapshots` | 该场已固化的赛前预测快照（只读，无记录返回空列表） |
+| GET | `/api/match/<id>/odds-history` | 该场已捕获的赛前赔率历史，最早在前（只读，无记录返回空列表） |
 | GET | `/api/dates` | 可用日期与联赛列表 |
 | GET | `/api/strategy?sport=` | 策略推荐（价值盘口 + 串关） |
 | GET/POST | `/api/refresh` | 手动触发一次抓取 |
@@ -257,6 +260,29 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 模型概率、展示概率、期望值（EV/Kelly）、市场赔率与隐含概率，以及按运动类型保留的比分/得分数据
 （足球 `expected_goals` / `top_scores` / `goals_prediction`；篮球 `expected_home_points` /
 `expected_away_points` / `expected_total` / `spread` / `over_line` / `over_prob` / `under_prob`）。
+
+## 赛前赔率历史
+
+`daily_matches.json` 中每场比赛只保留**最新**盘口（`match["odds"]` 会被新值覆盖）。
+赔率历史是一份**附加的**时序层，用于保留盘口随时间的每一次变动。
+
+- **捕获方式**：由后台抓取线程在每次 `refresh` 中**自动捕获**，不依赖用户打开页面。
+  流程为：抓取盘口 → 合并到 canonical 比赛记录 → 以该记录的比赛 `id` 捕获变化的赛前盘口 → 落盘。
+- **去重规则**：仅抑制**连续重复**——只有与该场「最新一条」规范化盘口相同才跳过。
+  因此 `A → B → A` 会保留 3 条，市场来回波动可被完整重建。
+- **时序门禁**：只记录**赛前**盘口。未开赛（`upcoming`）允许写入；
+  进行中（`live`）与已完赛（`finished`）拒绝新写入，但既有历史始终可读。
+  不会把滚球盘口混入赛前历史。
+- **规范化与指纹**：先剔除空值（`None` / 空字符串）并按稳定键序排列，再用
+  `sha256(json.dumps(..., sort_keys=True))` 生成指纹，与字典顺序无关。
+- **不可变**：每次观察写入独立记录，历史记录不会被后续盘口覆盖。
+- **存储**：`data/odds_snapshots.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建）。
+- **字段**：`snapshot_id`、`match_id`、`sport`、`league`、`home_team`、`away_team`、
+  `match_date`、`match_time`、`kickoff_at`、`captured_at`、`source`、`jczq_no`、
+  `odds`、`odds_fingerprint`。`odds` 只保留数据源实际提供的字段
+  （足球含 `draw`，篮球没有则不写入），不虚构缺失值。
+- **抓取统计**：`/api/refresh` 返回的 `odds_snapshots_added` 表示该次刷新**实际新增**的
+  历史观察条数；盘口未变的一次刷新为 `0`。
 
 ## 配置说明
 

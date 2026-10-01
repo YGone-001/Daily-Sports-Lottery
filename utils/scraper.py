@@ -13,6 +13,7 @@ from datetime import datetime
 
 from utils import fetcher_500
 from utils.daily_loader import get_beijing_now, load_json, save_json
+from utils.odds_snapshots import record_odds_snapshot
 from utils.team_strength import update_from_result
 
 DAILY_FILE = "daily_matches.json"
@@ -137,6 +138,30 @@ def _calibrate_from_finished(matches: list[dict]) -> int:
     return count
 
 
+def _capture_odds_history(matches: list[dict], now=None) -> int:
+    """
+    为仍可投注的比赛捕获赛前盘口历史，返回本次**实际新增**的历史观察条数。
+
+    只有「未开赛 + 有盘口 + 与最新一条不同」的比赛才会产生新记录，
+    因此盘口未变的一次刷新返回 0。
+
+    失败策略：单场写入失败仅记录告警并继续，绝不阻断 daily_matches.json
+    的正常落盘——赔率历史是附加层，其故障不应破坏主数据。
+    """
+    added = 0
+    for m in matches:
+        if not m.get("odds"):
+            continue
+        try:
+            snapshot = record_odds_snapshot(m, now=now)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Auto-Sync] 赔率历史写入失败 {m.get('id')}: {exc}")
+            continue
+        if snapshot is not None:
+            added += 1
+    return added
+
+
 def refresh(verbose: bool = True) -> dict:
     """
     执行一次完整抓取刷新。
@@ -149,6 +174,7 @@ def refresh(verbose: bool = True) -> dict:
         "added": 0,
         "updated": 0,
         "calibrated": 0,
+        "odds_snapshots_added": 0,
         "total": 0,
     }
 
@@ -212,6 +238,9 @@ def refresh(verbose: bool = True) -> dict:
     existing = data.get("matches", [])
     merged, added, updated = _merge(existing, incoming)
 
+    # 3b. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准）
+    odds_snapshots_added = _capture_odds_history(merged, now=now)
+
     # 4. 校准 Elo
     calibrated = _calibrate_from_finished(merged)
 
@@ -233,6 +262,7 @@ def refresh(verbose: bool = True) -> dict:
             "added": added,
             "updated": updated,
             "calibrated": calibrated,
+            "odds_snapshots_added": odds_snapshots_added,
             "total": len(merged),
             "finished_at": get_beijing_now().isoformat(),
         }
@@ -240,7 +270,8 @@ def refresh(verbose: bool = True) -> dict:
 
     if verbose:
         print(
-            f"  ✅ 新增 {added} | 更新 {updated} | Elo校准 {calibrated} | 库内共 {len(merged)} 场"
+            f"  ✅ 新增 {added} | 更新 {updated} | Elo校准 {calibrated} "
+            f"| 赔率历史 +{odds_snapshots_added} | 库内共 {len(merged)} 场"
         )
     return result
 

@@ -78,6 +78,9 @@ MODEL_VERSION = "baseline-1"
 # 快照运行时数据文件（位于 DATA_DIR 下，运行时生成，不纳入版本控制）
 PREDICTION_SNAPSHOT_FILE = "prediction_snapshots.json"
 
+# 赛前赔率历史运行时数据文件（位于 DATA_DIR 下，运行时生成，不纳入版本控制）
+ODDS_SNAPSHOT_FILE = "odds_snapshots.json"
+
 # 联赛强度系数（用于未知球队的 Elo 兜底估算）
 LEAGUE_STRENGTH = {
     "英超": 1900, "西甲": 1880, "意甲": 1850, "德甲": 1860, "法甲": 1820,
