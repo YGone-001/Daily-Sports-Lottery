@@ -80,6 +80,7 @@ worldCup/
 │   ├── settlements.py             # 结算：快照×赛果关联、结果指纹、冲突保护
 │   ├── evaluation_rows.py         # 评估样本：快照×结算拼接、溯源校验、源指纹
 │   ├── classification_evaluation.py  # 分类评估：accuracy / Brier / LogLoss（纯计算，不落盘）
+│   ├── calibration_evaluation.py  # 校准诊断：分箱可靠性 / ECE（纯计算，不落盘）
 │   └── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
@@ -501,6 +502,60 @@ multiclass_log_loss   = mean( -ln(p_actual) )         （自然对数）
 
 指标以原始浮点数返回，不做取整、不格式化为字符串、不转百分比；
 展示层取整属于后续 UI/API 工作。本层**尚未**通过 UI 或 HTTP API 暴露。
+
+## 概率校准诊断
+
+分类指标回答「预测对不对 / 概率好不好」，校准诊断回答另一个问题：
+
+> 当历史模型给某个结果分配了概率 `p` 时，该结果实际发生了多频繁？
+
+- **只消费评估样本**：输入是 `data/evaluation_rows.json`，走既有查询层。
+  不读 `daily_matches.json` / `prediction_snapshots.json` / `settlements.json` /
+  当前 Elo / 当前盘口，也不调用 `predict_match` / `enrich_match`。
+- **只评估 `model_probabilities`**：不使用 `display_probabilities` /
+  `market_implied_probabilities` / `market_odds` / `expected_values`，不做概率融合。
+- **纯诊断、不落盘、不改概率**：不生成 `calibration.json` 之类的文件，
+  不修改任何评估样本，**不产出校准后的概率**（无 Platt / temperature / isotonic 等重映射）。
+- **类别空间分开**：足球 `home_win` / `draw` / `away_win` 三分类；
+  篮球 `home_win` / `away_win` 二分类，兼容字段 `draw = 0` 不会成为第三个校准类别。
+- **按类别 one-vs-rest**：每条评估样本对每个必需类别贡献一个
+  `(预测概率 p_k, 观测结果 y_k)` 二元观测；校准按类别分别计算。
+- **固定 10 个等宽分箱**：`[0.0,0.1) … [0.8,0.9) [0.9,1.0]`，
+  分箱方式 `index = min(int(p * 10), 9)`（最后一箱包含 `1.0`）。不做自适应 / 分位数分箱。
+- **分组与排序**：按 `(sport, model_name, model_version)` 独立诊断，
+  按该键字典序返回；不混合运动或模型版本，不按 ECE 排名。
+- **校验复用**：概率值 / 概率总和 / 篮球 draw / 实际结果的校验与
+  分类评估完全一致（同一套 `ClassificationEvaluationError`），
+  因此畸形历史行不会被静默丢弃或给出第二套解释。
+- **本层尚未**通过 UI 或 HTTP API 暴露；`utils/scraper.py` 未接入校准诊断。
+
+### 诊断定义
+
+每个分箱 `b`：
+
+```text
+count                     = 落入该箱的观测数
+mean_predicted_probability = 箱内预测概率均值（置信度）
+observed_frequency         = 箱内观测结果均值（实际发生频率）
+calibration_gap            = |mean_predicted_probability - observed_frequency|
+```
+
+空箱的上述三项均为 `None`（不使用 NaN）。
+
+```text
+ECE_class = Σ_b (n_b / N) * |mean_probability_b - observed_frequency_b|
+```
+
+其中 `N` 为该组评估样本数，`n_b` 为该类别在箱 `b` 的观测数；空箱贡献 0。
+因为每条有效样本都会为每个必需类别提供一个概率，所以每个类别都有 `Σ_b n_b == N`。
+
+```text
+macro_expected_calibration_error = mean(ECE_class across required classes)
+```
+
+足球除以 3，篮球除以 2。这只是诊断性汇总，**不用于排名或择优**。
+
+诊断结果以原始浮点数返回（例如 `0.06327`，而不是 `"6.33%"`），不做取整、不格式化。
 
 ## 配置说明
 

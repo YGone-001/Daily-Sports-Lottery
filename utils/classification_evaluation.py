@@ -259,6 +259,55 @@ def _group_key(row: dict) -> tuple:
     return (row.get("sport"), row.get("model_name"), row.get("model_version"))
 
 
+def validate_group(rows: Sequence[dict]) -> tuple[str, str, str]:
+    """
+    校验一组评估样本的**同质性**与 `evaluation_id` 唯一性。
+
+    返回 (sport, model_name, model_version)。
+    空组 -> `empty_group`；三者任一不一致 -> `mixed_group`；
+    重复 `evaluation_id` -> `duplicate_evaluation_id`（不静默去重）。
+
+    这是评估侧唯一的「分组合法性」定义，分类评估与校准诊断共用。
+    """
+    if not rows:
+        raise ClassificationEvaluationError("empty_group", detail="评估组为空")
+
+    key = _group_key(rows[0])
+    if any(_group_key(row) != key for row in rows[1:]):
+        raise ClassificationEvaluationError(
+            "mixed_group",
+            detail=f"期望 {key}，收到混合分组",
+        )
+
+    seen_ids: set = set()
+    for row in rows:
+        evaluation_id = row.get("evaluation_id")
+        if evaluation_id is None:
+            continue
+        if evaluation_id in seen_ids:
+            raise ClassificationEvaluationError(
+                "duplicate_evaluation_id",
+                evaluation_id=evaluation_id,
+                match_id=row.get("match_id"),
+                sport=row.get("sport"),
+                model_name=row.get("model_name"),
+                model_version=row.get("model_version"),
+            )
+        seen_ids.add(evaluation_id)
+    return key
+
+
+def validate_row(row: dict) -> tuple[tuple[str, ...], list[float], str]:
+    """
+    校验单行评估样本，返回 (类别顺序, 归一化概率, 实际类别)。
+
+    概率值 / 概率总和 / 篮球 draw / 实际结果的校验语义在此统一定义，
+    评估侧的任何派生分析都应经由本函数，避免出现第二套解释。
+    """
+    classes, probabilities = normalize_class_probabilities(row)
+    return classes, probabilities, _actual_class(row, classes)
+
+
 def evaluate_classification_group(rows: Iterable[dict]) -> dict:
     """
     对一组**同质**评估样本计算分类指标。
@@ -270,38 +319,14 @@ def evaluate_classification_group(rows: Iterable[dict]) -> dict:
     本函数不修改任何输入行。
     """
     rows = list(rows)
-    if not rows:
-        raise ClassificationEvaluationError("empty_group", detail="评估组为空")
+    key = validate_group(rows)
 
-    first = rows[0]
-    key = _group_key(first)
-    if any(_group_key(row) != key for row in rows[1:]):
-        raise ClassificationEvaluationError(
-            "mixed_group",
-            detail=f"期望 {key}，收到混合分组",
-        )
-
-    seen_ids: set = set()
     correct_count = 0
     brier_total = 0.0
     log_loss_total = 0.0
 
     for row in rows:
-        evaluation_id = row.get("evaluation_id")
-        if evaluation_id is not None:
-            if evaluation_id in seen_ids:
-                raise ClassificationEvaluationError(
-                    "duplicate_evaluation_id",
-                    evaluation_id=evaluation_id,
-                    match_id=row.get("match_id"),
-                    sport=row.get("sport"),
-                    model_name=row.get("model_name"),
-                    model_version=row.get("model_version"),
-                )
-            seen_ids.add(evaluation_id)
-
-        classes, probabilities = normalize_class_probabilities(row)
-        actual = _actual_class(row, classes)
+        classes, probabilities, actual = validate_row(row)
 
         predicted = _argmax_class(classes, probabilities)
         if predicted == actual:
@@ -318,11 +343,11 @@ def evaluate_classification_group(rows: Iterable[dict]) -> dict:
 
     sample_count = len(rows)
     return {
-        "sport": first.get("sport"),
-        "model_name": first.get("model_name"),
-        "model_version": first.get("model_version"),
+        "sport": key[0],
+        "model_name": key[1],
+        "model_version": key[2],
         "probability_source": PROBABILITY_SOURCE,
-        "classes": list(classes_for_sport(first.get("sport"))),
+        "classes": list(classes_for_sport(key[0])),
         "sample_count": sample_count,
         "accuracy": correct_count / sample_count,
         "brier_score": brier_total / sample_count,
