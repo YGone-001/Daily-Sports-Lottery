@@ -78,7 +78,8 @@ worldCup/
 │   ├── prediction_snapshots.py    # 赛前快照：身份、时序门禁、幂等、不可变
 │   ├── odds_snapshots.py          # 赛前赔率历史：规范化、指纹、连续重复抑制
 │   ├── settlements.py             # 结算：快照×赛果关联、结果指纹、冲突保护
-│   └── evaluation_rows.py         # 评估样本：快照×结算拼接、溯源校验、源指纹
+│   ├── evaluation_rows.py         # 评估样本：快照×结算拼接、溯源校验、源指纹
+│   └── classification_evaluation.py  # 分类评估：accuracy / Brier / LogLoss（纯计算，不落盘）
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
 └── static/
@@ -405,6 +406,63 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 - **读取方式**：本层只提供服务层查询函数（`get_evaluation_row` /
   `get_evaluation_row_for_snapshot` / `get_evaluation_rows_for_match` /
   `get_all_evaluation_rows`），暂不暴露 HTTP 接口。
+
+## 分类评估
+
+在不可变评估样本之上计算**纯分类指标**：`sample_count`、`accuracy`、
+`brier_score`、`multiclass_log_loss`。
+
+- **只消费评估样本**：输入是 `data/evaluation_rows.json`。
+  不读 `daily_matches.json` / `prediction_snapshots.json` / `settlements.json` /
+  球队实力 / 当前 Elo / 当前盘口，也不调用 `predict_match` / `enrich_match`。
+- **纯计算、不落盘**：指标由既有评估样本确定性推导，**不新增**任何运行时指标文件
+  （没有 `classification_metrics.json` / `backtest_results.json` / `model_scores.json`）。
+  计算函数接收行数据作为输入，可独立测试；`evaluate_all_classification()` 只是
+  「读取 + 计算」的便捷入口。
+- **概率来源唯一**：一律使用 `evaluation_row["model_probabilities"]`。
+  不使用 `display_probabilities`、`market_implied_probabilities`、`market_odds`、
+  `expected_values`，不做任何概率融合。
+- **历史量纲是百分点**：历史 schema 中概率为 `0..100` 的整数百分点
+  （`53` 表示 `0.53`）。**不做** `[0,1]` 与 `[0,100]` 的自动判别，
+  `0.60/0.20/0.20` 这类小数在历史 schema 下属畸形数据，会被显式拒绝。
+- **取整重归一化**：独立取整后必需类别总和可能是 `99 / 100 / 101`，
+  接受该区间并**重归一化到精确的 1.0**；总和落在区间外（如 `90`）直接拒绝，
+  不会静默归一化畸形分布。
+- **足球三分类**：类别顺序固定为 `home_win` / `draw` / `away_win`。
+- **篮球二分类**：类别顺序固定为 `home_win` / `away_win`。
+  模型可能写入的兼容字段 `draw = 0` 会被忽略；若 `draw` 非零，
+  说明有实质概率质量会被丢弃，按畸形数据拒绝。篮球事实结果为平局同样拒绝，
+  不虚构胜者。
+- **分组独立**：按 `(sport, model_name, model_version)` 分别计算，
+  **不产生**跨运动的混合指标，也不混合不同模型版本。
+- **确定性顺序**：摘要按 `sport` / `model_name` / `model_version` 字典序返回，
+  不按指标优劣排序、不做模型排名。
+- **空输入**：`build_classification_summaries([])` 返回 `[]`，不伪造零值摘要；
+  直接对空分组求值会抛出显式错误。
+- **严格校验**：畸形行不会被静默跳过，一律抛出 `ClassificationEvaluationError`
+  （reason 如 `duplicate_evaluation_id` / `unsupported_sport` / `missing_probability` /
+  `invalid_probability` / `invalid_probability_total` / `invalid_actual_outcome` /
+  `nonzero_basketball_draw_probability` / `mixed_group`）。
+
+### 指标定义
+
+```text
+sample_count          = 该 (sport, model_name, model_version) 组内有效且唯一的评估样本数
+                        （每个 evaluation_id 只计一次；重复 evaluation_id 直接报错）
+
+predicted class       = argmax(归一化后的 model_probabilities)
+                        并列时取固定类别顺序中靠前者
+accuracy              = 正确数 / sample_count        （返回 0.0..1.0，不是百分数）
+
+brier_score           = mean( sum_k (p_k - y_k)^2 )
+                        多分类 Brier，**不**再按类别数除一次
+
+multiclass_log_loss   = mean( -ln(p_actual) )         （自然对数）
+                        仅取对数时用 epsilon = 1e-15 裁剪，不修改已存储的分布
+```
+
+指标以原始浮点数返回，不做取整、不格式化为字符串、不转百分比；
+展示层取整属于后续 UI/API 工作。本层**尚未**通过 UI 或 HTTP API 暴露。
 
 ## 配置说明
 
