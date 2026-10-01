@@ -81,6 +81,7 @@ worldCup/
 │   ├── evaluation_rows.py         # 评估样本：快照×结算拼接、溯源校验、源指纹
 │   ├── classification_evaluation.py  # 分类评估：accuracy / Brier / LogLoss（纯计算，不落盘）
 │   ├── calibration_evaluation.py  # 校准诊断：分箱可靠性 / ECE（纯计算，不落盘）
+│   ├── dixon_coles_fitting.py     # 离线 rho 拟合：时间加权 Dixon-Coles 诊断（纯计算，不落盘）
 │   └── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
 ├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
 ├── templates/                     # base / index / match / strategy / history
@@ -613,6 +614,42 @@ macro_expected_calibration_error = mean(ECE_class across required classes)
 足球除以 3，篮球除以 2。这只是诊断性汇总，**不用于排名或择优**。
 
 诊断结果以原始浮点数返回（例如 `0.06327`，而不是 `"6.33%"`），不做取整、不格式化。
+
+## Dixon-Coles rho 拟合（离线诊断）
+
+在不可变评估样本之上做**离线**拟合，回答：
+
+> 给定历史足球模型在开赛前**实际产出**的期望进球，哪个 Dixon-Coles 低比分相关系数
+> `rho` 能让时间加权的历史负对数似然最小？
+
+- **只消费评估样本**：使用 `expected_score_data.expected_goals.home/away`（历史 λ / μ）、
+  `final_score.home/away`、`kickoff_at`、`sport` / `model_name` / `model_version`。
+  **不重建历史 λ**（不调用 `predict_match` / `expected_goals` / `enrich_match`），
+  不读当前 Elo / 当前攻防评分 / 当前盘口。
+- **仅足球**：篮球分组会被上层构建器直接跳过；对篮球行直接调用分组拟合会显式报错。
+- **按模型版本分组**：`(sport, model_name, model_version)` 各自独立拟合，
+  绝不跨版本混合（不同版本的 λ 不同，需要各自的诊断）。
+- **低比分修正与线上模型完全一致**：
+  `0-0 → 1 - λμρ`、`0-1 → 1 + λρ`、`1-0 → 1 + μρ`、`1-1 → 1 - ρ`、其他 `→ 1`。
+- **似然只在实际比分上求值**：`P = Poisson(x|λ) · Poisson(y|μ) · tau`，
+  拟合期间不对完整比分矩阵做重归一化。
+- **时间加权**：默认半衰期 `180` 天，`weight = exp(-ln2 · age_days / 180)`。
+  基准时间取**该分组内最晚的 `kickoff_at`**，不使用当前时钟——因此同一批历史数据
+  无论哪天拟合结果都完全相同。
+- **拟合目标**：加权负对数似然之和 `Σ_i weight_i · -ln(P_i)`（**不**按样本数取平均）。
+- **候选网格**：默认 `[-0.25, 0.25]`、步长 `0.005`（整数索引构造，避免浮点漂移）。
+  某个候选只要在任一观测上使低比分修正 `<= 0` 或非有限，就**整体剔除**，不做部分拟合、不裁剪。
+- **确定性并列裁决**：加权 NLL 最小 → `|rho|` 更小 → 数值更小。
+- **诊断输出**：`sample_count`、`low_score_sample_count`、`reference_kickoff_at`、
+  `half_life_days`、`effective_sample_weight`、`rho_grid`（含候选数与有效候选数）、
+  `fitted_rho`、`weighted_nll`、`rho_zero_weighted_nll`、
+  `weighted_nll_improvement_vs_zero`。其中 `rho = 0` 即独立泊松基线。
+- **不落盘、不部署**：不生成任何拟合结果文件，不修改 `config.py`，
+  **不把拟合结果应用到线上预测**。
+- **线上模型不变**：`config.MODEL_CONFIG["dixon_coles_rho"]` 仍为 `-0.15`，
+  足球版本仍为 `football-ad-1`，篮球仍为 `baseline-1`。
+  如果运行期自动重拟合，同一个 `model_version` 的含义会随时间漂移，破坏既有的
+  版本化历史对比体系——因此拟合与部署必须分离，后续由独立的部署任务决定是否采用。
 
 ## 配置说明
 
