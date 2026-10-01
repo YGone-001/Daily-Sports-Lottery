@@ -34,14 +34,49 @@
 
 | 数据源 | 地址 | 提供 |
 | --- | --- | --- |
-| 即时比分（足球） | `live.500.com/index.php` | 赛程、**开赛时间**、竞彩编号、实时比分 |
-| 即时比分（篮球） | `live.500.com/lq.php` | 内联 `matchList` 赛程 + 竞彩官方赔率 |
+| 即时比分（足球） | `live.500.com/` → `weekfixture.php` → `2h1.php`（按序尝试） | 赛程、**开赛时间**、实时比分、竞彩编号（有则用） |
+| 即时比分（篮球） | `live.500.com/lq.php`（内联 `matchList` / `oddsList`，并支持表格行兜底） | 赛程、开赛时间、竞彩官方赔率 |
 | 竞彩赔率 | `trade.500.com/static/public/{lot}/newxml/pl/pl_{play}_2.xml` | 胜平负 / 让分 / 大小分盘口 |
 | 完场比分 | `live.500.com/wanchang.php` | 历史赛果（用于 Elo 校准与复盘） |
 
-两个源通过 **竞彩编号**（如 `3001`）精确合并：赛程取时间与队名，赔率取盘口。
+事件与赔率通过 **竞彩编号**（如 `3001`）精确合并；当来源不再提供编号时，
+退化为 `utils.match_identity.same_event` 的 `(sport, date, home, away)` 主客队对匹配。
 
-> 曾尝试的 `trade.500.com/jczq` 页面为纯 AJAX，`live.500.com` 的静态 XML 为 2019 年陈旧数据，
+### 来源兼容性与容错
+
+500.com 的前端会改版，适配器因此按「**布局容错 + 候选页回退**」设计：
+
+- **候选页回退**：足球即时比分依次尝试 `live.500.com/`、`weekfixture.php`、`2h1.php`，
+  任一页面可用即可；单个页面 404/500/超时不会影响其他页面。
+- **两种布局并存**：
+  - 新版页面行带 `gy="联赛,主队,客队"`，**列数与列序可变**，队名与联赛以 `gy` 为权威来源；
+  - 旧版页面无 `gy`，沿用固定列索引 + `mainName` / `clientName` 解析。
+- **字段定位基于模式而非下标**：开赛时间在行文本中按 `MM-DD HH:MM` 定位；
+  全场比分优先取 `class="pk"` 单元格（避免误取半场比分）。
+- **HTML 实体解码**：`&nbsp;` 等实体在剥离标签时统一解码，避免
+  `10-01&nbsp;22:25` 这类时间戳解析失败。
+- **防御式解析**：缺字段 / 空行 / 多余列只计入 `parser_errors`，**绝不产出缺字段的非法比赛**。
+- **不伪造市场信息**：即时比分源不提供赔率时 `odds = None`；
+  赔率源只有在真的给出价格时才写入 `home_win` / `draw` / `away_win`，
+  没有默认值、估算值、占位值或拷贝值。
+- **市场准入不变**：没有可用盘口覆盖 → 不进入 canonical 集合 → 不产生预测快照。
+
+### 数据源健康诊断
+
+`utils.fetcher_500.source_diagnostics()` 返回最近一次各源的结构化状态，
+可区分四种情况（`unavailable` / `empty` / `ok`，外加每源的 `parser_errors` 计数）：
+
+```text
+[500fetcher] jczq_odds_football: status=empty rows=0 parser_errors=0
+             reachable but no matches on sale
+```
+
+`utils.scraper.refresh` 返回的 `sources` 字段同时给出各源行数，
+因此刷新结果可以区分「源不可达」「源可达但为空」「解析失败」「无可用赔率」。
+
+> 竞彩赔率 XML 端点在无在售赛事时返回 `<xml></xml>`（HTTP 200，0 场），
+> 这是「源可达但为空」，不是故障；此时不会有任何赛事被准入。
+> 曾尝试的 `trade.500.com/jczq` 页面为纯 AJAX、`www.500.com` 上的同名 XML 为 2019 年陈旧数据，
 > 均已弃用；上面的端点才是当前可用的权威来源。
 
 ## 项目结构

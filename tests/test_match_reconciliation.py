@@ -127,8 +127,9 @@ def test_fetcher_rows_kickoff_known_markers():
         '<td><span class="mainName">客队</span></td><td>析</td>'
         "</tr></table>"
     )
-    parsed_live = _parse_live(html_live, "a", "football")
+    parsed_live, live_errors = _parse_live(html_live, "a", "football")
     assert len(parsed_live) == 1
+    assert live_errors == 0
     assert parsed_live[0]["kickoff_time_known"] is True
     assert parsed_live[0]["time"] == "20:00"
 
@@ -139,8 +140,9 @@ def test_fetcher_rows_kickoff_known_markers():
         "var oddsList = {};"
         "</script>"
     )
-    parsed_lq = _parse_lq(html_lq)
+    parsed_lq, lq_errors = _parse_lq(html_lq)
     assert len(parsed_lq) == 1
+    assert lq_errors == 0
     assert parsed_lq[0]["kickoff_time_known"] is True
     assert parsed_lq[0]["time"] == "19:30"
 

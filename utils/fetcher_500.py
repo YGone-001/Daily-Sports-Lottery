@@ -37,6 +37,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
 import time
@@ -57,6 +58,34 @@ REQUEST_HEADERS = {
 _CACHE: dict[str, tuple[float, object]] = {}
 CACHE_TTL = 120  # 秒
 
+# 数据源健康诊断（结构化、只读），用于区分：
+#   unavailable  —— 源不可达（HTTP 错误 / 超时 / 异常）
+#   empty        —— 源可达但没有数据
+#   ok           —— 源可达且有数据
+# parser_errors 单独计数，表示「有响应但解析失败的行数」。
+_DIAGNOSTICS: dict[str, dict] = {}
+
+
+def source_diagnostics() -> dict:
+    """返回最近一次各数据源抓取的结构化诊断（深拷贝副本，不暴露内部状态）。"""
+    return copy.deepcopy(_DIAGNOSTICS)
+
+
+def _record_diag(source: str, status: str, *, rows: int = 0,
+                 parser_errors: int = 0, note: str = "") -> None:
+    _DIAGNOSTICS[source] = {
+        "status": status,
+        "rows": rows,
+        "parser_errors": parser_errors,
+        "note": note,
+        "checked_at": datetime.now(BEIJING_TZ).isoformat(),
+    }
+    if status != "ok" or parser_errors:
+        print(
+            f"[500fetcher] {source}: status={status} rows={rows} "
+            f"parser_errors={parser_errors} {note}".rstrip()
+        )
+
 
 # ---------------------------------------------------------------------------
 # 通用工具
@@ -72,8 +101,20 @@ def _cached(key: str, ttl: int, loader):
     return value
 
 
+# 常见 HTML 实体（含 `&nbsp;`）：不解码会让 '10-01&nbsp;22:25' 这类时间戳解析失败
+_ENTITIES = {
+    "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+    "&quot;": '"', "&#39;": "'", "&apos;": "'",
+}
+
+
 def _strip_tags(html: str) -> str:
     text = re.sub(r"<[^>]+>", " ", html)
+    for entity, char in _ENTITIES.items():
+        if entity in text:
+            text = text.replace(entity, char)
+    if "&#" in text:
+        text = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -105,90 +146,207 @@ _STATUS_MAP = {
 }
 
 
+# 足球即时比分的候选页面（按权威性排序）。
+# 主页 `/` 历史上 SSR 直出完整赛程；改版后它变为「壳页」，真实赛程表迁到
+# 以下 SSR 子页面。逐个尝试并合并，任一可用即可恢复开赛时间供给。
+FOOTBALL_LIVE_PAGES = (
+    "https://live.500.com/",              # 旧布局（仍可能渲染）
+    "https://live.500.com/weekfixture.php",  # 未来一周赛程（行数最多）
+    "https://live.500.com/2h1.php",          # 即将开赛
+)
+
+# 篮球即时比分的候选页面
+BASKETBALL_LIVE_PAGES = (
+    "https://live.500.com/lq.php",        # matchList/oddsList + 可能的表格行
+)
+
+
+def _live_pages(sport: str) -> tuple[str, ...]:
+    return BASKETBALL_LIVE_PAGES if sport == "basketball" else FOOTBALL_LIVE_PAGES
+
+
 def fetch_live_matches(sport: str = "football") -> list[dict]:
     """
     抓取 live.500.com 即时比分（足球 a / 篮球 b）。
 
-    优势：SSR 直出，含**开赛时间**与**竞彩编号**，可与 fetch_jczq_xml
-    的赔率数据按编号精确合并 —— 解决 XML 缺少开赛时间的问题。
+    优势：SSR 直出，含**开赛时间**，可与 fetch_jczq_xml 的赔率数据按
+    竞彩编号（有则用）或主客队对（无则退化）合并 —— 解决 XML 缺少开赛时间的问题。
+
+    兼容性：主页改版后不再直出赛程表，因此这里按候选页面顺序逐个尝试，
+    并同时支持「旧索引布局」与「新 `gy` 属性布局」。任一页面解析出数据即可。
     """
     key = f"live:{sport}"
 
     def loader():
         prefix = "b" if sport == "basketball" else "a"
-        try:
-            resp = requests.get(
-                "https://live.500.com/", headers=REQUEST_HEADERS, timeout=20
-            )
-            resp.encoding = "gb2312"
-            html = resp.text
-        except Exception as exc:  # noqa: BLE001
-            print(f"[500fetcher] live.500.com 抓取失败: {exc}")
-            return []
+        source = f"live_{sport}"
+        collected: list[dict] = []
+        seen: set[tuple] = set()
+        parser_errors = 0
+        reachable = False
 
-        return _parse_live(html, prefix, sport)
+        for url in _live_pages(sport):
+            try:
+                resp = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
+                resp.raise_for_status()
+                resp.encoding = "gb2312"
+                html = resp.text
+                reachable = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[500fetcher] live 抓取失败 {url}: {exc}")
+                continue
+
+            rows, errors = _parse_live(html, prefix, sport)
+            parser_errors += errors
+            for row in rows:
+                ident = (row["sport"], row["date"], row["home"], row["away"])
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                collected.append(row)
+
+        if not reachable:
+            _record_diag(source, "unavailable", note="all live pages unreachable")
+        elif not collected:
+            _record_diag(
+                source, "empty", parser_errors=parser_errors,
+                note="reachable but no rows parsed",
+            )
+        else:
+            _record_diag(source, "ok", rows=len(collected), parser_errors=parser_errors)
+
+        return collected
 
     return _cached(key, 90, loader)
 
 
-def _parse_live(html: str, prefix: str, sport: str) -> list[dict]:
-    """解析即时比分页的比赛行"""
-    out: list[dict] = []
+# 通用行解析辅助：容忍列数 / 列序 / 附加字段变化
+_LIVE_ROW_RE = re.compile(r'<tr\s+id="([ab])(\d+)"([^>]*)>(.*?)</tr>', re.S)
+_CELL_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S)
+_CLASS_ATTR_RE = re.compile(r'class="([^"]*)"')
+_DATETIME_RE = re.compile(r"(\d{2})-(\d{2})\s+(\d{2}:\d{2})")
+_FULL_SCORE_RE = re.compile(r"^(\d{1,3})\s*-\s*(\d{1,3})$")
+
+
+def _cells_of(body: str) -> list[tuple[str, str]]:
+    """返回行的 [(class, text), ...]，与列数无关。"""
+    out: list[tuple[str, str]] = []
+    for raw in _CELL_RE.findall(body):
+        cls = _CLASS_ATTR_RE.search(raw)
+        out.append((cls.group(1) if cls else "", _strip_tags(raw)))
+    return out
+
+
+def _score_from_cells(cells: list[tuple[str, str]]) -> dict | None:
+    """
+    取全场比分 `{"ft": [home, away]}`。
+
+    优先 `class="pk"` 单元格（新布局的全场比分位），
+    其次任意 `数字 - 数字` 单元格（旧布局 / 兜底）。
+    半场比分单元格不带 pk，因此不会被误取。
+    """
+    for cls, text in cells:
+        if "pk" in cls.split():
+            m = _FULL_SCORE_RE.match(text.strip())
+            if m:
+                return {"ft": [int(m.group(1)), int(m.group(2))]}
+    for _, text in cells:
+        m = _FULL_SCORE_RE.match(text.strip())
+        if m:
+            return {"ft": [int(m.group(1)), int(m.group(2))]}
+    return None
+
+
+def _resolve_date(mm: str, dd: str) -> str | None:
+    """'09-30' -> '2026-09-30'（跨年时回退到上一年）。失败返回 None。"""
     year = datetime.now(BEIJING_TZ).year
+    mdate = f"{year}-{mm}-{dd}"
+    try:
+        parsed = datetime.strptime(mdate, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    if (parsed - datetime.now(BEIJING_TZ).date()).days > 180:
+        mdate = f"{year - 1}-{mm}-{dd}"
+    return mdate
 
-    # 按 <tr id="a123456" ...>...</tr> 切块
-    for m in re.finditer(r'<tr\s+id="%s(\d+)"([^>]*)>(.*?)</tr>' % prefix, html, re.S):
-        fid = m.group(1)
-        attrs = dict(_ATTR_RE.findall(m.group(2)))
-        body = m.group(3)
 
-        tds = re.findall(r"<td[^>]*>(.*?)</td>", body, re.S)
-        if len(tds) < 9:
+def _parse_live(html: str, prefix: str, sport: str) -> tuple[list[dict], int]:
+    """
+    解析即时比分页的比赛行，返回 `(rows, parser_errors)`。
+
+    同时支持两种布局：
+    - 新布局：行带 `gy="联赛,主队,客队"`，列数可变（9/12/14…），
+      队名/联赛以 `gy` 为权威来源，避免列序漂移；
+    - 旧布局：无 `gy`，按固定列索引 + `mainName`/`clientName` 解析。
+
+    解析失败的行只计入 `parser_errors`，绝不产出缺字段的非法比赛。
+    """
+    out: list[dict] = []
+    errors = 0
+
+    for m in _LIVE_ROW_RE.finditer(html):
+        if m.group(1) != prefix:
             continue
+        fid = m.group(2)
+        attrs = dict(_ATTR_RE.findall(m.group(3)))
+        cells = _cells_of(m.group(4))
 
-        def _text(idx):
-            return _strip_tags(tds[idx]) if idx < len(tds) else ""
-
-        # 联赛 / 轮次 / 时间 / 状态
-        league = _text(1)
-        round_name = _text(2)
-        dt_raw = _text(3)                       # '09-30 14:00'
-        status_raw = _text(4)
-        matchnum = re.sub(r"[^\d]", "", _text(0))  # '周三001' -> '001'
-
-        tm = re.match(r"(\d{2})-(\d{2})\s+(\d{2}:\d{2})", dt_raw)
+        # 开赛时间：在整行文本中定位 'MM-DD HH:MM'（与列序无关）
+        joined = " ".join(text for _, text in cells)
+        tm = _DATETIME_RE.search(joined)
         if not tm:
+            errors += 1
             continue
-        mdate = f"{year}-{tm.group(1)}-{tm.group(2)}"
+        mdate = _resolve_date(tm.group(1), tm.group(2))
+        if not mdate:
+            errors += 1
+            continue
         hhmm = tm.group(3)
-        try:
-            parsed = datetime.strptime(mdate, "%Y-%m-%d").date()
-            if (parsed - datetime.now(BEIJING_TZ).date()).days > 180:
-                mdate = f"{year - 1}-{tm.group(1)}-{tm.group(2)}"
-        except ValueError:
-            continue
 
-        # 队名：就近取 <a> 文本
-        home = _team_from_td(tds[5]) if len(tds) > 5 else ""
-        away = _team_from_td(tds[7]) if len(tds) > 7 else ""
-        if not home or not away:
-            continue
-
-        # 比分：td[6] 形如 '2-1' 或空
-        score = None
-        sc_raw = _text(6)
-        sc_m = re.search(r"(\d+)\s*-\s*(\d+)", sc_raw)
-        if sc_m:
-            score = {"ft": [int(sc_m.group(1)), int(sc_m.group(2))]}
-
-        status = _STATUS_MAP.get(attrs.get("status", "0"), "upcoming")
-        # 有比分且标记完场才认为 finished
+        score = _score_from_cells(cells)
+        raw_status = str(attrs.get("status", "0"))
+        status = _STATUS_MAP.get(raw_status, "upcoming")
         if status == "finished" and not score:
             status = "upcoming"
 
+        gy = [part.strip() for part in (attrs.get("gy") or "").split(",")]
+        if len(gy) >= 3 and gy[1] and gy[2]:
+            # 新布局：gy 权威给出 联赛 / 主队 / 客队
+            league, home, away = gy[0], gy[1], gy[2]
+            round_name = next(
+                (t for _, t in cells
+                 if re.match(r"^(第\d+轮|分组赛|小组赛|半决赛|决赛|附加赛)", t)),
+                "",
+            )
+            home_rank = _parse_rank_from_text(
+                next((t for _, t in cells if home in t), "")
+            )
+            away_rank = _parse_rank_from_text(
+                next((t for _, t in cells if away in t), "")
+            )
+        else:
+            # 旧布局：保持既有列索引语义
+            if len(cells) < 9:
+                errors += 1
+                continue
+            texts = [t for _, t in cells]
+            league = texts[1]
+            round_name = texts[2]
+            home = _team_from_td(re.findall(_CELL_RE, m.group(4))[5])
+            away = _team_from_td(re.findall(_CELL_RE, m.group(4))[7])
+            home_rank = None
+            away_rank = None
+            matchnum = re.sub(r"[^\d]", "", texts[0])
+            if not attrs.get("order") and matchnum:
+                attrs["order"] = matchnum
+
+        if not home or not away or home == away:
+            errors += 1
+            continue
+
         out.append(
             {
-                "id": f"500l-{mdate}-{attrs.get('order') or matchnum or fid}",
+                "id": f"500l-{mdate}-{attrs.get('order') or fid}",
                 "sport": sport,
                 "league": league,
                 "round": round_name,
@@ -198,14 +356,20 @@ def _parse_live(html: str, prefix: str, sport: str) -> list[dict]:
                 "status": status,
                 "home": home,
                 "away": away,
-                "home_rank": None,
-                "away_rank": None,
+                "home_rank": home_rank,
+                "away_rank": away_rank,
                 "score": score,
                 "odds": None,
-                "jczq_no": attrs.get("order") or "",  # 竞彩编号，用于与赔率合并
+                # 竞彩编号：新布局多数页面不提供，缺失时由 same_event 退化为主客队对匹配
+                "jczq_no": attrs.get("order") or "",
             }
         )
-    return out
+    return out, errors
+
+
+def _parse_rank_from_text(text: str) -> int | None:
+    m = re.search(r"\[(\d{1,3})\]", text or "")
+    return int(m.group(1)) if m else None
 
 
 def _team_from_td(td_html: str) -> str:
@@ -261,16 +425,46 @@ def fetch_live_basketball() -> list[dict]:
     key = "live:basketball"
 
     def loader():
-        try:
-            resp = requests.get(
-                "https://live.500.com/lq.php", headers=REQUEST_HEADERS, timeout=20
-            )
-            html = resp.content.decode("gb18030", errors="replace")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[500fetcher] 篮球即时比分抓取失败: {exc}")
-            return []
+        source = "live_basketball"
+        collected: list[dict] = []
+        seen: set[tuple] = set()
+        parser_errors = 0
+        reachable = False
 
-        return _parse_lq(html)
+        for url in BASKETBALL_LIVE_PAGES:
+            try:
+                resp = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
+                resp.raise_for_status()
+                html = resp.content.decode("gb18030", errors="replace")
+                reachable = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[500fetcher] 篮球即时比分抓取失败 {url}: {exc}")
+                continue
+
+            # 1) 内联 matchList / oddsList（改版后可能为空数组）
+            rows, errors = _parse_lq(html)
+            # 2) 兜底：页面若直出 <tr id="bN"> 表格行，同样按容错逻辑解析
+            table_rows, table_errors = _parse_live(html, "b", "basketball")
+            parser_errors += errors + table_errors
+
+            for row in rows + table_rows:
+                ident = (row["sport"], row["date"], row["home"], row["away"])
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                collected.append(row)
+
+        if not reachable:
+            _record_diag(source, "unavailable", note="all basketball pages unreachable")
+        elif not collected:
+            _record_diag(
+                source, "empty", parser_errors=parser_errors,
+                note="reachable but matchList empty / no rows parsed",
+            )
+        else:
+            _record_diag(source, "ok", rows=len(collected), parser_errors=parser_errors)
+
+        return collected
 
     return _cached(key, 90, loader)
 
@@ -297,7 +491,14 @@ def _js_object(html: str, name: str):
         return None
 
 
-def _parse_lq(html: str) -> list[dict]:
+def _parse_lq(html: str) -> tuple[list[dict], int]:
+    """
+    解析篮球即时比分页内联的 `matchList` / `oddsList`。
+
+    返回 `(rows, parser_errors)`。改版后 `matchList` 可能为空数组（页面改由
+    JS 异步取数），此时返回 `([], 0)` —— 属于「源可达但为空」，不是解析失败。
+    字段缺失 / 越界的行计入 `parser_errors` 且不产出非法比赛。
+    """
     rows = _js_array(html, "matchList") or []
     odds_map = _js_object(html, "oddsList") or {}
 
@@ -305,18 +506,22 @@ def _parse_lq(html: str) -> list[dict]:
         return row[idx] if idx < len(row) else default
 
     out: list[dict] = []
+    errors = 0
     for row in rows:
         if not isinstance(row, list):  # noqa: UP038
+            errors += 1
             continue
         mid = str(_at(row, _LQ_ID))
         home = str(_at(row, _LQ_HOME)).strip()
         away = str(_at(row, _LQ_AWAY)).strip()
         if not home or not away:
+            errors += 1
             continue
 
         mdate = str(_at(row, _LQ_DATE)).strip()
         hhmm = str(_at(row, _LQ_TIME)).strip() or "00:00"
         if not re.match(r"\d{4}-\d{2}-\d{2}", mdate):
+            errors += 1
             continue
 
         raw_status = str(_at(row, _LQ_STATUS))
@@ -368,7 +573,7 @@ def _parse_lq(html: str) -> list[dict]:
                 "jczq_no": str(_at(row, _LQ_NO)).strip(),
             }
         )
-    return out
+    return out, errors
 
 
 # ---------------------------------------------------------------------------
@@ -392,11 +597,16 @@ def fetch_finished_matches(date: str | None = None) -> list[dict]:
             resp = requests.get(
                 url, params=params, headers=REQUEST_HEADERS, timeout=20
             )
+            resp.raise_for_status()
             resp.encoding = "gb2312"
-            return _parse_wanchang(resp.text)
+            rows = _parse_wanchang(resp.text)
         except Exception as exc:  # noqa: BLE001
             print(f"[500fetcher] wanchang 抓取失败: {exc}")
+            _record_diag("wanchang", "unavailable", note=str(exc))
             return []
+
+        _record_diag("wanchang", "ok" if rows else "empty", rows=len(rows))
+        return rows
 
     return _cached(key, CACHE_TTL, loader)
 
@@ -601,10 +811,13 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
             return []
 
         by_id: dict[str, dict] = {}      # 按竞彩 match id 聚合
+        parser_errors = 0
+        reachable = False
 
         for play in cfg["plays"]:
             try:
                 xml = _fetch_xml(cfg["lot"], play)
+                reachable = True
             except Exception as exc:  # noqa: BLE001
                 print(f"[500fetcher] 竞彩XML {cfg['lot']}/{play} 失败: {exc}")
                 continue
@@ -612,12 +825,14 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
             for attrs, rows in _iter_xml_matches(xml):
                 mid = attrs.get("id")
                 if not mid:
+                    parser_errors += 1
                     continue
                 latest = rows[0] if rows else {}
 
                 entry = by_id.get(mid)
                 if entry is None:
                     if not attrs.get("home") or not attrs.get("away"):
+                        parser_errors += 1
                         continue
                     entry = {
                         "id": f"500j-{attrs.get('date','')}-{attrs.get('matchnum', mid)}",
@@ -660,10 +875,18 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
         for entry in by_id.values():
             odds = {k: v for k, v in (entry.get("odds") or {}).items() if v is not None}
             entry["odds"] = odds or None
-            if entry["odds"] and entry["odds"].get("matchnum"):
-                # 竞彩编号 <= 竞赛日，开赛时间由 live 源或页脚补全；先用占位
-                pass
             out.append(entry)
+
+        source = f"jczq_odds_{sport}"
+        if not reachable:
+            _record_diag(source, "unavailable", note="all play XML unreachable")
+        elif not out:
+            _record_diag(
+                source, "empty", parser_errors=parser_errors,
+                note="reachable but no matches on sale",
+            )
+        else:
+            _record_diag(source, "ok", rows=len(out), parser_errors=parser_errors)
 
         return out
 
