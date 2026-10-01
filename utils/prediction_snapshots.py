@@ -218,24 +218,20 @@ def snapshot_exists(match_id: str, model_version: str | None = None) -> bool:
     return get_snapshot(sid) is not None
 
 
-def create_snapshot(
+def _create_or_get(
     match: dict,
-    prediction: dict | None = None,
+    prediction: dict | None,
     *,
-    model_version: str | None = None,
-    now: datetime | None = None,
-) -> dict | None:
+    model_version: str,
+    now: datetime | None,
+) -> tuple[dict | None, bool]:
     """
-    为一场比赛创建 canonical 赛前快照。
+    内部持久化原语：在同一把锁内完成「检查 + 写入」，不存在 check-then-write 竞态。
 
-    行为
-    ----
-    - 仅当比赛状态为 `upcoming` 时才新建；`live` / `finished` 返回已有快照或 None。
-    - `prediction` 为空时，内部调用 `models.predictor.predict_match` 计算。
-    - 幂等：同 match_id + 同 model_version 若已有快照，直接返回既有记录，不覆盖。
-    - 返回值：该场该模型版本的快照记录（新建或既有），或在被拒绝时返回 None。
+    返回 (snapshot, created)：
+        created=True  -> 本次调用确实新增并落盘了一条记录，snapshot 为写入内容
+        created=False -> 本次未新增；snapshot 为既有记录，或被时序门禁拒绝时为 None
     """
-    model_version = resolve_model_version(model_version)
     match_id = str(match.get("id") or "")
     if not match_id:
         raise ValueError("快照需要比赛 id（match_id）")
@@ -245,7 +241,7 @@ def create_snapshot(
     # 时序门禁：以比赛当前状态为准（upcoming 才允许新建）
     status = add_time_status(dict(match), now).get("status")
     if status != "upcoming":
-        return get_snapshot(snapshot_id)
+        return get_snapshot(snapshot_id), False
 
     if prediction is None:
         from models.predictor import predict_match
@@ -267,11 +263,56 @@ def create_snapshot(
         existing = store["snapshots"].get(snapshot_id)
         if isinstance(existing, dict):
             # 不可变：已有快照一律原样返回，绝不用新状态覆盖。
-            return existing
+            return existing, False
         store["snapshots"][snapshot_id] = snapshot
         _save_store(store)
 
+    return snapshot, True
+
+
+def create_snapshot(
+    match: dict,
+    prediction: dict | None = None,
+    *,
+    model_version: str | None = None,
+    now: datetime | None = None,
+) -> dict | None:
+    """
+    为一场比赛创建 canonical 赛前快照。
+
+    行为
+    ----
+    - 仅当比赛状态为 `upcoming` 时才新建；`live` / `finished` 返回已有快照或 None。
+    - `prediction` 为空时，内部调用 `models.predictor.predict_match` 计算。
+    - 幂等：同 match_id + 同 model_version 若已有快照，直接返回既有记录，不覆盖。
+    - 返回值：该场该模型版本的快照记录（新建或既有），或在被拒绝时返回 None。
+    """
+    snapshot, _created = _create_or_get(
+        match, prediction, model_version=resolve_model_version(model_version), now=now
+    )
     return snapshot
+
+
+def capture_snapshot(
+    match: dict,
+    prediction: dict | None = None,
+    *,
+    model_version: str | None = None,
+    now: datetime | None = None,
+) -> tuple[dict | None, bool]:
+    """
+    与 `create_snapshot` 行为一致，但额外返回「本次是否新增并持久化」的精确标志。
+
+    返回 (snapshot, created)：
+        created=True  -> 本次调用确实新增并落盘了一条记录
+        created=False -> 本次未新增（既有快照 / live-finished 时序拒绝）
+
+    供抓取器的自动捕获统计使用：不能用 `is not None` 近似判断，因为既有快照
+    同样会返回 dict。检查与写入由 `_create_or_get` 在同一把锁内完成。
+    """
+    return _create_or_get(
+        match, prediction, model_version=resolve_model_version(model_version), now=now
+    )
 
 
 def ensure_snapshot(

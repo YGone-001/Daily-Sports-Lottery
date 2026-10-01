@@ -12,8 +12,15 @@ from __future__ import annotations
 from datetime import datetime
 
 from utils import fetcher_500
-from utils.daily_loader import get_beijing_now, load_json, save_json
+from utils.daily_loader import (
+    add_time_status,
+    enrich_match,
+    get_beijing_now,
+    load_json,
+    save_json,
+)
 from utils.odds_snapshots import record_odds_snapshot
+from utils.prediction_snapshots import capture_snapshot
 from utils.team_strength import update_from_result
 
 DAILY_FILE = "daily_matches.json"
@@ -162,6 +169,38 @@ def _capture_odds_history(matches: list[dict], now=None) -> int:
     return added
 
 
+def _capture_prediction_snapshots(matches: list[dict], now=None) -> int:
+    """
+    为合并后仍「未开赛」的比赛自动固化 canonical 赛前预测快照，
+    返回本次**实际新增**的快照条数。
+
+    必须在 `_calibrate_from_finished(...)` **之后**调用：这样本轮已完赛的比赛
+    结果会先写入 Elo，随后生成的预测快照使用的是「当前刷新时刻已知」的最新实力，
+    而不是过期的旧 Elo。这不是未来泄漏——这些结果在目标比赛开赛前就已发生。
+
+    只处理 upcoming：live / finished 一律跳过（复用既有时间状态判定，不自行实现）。
+
+    失败策略：单场失败仅记录告警（比赛 id + 异常）并继续，
+    绝不阻断 daily_matches.json 的落盘。
+    """
+    added = 0
+    for m in matches:
+        match_id = m.get("id")
+        if not match_id:
+            continue
+        if add_time_status(m, now).get("status") != "upcoming":
+            continue
+        try:
+            enriched = enrich_match(m, now)
+            _snapshot, created = capture_snapshot(enriched, now=now)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Auto-Sync] 预测快照写入失败 {match_id}: {exc}")
+            continue
+        if created:
+            added += 1
+    return added
+
+
 def refresh(verbose: bool = True) -> dict:
     """
     执行一次完整抓取刷新。
@@ -175,6 +214,7 @@ def refresh(verbose: bool = True) -> dict:
         "updated": 0,
         "calibrated": 0,
         "odds_snapshots_added": 0,
+        "prediction_snapshots_added": 0,
         "total": 0,
     }
 
@@ -241,10 +281,14 @@ def refresh(verbose: bool = True) -> dict:
     # 3b. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准）
     odds_snapshots_added = _capture_odds_history(merged, now=now)
 
-    # 4. 校准 Elo
+    # 4. 校准 Elo（用本轮新完赛结果更新实力）
     calibrated = _calibrate_from_finished(merged)
 
-    # 5. 落盘
+    # 5. 自动固化赛前预测快照
+    #    必须在 Elo 校准之后：快照应使用「当前刷新时刻已知」的最新实力。
+    prediction_snapshots_added = _capture_prediction_snapshots(merged, now=now)
+
+    # 6. 落盘
     save_json(
         DAILY_FILE,
         {
@@ -263,6 +307,7 @@ def refresh(verbose: bool = True) -> dict:
             "updated": updated,
             "calibrated": calibrated,
             "odds_snapshots_added": odds_snapshots_added,
+            "prediction_snapshots_added": prediction_snapshots_added,
             "total": len(merged),
             "finished_at": get_beijing_now().isoformat(),
         }
@@ -271,7 +316,8 @@ def refresh(verbose: bool = True) -> dict:
     if verbose:
         print(
             f"  ✅ 新增 {added} | 更新 {updated} | Elo校准 {calibrated} "
-            f"| 赔率历史 +{odds_snapshots_added} | 库内共 {len(merged)} 场"
+            f"| 赔率历史 +{odds_snapshots_added} | 预测快照 +{prediction_snapshots_added} "
+            f"| 库内共 {len(merged)} 场"
         )
     return result
 

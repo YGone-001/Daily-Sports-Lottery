@@ -9,6 +9,7 @@ import config
 from utils.daily_loader import enrich_match, get_match_datetime
 from utils.prediction_snapshots import (
     SNAPSHOT_SLOT,
+    capture_snapshot,
     create_snapshot,
     ensure_snapshot,
     get_snapshot,
@@ -129,6 +130,40 @@ def test_snapshot_immutable_after_elo_change(isolated_data_dir, make_match):
 
     stored = get_snapshot(original["snapshot_id"])
     assert stored["home_elo"] == original["home_elo"]
+
+
+def test_capture_snapshot_reports_exact_creation(isolated_data_dir, make_match):
+    """
+    capture_snapshot 精确区分「本次新增」与「已存在」：
+    首次 (dict, True)，重复 (dict, False)，库中始终 1 条。
+    同时不改变 create_snapshot / ensure_snapshot 的既有契约。
+    """
+    m = enrich_match(make_match())
+
+    first_snapshot, first_created = capture_snapshot(m)
+    second_snapshot, second_created = capture_snapshot(enrich_match(make_match()))
+
+    assert first_created is True
+    assert second_created is False
+    assert first_snapshot["snapshot_id"] == second_snapshot["snapshot_id"]
+    assert len(get_snapshots_for_match(m["id"])) == 1
+
+    # 既有公开契约不变：create_snapshot 仍返回既有记录（dict）
+    assert create_snapshot(enrich_match(make_match()))["snapshot_id"] == first_snapshot["snapshot_id"]
+    # ensure_snapshot 同样保持幂等返回既有记录
+    assert ensure_snapshot(enrich_match(make_match()))["snapshot_id"] == first_snapshot["snapshot_id"]
+
+
+def test_capture_snapshot_reports_rejection(isolated_data_dir, make_match):
+    """时序门禁拒绝时：(None, False)，不写入。"""
+    m = enrich_match(make_match())
+    live_now = get_match_datetime(m) + timedelta(minutes=10)
+
+    snapshot, created = capture_snapshot(m, now=live_now)
+
+    assert snapshot is None
+    assert created is False
+    assert get_snapshots_for_match(m["id"]) == []
 
 
 def test_live_match_rejected(isolated_data_dir, make_match):
