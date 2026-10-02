@@ -37,8 +37,8 @@
         <span class="fg-label">类别</span>
         <div class="chip-row">
             <a href="/?date={{ display_date }}&sport=all" class="chip {% if current_sport == 'all' %}chip-on{% endif %}">全部</a>
-            <a href="/?date={{ display_date }}&sport=football" class="chip {% if current_sport == 'football' %}chip-on{% endif %}">⚽ 足球</a>
-            <a href="/?date={{ display_date }}&sport=basketball" class="chip {% if current_sport == 'basketball' %}chip-on{% endif %}">🏀 篮球</a>
+            <a href="/?date={{ display_date }}&sport=football" class="chip {% if current_sport == 'football' %}chip-on{% endif %}"><svg class="icon"><use href="#i-football"/></svg>足球</a>
+            <a href="/?date={{ display_date }}&sport=basketball" class="chip {% if current_sport == 'basketball' %}chip-on{% endif %}"><svg class="icon"><use href="#i-basketball"/></svg>篮球</a>
         </div>
     </div>
     {% if dates %}
@@ -62,7 +62,7 @@
     <section class="league-block">
         <div class="lb-header">
             <div class="lb-left">
-                <span class="lb-sport">{{ '⚽' if g.sport == 'football' else '🏀' }}</span>
+                <span class="lb-sport"><svg class="icon"><use href="#i-{{ 'football' if g.sport == 'football' else 'basketball' }}"/></svg></span>
                 <h2 class="lb-name">{{ g.league }}</h2>
                 <span class="lb-count">{{ g.matches | length }} 场</span>
             </div>
@@ -85,7 +85,7 @@
                         {% else %}
                         <span class="tag tag-up">待赛</span>
                         {% endif %}
-                        {% if has_value %}<span class="tag tag-value">🔥 价值</span>{% endif %}
+                        {% if has_value %}<span class="tag tag-value"><svg class="icon"><use href="#i-flame"/></svg>价值</span>{% endif %}
                     </div>
 
                     <div class="mc-teams">

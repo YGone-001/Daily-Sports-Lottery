@@ -47,7 +47,7 @@
 <div class="prob-cards">
     <div class="prob-card {% if p.ev_analysis.home.is_value %}is-value{% endif %}">
         {% if p.ev_analysis.home.is_value %}
-        <div class="pc-badge">🔥 价值 +{{ p.ev_analysis.home.ev }}%</div>
+        <div class="pc-badge"><svg class="icon"><use href="#i-flame"/></svg>价值 +{{ p.ev_analysis.home.ev }}%</div>
         {% endif %}
         <div class="pc-val c-home">{{ p.probabilities.home_win }}%</div>
         <div class="pc-lbl">主胜 · {{ match.home }}</div>
@@ -59,7 +59,7 @@
     {% if not is_bb %}
     <div class="prob-card {% if p.ev_analysis.draw.is_value %}is-value{% endif %}">
         {% if p.ev_analysis.draw.is_value %}
-        <div class="pc-badge">🔥 价值 +{{ p.ev_analysis.draw.ev }}%</div>
+        <div class="pc-badge"><svg class="icon"><use href="#i-flame"/></svg>价值 +{{ p.ev_analysis.draw.ev }}%</div>
         {% endif %}
         <div class="pc-val c-draw">{{ p.probabilities.draw }}%</div>
         <div class="pc-lbl">平局</div>
@@ -71,7 +71,7 @@
 
     <div class="prob-card {% if p.ev_analysis.away.is_value %}is-value{% endif %}">
         {% if p.ev_analysis.away.is_value %}
-        <div class="pc-badge">🔥 价值 +{{ p.ev_analysis.away.ev }}%</div>
+        <div class="pc-badge"><svg class="icon"><use href="#i-flame"/></svg>价值 +{{ p.ev_analysis.away.ev }}%</div>
         {% endif %}
         <div class="pc-val c-away">{{ p.probabilities.away_win }}%</div>
         <div class="pc-lbl">客胜 · {{ match.away }}</div>
@@ -93,7 +93,7 @@
     {% if is_bb and p.basketball %}
     <!-- 篮球专属面板 -->
     <div class="data-card span-2">
-        <h3 class="dc-title">🏀 篮球盘口分析</h3>
+        <h3 class="dc-title"><svg class="icon"><use href="#i-basketball"/></svg>篮球盘口分析</h3>
         <div class="bb-grid" style="grid-template-columns: repeat(4, 1fr);">
             <div class="bb-cell">
                 <span class="bb-val">{{ p.basketball.expected_home_points }}</span>
@@ -126,7 +126,7 @@
     {% else %}
     <!-- 足球：最可能比分 -->
     <div class="data-card">
-        <h3 class="dc-title">🎯 最可能比分</h3>
+        <h3 class="dc-title"><svg class="icon"><use href="#i-target"/></svg>最可能比分</h3>
         <div class="score-pills">
             {% for s in p.top_scores %}
             <div class="score-pill {% if match.score and match.score.ft and s.score == (match.score.ft[0]|string ~ '-' ~ match.score.ft[1]|string) %}hit{% endif %}">
@@ -139,7 +139,7 @@
 
     <!-- 足球：进球数 -->
     <div class="data-card">
-        <h3 class="dc-title">⚽ 进球数分布</h3>
+        <h3 class="dc-title"><svg class="icon"><use href="#i-football"/></svg>进球数分布</h3>
         <div class="bb-grid">
             <div class="bb-cell">
                 <span class="bb-val">{{ p.goals_prediction.most_likely }}</span>
@@ -164,7 +164,7 @@
     <!-- 赔率对比 -->
     {% if p.market.odds and p.market.implied_probabilities and p.market.implied_probabilities.home_win != None %}
     <div class="data-card span-2">
-        <h3 class="dc-title">⚖️ 市场赔率 vs 模型概率</h3>
+        <h3 class="dc-title"><svg class="icon"><use href="#i-scale"/></svg>市场赔率 vs 模型概率</h3>
         <table class="data-table">
             <thead>
                 <tr>
@@ -211,7 +211,7 @@
     {% set has_value = p.ev_analysis and (p.ev_analysis.home.is_value or p.ev_analysis.draw.is_value or p.ev_analysis.away.is_value) %}
     {% if has_value %}
     <div class="data-card span-2">
-        <h3 class="dc-title">💰 凯利仓位计算器</h3>
+        <h3 class="dc-title"><svg class="icon"><use href="#i-coins"/></svg>凯利仓位计算器</h3>
         <div class="kelly-box">
             <div class="kelly-slider-row">
                 <span style="font-size:var(--fs-xs);font-weight:600;color:var(--text-secondary);white-space:nowrap;">模拟本金</span>
@@ -250,7 +250,7 @@
 
     <!-- 战力雷达 -->
     <div class="data-card span-2">
-        <h3 class="dc-title">🕸️ 六维战力对比</h3>
+        <h3 class="dc-title"><svg class="icon"><use href="#i-radar"/></svg>六维战力对比</h3>
         <div class="radar-wrap">
             <canvas id="radarChart"></canvas>
         </div>
@@ -258,7 +258,7 @@
 
     <!-- 实力情报 -->
     <div class="data-card span-2">
-        <h3 class="dc-title">📋 模型输入</h3>
+        <h3 class="dc-title"><svg class="icon"><use href="#i-list"/></svg>模型输入</h3>
         <div class="intel-list">
             <div class="intel-item">
                 <span class="intel-name">{{ match.home }}</span>
