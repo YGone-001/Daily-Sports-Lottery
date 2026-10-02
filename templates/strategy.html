@@ -14,9 +14,9 @@
         <span class="kelly-amount" id="bankrollVal">10,000</span>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <span class="chip chip-on" data-sport="football">⚽ 足球</span>
-        <span class="chip" data-sport="basketball">🏀 篮球</span>
-        <span class="chip" data-sport="all">全部</span>
+        <button type="button" class="chip chip-on" data-sport="football" aria-pressed="true">⚽ 足球</button>
+        <button type="button" class="chip" data-sport="basketball" aria-pressed="false">🏀 篮球</button>
+        <button type="button" class="chip" data-sport="all" aria-pressed="false">全部</button>
     </div>
 </div>
 
@@ -147,8 +147,12 @@ document.addEventListener('DOMContentLoaded', function () {
 
     sportChips.forEach(function (chip) {
         chip.addEventListener('click', function () {
-            sportChips.forEach(function (c) { c.classList.remove('chip-on'); });
+            sportChips.forEach(function (c) {
+                c.classList.remove('chip-on');
+                c.setAttribute('aria-pressed', 'false');
+            });
             chip.classList.add('chip-on');
+            chip.setAttribute('aria-pressed', 'true');
             currentSport = chip.dataset.sport;
             load(currentSport);
         });

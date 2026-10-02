@@ -327,6 +327,8 @@ a { color: inherit; text-decoration: none; }
     border-radius: 20px;
     font-size: .8rem;
     font-weight: 600;
+    font-family: inherit;
+    line-height: inherit;
     color: var(--text-secondary);
     background: var(--bg-overlay);
     border: 1px solid transparent;
