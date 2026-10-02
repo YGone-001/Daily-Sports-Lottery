@@ -79,6 +79,13 @@ body {
 
 a { color: inherit; text-decoration: none; }
 
+/* ------------------------------------------------------------ 焦点可见性 */
+/* 键盘导航时的可见焦点环。用 :focus-visible 而非 :focus，鼠标点击不触发。 */
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
 /* ---------------------------------------------------------------- 导航 */
 .top-nav {
     position: sticky;
@@ -1026,4 +1033,19 @@ a { color: inherit; text-decoration: none; }
     .filter-bar { flex-direction: column; align-items: stretch; }
     .filter-actions { margin-left: 0; }
     .btn-refresh { width: 100%; }
+}
+
+/* ======================================================================
+   动效偏好
+   ====================================================================== */
+/* 尊重系统的"减弱动态效果"设置：闪烁、脉冲、旋转与过渡全部停下。 */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+        scroll-behavior: auto !important;
+    }
 }
