@@ -18,11 +18,11 @@
 
     --accent: #2563eb;
     --accent-soft: #eff4ff;
-    --win: #e11d48;
-    --draw: #8b5cf6;
-    --loss: #059669;
-    --value: #b45309;
-    --live: #ef4444;
+    --side-home: #e11d48;
+    --side-draw: #8b5cf6;
+    --side-away: #059669;
+    --signal-value: #b45309;
+    --state-live: #ef4444;
 
     --radius-sm: 6px;
     --radius: 10px;
@@ -51,11 +51,11 @@
 
     --accent: #60a5fa;
     --accent-soft: #16233a;
-    --win: #f43f5e;
-    --draw: #a78bfa;
-    --loss: #10b981;
-    --value: #fbbf24;
-    --live: #f87171;
+    --side-home: #f43f5e;
+    --side-draw: #a78bfa;
+    --side-away: #10b981;
+    --signal-value: #fbbf24;
+    --state-live: #f87171;
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
     --shadow: 0 2px 8px rgba(0, 0, 0, .4);
@@ -124,7 +124,7 @@ a { color: inherit; text-decoration: none; }
     letter-spacing: .08em;
     padding: 2px 6px;
     border-radius: 4px;
-    background: var(--win);
+    background: var(--side-home);
     color: #fff;
     line-height: 1.4;
 }
@@ -162,7 +162,7 @@ a { color: inherit; text-decoration: none; }
 .sync-dot {
     width: 6px; height: 6px;
     border-radius: 50%;
-    background: var(--loss);
+    background: var(--side-away);
     animation: blink 2s infinite;
 }
 
@@ -283,9 +283,9 @@ a { color: inherit; text-decoration: none; }
     letter-spacing: -.02em;
 }
 
-.sp-val.c-live { color: var(--live); }
+.sp-val.c-live { color: var(--state-live); }
 .sp-val.c-up { color: var(--accent); }
-.sp-val.c-odds { color: var(--value); }
+.sp-val.c-odds { color: var(--signal-value); }
 
 .sp-lbl {
     display: block;
@@ -421,7 +421,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .match-card.has-value {
-    border-color: var(--value);
+    border-color: var(--signal-value);
     background: var(--bg-elev);
 }
 
@@ -430,10 +430,10 @@ a { color: inherit; text-decoration: none; }
     position: absolute;
     left: 0; top: 0; bottom: 0;
     width: 3px;
-    background: var(--value);
+    background: var(--signal-value);
 }
 
-.match-card.is-live { border-color: var(--live); }
+.match-card.is-live { border-color: var(--state-live); }
 .match-card.is-finished { opacity: .85; }
 
 .mc-top { display: flex; align-items: center; gap: 6px; font-size: .72rem; }
@@ -454,7 +454,7 @@ a { color: inherit; text-decoration: none; }
 .tag-done { background: var(--bg-overlay); color: var(--text-faint); }
 
 .tag-live {
-    background: var(--live);
+    background: var(--state-live);
     color: #fff;
     display: inline-flex;
     align-items: center;
@@ -469,7 +469,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .tag-value {
-    background: var(--value);
+    background: var(--signal-value);
     color: #fff;
     margin-left: 0;
 }
@@ -531,7 +531,7 @@ a { color: inherit; text-decoration: none; }
 
 .mc-prob.pv-on {
     background: var(--bg-elev);
-    border-color: var(--value);
+    border-color: var(--signal-value);
 }
 
 .pv-num {
@@ -558,7 +558,7 @@ a { color: inherit; text-decoration: none; }
     font-family: var(--mono);
     font-size: .62rem;
     font-weight: 700;
-    color: var(--value);
+    color: var(--signal-value);
     margin-top: 2px;
 }
 
@@ -571,9 +571,9 @@ a { color: inherit; text-decoration: none; }
 }
 
 .mc-bar-seg { height: 100%; transition: width .6s cubic-bezier(.4,0,.2,1); }
-.seg-home { background: var(--win); }
-.seg-draw { background: var(--draw); }
-.seg-away { background: var(--loss); }
+.seg-home { background: var(--side-home); }
+.seg-draw { background: var(--side-draw); }
+.seg-away { background: var(--side-away); }
 
 .mc-foot {
     display: flex;
@@ -586,7 +586,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .mc-suspense { display: flex; align-items: center; gap: 2px; }
-.s-on { color: var(--value); font-size: .72rem; }
+.s-on { color: var(--signal-value); font-size: .72rem; }
 .s-off { color: var(--text-faint); font-size: .72rem; }
 .s-txt { margin-left: 4px; color: var(--text-muted); font-weight: 600; }
 
@@ -700,7 +700,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .prob-card.is-value {
-    border-color: var(--value);
+    border-color: var(--signal-value);
 }
 
 .pc-badge {
@@ -712,7 +712,7 @@ a { color: inherit; text-decoration: none; }
     font-weight: 800;
     padding: 2px 9px;
     border-radius: 10px;
-    background: var(--value);
+    background: var(--signal-value);
     color: #fff;
     white-space: nowrap;
 }
@@ -727,11 +727,11 @@ a { color: inherit; text-decoration: none; }
 
 .pc-lbl { font-size: .78rem; color: var(--text-secondary); font-weight: 600; margin-top: 4px; }
 
-.pc-ev { font-family: var(--mono); font-size: .72rem; color: var(--value); font-weight: 700; margin-top: 3px; }
+.pc-ev { font-family: var(--mono); font-size: .72rem; color: var(--signal-value); font-weight: 700; margin-top: 3px; }
 
-.c-home { color: var(--win); }
-.c-draw { color: var(--draw); }
-.c-away { color: var(--loss); }
+.c-home { color: var(--side-home); }
+.c-draw { color: var(--side-draw); }
+.c-away { color: var(--side-away); }
 
 .data-grid {
     display: grid;
@@ -798,7 +798,7 @@ a { color: inherit; text-decoration: none; }
 
 .data-table tr.is-value-row td {
     background: var(--bg-overlay);
-    color: var(--value);
+    color: var(--signal-value);
     font-weight: 800;
 }
 
@@ -832,7 +832,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .kr-label { font-size: .8rem; font-weight: 600; }
-.kr-bet { font-family: var(--mono); font-size: .92rem; font-weight: 800; color: var(--win); }
+.kr-bet { font-family: var(--mono); font-size: .92rem; font-weight: 800; color: var(--side-home); }
 .kr-ret { font-family: var(--mono); font-size: .85rem; font-weight: 700; color: var(--accent); }
 
 .radar-wrap { height: 300px; position: relative; }
@@ -913,9 +913,9 @@ a { color: inherit; text-decoration: none; }
     border-left: 3px solid var(--border-strong);
 }
 
-.combo-card.double { border-left-color: var(--loss); }
-.combo-card.treble { border-left-color: var(--value); }
-.combo-card.four { border-left-color: var(--draw); }
+.combo-card.double { border-left-color: var(--side-away); }
+.combo-card.treble { border-left-color: var(--signal-value); }
+.combo-card.four { border-left-color: var(--side-draw); }
 
 .cc-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; gap: 12px; }
 .cc-title { font-size: 1rem; font-weight: 800; }
@@ -939,7 +939,7 @@ a { color: inherit; text-decoration: none; }
 .cc-leg:last-child { border-bottom: none; }
 .cc-leg-name { font-weight: 600; }
 .cc-leg-right { display: flex; align-items: center; gap: 10px; }
-.cc-leg-outcome { font-weight: 700; color: var(--win); }
+.cc-leg-outcome { font-weight: 700; color: var(--side-home); }
 .cc-leg-odds { font-family: var(--mono); color: var(--text-muted); font-size: .76rem; }
 
 .value-table { max-width: 720px; margin: 0 auto 24px; }
@@ -977,8 +977,8 @@ a { color: inherit; text-decoration: none; }
 .hr-match { font-weight: 600; }
 .hr-score { font-family: var(--mono); font-weight: 800; text-align: center; font-size: .95rem; }
 .hr-verdict { text-align: right; font-size: .74rem; font-weight: 700; }
-.hr-verdict.ok { color: var(--loss); }
-.hr-verdict.bad { color: var(--live); }
+.hr-verdict.ok { color: var(--side-away); }
+.hr-verdict.bad { color: var(--state-live); }
 .hr-verdict em {
     display: block;
     font-style: normal;

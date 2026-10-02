@@ -31,7 +31,7 @@
         <span class="cb-lbl">已复盘场次</span>
     </div>
     <div class="calib-pod">
-        <span class="cb-val" style="color:var(--loss);">
+        <span class="cb-val" style="color:var(--side-away);">
             {{ (ns.hit / ns.total * 100) | round(1) if ns.total else 0 }}%
         </span>
         <span class="cb-lbl">胜负命中率 ({{ ns.hit }}/{{ ns.total }})</span>

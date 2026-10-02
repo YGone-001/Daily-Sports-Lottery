@@ -29,7 +29,7 @@
     <!-- 单个价值选项 -->
     <div class="value-table">
         <div class="data-card">
-            <h3 class="dc-title">🔥 正 EV 价值选项 <span id="vbCount" style="color:var(--value);"></span></h3>
+            <h3 class="dc-title">🔥 正 EV 价值选项 <span id="vbCount" style="color:var(--signal-value);"></span></h3>
             <div id="valueBets"></div>
         </div>
     </div>
@@ -85,9 +85,9 @@ document.addEventListener('DOMContentLoaded', function () {
             '<div class="cc-head">' +
                 '<div class="cc-title">' + title + '<span class="cc-note">' + note + '</span></div>' +
                 '<div class="cc-metrics">' +
-                    '<div class="cc-metric">联合胜率 <strong style="color:var(--loss)">' + c.combined_prob + '%</strong></div>' +
+                    '<div class="cc-metric">联合胜率 <strong style="color:var(--side-away)">' + c.combined_prob + '%</strong></div>' +
                     '<div class="cc-metric">复合赔率 <strong>@' + c.combined_odds + '</strong></div>' +
-                    '<div class="cc-metric">期望值 <strong style="color:var(--value)">+' + c.ev + '%</strong></div>' +
+                    '<div class="cc-metric">期望值 <strong style="color:var(--signal-value)">+' + c.ev + '%</strong></div>' +
                 '</div>' +
             '</div>' +
             '<div class="cc-legs">' + renderLegs(c.legs) + '</div>' +
@@ -110,7 +110,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     '<span class="cc-leg-right">' +
                         '<span class="cc-leg-outcome">' + b.outcome + '</span>' +
                         '<span class="cc-leg-odds">@' + b.odds + '</span>' +
-                        '<span style="font-family:var(--mono);color:var(--value);font-weight:800;">+' + b.ev + '%</span>' +
+                        '<span style="font-family:var(--mono);color:var(--signal-value);font-weight:800;">+' + b.ev + '%</span>' +
                         '<span style="font-size:.72rem;color:var(--text-muted);">仓位 ' + b.kelly_pct + '%</span>' +
                     '</span></div>';
             }).join('');
@@ -139,7 +139,7 @@ document.addEventListener('DOMContentLoaded', function () {
             .then(function (d) { data = d; render(); })
             .catch(function () {
                 document.getElementById('loading').innerHTML =
-                    '<p style="color:var(--live);">加载失败，请稍后重试</p>';
+                    '<p style="color:var(--state-live);">加载失败，请稍后重试</p>';
             });
     }
 
