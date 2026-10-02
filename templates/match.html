@@ -96,30 +96,30 @@
         <h3 class="dc-title"><svg class="icon"><use href="#i-basketball"/></svg>篮球盘口分析</h3>
         <div class="bb-grid" style="grid-template-columns: repeat(4, 1fr);">
             <div class="bb-cell">
-                <span class="bb-val">{{ p.basketball.expected_home_points }}</span>
-                <span class="bb-lbl">{{ match.home }} 预期得分</span>
+                <span class="m-val m-val-sm">{{ p.basketball.expected_home_points }}</span>
+                <span class="m-lbl">{{ match.home }} 预期得分</span>
             </div>
             <div class="bb-cell">
-                <span class="bb-val">{{ p.basketball.expected_away_points }}</span>
-                <span class="bb-lbl">{{ match.away }} 预期得分</span>
+                <span class="m-val m-val-sm">{{ p.basketball.expected_away_points }}</span>
+                <span class="m-lbl">{{ match.away }} 预期得分</span>
             </div>
             <div class="bb-cell">
-                <span class="bb-val">{{ p.basketball.expected_total }}</span>
-                <span class="bb-lbl">预期总分</span>
+                <span class="m-val m-val-sm">{{ p.basketball.expected_total }}</span>
+                <span class="m-lbl">预期总分</span>
             </div>
             <div class="bb-cell">
-                <span class="bb-val">{{ p.basketball.spread }}</span>
-                <span class="bb-lbl">让分 (主队视角)</span>
+                <span class="m-val m-val-sm">{{ p.basketball.spread }}</span>
+                <span class="m-lbl">让分 (主队视角)</span>
             </div>
         </div>
         <div class="bb-grid" style="grid-template-columns: repeat(2, 1fr); margin-top: 10px;">
             <div class="bb-cell">
-                <span class="bb-val c-home">{{ p.basketball.over_prob }}%</span>
-                <span class="bb-lbl">大分 (>&nbsp;{{ p.basketball.over_line }})</span>
+                <span class="m-val m-val-sm c-home">{{ p.basketball.over_prob }}%</span>
+                <span class="m-lbl">大分 (>&nbsp;{{ p.basketball.over_line }})</span>
             </div>
             <div class="bb-cell">
-                <span class="bb-val c-away">{{ p.basketball.under_prob }}%</span>
-                <span class="bb-lbl">小分 (<&nbsp;{{ p.basketball.over_line }})</span>
+                <span class="m-val m-val-sm c-away">{{ p.basketball.under_prob }}%</span>
+                <span class="m-lbl">小分 (<&nbsp;{{ p.basketball.over_line }})</span>
             </div>
         </div>
     </div>
@@ -130,8 +130,8 @@
         <div class="score-pills">
             {% for s in p.top_scores %}
             <div class="score-pill {% if match.score and match.score.ft and s.score == (match.score.ft[0]|string ~ '-' ~ match.score.ft[1]|string) %}hit{% endif %}">
-                <span class="sp-val-s">{{ s.score }}</span>
-                <span class="sp-prob">{{ s.probability }}%</span>
+                <span class="m-val m-val-sm">{{ s.score }}</span>
+                <span class="m-lbl">{{ s.probability }}%</span>
             </div>
             {% endfor %}
         </div>
@@ -142,16 +142,16 @@
         <h3 class="dc-title"><svg class="icon"><use href="#i-football"/></svg>进球数分布</h3>
         <div class="bb-grid">
             <div class="bb-cell">
-                <span class="bb-val">{{ p.goals_prediction.most_likely }}</span>
-                <span class="bb-lbl">最可能总进球</span>
+                <span class="m-val m-val-sm">{{ p.goals_prediction.most_likely }}</span>
+                <span class="m-lbl">最可能总进球</span>
             </div>
             <div class="bb-cell">
-                <span class="bb-val c-home">{{ (p.goals_prediction.over_2_5 * 100) | round(1) }}%</span>
-                <span class="bb-lbl">大球 (>2.5)</span>
+                <span class="m-val m-val-sm c-home">{{ (p.goals_prediction.over_2_5 * 100) | round(1) }}%</span>
+                <span class="m-lbl">大球 (>2.5)</span>
             </div>
             <div class="bb-cell">
-                <span class="bb-val c-away">{{ (p.goals_prediction.under_2_5 * 100) | round(1) }}%</span>
-                <span class="bb-lbl">小球 (<2.5)</span>
+                <span class="m-val m-val-sm c-away">{{ (p.goals_prediction.under_2_5 * 100) | round(1) }}%</span>
+                <span class="m-lbl">小球 (<2.5)</span>
             </div>
         </div>
         <div style="display:flex;justify-content:space-between;font-size:var(--fs-xs);color:var(--text-muted);margin-top:10px;font-family:var(--mono);">

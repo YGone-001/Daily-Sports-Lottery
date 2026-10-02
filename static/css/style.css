@@ -323,26 +323,32 @@ a { color: inherit; text-decoration: none; }
     box-shadow: var(--shadow-sm);
 }
 
-.sp-val {
+/* ---------------------------------------------------------------- 指标块 */
+/* 数值 + 标签的统一排版。容器（.stat-pod / .calib-pod / .bb-cell /
+   .score-pill）各自负责底色与留白，内容排版统一走这两个类。 */
+.m-val {
     display: block;
     font-family: var(--mono);
-    font-size: var(--fs-xl);
+    font-size: var(--fs-2xl);
     font-weight: 800;
-    line-height: 1.1;
+    line-height: 1.15;
     letter-spacing: -.02em;
 }
 
-.sp-val.c-live { color: var(--state-live); }
-.sp-val.c-up { color: var(--accent); }
-.sp-val.c-odds { color: var(--signal-value); }
+.m-val-sm { font-size: var(--fs-lg); }
 
-.sp-lbl {
+.m-lbl {
     display: block;
-    margin-top: 2px;
+    margin-top: 3px;
     font-size: var(--fs-xs);
     color: var(--text-muted);
     font-weight: 600;
 }
+
+/* 数值语义色（独立于容器，便于任意指标块复用） */
+.c-live { color: var(--state-live); }
+.c-up { color: var(--accent); }
+.c-odds { color: var(--signal-value); }
 
 /* ---------------------------------------------------------- 筛选栏 */
 .filter-bar {
@@ -932,9 +938,6 @@ a { color: inherit; text-decoration: none; }
 
 .score-pill.hit { background: var(--accent-soft); border: 1px solid var(--accent); }
 
-.sp-val-s { display: block; font-family: var(--mono); font-size: var(--fs-md); font-weight: 800; }
-.sp-prob { display: block; font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; }
-
 .data-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); }
 
 .data-table th {
@@ -1013,9 +1016,6 @@ a { color: inherit; text-decoration: none; }
 .bb-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 
 .bb-cell { text-align: center; padding: 12px 8px; background: var(--bg-overlay); border-radius: var(--radius-sm); }
-
-.bb-val { font-family: var(--mono); font-size: var(--fs-lg); font-weight: 800; display: block; }
-.bb-lbl { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; display: block; }
 
 .back-nav { margin-top: 24px; }
 
@@ -1171,16 +1171,6 @@ a { color: inherit; text-decoration: none; }
     text-align: center;
     box-shadow: var(--shadow-sm);
 }
-
-.cb-val {
-    font-family: var(--mono);
-    font-size: var(--fs-2xl);
-    font-weight: 800;
-    letter-spacing: -.02em;
-    display: block;
-}
-
-.cb-lbl { font-size: var(--fs-xs); color: var(--text-muted); font-weight: 600; display: block; margin-top: 3px; }
 
 /* ======================================================================
    响应式
