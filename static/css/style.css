@@ -138,6 +138,7 @@ a { color: inherit; text-decoration: none; }
     font-weight: 600;
     color: var(--text-secondary);
     transition: all .15s;
+    white-space: nowrap;
 }
 
 .nav-link:hover { background: var(--bg-overlay); color: var(--text-primary); }
@@ -1012,8 +1013,20 @@ a { color: inherit; text-decoration: none; }
    响应式
    ====================================================================== */
 @media (max-width: 860px) {
-    .nav-inner { gap: 16px; padding: 0 16px; }
+    /* 导航折成两行：品牌与状态在首行，导航链接独占第二行。
+       原先固定 58px 高且不换行，窄屏下链接会被压到折字并横向溢出。 */
+    .nav-inner {
+        height: auto;
+        min-height: 58px;
+        flex-wrap: wrap;
+        gap: 6px 14px;
+        padding: 8px 16px;
+    }
+    .nav-brand { order: 1; }
+    .nav-right { order: 2; margin-left: auto; }
+    .nav-links { order: 3; flex: 0 0 100%; gap: 4px; }
     .brand-text { display: none; }
+    .sync-badge { display: none; }
     .main-content { padding: 20px 16px 48px; }
     .terminal-header { flex-direction: column; align-items: flex-start; }
     .stat-cluster { width: 100%; }
