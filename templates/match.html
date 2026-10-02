@@ -214,8 +214,11 @@
         <h3 class="dc-title"><svg class="icon"><use href="#i-coins"/></svg>凯利仓位计算器</h3>
         <div class="kelly-box">
             <div class="kelly-slider-row">
-                <span class="slider-label">模拟本金</span>
-                <input type="range" id="bankroll" min="1000" max="200000" step="1000" value="10000">
+                <label class="slider-label" for="bankroll">模拟本金</label>
+                <div class="kelly-slider-main">
+                    <input type="range" id="bankroll" min="1000" max="200000" step="1000" value="10000" aria-describedby="bankroll-scale">
+                    <div class="slider-scale" id="bankroll-scale"><span>¥1,000</span><span>¥200,000</span></div>
+                </div>
                 <span class="kelly-amount" id="bankrollVal">10,000</span>
             </div>
             <div id="kellyRows">

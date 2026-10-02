@@ -88,9 +88,9 @@
                 <span class="brand-badge">LIVE</span>
             </a>
             <div class="nav-links">
-                <a href="/" class="nav-link {% if active_page == 'index' %}active{% endif %}">今日赛事</a>
-                <a href="/strategy" class="nav-link {% if active_page == 'strategy' %}active{% endif %}">智能策略</a>
-                <a href="/history" class="nav-link {% if active_page == 'history' %}active{% endif %}">历史复盘</a>
+                <a href="/" class="nav-link {% if active_page == 'index' %}active{% endif %}"{% if active_page == 'index' %} aria-current="page"{% endif %}>今日赛事</a>
+                <a href="/strategy" class="nav-link {% if active_page == 'strategy' %}active{% endif %}"{% if active_page == 'strategy' %} aria-current="page"{% endif %}>智能策略</a>
+                <a href="/history" class="nav-link {% if active_page == 'history' %}active{% endif %}"{% if active_page == 'history' %} aria-current="page"{% endif %}>历史复盘</a>
             </div>
             <div class="nav-right">
                 {% if meta and meta.last_refresh %}
@@ -103,7 +103,7 @@
                     <span class="clock-icon">◷</span>
                     <span id="live-clock" class="mono">--:--:--</span>
                 </span>
-                <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">
+                <button class="theme-toggle" onclick="toggleTheme()" title="切换主题" aria-label="切换深浅色主题">
                     <span class="icon-sun">☀</span>
                     <span class="icon-moon">☾</span>
                 </button>

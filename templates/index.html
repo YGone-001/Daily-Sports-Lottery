@@ -12,19 +12,19 @@
     <div class="th-right">
         <div class="stat-cluster">
             <div class="stat-pod">
-                <span class="m-val">{{ stats.total }}</span>
+                <span class="m-val{% if not stats.total %} is-zero{% endif %}">{{ stats.total }}</span>
                 <span class="m-lbl">赛事</span>
             </div>
             <div class="stat-pod">
-                <span class="m-val c-live">{{ stats.live }}</span>
+                <span class="m-val{% if stats.live %} c-live{% else %} is-zero{% endif %}">{{ stats.live }}</span>
                 <span class="m-lbl">进行中</span>
             </div>
             <div class="stat-pod">
-                <span class="m-val c-up">{{ stats.upcoming }}</span>
+                <span class="m-val{% if stats.upcoming %} c-up{% else %} is-zero{% endif %}">{{ stats.upcoming }}</span>
                 <span class="m-lbl">待开赛</span>
             </div>
             <div class="stat-pod">
-                <span class="m-val c-odds">{{ stats.with_odds }}</span>
+                <span class="m-val{% if stats.with_odds %} c-odds{% else %} is-zero{% endif %}">{{ stats.with_odds }}</span>
                 <span class="m-lbl">有赔率</span>
             </div>
         </div>
@@ -52,7 +52,7 @@
     </div>
     {% endif %}
     <div class="filter-group filter-actions">
-        <button class="btn-refresh" onclick="triggerRefresh(this)">⟳ 同步数据</button>
+        <button class="btn-refresh" onclick="triggerRefresh(this)" aria-live="polite">⟳ 同步数据</button>
     </div>
 </div>
 

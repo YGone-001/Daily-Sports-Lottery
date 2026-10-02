@@ -351,6 +351,9 @@ a { color: inherit; text-decoration: none; }
 .c-odds { color: var(--signal-value); }
 .c-ok { color: var(--state-ok); }
 
+/* 统计值为 0 时不占用强调色，退到弱化灰，避免空数据抢注意力 */
+.is-zero { color: var(--text-faint); }
+
 /* ---------------------------------------------------------- 筛选栏 */
 .filter-bar {
     display: flex;
@@ -970,9 +973,32 @@ a { color: inherit; text-decoration: none; }
 
 .kelly-box { padding: 4px 0; }
 
-.kelly-slider-row { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+.kelly-slider-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 16px;
+}
 
-.kelly-slider-row input[type=range] { flex: 1; accent-color: var(--accent); cursor: pointer; }
+.kelly-slider-main { min-width: 0; }
+
+.kelly-slider-main input[type=range] {
+    display: block;
+    width: 100%;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+/* 量程刻度：与滑块的 min / max 对应，纯视觉提示 */
+.slider-scale {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+    font-family: var(--mono);
+    font-size: var(--fs-2xs);
+    color: var(--text-faint);
+}
 
 .kelly-amount {
     font-family: var(--mono);
@@ -1140,6 +1166,12 @@ a { color: inherit; text-decoration: none; }
     border-radius: var(--radius);
     margin-bottom: 8px;
     font-size: var(--fs-xs);
+}
+
+/* 悬停反馈与首页赛事行保持一致（键盘焦点由全局 :focus-visible 负责） */
+.history-row:hover {
+    border-color: var(--border-strong);
+    background: var(--bg-overlay);
 }
 
 .hr-date { font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-muted); }
