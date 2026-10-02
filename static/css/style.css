@@ -18,11 +18,19 @@
 
     --accent: #2563eb;
     --accent-soft: #eff4ff;
+
+    /* 侧别语义色 —— 全站唯一的颜色定义处 */
     --side-home: #e11d48;
     --side-draw: #8b5cf6;
     --side-away: #059669;
+
+    /* 信号色：正 EV 价值 */
     --signal-value: #b45309;
-    --state-live: #ef4444;
+
+    /* 状态色 —— 一律复用上面的色值，不引入新颜色 */
+    --state-live: var(--side-home);
+    --state-ok: var(--side-away);
+    --state-bad: var(--side-home);
 
     --radius-sm: 6px;
     --radius: 10px;
@@ -51,11 +59,19 @@
 
     --accent: #60a5fa;
     --accent-soft: #16233a;
+
+    /* 侧别语义色 —— 全站唯一的颜色定义处 */
     --side-home: #f43f5e;
     --side-draw: #a78bfa;
     --side-away: #10b981;
+
+    /* 信号色：正 EV 价值 */
     --signal-value: #fbbf24;
-    --state-live: #f87171;
+
+    /* 状态色 —— 一律复用上面的色值，不引入新颜色 */
+    --state-live: var(--side-home);
+    --state-ok: var(--side-away);
+    --state-bad: var(--side-home);
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
     --shadow: 0 2px 8px rgba(0, 0, 0, .4);
@@ -124,7 +140,7 @@ a { color: inherit; text-decoration: none; }
     letter-spacing: .08em;
     padding: 2px 6px;
     border-radius: 4px;
-    background: var(--side-home);
+    background: var(--state-live);
     color: #fff;
     line-height: 1.4;
 }
@@ -162,7 +178,7 @@ a { color: inherit; text-decoration: none; }
 .sync-dot {
     width: 6px; height: 6px;
     border-radius: 50%;
-    background: var(--side-away);
+    background: var(--state-ok);
     animation: blink 2s infinite;
 }
 
@@ -832,7 +848,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .kr-label { font-size: .8rem; font-weight: 600; }
-.kr-bet { font-family: var(--mono); font-size: .92rem; font-weight: 800; color: var(--side-home); }
+.kr-bet { font-family: var(--mono); font-size: .92rem; font-weight: 800; color: var(--accent); }
 .kr-ret { font-family: var(--mono); font-size: .85rem; font-weight: 700; color: var(--accent); }
 
 .radar-wrap { height: 300px; position: relative; }
@@ -977,8 +993,8 @@ a { color: inherit; text-decoration: none; }
 .hr-match { font-weight: 600; }
 .hr-score { font-family: var(--mono); font-weight: 800; text-align: center; font-size: .95rem; }
 .hr-verdict { text-align: right; font-size: .74rem; font-weight: 700; }
-.hr-verdict.ok { color: var(--side-away); }
-.hr-verdict.bad { color: var(--state-live); }
+.hr-verdict.ok { color: var(--state-ok); }
+.hr-verdict.bad { color: var(--state-bad); }
 .hr-verdict em {
     display: block;
     font-style: normal;
