@@ -6,9 +6,10 @@
     <title>每日体彩预测终端</title>
     <meta name="description" content="每日竞彩足球/篮球量化预测 - 基于Elo与泊松分布的价值投注分析">
     <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;800&family=Noto+Sans+SC:wght@400;500;700;900&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- 图表库只有赛事详情页用到，改在该页按需引入，不占首屏 -->
     <script>
     (function() {
         var stored = localStorage.getItem('theme');
