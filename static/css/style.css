@@ -163,6 +163,27 @@ a { color: inherit; text-decoration: none; }
     50% { opacity: .3; }
 }
 
+.clock-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: .72rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    padding: 4px 10px;
+    border-radius: 20px;
+    background: var(--accent-soft);
+    border: 1px solid var(--border);
+}
+
+.clock-icon {
+    font-size: .78rem;
+    color: var(--accent);
+    line-height: 1;
+}
+
 .theme-toggle {
     width: 34px; height: 34px;
     border: 1px solid var(--border);
@@ -220,6 +241,18 @@ a { color: inherit; text-decoration: none; }
 }
 
 .th-sub .sep { color: var(--text-faint); }
+
+/* 副标题条目：小标签 + 值，避免裸时间戳产生歧义 */
+.th-item { display: inline-flex; align-items: center; gap: 6px; }
+
+.th-label {
+    font-size: .68rem;
+    letter-spacing: .04em;
+    color: var(--text-faint);
+    background: var(--bg-overlay);
+    padding: 1px 6px;
+    border-radius: 4px;
+}
 
 .stat-cluster { display: flex; gap: 8px; }
 

@@ -3,7 +3,35 @@
  */
 document.addEventListener('DOMContentLoaded', function () {
     animateBars();
+    startClock();
 });
+
+/** 北京时间（UTC+8）实时时钟 */
+function beijingNow(base) {
+    var d = base || new Date();
+    var t = d.getTime();
+    // 先把本地时区偏移归零，再整体 +8 小时，得到「视作本地」的北京时间
+    return new Date(t + d.getTimezoneOffset() * 60000 + 8 * 3600000);
+}
+
+function pad2(n) {
+    return n < 10 ? '0' + n : String(n);
+}
+
+/** 每秒刷新页面上所有北京时间 */
+function tickClock() {
+    var bj = beijingNow();
+    var clock = document.getElementById('live-clock');
+    if (clock) {
+        clock.textContent =
+            pad2(bj.getHours()) + ':' + pad2(bj.getMinutes()) + ':' + pad2(bj.getSeconds());
+    }
+}
+
+function startClock() {
+    tickClock();
+    setInterval(tickClock, 1000);
+}
 
 /** 概率条入场动画 */
 function animateBars() {

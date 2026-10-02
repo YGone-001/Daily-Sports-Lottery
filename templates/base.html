@@ -37,11 +37,15 @@
             </div>
             <div class="nav-right">
                 {% if meta and meta.last_refresh %}
-                <span class="sync-badge" title="最近同步时间">
+                <span class="sync-badge" title="数据最近同步时间：{{ meta.last_refresh[11:19] }}">
                     <span class="sync-dot"></span>
-                    {{ meta.last_refresh[11:16] }}
+                    同步 {{ meta.last_refresh[11:16] }}
                 </span>
                 {% endif %}
+                <span class="clock-badge" title="当前北京时间（UTC+8）">
+                    <span class="clock-icon">◷</span>
+                    <span id="live-clock" class="mono">--:--:--</span>
+                </span>
                 <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">
                     <span class="icon-sun">☀</span>
                     <span class="icon-moon">☾</span>

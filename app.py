@@ -73,7 +73,6 @@ def index():
             ensure_snapshot(m, m.get("prediction"))
     stats = get_daily_stats(display_date, sport)
     dates = get_available_dates()
-    now = get_beijing_now()
 
     return render_template(
         "index.html",
@@ -83,7 +82,6 @@ def index():
         display_date=display_date,
         current_sport=sport or "all",
         meta=get_meta(),
-        beijing_now=now.strftime("%Y-%m-%d %H:%M"),
         active_page="index",
     )
 
