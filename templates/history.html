@@ -31,13 +31,13 @@
         <span class="m-lbl">已复盘场次</span>
     </div>
     <div class="calib-pod">
-        <span class="m-val" style="color:var(--side-away);">
+        <span class="m-val c-ok">
             {{ (ns.hit / ns.total * 100) | round(1) if ns.total else 0 }}%
         </span>
         <span class="m-lbl">胜负命中率 ({{ ns.hit }}/{{ ns.total }})</span>
     </div>
     <div class="calib-pod">
-        <span class="m-val" style="color:var(--accent);">
+        <span class="m-val c-up">
             {{ (ns.score_hit / ns.total * 100) | round(1) if ns.total else 0 }}%
         </span>
         <span class="m-lbl">比分命中率 ({{ ns.score_hit }}/{{ ns.total }})</span>
@@ -47,11 +47,11 @@
 <div>
     {% for m in matches %}
     {% if m.comparison and m.comparison.actual_score %}
-    <a href="/match/{{ m.id }}" class="history-row" style="display:grid;">
+    <a href="/match/{{ m.id }}" class="history-row">
         <div class="hr-date mono">{{ m.date }} {{ m.time }}</div>
         <div class="hr-match">
-            {{ m.home }} <span style="color:var(--text-faint);">vs</span> {{ m.away }}
-            <span style="font-size:var(--fs-xs);color:var(--text-faint);margin-left:6px;">{{ m.league }}</span>
+            {{ m.home }} <span class="hr-vs">vs</span> {{ m.away }}
+            <span class="hr-league">{{ m.league }}</span>
         </div>
         <div class="hr-score">{{ m.comparison.actual_score }}</div>
         <div class="hr-verdict {% if m.comparison.correct %}ok{% else %}bad{% endif %}">

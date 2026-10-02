@@ -345,10 +345,11 @@ a { color: inherit; text-decoration: none; }
     font-weight: 600;
 }
 
-/* 数值语义色（独立于容器，便于任意指标块复用） */
+/* 语义色（数值 / 文本通用，独立于容器） */
 .c-live { color: var(--state-live); }
 .c-up { color: var(--accent); }
 .c-odds { color: var(--signal-value); }
+.c-ok { color: var(--state-ok); }
 
 /* ---------------------------------------------------------- 筛选栏 */
 .filter-bar {
@@ -1233,6 +1234,45 @@ a { color: inherit; text-decoration: none; }
     .filter-actions { margin-left: 0; }
     .btn-refresh { width: 100%; }
 }
+
+/* ======================================================================
+   工具类
+   ====================================================================== */
+/* 以下类由模板里的内联样式回收而来，按用途命名，便于统一改主题 */
+
+.hr-vs { color: var(--text-faint); }
+
+.hr-league { font-size: var(--fs-xs); color: var(--text-faint); margin-left: 6px; }
+
+.mc-bar-lg { height: 6px; border-radius: 3px; margin-bottom: 20px; }
+
+.bb-grid-4 { grid-template-columns: repeat(4, 1fr); }
+.bb-grid-2 { grid-template-columns: repeat(2, 1fr); margin-top: 10px; }
+
+.note-faint { font-size: var(--fs-xs); color: var(--text-faint); margin-top: 10px; }
+
+.goals-foot {
+    display: flex;
+    justify-content: space-between;
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    margin-top: 10px;
+    font-family: var(--mono);
+}
+
+.slider-label {
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.chip-row-tight { gap: 8px; }
+
+.leg-ev { font-family: var(--mono); color: var(--signal-value); font-weight: 800; }
+.leg-kelly { font-size: var(--fs-xs); color: var(--text-muted); }
+
+.load-error { color: var(--state-live); padding: 20px; text-align: center; }
 
 /* ======================================================================
    动效偏好
