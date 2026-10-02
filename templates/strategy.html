@@ -76,14 +76,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function renderCombo(key, cls, title, note) {
         var c = data[key];
-        if (!c) {
-            return '<div class="combo-card ' + cls + '">' +
-                '<div class="cc-head"><div class="cc-title">' + title + '</div></div>' +
-                '<p style="font-size:var(--fs-xs);color:var(--text-muted);">当前盘口未找到符合条件的组合</p></div>';
-        }
+        if (!c) { return ''; }
         return '<div class="combo-card ' + cls + '">' +
             '<div class="cc-head">' +
-                '<div class="cc-title">' + title + '<span class="cc-note">' + note + '</span></div>' +
+                '<div class="cc-title"><span class="cc-dot ' + cls + '"></span>' + title +
+                    '<span class="cc-note">' + note + '</span></div>' +
                 '<div class="cc-metrics">' +
                     '<div class="cc-metric">联合胜率 <strong style="color:var(--side-away)">' + c.combined_prob + '%</strong></div>' +
                     '<div class="cc-metric">复合赔率 <strong>@' + c.combined_odds + '</strong></div>' +
@@ -117,14 +114,25 @@ document.addEventListener('DOMContentLoaded', function () {
             document.getElementById('valueBets').innerHTML = rows;
         } else {
             document.getElementById('valueBets').innerHTML =
-                '<p style="font-size:var(--fs-xs);color:var(--text-muted);">当前盘口未发现正 EV 机会。这通常意味着市场定价有效。</p>';
+                '<div class="empty-inline">' +
+                    '<p class="ei-title">当前盘口未发现正 EV 机会</p>' +
+                    '<p class="ei-sub">这通常意味着市场定价有效，模型概率与赔率隐含概率基本一致。</p>' +
+                '</div>';
         }
 
-        // 串关
-        document.getElementById('comboList').innerHTML =
-            renderCombo('best_double', 'double', '二串一', '最稳组合') +
+        // 串关：三项全空时合并为一张说明卡，不再重复渲染三段相同文案
+        var comboHtml = renderCombo('best_double', 'double', '二串一', '最稳组合') +
             renderCombo('best_treble', 'treble', '三串一', '平衡组合') +
             renderCombo('best_four', 'four', '四串一', '高赔组合');
+        if (!comboHtml) {
+            comboHtml = '<div class="combo-card">' +
+                '<div class="empty-inline">' +
+                    '<p class="ei-title">今日没有符合条件的串关组合</p>' +
+                    '<p class="ei-sub">串关至少需要 2 场正 EV 选项，当前全天只找到 ' + bets.length +
+                        ' 项，不足以组成串关。<br>可以关注上方的单项价值选项，或等待盘口更新。</p>' +
+                '</div></div>';
+        }
+        document.getElementById('comboList').innerHTML = comboHtml;
 
         document.getElementById('loading').style.display = 'none';
         document.getElementById('content').style.display = 'block';
