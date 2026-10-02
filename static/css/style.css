@@ -43,6 +43,17 @@
     --shadow: 0 2px 8px rgba(16, 24, 40, .07);
     --shadow-lg: 0 8px 24px rgba(16, 24, 40, .1);
 
+    /* 字阶 —— 全站唯一字号来源。角标最低 11px，正文一律 >=13px。 */
+    --fs-2xs: 11px;   /* 角标：仅用于非关键信息 */
+    --fs-xs: 13px;    /* 次要信息、标签、表格 */
+    --fs-sm: 15px;    /* 正文、队名 */
+    --fs-base: 16px;  /* 强调正文、导航 */
+    --fs-md: 18px;    /* 重点数字 */
+    --fs-lg: 20px;    /* 小标题 */
+    --fs-xl: 22px;    /* 汇总数字 */
+    --fs-2xl: 26px;   /* 页面标题 */
+    --fs-3xl: 32px;   /* 大数字、详情比分 */
+
     --mono: 'JetBrains Mono', ui-monospace, monospace;
     --sans: 'Inter', 'Noto Sans SC', -apple-system, sans-serif;
 }
@@ -132,16 +143,16 @@ a { color: inherit; text-decoration: none; }
     align-items: center;
     gap: 9px;
     font-weight: 800;
-    font-size: 1rem;
+    font-size: var(--fs-base);
     letter-spacing: -.01em;
     white-space: nowrap;
 }
 
-.brand-mark { color: var(--accent); font-size: 1.15rem; line-height: 1; }
+.brand-mark { color: var(--accent); font-size: var(--fs-md); line-height: 1; }
 
 .brand-badge {
     font-family: var(--mono);
-    font-size: .58rem;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     letter-spacing: .08em;
     padding: 2px 6px;
@@ -156,7 +167,7 @@ a { color: inherit; text-decoration: none; }
 .nav-link {
     padding: 7px 14px;
     border-radius: var(--radius-sm);
-    font-size: .875rem;
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--text-secondary);
     transition: all .15s;
@@ -173,7 +184,7 @@ a { color: inherit; text-decoration: none; }
     align-items: center;
     gap: 6px;
     font-family: var(--mono);
-    font-size: .72rem;
+    font-size: var(--fs-xs);
     font-weight: 600;
     color: var(--text-muted);
     padding: 4px 10px;
@@ -198,7 +209,7 @@ a { color: inherit; text-decoration: none; }
     align-items: center;
     gap: 6px;
     font-family: var(--mono);
-    font-size: .72rem;
+    font-size: var(--fs-xs);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
@@ -209,7 +220,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .clock-icon {
-    font-size: .78rem;
+    font-size: var(--fs-xs);
     color: var(--accent);
     line-height: 1;
 }
@@ -220,7 +231,7 @@ a { color: inherit; text-decoration: none; }
     border-radius: var(--radius-sm);
     background: var(--bg-elev);
     cursor: pointer;
-    font-size: .9rem;
+    font-size: var(--fs-sm);
     display: grid;
     place-items: center;
     color: var(--text-secondary);
@@ -255,7 +266,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .th-title {
-    font-size: 1.65rem;
+    font-size: var(--fs-2xl);
     font-weight: 900;
     letter-spacing: -.025em;
     line-height: 1.2;
@@ -263,7 +274,7 @@ a { color: inherit; text-decoration: none; }
 
 .th-sub {
     margin-top: 6px;
-    font-size: .8rem;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     display: flex;
     align-items: center;
@@ -276,7 +287,7 @@ a { color: inherit; text-decoration: none; }
 .th-item { display: inline-flex; align-items: center; gap: 6px; }
 
 .th-label {
-    font-size: .68rem;
+    font-size: var(--fs-xs);
     letter-spacing: .04em;
     color: var(--text-faint);
     background: var(--bg-overlay);
@@ -299,7 +310,7 @@ a { color: inherit; text-decoration: none; }
 .sp-val {
     display: block;
     font-family: var(--mono);
-    font-size: 1.4rem;
+    font-size: var(--fs-xl);
     font-weight: 800;
     line-height: 1.1;
     letter-spacing: -.02em;
@@ -312,7 +323,7 @@ a { color: inherit; text-decoration: none; }
 .sp-lbl {
     display: block;
     margin-top: 2px;
-    font-size: .68rem;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     font-weight: 600;
 }
@@ -334,7 +345,7 @@ a { color: inherit; text-decoration: none; }
 .filter-group { display: flex; align-items: center; gap: 10px; }
 
 .fg-label {
-    font-size: .7rem;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--text-faint);
     text-transform: uppercase;
@@ -347,7 +358,7 @@ a { color: inherit; text-decoration: none; }
 .chip {
     padding: 5px 12px;
     border-radius: 20px;
-    font-size: .8rem;
+    font-size: var(--fs-xs);
     font-weight: 600;
     font-family: inherit;
     line-height: inherit;
@@ -374,7 +385,7 @@ a { color: inherit; text-decoration: none; }
     border: 1px solid var(--border-strong);
     background: var(--bg-elev);
     color: var(--text-primary);
-    font-size: .8rem;
+    font-size: var(--fs-xs);
     font-weight: 700;
     font-family: var(--sans);
     cursor: pointer;
@@ -398,13 +409,13 @@ a { color: inherit; text-decoration: none; }
 
 .lb-left { display: flex; align-items: baseline; gap: 9px; }
 
-.lb-sport { font-size: .95rem; }
+.lb-sport { font-size: var(--fs-sm); }
 
-.lb-name { font-size: 1.05rem; font-weight: 800; letter-spacing: -.01em; }
+.lb-name { font-size: var(--fs-md); font-weight: 800; letter-spacing: -.01em; }
 
 .lb-count {
     font-family: var(--mono);
-    font-size: .72rem;
+    font-size: var(--fs-xs);
     font-weight: 600;
     color: var(--text-muted);
     background: var(--bg-overlay);
@@ -458,7 +469,7 @@ a { color: inherit; text-decoration: none; }
 .match-card.is-live { border-color: var(--state-live); }
 .match-card.is-finished { opacity: .85; }
 
-.mc-top { display: flex; align-items: center; gap: 6px; font-size: .72rem; }
+.mc-top { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); }
 
 .mc-time { font-weight: 700; color: var(--text-primary); }
 .mc-round { color: var(--text-faint); }
@@ -466,7 +477,7 @@ a { color: inherit; text-decoration: none; }
 .tag {
     padding: 2px 7px;
     border-radius: 4px;
-    font-size: .65rem;
+    font-size: var(--fs-xs);
     font-weight: 700;
     letter-spacing: .02em;
     margin-left: auto;
@@ -507,7 +518,7 @@ a { color: inherit; text-decoration: none; }
 .mc-team-away { justify-content: flex-end; }
 
 .mc-tname {
-    font-size: .92rem;
+    font-size: var(--fs-sm);
     font-weight: 700;
     white-space: nowrap;
     overflow: hidden;
@@ -516,7 +527,7 @@ a { color: inherit; text-decoration: none; }
 
 .mc-rank {
     font-family: var(--mono);
-    font-size: .62rem;
+    font-size: var(--fs-2xs);
     color: var(--text-faint);
     flex-shrink: 0;
 }
@@ -524,17 +535,17 @@ a { color: inherit; text-decoration: none; }
 .mc-center { text-align: center; padding: 0 4px; }
 
 .mc-score {
-    font-size: 1.25rem;
+    font-size: var(--fs-lg);
     font-weight: 800;
     color: var(--text-primary);
     letter-spacing: -.02em;
 }
 
-.mc-ht { display: block; font-size: .6rem; color: var(--text-faint); margin-top: 1px; }
+.mc-ht { display: block; font-size: var(--fs-2xs); color: var(--text-faint); margin-top: 1px; }
 
 .mc-vs {
     font-family: var(--mono);
-    font-size: .78rem;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--text-faint);
 }
@@ -559,17 +570,17 @@ a { color: inherit; text-decoration: none; }
 .pv-num {
     display: block;
     font-family: var(--mono);
-    font-size: 1.05rem;
+    font-size: var(--fs-md);
     font-weight: 800;
     line-height: 1.15;
     letter-spacing: -.02em;
 }
 
-.pv-num em { font-size: .62rem; font-style: normal; font-weight: 600; color: var(--text-muted); }
+.pv-num em { font-size: var(--fs-2xs); font-style: normal; font-weight: 600; color: var(--text-muted); }
 
 .pv-lbl {
     display: block;
-    font-size: .65rem;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     font-weight: 600;
     margin-top: 1px;
@@ -578,7 +589,7 @@ a { color: inherit; text-decoration: none; }
 .pv-ev {
     display: block;
     font-family: var(--mono);
-    font-size: .62rem;
+    font-size: var(--fs-2xs);
     font-weight: 700;
     color: var(--signal-value);
     margin-top: 2px;
@@ -602,21 +613,21 @@ a { color: inherit; text-decoration: none; }
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    font-size: .7rem;
+    font-size: var(--fs-xs);
     margin-top: auto;
     padding-top: 2px;
 }
 
 .mc-suspense { display: flex; align-items: center; gap: 2px; }
-.s-on { color: var(--signal-value); font-size: .72rem; }
-.s-off { color: var(--text-faint); font-size: .72rem; }
+.s-on { color: var(--signal-value); font-size: var(--fs-xs); }
+.s-off { color: var(--text-faint); font-size: var(--fs-xs); }
 .s-txt { margin-left: 4px; color: var(--text-muted); font-weight: 600; }
 
-.mc-odds { font-size: .72rem; color: var(--text-secondary); font-weight: 600; }
+.mc-odds { font-size: var(--fs-xs); color: var(--text-secondary); font-weight: 600; }
 
 .mc-result-line {
     text-align: center;
-    font-size: .75rem;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--text-secondary);
     padding: 5px;
@@ -624,14 +635,14 @@ a { color: inherit; text-decoration: none; }
     border-radius: var(--radius-sm);
 }
 
-.mc-noodds { text-align: center; font-size: .7rem; color: var(--text-faint); padding: 4px; }
+.mc-noodds { text-align: center; font-size: var(--fs-xs); color: var(--text-faint); padding: 4px; }
 
 /* ---------------------------------------------------------- 空状态 */
 .empty-state { text-align: center; padding: 80px 24px; color: var(--text-muted); }
 
-.es-icon { font-size: 2.5rem; color: var(--text-faint); margin-bottom: 12px; }
-.es-title { font-size: 1rem; font-weight: 700; color: var(--text-secondary); }
-.es-sub { font-size: .82rem; margin-top: 4px; }
+.es-icon { font-size: var(--fs-3xl); color: var(--text-faint); margin-bottom: 12px; }
+.es-title { font-size: var(--fs-base); font-weight: 700; color: var(--text-secondary); }
+.es-sub { font-size: var(--fs-xs); margin-top: 4px; }
 
 /* ---------------------------------------------------------- 页脚 */
 .site-footer {
@@ -641,8 +652,8 @@ a { color: inherit; text-decoration: none; }
     background: var(--bg-elev);
 }
 
-.footer-main { font-size: .78rem; font-weight: 600; color: var(--text-secondary); }
-.footer-sub { font-size: .7rem; color: var(--text-faint); margin-top: 4px; }
+.footer-main { font-size: var(--fs-xs); font-weight: 600; color: var(--text-secondary); }
+.footer-sub { font-size: var(--fs-xs); color: var(--text-faint); margin-top: 4px; }
 
 /* ======================================================================
    单场详情页
@@ -661,7 +672,7 @@ a { color: inherit; text-decoration: none; }
     align-items: center;
     justify-content: center;
     gap: 10px;
-    font-size: .78rem;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     margin-bottom: 18px;
     font-weight: 600;
@@ -683,23 +694,23 @@ a { color: inherit; text-decoration: none; }
 
 .dh-team { text-align: center; }
 
-.dh-tname { font-size: 1.4rem; font-weight: 900; letter-spacing: -.02em; }
+.dh-tname { font-size: var(--fs-xl); font-weight: 900; letter-spacing: -.02em; }
 
-.dh-tmeta { font-size: .72rem; color: var(--text-muted); margin-top: 4px; font-family: var(--mono); }
+.dh-tmeta { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 4px; font-family: var(--mono); }
 
 .dh-center { text-align: center; }
 
 .dh-score {
     font-family: var(--mono);
-    font-size: 2.4rem;
+    font-size: var(--fs-3xl);
     font-weight: 800;
     letter-spacing: -.03em;
     line-height: 1;
 }
 
-.dh-vs { font-family: var(--mono); font-size: 1.1rem; font-weight: 700; color: var(--text-faint); }
+.dh-vs { font-family: var(--mono); font-size: var(--fs-md); font-weight: 700; color: var(--text-faint); }
 
-.dh-status { font-size: .72rem; color: var(--text-muted); margin-top: 6px; font-weight: 600; }
+.dh-status { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 6px; font-weight: 600; }
 
 /* 用 flex 均分而非固定 3 列：篮球没有平局选项，只渲染 2 张卡时
    固定 3 列会在右侧留出 1/3 空白。flex 让卡片数量自适应。 */
@@ -730,7 +741,7 @@ a { color: inherit; text-decoration: none; }
     top: -9px;
     left: 50%;
     transform: translateX(-50%);
-    font-size: .62rem;
+    font-size: var(--fs-2xs);
     font-weight: 800;
     padding: 2px 9px;
     border-radius: 10px;
@@ -741,15 +752,15 @@ a { color: inherit; text-decoration: none; }
 
 .pc-val {
     font-family: var(--mono);
-    font-size: 2rem;
+    font-size: var(--fs-3xl);
     font-weight: 800;
     line-height: 1.1;
     letter-spacing: -.03em;
 }
 
-.pc-lbl { font-size: .78rem; color: var(--text-secondary); font-weight: 600; margin-top: 4px; }
+.pc-lbl { font-size: var(--fs-xs); color: var(--text-secondary); font-weight: 600; margin-top: 4px; }
 
-.pc-ev { font-family: var(--mono); font-size: .72rem; color: var(--signal-value); font-weight: 700; margin-top: 3px; }
+.pc-ev { font-family: var(--mono); font-size: var(--fs-xs); color: var(--signal-value); font-weight: 700; margin-top: 3px; }
 
 .c-home { color: var(--side-home); }
 .c-draw { color: var(--side-draw); }
@@ -772,7 +783,7 @@ a { color: inherit; text-decoration: none; }
 .data-card.span-2 { grid-column: span 2; }
 
 .dc-title {
-    font-size: .82rem;
+    font-size: var(--fs-xs);
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: .05em;
@@ -795,15 +806,15 @@ a { color: inherit; text-decoration: none; }
 
 .score-pill.hit { background: var(--accent-soft); border: 1px solid var(--accent); }
 
-.sp-val-s { display: block; font-family: var(--mono); font-size: 1.15rem; font-weight: 800; }
-.sp-prob { display: block; font-size: .68rem; color: var(--text-muted); margin-top: 2px; }
+.sp-val-s { display: block; font-family: var(--mono); font-size: var(--fs-md); font-weight: 800; }
+.sp-prob { display: block; font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; }
 
-.data-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+.data-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); }
 
 .data-table th {
     text-align: left;
     padding: 8px 10px;
-    font-size: .68rem;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--text-faint);
     text-transform: uppercase;
@@ -835,7 +846,7 @@ a { color: inherit; text-decoration: none; }
 
 .kelly-amount {
     font-family: var(--mono);
-    font-size: 1.1rem;
+    font-size: var(--fs-md);
     font-weight: 800;
     color: var(--accent);
     min-width: 70px;
@@ -853,9 +864,9 @@ a { color: inherit; text-decoration: none; }
     margin-bottom: 8px;
 }
 
-.kr-label { font-size: .8rem; font-weight: 600; }
-.kr-bet { font-family: var(--mono); font-size: .92rem; font-weight: 800; color: var(--accent); }
-.kr-ret { font-family: var(--mono); font-size: .85rem; font-weight: 700; color: var(--accent); }
+.kr-label { font-size: var(--fs-xs); font-weight: 600; }
+.kr-bet { font-family: var(--mono); font-size: var(--fs-sm); font-weight: 800; color: var(--accent); }
+.kr-ret { font-family: var(--mono); font-size: var(--fs-sm); font-weight: 700; color: var(--accent); }
 
 .radar-wrap { height: 300px; position: relative; }
 
@@ -864,7 +875,7 @@ a { color: inherit; text-decoration: none; }
 .intel-item {
     display: flex;
     gap: 8px;
-    font-size: .82rem;
+    font-size: var(--fs-xs);
     padding: 8px 10px;
     background: var(--bg-overlay);
     border-radius: var(--radius-sm);
@@ -877,8 +888,8 @@ a { color: inherit; text-decoration: none; }
 
 .bb-cell { text-align: center; padding: 12px 8px; background: var(--bg-overlay); border-radius: var(--radius-sm); }
 
-.bb-val { font-family: var(--mono); font-size: 1.2rem; font-weight: 800; display: block; }
-.bb-lbl { font-size: .68rem; color: var(--text-muted); margin-top: 2px; display: block; }
+.bb-val { font-family: var(--mono); font-size: var(--fs-lg); font-weight: 800; display: block; }
+.bb-lbl { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; display: block; }
 
 .back-nav { margin-top: 24px; }
 
@@ -886,7 +897,7 @@ a { color: inherit; text-decoration: none; }
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: .82rem;
+    font-size: var(--fs-xs);
     font-weight: 700;
     color: var(--text-secondary);
     padding: 8px 16px;
@@ -902,8 +913,8 @@ a { color: inherit; text-decoration: none; }
    策略舱
    ====================================================================== */
 .strategy-head { text-align: center; margin-bottom: 24px; }
-.sh-title { font-size: 1.5rem; font-weight: 900; letter-spacing: -.02em; }
-.sh-sub { font-size: .84rem; color: var(--text-muted); margin-top: 6px; }
+.sh-title { font-size: var(--fs-xl); font-weight: 900; letter-spacing: -.02em; }
+.sh-sub { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 6px; }
 
 .bankroll-card {
     max-width: 720px;
@@ -916,7 +927,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .bc-title {
-    font-size: .8rem;
+    font-size: var(--fs-xs);
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: .05em;
@@ -940,9 +951,9 @@ a { color: inherit; text-decoration: none; }
 .combo-card.four { border-left-color: var(--side-draw); }
 
 .cc-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; gap: 12px; }
-.cc-title { font-size: 1rem; font-weight: 800; }
-.cc-note { font-size: .7rem; color: var(--text-muted); font-weight: 500; margin-left: 6px; }
-.cc-metrics { text-align: right; font-size: .78rem; }
+.cc-title { font-size: var(--fs-base); font-weight: 800; }
+.cc-note { font-size: var(--fs-xs); color: var(--text-muted); font-weight: 500; margin-left: 6px; }
+.cc-metrics { text-align: right; font-size: var(--fs-xs); }
 .cc-metric { color: var(--text-secondary); }
 .cc-metric strong { font-family: var(--mono); font-weight: 800; }
 
@@ -954,7 +965,7 @@ a { color: inherit; text-decoration: none; }
     align-items: center;
     gap: 10px;
     padding: 6px 0;
-    font-size: .8rem;
+    font-size: var(--fs-xs);
     border-bottom: 1px dashed var(--border);
 }
 
@@ -962,7 +973,7 @@ a { color: inherit; text-decoration: none; }
 .cc-leg-name { font-weight: 600; }
 .cc-leg-right { display: flex; align-items: center; gap: 10px; }
 .cc-leg-outcome { font-weight: 700; color: var(--side-home); }
-.cc-leg-odds { font-family: var(--mono); color: var(--text-muted); font-size: .76rem; }
+.cc-leg-odds { font-family: var(--mono); color: var(--text-muted); font-size: var(--fs-xs); }
 
 .value-table { max-width: 720px; margin: 0 auto 24px; }
 
@@ -984,7 +995,7 @@ a { color: inherit; text-decoration: none; }
    ====================================================================== */
 .history-row {
     display: grid;
-    grid-template-columns: 110px 1fr 90px 130px;
+    grid-template-columns: 140px 1fr 90px 150px;
     gap: 12px;
     align-items: center;
     padding: 12px 16px;
@@ -992,19 +1003,19 @@ a { color: inherit; text-decoration: none; }
     border: 1px solid var(--border);
     border-radius: var(--radius);
     margin-bottom: 8px;
-    font-size: .82rem;
+    font-size: var(--fs-xs);
 }
 
-.hr-date { font-family: var(--mono); font-size: .72rem; color: var(--text-muted); }
+.hr-date { font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-muted); }
 .hr-match { font-weight: 600; }
-.hr-score { font-family: var(--mono); font-weight: 800; text-align: center; font-size: .95rem; }
-.hr-verdict { text-align: right; font-size: .74rem; font-weight: 700; }
+.hr-score { font-family: var(--mono); font-weight: 800; text-align: center; font-size: var(--fs-sm); }
+.hr-verdict { text-align: right; font-size: var(--fs-xs); font-weight: 700; }
 .hr-verdict.ok { color: var(--state-ok); }
 .hr-verdict.bad { color: var(--state-bad); }
 .hr-verdict em {
     display: block;
     font-style: normal;
-    font-size: .66rem;
+    font-size: var(--fs-xs);
     color: var(--text-muted);
     font-weight: 500;
     margin-top: 1px;
@@ -1028,13 +1039,13 @@ a { color: inherit; text-decoration: none; }
 
 .cb-val {
     font-family: var(--mono);
-    font-size: 1.6rem;
+    font-size: var(--fs-2xl);
     font-weight: 800;
     letter-spacing: -.02em;
     display: block;
 }
 
-.cb-lbl { font-size: .7rem; color: var(--text-muted); font-weight: 600; display: block; margin-top: 3px; }
+.cb-lbl { font-size: var(--fs-xs); color: var(--text-muted); font-weight: 600; display: block; margin-top: 3px; }
 
 /* ======================================================================
    响应式
@@ -1060,16 +1071,16 @@ a { color: inherit; text-decoration: none; }
     .stat-pod { flex: 1; min-width: 0; }
     .match-grid { grid-template-columns: 1fr; }
     .data-card.span-2 { grid-column: span 1; }
-    .pc-val { font-size: 1.5rem; }
-    .dh-tname { font-size: 1.05rem; }
-    .dh-score { font-size: 1.8rem; }
+    .pc-val { font-size: var(--fs-xl); }
+    .dh-tname { font-size: var(--fs-md); }
+    .dh-score { font-size: var(--fs-2xl); }
     .history-row { grid-template-columns: 1fr auto; gap: 8px; }
     .hr-date { grid-column: 1 / -1; }
 }
 
 @media (max-width: 520px) {
     .nav-links { gap: 0; }
-    .nav-link { padding: 6px 9px; font-size: .78rem; }
+    .nav-link { padding: 6px 9px; font-size: var(--fs-xs); }
     .filter-bar { flex-direction: column; align-items: stretch; }
     .filter-actions { margin-left: 0; }
     .btn-refresh { width: 100%; }

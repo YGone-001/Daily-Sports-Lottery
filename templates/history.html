@@ -51,7 +51,7 @@
         <div class="hr-date mono">{{ m.date }} {{ m.time }}</div>
         <div class="hr-match">
             {{ m.home }} <span style="color:var(--text-faint);">vs</span> {{ m.away }}
-            <span style="font-size:.68rem;color:var(--text-faint);margin-left:6px;">{{ m.league }}</span>
+            <span style="font-size:var(--fs-xs);color:var(--text-faint);margin-left:6px;">{{ m.league }}</span>
         </div>
         <div class="hr-score">{{ m.comparison.actual_score }}</div>
         <div class="hr-verdict {% if m.comparison.correct %}ok{% else %}bad{% endif %}">

@@ -9,7 +9,7 @@
 <div class="bankroll-card">
     <div class="bc-title">资金管理</div>
     <div class="kelly-slider-row">
-        <span style="font-size:.82rem;font-weight:600;color:var(--text-secondary);white-space:nowrap;">模拟本金</span>
+        <span style="font-size:var(--fs-xs);font-weight:600;color:var(--text-secondary);white-space:nowrap;">模拟本金</span>
         <input type="range" id="bankroll" min="1000" max="200000" step="1000" value="10000">
         <span class="kelly-amount" id="bankrollVal">10,000</span>
     </div>
@@ -79,7 +79,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!c) {
             return '<div class="combo-card ' + cls + '">' +
                 '<div class="cc-head"><div class="cc-title">' + title + '</div></div>' +
-                '<p style="font-size:.8rem;color:var(--text-muted);">当前盘口未找到符合条件的组合</p></div>';
+                '<p style="font-size:var(--fs-xs);color:var(--text-muted);">当前盘口未找到符合条件的组合</p></div>';
         }
         return '<div class="combo-card ' + cls + '">' +
             '<div class="cc-head">' +
@@ -111,13 +111,13 @@ document.addEventListener('DOMContentLoaded', function () {
                         '<span class="cc-leg-outcome">' + b.outcome + '</span>' +
                         '<span class="cc-leg-odds">@' + b.odds + '</span>' +
                         '<span style="font-family:var(--mono);color:var(--signal-value);font-weight:800;">+' + b.ev + '%</span>' +
-                        '<span style="font-size:.72rem;color:var(--text-muted);">仓位 ' + b.kelly_pct + '%</span>' +
+                        '<span style="font-size:var(--fs-xs);color:var(--text-muted);">仓位 ' + b.kelly_pct + '%</span>' +
                     '</span></div>';
             }).join('');
             document.getElementById('valueBets').innerHTML = rows;
         } else {
             document.getElementById('valueBets').innerHTML =
-                '<p style="font-size:.82rem;color:var(--text-muted);">当前盘口未发现正 EV 机会。这通常意味着市场定价有效。</p>';
+                '<p style="font-size:var(--fs-xs);color:var(--text-muted);">当前盘口未发现正 EV 机会。这通常意味着市场定价有效。</p>';
         }
 
         // 串关
