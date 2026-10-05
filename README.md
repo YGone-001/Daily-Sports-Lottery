@@ -949,6 +949,85 @@ summaries = evaluate_all_temporal()          # 默认 30 / 90 / 180 天 + all-ti
 因此 `all_time` 与每个窗口的结果，等于既有分类 / 校准评估器作用于**同一时序**的输出；
 且输出与调用方传入的行顺序无关。
 
+## 生产证据状态（Production Evidence Status）
+
+`utils/evidence_status.py` 是一个**只读**运营模块，把「证据积累到什么程度」变成可度量的事实，
+避免反复编写一次性巡检脚本。它**不改变任何预测行为**，也不写入任何存储。
+
+- **只读**：不写入 / 不改写任何运行时存储，也不直接重写 JSON。
+- **数据来源**：`daily_matches` / `prediction_snapshots` / `odds_snapshots` / `settlements` /
+  `evaluation_rows`（经既有查询层读取）。
+- **确定性**：按 `(sport, model_name, model_version)` 字典序输出，与调用顺序无关。
+- **不重算指标**：分类 / 校准 / 时序诊断直接复用
+  `utils.classification_evaluation` / `utils.calibration_evaluation` /
+  `utils.temporal_evaluation`，不在此模块重新实现 Accuracy / Brier / LogLoss / ECE / 时序窗口。
+- **不合并版本**：当前版本（`config.MODEL_VERSIONS`）与历史版本分开报告。
+- **零数据安全**：存储为空时返回事实性零计数，不抛异常、不伪造指标。
+
+```python
+from utils.evidence_status import build_evidence_status, get_evidence_status
+
+status = get_evidence_status()      # 读取运行时存储
+# 或直接运行：python -m utils.evidence_status
+```
+
+输出字段（概念等价）：
+
+```text
+models[]            sport / model_name / model_version / prediction_snapshots /
+                    settlements / evaluation_rows /
+                    matched_snapshot_odds_matches / gate
+historical_models[] 历史版本单独分组（不参与采集就绪判定）
+integrity           duplicate_snapshots / duplicate_settlements / duplicate_evaluation_rows /
+                    unsettled_eligible_snapshots /
+                    finished_without_evaluation =
+                        finished_without_evaluation_no_eligible_snapshot
+                      + finished_without_evaluation_had_eligible_snapshot /
+                    settlements_without_evaluation
+collection_ready / collection_evidence / pipeline_integrity / evidence_review_ready
+diagnostics         既有评估器的紧凑摘要（无评估样本时为 None）
+```
+
+**采集就绪（`collection_ready`）必须为「同场」证据**：要求至少一场比赛**同时**拥有
+「当前版本预测快照」与「盘口快照」（按 `match_id` 取交集）。因此：
+
+- 预测快照属比赛 A、盘口快照属比赛 B（跨场）→ **不**就绪；
+- 仅有预测快照、或仅有盘口快照 → **不**就绪；
+- 仅有**历史版本**快照（即使有同场盘口）→ **不**就绪（只认 `config.MODEL_VERSIONS` 的当前版本）。
+
+`collection_evidence` 给出事实计数：`prediction_snapshots`（当前版本）、`odds_snapshots`、
+以及 `matched_snapshot_odds_matches`（同场匹配数）。**不**声称所有盘口快照都产生了预测快照
+（例如 `kickoff_time_known = false` 的候选只有盘口快照、没有预测快照）。
+
+**证据门禁**（每个模型版本；运营阈值，**不是**统计显著性判断）：
+
+```text
+0..29     -> 未达 Gate A（gate = "R" 当且仅当该模型存在同场「当前版本预测快照 × 盘口快照」证据，
+                          否则 "none"）
+30..99    -> Gate A
+100..299  -> Gate B
+300+      -> Gate C
+```
+
+**Gate R 是按模型、按当前版本判定的采集就绪**：篮球不会因为足球证明了采集就绪而获得 R；
+仅有预测快照而无同场盘口、或仅有盘口而无当前预测快照，均为 `none`。
+Gate A/B/C 仅由真实评估样本数决定，阈值不变。
+
+`collection_ready` **仅**依据真实「同场」快照 / 盘口管道证据，绝不由评估样本数量推断；
+`evidence_review_ready` 仅在某个当前版本达到 Gate B 或 Gate C 时为 `True`。
+
+**完赛但无评估样本的分类基于「资格」而非「快照是否存在」**：对每场已终态且没有评估样本的
+canonical 比赛，判定其是否存在**合格赛前快照**（复用既有 `utils.settlements.is_valid_prematch`）：
+
+```text
+finished_without_evaluation
+  = finished_without_evaluation_no_eligible_snapshot   # 零快照，或快照均不合格 —— 预期，不影响完整性
+  + finished_without_evaluation_had_eligible_snapshot  # 有合格快照却无评估 —— 下游问题，integrity = false
+```
+
+即：仅「存在快照但**无一合格**」与「有合格快照」才是权威区分；字面上的快照存在与否只是
+信息性子计数 `finished_without_evaluation_never_snapshot`。
+
 ## 配置说明
 
 ### 环境变量
