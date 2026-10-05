@@ -20,11 +20,13 @@ Production Evidence Status Core
 门禁语义（每个当前模型版本）
 ----------------------------
 ```text
-evaluation_rows 0..29   -> below A  (gate = "R" 若已有 >=1 预测快照，否则 "none")
+evaluation_rows 0..29   -> below A  (gate = "R" 当且仅当存在同场「当前版本预测快照 × 盘口快照」证据)
 evaluation_rows 30..99  -> Gate A
 evaluation_rows 100..299-> Gate B
 evaluation_rows 300+    -> Gate C
 ```
+Gate R 表示**真实的当前版本采集路径已被证明**（同一场比赛同时有当前版本预测快照与盘口快照），
+而不是「存在任意预测快照对象」。仅有预测快照、或仅有盘口快照，都不构成 R。
 门禁是**运营性证据复核阈值**，不是统计显著性判断，也不得转成质量评分 / 置信度标签。
 """
 from __future__ import annotations
@@ -75,12 +77,18 @@ def _duplicates(records: Iterable[dict], key_field: str) -> int:
     return sum(c - 1 for c in counts.values() if c > 1)
 
 
-def gate_for(evaluation_rows: int, prediction_snapshots: int) -> str:
-    """返回该模型版本当前达到的证据门禁标签（"none" / "R" / "A" / "B" / "C"）。"""
+def gate_for(evaluation_rows: int, matched_snapshot_odds_matches: int) -> str:
+    """
+    返回该模型版本当前达到的证据门禁标签（"none" / "R" / "A" / "B" / "C"）。
+
+    Gate R 要求**同场**证据：至少一场比赛同时拥有该当前版本的预测快照与盘口快照。
+    仅有预测快照对象、或仅有盘口快照，都**不**构成 R（返回 "none"）。
+    Gate A/B/C 仅由真实评估样本数决定，阈值不变。
+    """
     for threshold, label in _GATE_BOUNDS:
         if evaluation_rows >= threshold:
             return label
-    if prediction_snapshots >= 1:
+    if matched_snapshot_odds_matches >= 1:
         return GATE_COLLECTION
     return GATE_NONE
 
@@ -117,29 +125,52 @@ def _count_model(records: Iterable[dict], sport: str, model_name: str, model_ver
 
 def _model_breakdowns(
     snapshots: list[dict],
+    odds_snapshots: list[dict],
     settlements: list[dict],
     evaluation_rows: list[dict],
     versions: dict,
     names: dict,
-) -> tuple[list[dict], list[dict]]:
-    """返回 (当前版本分组, 历史版本分组)，均为确定性字典序。"""
+) -> tuple[list[dict], list[dict], set]:
+    """
+    返回 (当前版本分组, 历史版本分组, 全局同场匹配的 match_id 集合)。
+
+    当前版本分组的 `matched_snapshot_odds_matches` = 该模型的当前版本预测快照 match_id
+    与盘口快照 match_id 的**交集**大小。仅当前版本参与，历史版本不参与采集就绪判定。
+    """
+    odds_match_ids = {
+        o.get("match_id") for o in odds_snapshots if o.get("match_id") is not None
+    }
+
     current: list[dict] = []
     current_keys: set[tuple] = set()
+    matched_all: set = set()
     for sport in sorted(versions):
         version = versions[sport]
         name = names.get(sport, "")
         current_keys.add((sport, name, version))
-        snap = _count_model(snapshots, sport, name, version)
-        sett = _count_model(settlements, sport, name, version)
+
+        model_snaps = [
+            s for s in snapshots
+            if s.get("sport") == sport
+            and s.get("model_name") == name
+            and s.get("model_version") == version
+        ]
+        current_match_ids = {
+            s.get("match_id") for s in model_snaps if s.get("match_id") is not None
+        }
+        matched = current_match_ids & odds_match_ids
+        matched_all |= matched
+
         rows = _count_model(evaluation_rows, sport, name, version)
         current.append({
             "sport": sport,
             "model_name": name,
             "model_version": version,
-            "prediction_snapshots": snap,
-            "settlements": sett,
+            "prediction_snapshots": len(model_snaps),
+            "settlements": _count_model(settlements, sport, name, version),
             "evaluation_rows": rows,
-            "gate": gate_for(rows, snap),
+            "matched_snapshot_odds_matches": len(matched),
+            "gate": gate_for(rows, len(matched)),
         })
 
     buckets: dict[tuple, dict] = {}
@@ -160,7 +191,7 @@ def _model_breakdowns(
     _add(evaluation_rows, "evaluation_rows")
 
     historical = [buckets[k] for k in sorted(buckets)]
-    return current, historical
+    return current, historical, matched_all
 
 
 def _integrity(
@@ -189,16 +220,24 @@ def _integrity(
         if s.get("snapshot_id") not in settled_snapshot_ids:
             unsettled_eligible += 1
 
-    # 已完赛但没有评估样本的 canonical 比赛，并区分两种成因。
+    # 已完赛但没有评估样本的 canonical 比赛：按「是否存在合格赛前快照」二分。
+    # 分类依据是**资格**（既有 is_valid_prematch），而不是字面上的快照存在与否。
+    #   finished_without_evaluation
+    #     = finished_without_evaluation_no_eligible_snapshot
+    #     + finished_without_evaluation_had_eligible_snapshot
     finished_without_eval = [m for m in matches if _is_finished(m) and m.get("id") not in eval_match_ids]
-    never_snapshot = 0
-    had_eligible = 0
+    never_snapshot = 0   # 信息性子计数：字面上零快照
+    no_eligible = 0      # 权威分类：零快照，或快照存在但无任一合格
+    had_eligible = 0     # 权威分类：至少一条合格赛前快照
     for m in finished_without_eval:
         match_snaps = snaps_by_match.get(m.get("id"), [])
-        if not snaps_by_match.get(m.get("id")):
+        if not match_snaps:
             never_snapshot += 1
+            no_eligible += 1
         elif any(_is_valid_prematch(s) for s in match_snaps):
             had_eligible += 1
+        else:
+            no_eligible += 1
 
     return {
         "duplicate_snapshots": _duplicates(snapshots, "snapshot_id"),
@@ -206,8 +245,9 @@ def _integrity(
         "duplicate_evaluation_rows": _duplicates(evaluation_rows, "evaluation_id"),
         "unsettled_eligible_snapshots": unsettled_eligible,
         "finished_without_evaluation": len(finished_without_eval),
-        "finished_without_evaluation_never_snapshot": never_snapshot,
+        "finished_without_evaluation_no_eligible_snapshot": no_eligible,
         "finished_without_evaluation_had_eligible_snapshot": had_eligible,
+        "finished_without_evaluation_never_snapshot": never_snapshot,
         "settlements_without_evaluation": sum(
             1 for s in settlements if s.get("settlement_id") not in eval_settlement_ids
         ),
@@ -273,19 +313,20 @@ def build_evidence_status(
     versions = dict(model_versions if model_versions is not None else config.MODEL_VERSIONS)
     names = dict(model_names) if model_names else _default_model_names(versions)
 
-    models, historical = _model_breakdowns(
-        snapshots, settlements, evaluation_rows, versions, names
+    models, historical, matched_collection_match_ids = _model_breakdowns(
+        snapshots, odds_snapshots, settlements, evaluation_rows, versions, names
     )
     integrity = _integrity(matches, snapshots, settlements, evaluation_rows)
 
     total_current_snapshots = sum(m["prediction_snapshots"] for m in models)
 
-    # 采集就绪：真实预测快照（只能由「有盘口 + 已准入 + 开赛时间已知」路径产生）
-    # 与真实盘口观察同时存在。绝不由评估样本数量推断。
-    collection_ready = total_current_snapshots >= 1 and len(odds_snapshots) >= 1
+    # 采集就绪：必须存在**同一场比赛**同时拥有「当前版本预测快照」与「盘口快照」。
+    # 跨场匹配（快照属比赛 A、盘口属比赛 B）无效；历史版本快照不计入；
+    # 仅有预测快照或仅有盘口快照都不算。绝不由评估样本数量推断。
+    collection_ready = bool(matched_collection_match_ids)
 
     # 管道完整性：重复身份 / 卡住的合格快照 / 无评估样本的结算 均为 0。
-    # 注意：已完赛但**从未**有合格快照的历史比赛属预期情形，不计为失败。
+    # 注意：已完赛但**没有合格赛前快照**的历史比赛属预期情形，不计为失败。
     integrity_failures = (
         integrity["duplicate_snapshots"]
         + integrity["duplicate_settlements"]
@@ -308,6 +349,7 @@ def build_evidence_status(
         "collection_evidence": {
             "prediction_snapshots": total_current_snapshots,
             "odds_snapshots": len(odds_snapshots),
+            "matched_snapshot_odds_matches": len(matched_collection_match_ids),
         },
         "pipeline_integrity": pipeline_integrity,
         "evidence_review_ready": evidence_review_ready,

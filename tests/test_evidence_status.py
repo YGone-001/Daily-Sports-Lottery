@@ -108,7 +108,11 @@ def test_get_evidence_status_on_empty_stores(isolated_data_dir):
     assert s["collection_ready"] is False
     assert s["pipeline_integrity"] is True
     assert s["diagnostics"] is None
-    assert s["collection_evidence"] == {"prediction_snapshots": 0, "odds_snapshots": 0}
+    assert s["collection_evidence"] == {
+        "prediction_snapshots": 0,
+        "odds_snapshots": 0,
+        "matched_snapshot_odds_matches": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +205,7 @@ def test_finished_match_without_snapshot_is_expected_not_failure():
     m = make_match(mid="m9", status="finished", score={"ft": [2, 1]})
     s = es.build_evidence_status(matches=[m])
     assert s["integrity"]["finished_without_evaluation"] == 1
+    assert s["integrity"]["finished_without_evaluation_no_eligible_snapshot"] == 1
     assert s["integrity"]["finished_without_evaluation_never_snapshot"] == 1
     assert s["integrity"]["finished_without_evaluation_had_eligible_snapshot"] == 0
     assert s["pipeline_integrity"] is True
@@ -210,6 +215,7 @@ def test_eligible_finished_snapshot_without_settlement_fails_integrity():
     m = make_match(mid="m1", status="finished", score={"ft": [2, 1]})
     s = es.build_evidence_status(matches=[m], snapshots=[make_snapshot(mid="m1")])
     assert s["integrity"]["unsettled_eligible_snapshots"] == 1
+    assert s["integrity"]["finished_without_evaluation_no_eligible_snapshot"] == 0
     assert s["integrity"]["finished_without_evaluation_had_eligible_snapshot"] == 1
     assert s["pipeline_integrity"] is False
 
@@ -302,3 +308,114 @@ def test_diagnostics_none_when_no_rows():
 def test_diagnostics_disabled_flag():
     s = es.build_evidence_status(evaluation_rows=[make_eval_row()], with_diagnostics=False)
     assert s["diagnostics"] is None
+
+
+# ---------------------------------------------------------------------------
+# 采集就绪必须「同场」（Correction 1）
+# ---------------------------------------------------------------------------
+
+def test_same_match_readiness_positive():
+    s = es.build_evidence_status(
+        snapshots=[make_snapshot(mid="m1")],
+        odds_snapshots=[_odds(mid="m1")],
+    )
+    assert s["collection_ready"] is True
+    assert s["collection_evidence"]["matched_snapshot_odds_matches"] == 1
+    assert _model(s, "football")["gate"] == "R"
+    assert _model(s, "football")["matched_snapshot_odds_matches"] == 1
+
+
+def test_cross_match_readiness_negative():
+    s = es.build_evidence_status(
+        snapshots=[make_snapshot(mid="m1")],
+        odds_snapshots=[_odds(mid="m2")],
+    )
+    assert s["collection_ready"] is False
+    assert s["collection_evidence"]["matched_snapshot_odds_matches"] == 0
+    assert _model(s, "football")["gate"] == "none"
+
+
+def test_odds_only_is_not_ready():
+    s = es.build_evidence_status(odds_snapshots=[_odds(mid="m1")])
+    assert s["collection_ready"] is False
+    assert s["collection_evidence"]["matched_snapshot_odds_matches"] == 0
+    assert _model(s, "football")["gate"] == "none"
+
+
+def test_snapshot_only_is_not_ready():
+    s = es.build_evidence_status(snapshots=[make_snapshot(mid="m1")])
+    assert s["collection_ready"] is False
+    assert s["collection_evidence"]["matched_snapshot_odds_matches"] == 0
+    assert _model(s, "football")["gate"] == "none"
+
+
+def test_historical_snapshot_does_not_satisfy_readiness():
+    s = es.build_evidence_status(
+        snapshots=[make_snapshot(mid="m1", version="football-ad-1", sid="h1")],
+        odds_snapshots=[_odds(mid="m1")],
+    )
+    assert s["collection_ready"] is False
+    assert _model(s, "football")["gate"] == "none"
+    assert s["historical_models"][0]["model_version"] == "football-ad-1"
+    assert s["historical_models"][0]["prediction_snapshots"] == 1
+
+
+def test_per_sport_readiness():
+    s = es.build_evidence_status(
+        snapshots=[make_snapshot(mid="m1")],
+        odds_snapshots=[_odds(mid="m1"), _odds("ob", "b1")],
+    )
+    assert s["collection_ready"] is True
+    assert _model(s, "football")["gate"] == "R"
+    assert _model(s, "basketball")["gate"] == "none"
+    assert _model(s, "basketball")["matched_snapshot_odds_matches"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 完赛分类必须基于「资格」（Correction 2）
+# ---------------------------------------------------------------------------
+
+def test_finished_ineligible_snapshot_only_is_expected():
+    # prediction_generated_at > kickoff_at -> is_valid_prematch(...) 为 false
+    snap = make_snapshot(
+        mid="m1", generated="2030-01-01T21:00:00+08:00", kickoff="2030-01-01T20:00:00+08:00"
+    )
+    m = make_match(mid="m1", status="finished", score={"ft": [2, 1]})
+    s = es.build_evidence_status(matches=[m], snapshots=[snap])
+    assert s["integrity"]["finished_without_evaluation"] == 1
+    assert s["integrity"]["finished_without_evaluation_no_eligible_snapshot"] == 1
+    assert s["integrity"]["finished_without_evaluation_had_eligible_snapshot"] == 0
+    assert s["integrity"]["unsettled_eligible_snapshots"] == 0
+    assert s["pipeline_integrity"] is True
+
+
+def test_finished_eligible_snapshot_missing_downstream():
+    m = make_match(mid="m1", status="finished", score={"ft": [2, 1]})
+    s = es.build_evidence_status(matches=[m], snapshots=[make_snapshot(mid="m1")])
+    assert s["integrity"]["finished_without_evaluation"] == 1
+    assert s["integrity"]["finished_without_evaluation_no_eligible_snapshot"] == 0
+    assert s["integrity"]["finished_without_evaluation_had_eligible_snapshot"] == 1
+    assert s["integrity"]["unsettled_eligible_snapshots"] == 1
+    assert s["pipeline_integrity"] is False
+
+
+def test_partition_invariant_over_mixed_finished_matches():
+    m_none = make_match(mid="mA", status="finished", score={"ft": [1, 0]})
+    m_ineligible = make_match(mid="mB", status="finished", score={"ft": [1, 1]})
+    m_eligible = make_match(mid="mC", status="finished", score={"ft": [0, 2]})
+    s = es.build_evidence_status(
+        matches=[m_none, m_ineligible, m_eligible],
+        snapshots=[
+            make_snapshot(mid="mB", sid="sB", generated="2030-01-01T21:00:00+08:00"),
+            make_snapshot(mid="mC", sid="sC"),
+        ],
+    )
+    integ = s["integrity"]
+    assert integ["finished_without_evaluation"] == 3
+    assert integ["finished_without_evaluation_no_eligible_snapshot"] == 2
+    assert integ["finished_without_evaluation_had_eligible_snapshot"] == 1
+    assert (
+        integ["finished_without_evaluation"]
+        == integ["finished_without_evaluation_no_eligible_snapshot"]
+        + integ["finished_without_evaluation_had_eligible_snapshot"]
+    )

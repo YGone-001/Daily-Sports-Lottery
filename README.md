@@ -975,26 +975,58 @@ status = get_evidence_status()      # 读取运行时存储
 
 ```text
 models[]            sport / model_name / model_version / prediction_snapshots /
-                    settlements / evaluation_rows / gate
-historical_models[] 历史版本单独分组
+                    settlements / evaluation_rows /
+                    matched_snapshot_odds_matches / gate
+historical_models[] 历史版本单独分组（不参与采集就绪判定）
 integrity           duplicate_snapshots / duplicate_settlements / duplicate_evaluation_rows /
-                    unsettled_eligible_snapshots / finished_without_evaluation /
+                    unsettled_eligible_snapshots /
+                    finished_without_evaluation =
+                        finished_without_evaluation_no_eligible_snapshot
+                      + finished_without_evaluation_had_eligible_snapshot /
                     settlements_without_evaluation
-collection_ready / pipeline_integrity / evidence_review_ready
+collection_ready / collection_evidence / pipeline_integrity / evidence_review_ready
 diagnostics         既有评估器的紧凑摘要（无评估样本时为 None）
 ```
+
+**采集就绪（`collection_ready`）必须为「同场」证据**：要求至少一场比赛**同时**拥有
+「当前版本预测快照」与「盘口快照」（按 `match_id` 取交集）。因此：
+
+- 预测快照属比赛 A、盘口快照属比赛 B（跨场）→ **不**就绪；
+- 仅有预测快照、或仅有盘口快照 → **不**就绪；
+- 仅有**历史版本**快照（即使有同场盘口）→ **不**就绪（只认 `config.MODEL_VERSIONS` 的当前版本）。
+
+`collection_evidence` 给出事实计数：`prediction_snapshots`（当前版本）、`odds_snapshots`、
+以及 `matched_snapshot_odds_matches`（同场匹配数）。**不**声称所有盘口快照都产生了预测快照
+（例如 `kickoff_time_known = false` 的候选只有盘口快照、没有预测快照）。
 
 **证据门禁**（每个模型版本；运营阈值，**不是**统计显著性判断）：
 
 ```text
-0..29     -> 未达 Gate A（gate = "R" 若已有 >=1 预测快照，否则 "none"）
+0..29     -> 未达 Gate A（gate = "R" 当且仅当该模型存在同场「当前版本预测快照 × 盘口快照」证据，
+                          否则 "none"）
 30..99    -> Gate A
 100..299  -> Gate B
 300+      -> Gate C
 ```
 
-`collection_ready` **仅**依据真实快照 / 盘口管道证据，绝不由评估样本数量推断；
+**Gate R 是按模型、按当前版本判定的采集就绪**：篮球不会因为足球证明了采集就绪而获得 R；
+仅有预测快照而无同场盘口、或仅有盘口而无当前预测快照，均为 `none`。
+Gate A/B/C 仅由真实评估样本数决定，阈值不变。
+
+`collection_ready` **仅**依据真实「同场」快照 / 盘口管道证据，绝不由评估样本数量推断；
 `evidence_review_ready` 仅在某个当前版本达到 Gate B 或 Gate C 时为 `True`。
+
+**完赛但无评估样本的分类基于「资格」而非「快照是否存在」**：对每场已终态且没有评估样本的
+canonical 比赛，判定其是否存在**合格赛前快照**（复用既有 `utils.settlements.is_valid_prematch`）：
+
+```text
+finished_without_evaluation
+  = finished_without_evaluation_no_eligible_snapshot   # 零快照，或快照均不合格 —— 预期，不影响完整性
+  + finished_without_evaluation_had_eligible_snapshot  # 有合格快照却无评估 —— 下游问题，integrity = false
+```
+
+即：仅「存在快照但**无一合格**」与「有合格快照」才是权威区分；字面上的快照存在与否只是
+信息性子计数 `finished_without_evaluation_never_snapshot`。
 
 ## 配置说明
 
