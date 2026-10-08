@@ -1180,6 +1180,9 @@ a { color: inherit; text-decoration: none; }
 .hr-verdict { text-align: right; font-size: var(--fs-xs); font-weight: 700; }
 .hr-verdict.ok { color: var(--state-ok); }
 .hr-verdict.bad { color: var(--state-bad); }
+.hr-verdict.unverified { color: var(--text-muted); }
+.hr-verdict.historical { color: var(--side-draw); }
+.hr-verdict.ambiguous { color: var(--side-away); }
 .hr-verdict em {
     display: block;
     font-style: normal;

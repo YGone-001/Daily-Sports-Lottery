@@ -4,7 +4,7 @@
 <section class="terminal-header">
     <div class="th-left">
         <h1 class="th-title">历史复盘</h1>
-        <p class="th-sub">模型预测 vs 真实赛果 · 共 {{ total }} 场完赛记录</p>
+        <p class="th-sub">不可变赛前预测 vs 真实赛果 · 共 {{ total }} 场完赛 · {{ stats.verified_evaluations }} 场赛前验证</p>
     </div>
     <div class="th-right">
         <div class="chip-row">
@@ -16,32 +16,75 @@
 </section>
 
 {% if matches %}
-{% set ns = namespace(hit=0, total=0, score_hit=0) %}
-{% for m in matches %}
-    {% if m.comparison and m.comparison.correct is defined %}
-        {% set ns.total = ns.total + 1 %}
-        {% if m.comparison.correct %}{% set ns.hit = ns.hit + 1 %}{% endif %}
-        {% if m.comparison.score_hit %}{% set ns.score_hit = ns.score_hit + 1 %}{% endif %}
-    {% endif %}
-{% endfor %}
-
 <div class="calib-bar">
+    {% if current_sport == 'football' %}
     <div class="calib-pod">
-        <span class="m-val">{{ ns.total }}</span>
-        <span class="m-lbl">已复盘场次</span>
+        <span class="m-val">{{ stats.football.total_finished }}</span>
+        <span class="m-lbl">完赛场次</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val">{{ stats.football.verified_evaluations }}/{{ stats.football.total_finished }}</span>
+        <span class="m-lbl">赛前验证覆盖 ({{ stats.football.unverified_matches }}场无证据)</span>
     </div>
     <div class="calib-pod">
         <span class="m-val c-ok">
-            {{ (ns.hit / ns.total * 100) | round(1) if ns.total else 0 }}%
+            {{ stats.football.accuracy_str }}
         </span>
-        <span class="m-lbl">胜负命中率 ({{ ns.hit }}/{{ ns.total }})</span>
+        <span class="m-lbl">胜负命中率 ({{ stats.football.ratio_str }})</span>
     </div>
     <div class="calib-pod">
         <span class="m-val c-up">
-            {{ (ns.score_hit / ns.total * 100) | round(1) if ns.total else 0 }}%
+            {{ stats.football.score_coverage_str }}
         </span>
-        <span class="m-lbl">比分命中率 ({{ ns.score_hit }}/{{ ns.total }})</span>
+        <span class="m-lbl">赛前 Top-3 比分覆盖率 ({{ stats.football.score_ratio_str }})</span>
     </div>
+    {% elif current_sport == 'basketball' %}
+    <div class="calib-pod">
+        <span class="m-val">{{ stats.basketball.total_finished }}</span>
+        <span class="m-lbl">完赛场次</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val">{{ stats.basketball.verified_evaluations }}/{{ stats.basketball.total_finished }}</span>
+        <span class="m-lbl">赛前验证覆盖 ({{ stats.basketball.unverified_matches }}场无证据)</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val">
+            {{ stats.basketball.accuracy_str }}
+        </span>
+        <span class="m-lbl">胜负命中率 ({{ stats.basketball.ratio_str }})</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val mr-none">不适用</span>
+        <span class="m-lbl">比分覆盖率</span>
+    </div>
+    {% else %}
+    <div class="calib-pod">
+        <span class="m-val">{{ stats.total_finished }}</span>
+        <span class="m-lbl">完赛总场次</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val">{{ stats.verified_evaluations }}/{{ stats.total_finished }}</span>
+        <span class="m-lbl">赛前验证覆盖 ({{ stats.unverified_matches }}场无证据)</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val c-ok">
+            {{ stats.football.accuracy_str }}
+        </span>
+        <span class="m-lbl">足球胜负命中 ({{ stats.football.ratio_str }})</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val c-up">
+            {{ stats.football.score_coverage_str }}
+        </span>
+        <span class="m-lbl">足球 Top-3 比分覆盖 ({{ stats.football.score_ratio_str }})</span>
+    </div>
+    <div class="calib-pod">
+        <span class="m-val">
+            {{ stats.basketball.accuracy_str }}
+        </span>
+        <span class="m-lbl">篮球胜负命中 ({{ stats.basketball.ratio_str }})</span>
+    </div>
+    {% endif %}
 </div>
 
 <div>
@@ -54,10 +97,27 @@
             <span class="hr-league">{{ m.league }}</span>
         </div>
         <div class="hr-score">{{ m.comparison.actual_score }}</div>
+        {% if m.comparison.evidence_status == 'verified' %}
         <div class="hr-verdict {% if m.comparison.correct %}ok{% else %}bad{% endif %}">
             {% if m.comparison.correct %}✓ 命中{% else %}✗ 偏差{% endif %}
+            <em>预测{{ m.comparison.predicted_label }} · 置信{{ m.comparison.confidence }}%{% if m.comparison.score_eligible %} · 比分{% if m.comparison.score_hit %}覆盖{% else %}未覆盖{% endif %}{% endif %}</em>
+        </div>
+        {% elif m.comparison.evidence_status == 'historical_version' %}
+        <div class="hr-verdict historical">
+            <span>历史版本 ({{ m.comparison.model_version }})</span>
             <em>预测{{ m.comparison.predicted_label }} · 置信{{ m.comparison.confidence }}%</em>
         </div>
+        {% elif m.comparison.evidence_status == 'ambiguous' %}
+        <div class="hr-verdict ambiguous">
+            <span>证据冲突 / 排除</span>
+            <em>多条不一致记录</em>
+        </div>
+        {% else %}
+        <div class="hr-verdict unverified">
+            <span>无赛前验证预测</span>
+            <em>未采集赛前快照</em>
+        </div>
+        {% endif %}
     </a>
     {% endif %}
     {% endfor %}

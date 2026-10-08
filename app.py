@@ -44,6 +44,7 @@ from utils.daily_loader import (
     get_matches_grouped,
     get_meta,
 )
+from utils.history_evidence import build_history_view_data
 from utils.odds_snapshots import get_odds_history_for_match
 from utils.prediction_snapshots import ensure_snapshot, get_snapshots_for_match
 from utils.settlements import get_settlements_for_match
@@ -111,25 +112,14 @@ def history():
     sport = request.args.get("sport")
     if sport == "all":
         sport = None
-    matches = [
-        enrich_match(m) for m in get_matches_by_date("all", sport)
-    ]
-    finished = [m for m in matches if m.get("status") == "finished" and m.get("score")]
-    finished.sort(key=lambda x: (x.get("date", ""), x.get("time", "")), reverse=True)
-
-    # 附带预测 vs 实际
-    for m in finished:
-        pred = predict_match(
-            m["home_team"], m["away_team"],
-            odds=m.get("odds"), sport=m.get("sport", "football"), league=m.get("league", ""),
-        )
-        m["prediction"] = pred
-        m["comparison"] = _compare(m, pred)
+    matches = get_matches_by_date("all", sport)
+    view_data = build_history_view_data(matches, sport=sport)
 
     return render_template(
         "history.html",
-        matches=finished[:200],
-        total=len(finished),
+        matches=view_data["matches"],
+        total=view_data["total_finished"],
+        stats=view_data["stats"],
         current_sport=sport or "all",
         active_page="history",
     )
