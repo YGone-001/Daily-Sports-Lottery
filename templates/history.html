@@ -24,7 +24,7 @@
     </div>
     <div class="calib-pod">
         <span class="m-val">{{ stats.football.verified_evaluations }}/{{ stats.football.total_finished }}</span>
-        <span class="m-lbl">赛前验证覆盖 ({{ stats.football.unverified_matches }}场无证据)</span>
+        <span class="m-lbl">赛前验证覆盖 ({{ stats.football.unverified_matches }}场未验证)</span>
     </div>
     <div class="calib-pod">
         <span class="m-val c-ok">
@@ -45,7 +45,7 @@
     </div>
     <div class="calib-pod">
         <span class="m-val">{{ stats.basketball.verified_evaluations }}/{{ stats.basketball.total_finished }}</span>
-        <span class="m-lbl">赛前验证覆盖 ({{ stats.basketball.unverified_matches }}场无证据)</span>
+        <span class="m-lbl">赛前验证覆盖 ({{ stats.basketball.unverified_matches }}场未验证)</span>
     </div>
     <div class="calib-pod">
         <span class="m-val">
@@ -64,7 +64,7 @@
     </div>
     <div class="calib-pod">
         <span class="m-val">{{ stats.verified_evaluations }}/{{ stats.total_finished }}</span>
-        <span class="m-lbl">赛前验证覆盖 ({{ stats.unverified_matches }}场无证据)</span>
+        <span class="m-lbl">赛前验证覆盖 ({{ stats.unverified_matches }}场未验证)</span>
     </div>
     <div class="calib-pod">
         <span class="m-val c-ok">
@@ -107,10 +107,10 @@
             <span>历史版本 ({{ m.comparison.model_version }})</span>
             <em>预测{{ m.comparison.predicted_label }} · 置信{{ m.comparison.confidence }}%</em>
         </div>
-        {% elif m.comparison.evidence_status == 'ambiguous' %}
+        {% elif m.comparison.evidence_status == 'ambiguous' or m.comparison.evidence_status == 'invalid' %}
         <div class="hr-verdict ambiguous">
-            <span>证据冲突 / 排除</span>
-            <em>多条不一致记录</em>
+            <span>{% if m.comparison.evidence_status == 'invalid' %}证据无效 / 排除{% else %}证据冲突 / 排除{% endif %}</span>
+            <em>{% if m.comparison.evidence_status == 'invalid' %}证据校验未通过{% else %}多条不一致记录{% endif %}</em>
         </div>
         {% else %}
         <div class="hr-verdict unverified">
