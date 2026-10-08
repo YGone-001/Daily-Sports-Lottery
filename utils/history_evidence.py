@@ -8,8 +8,9 @@ Key Invariants:
 - Never calls `predict_match(...)` or recomputes probabilities after kickoff.
 - Never mutates Elo, team profiles, snapshots, settlements, or evaluation rows.
 - Derives predicted outcomes and confidence solely from stored `model_probabilities`.
-- Validates the strict unbroken evidence chain:
-    canonical match score -> settlement -> prediction snapshot -> evaluation row
+- Validates the strict unbroken evidence chain and full cross-record provenance equality:
+    canonical match score <-> settlement <-> prediction snapshot <-> evaluation row
+- Duplicate evaluation identities carrying conflicting payloads fail closed as ambiguous.
 - Distinguishes qualified current-version evaluations, historical-version evaluations,
   no-evidence matches, and ambiguous/invalid records.
 - Preserves visibility of finished matches even when no prematch snapshot exists,
@@ -23,6 +24,7 @@ Key Invariants:
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Sequence
 
@@ -36,6 +38,7 @@ from utils.classification_evaluation import (
 from utils.evaluation_rows import (
     evaluation_id_for,
     get_all_evaluation_rows,
+    _as_dict,
 )
 from utils.match_lifecycle import valid_full_time_score
 from utils.prediction_snapshots import (
@@ -47,6 +50,7 @@ from utils.settlements import (
     extract_final_score,
     is_valid_prematch,
     outcome_from_score,
+    result_fingerprint,
     settlement_id_for,
     _load_store as load_settlements_store,
 )
@@ -147,38 +151,6 @@ def _validate_prematch_timestamps(eval_row: dict, snapshot: dict) -> bool:
     return True
 
 
-def _validate_score_and_outcomes(
-    match: dict, eval_row: dict, settlement: dict, sport: str
-) -> bool:
-    """Validate score validity and outcome alignment across match, eval, and settlement."""
-    score = match.get("score")
-    if not valid_full_time_score(score):
-        return False
-
-    canonical_final = extract_final_score(match)
-    if canonical_final is None:
-        return False
-
-    canonical_outcome = outcome_from_score(canonical_final)
-
-    # Basketball two-class evaluator does not support a draw
-    if sport == "basketball" and canonical_outcome == "draw":
-        return False
-
-    # Stored final score and outcome agreement
-    if eval_row.get("final_score") != canonical_final:
-        return False
-    if eval_row.get("actual_outcome") != canonical_outcome:
-        return False
-
-    if settlement.get("final_score") != canonical_final:
-        return False
-    if settlement.get("actual_outcome") != canonical_outcome:
-        return False
-
-    return True
-
-
 def _validate_probabilities_and_classes(eval_row: dict, sport: str) -> bool:
     """Verify probability vector passes authoritative classification validation."""
     try:
@@ -198,80 +170,139 @@ def qualify_current_version_evaluation(
 ) -> tuple[bool, str]:
     """Strictly qualify whether an evaluation row represents valid current-version evidence.
 
-    Checks:
-    1. match_id matches canonical finished match ID
-    2. sport matches canonical match sport
-    3. model_name and model_version match authoritative current model identity
-    4. snapshot_id, settlement_id, evaluation_id match deterministic identity contracts
-    5. Referenced snapshot and settlement exist in authoritative stores
-    6. Settlement and snapshot reference the same match and snapshot_id
-    7. Timestamps parseable, timezone-compatible, ordered as prematch
-    8. is_valid_prematch returns True
-    9. Stored evaluation probabilities equal original snapshot model_probabilities
-    10. Canonical score valid, outcomes agree, basketball tied score excluded
-    11. Passes authoritative classification validation
+    Enforces full provenance equality across snapshot, settlement, and evaluation row:
+    1. Deterministic identities: snapshot_id, settlement_id, evaluation_id.
+    2. Stored record identities in snapshot and settlement match expected IDs.
+    3. Match ID, sport, model_name, and model_version agree across all three records.
+    4. Exact temporal provenance: generated_at and kickoff_at agree across all records,
+       plus absolute-instant prematch ordering.
+    5. Frozen prediction payload equality between snapshot and evaluation row
+       (home_elo, away_elo, league, team names, model_probabilities, display_probabilities,
+        market_odds, market_implied_probabilities, expected_values, expected_score_data).
+    6. Result provenance equality (final_score, actual_outcome, result_fingerprint)
+       matching authoritative canonical score.
+    7. Basketball draw safely excluded from two-class classification.
+    8. Passes authoritative classification validation.
     """
     m_id = str(match.get("id") or "")
     m_sport = str(match.get("sport") or "football")
 
-    # 1. Match ID equals canonical finished match ID
+    expected_version = config.MODEL_VERSIONS.get(m_sport, "")
+    expected_model_name = MODEL_NAMES.get(m_sport, "")
+    if not expected_version or not expected_model_name:
+        return False, "unsupported_sport_model"
+
+    # Deterministic IDs
+    expected_snapshot_id = snapshot_id_for(m_id, expected_version)
+    expected_settlement_id = settlement_id_for(expected_snapshot_id)
+    expected_evaluation_id = evaluation_id_for(expected_snapshot_id, expected_settlement_id)
+
+    # 1. Identity validation on evaluation row
     if eval_row.get("match_id") != m_id:
         return False, "match_id_mismatch"
-
-    # 2. Sport equals canonical match sport
     if eval_row.get("sport") != m_sport:
         return False, "sport_mismatch"
-
-    # 3. Model name and model version match authoritative current model identity
-    expected_version = config.MODEL_VERSIONS.get(m_sport, "")
-    expected_name = MODEL_NAMES.get(m_sport, "")
     if eval_row.get("model_version") != expected_version:
         return False, "model_version_mismatch"
-    if eval_row.get("model_name") != expected_name:
+    if eval_row.get("model_name") != expected_model_name:
         return False, "model_name_mismatch"
-
-    # 4. Identity contracts
-    snap_id = eval_row.get("snapshot_id")
-    sett_id = eval_row.get("settlement_id")
-    eval_id = eval_row.get("evaluation_id")
-    if not (snap_id and sett_id and eval_id):
-        return False, "missing_identities"
-
-    if snap_id != snapshot_id_for(m_id, expected_version):
+    if eval_row.get("snapshot_id") != expected_snapshot_id:
         return False, "snapshot_id_contract_violation"
-    if sett_id != settlement_id_for(snap_id):
+    if eval_row.get("settlement_id") != expected_settlement_id:
         return False, "settlement_id_contract_violation"
-    if eval_id != evaluation_id_for(snap_id, sett_id):
+    if eval_row.get("evaluation_id") != expected_evaluation_id:
         return False, "evaluation_id_contract_violation"
 
-    # 5. Referenced immutable snapshot and settlement exist in stores
-    snapshot = snapshots.get(snap_id)
-    if not snapshot:
+    # 2. Referenced records existence & stored identity
+    snapshot = snapshots.get(expected_snapshot_id)
+    if not snapshot or not isinstance(snapshot, dict):
         return False, "referenced_snapshot_missing"
 
-    settlement = settlements.get(sett_id)
-    if not settlement:
+    settlement = settlements.get(expected_settlement_id)
+    if not settlement or not isinstance(settlement, dict):
         return False, "referenced_settlement_missing"
 
-    # 6. Cross references
-    if settlement.get("snapshot_id") != snap_id or settlement.get("match_id") != m_id:
-        return False, "settlement_reference_mismatch"
-    if snapshot.get("match_id") != m_id:
-        return False, "snapshot_reference_mismatch"
+    if snapshot.get("snapshot_id") != expected_snapshot_id:
+        return False, "snapshot_internal_id_mismatch"
+    if settlement.get("settlement_id") != expected_settlement_id:
+        return False, "settlement_internal_id_mismatch"
+    if settlement.get("snapshot_id") != expected_snapshot_id:
+        return False, "settlement_snapshot_id_mismatch"
 
-    # 7 & 8. Timestamps
+    # 3. Sport and Model Identity consistency across all three records
+    if snapshot.get("match_id") != m_id or settlement.get("match_id") != m_id:
+        return False, "match_id_provenance_mismatch"
+    if snapshot.get("sport") != m_sport or settlement.get("sport") != m_sport:
+        return False, "sport_provenance_mismatch"
+    if snapshot.get("model_name") != expected_model_name or settlement.get("model_name") != expected_model_name:
+        return False, "model_name_provenance_mismatch"
+    if snapshot.get("model_version") != expected_version or settlement.get("model_version") != expected_version:
+        return False, "model_version_provenance_mismatch"
+
+    # 4. Temporal Provenance exact equality
+    snap_gen = snapshot.get("generated_at")
+    snap_kick = snapshot.get("kickoff_at")
+    if eval_row.get("prediction_generated_at") != snap_gen:
+        return False, "prediction_generated_at_provenance_mismatch"
+    if settlement.get("prediction_generated_at") != snap_gen:
+        return False, "settlement_prediction_generated_at_provenance_mismatch"
+    if eval_row.get("kickoff_at") != snap_kick:
+        return False, "kickoff_at_provenance_mismatch"
+    if settlement.get("kickoff_at") != snap_kick:
+        return False, "settlement_kickoff_at_provenance_mismatch"
+
     if not _validate_prematch_timestamps(eval_row, snapshot):
         return False, "invalid_prematch_timestamps"
 
-    # 9. Probabilities equality with original snapshot
-    if eval_row.get("model_probabilities") != snapshot.get("model_probabilities"):
-        return False, "probabilities_snapshot_mismatch"
+    # 5. Frozen Prediction Payload equality
+    for field in ("league", "home_team", "away_team", "home_elo", "away_elo"):
+        if eval_row.get(field) != snapshot.get(field):
+            return False, f"{field}_payload_mismatch"
 
-    # 10. Canonical score and outcome agreement
-    if not _validate_score_and_outcomes(match, eval_row, settlement, m_sport):
-        return False, "score_or_outcome_invalid"
+    for field in (
+        "model_probabilities",
+        "display_probabilities",
+        "market_odds",
+        "market_implied_probabilities",
+        "expected_values",
+        "expected_score_data",
+    ):
+        if eval_row.get(field) != _as_dict(snapshot.get(field)):
+            return False, f"{field}_payload_mismatch"
 
-    # 11. Authoritative classification validation
+    # 6. Result Provenance
+    score = match.get("score")
+    if not valid_full_time_score(score):
+        return False, "canonical_score_invalid"
+
+    canonical_final = extract_final_score(match)
+    if canonical_final is None:
+        return False, "canonical_final_score_missing"
+
+    canonical_outcome = outcome_from_score(canonical_final)
+    if m_sport == "basketball" and canonical_outcome == "draw":
+        return False, "basketball_tied_score"
+
+    if eval_row.get("final_score") != canonical_final:
+        return False, "evaluation_final_score_mismatch"
+    if settlement.get("final_score") != canonical_final:
+        return False, "settlement_final_score_mismatch"
+
+    if eval_row.get("actual_outcome") != canonical_outcome:
+        return False, "evaluation_actual_outcome_mismatch"
+    if settlement.get("actual_outcome") != canonical_outcome:
+        return False, "settlement_actual_outcome_mismatch"
+
+    # Result Fingerprint
+    expected_fingerprint = result_fingerprint(canonical_final)
+    if settlement.get("result_fingerprint") != expected_fingerprint:
+        return False, "settlement_result_fingerprint_mismatch"
+    if eval_row.get("result_fingerprint") != expected_fingerprint:
+        return False, "evaluation_result_fingerprint_mismatch"
+    if eval_row.get("result_fingerprint") != settlement.get("result_fingerprint"):
+        return False, "result_fingerprint_mismatch"
+
+    # 7. Authoritative Classification Validation
     if not _validate_probabilities_and_classes(eval_row, m_sport):
         return False, "classification_validation_failed"
 
@@ -357,40 +388,51 @@ def build_history_view_data(
 
         m_evals = evals_by_match.get(m_id, [])
 
-        # Distinct evaluation identities for this match
-        distinct_evals: dict[str, dict] = {}
-        for r in m_evals:
-            if isinstance(r, dict):
-                eid = r.get("evaluation_id")
-                if eid and eid not in distinct_evals:
-                    distinct_evals[eid] = r
-
+        # Check for duplicate evaluation identities and content conflicts
         evidence_status = "no_evidence"
         selected_eval = None
 
-        if len(distinct_evals) > 1:
-            # Multiple distinct evaluation identities for one match -> ambiguous (fail closed)
-            evidence_status = "ambiguous"
-        elif len(distinct_evals) == 1:
-            eval_row = list(distinct_evals.values())[0]
+        if len(m_evals) > 1:
+            distinct_eids = {
+                r.get("evaluation_id")
+                for r in m_evals
+                if isinstance(r, dict) and r.get("evaluation_id")
+            }
+            if len(distinct_eids) > 1:
+                # Multiple distinct evaluation identities for one match -> ambiguous
+                evidence_status = "ambiguous"
+            else:
+                first = m_evals[0]
+                first_repr = json.dumps(first, sort_keys=True, ensure_ascii=False) if isinstance(first, dict) else ""
+                has_payload_conflict = any(
+                    json.dumps(r, sort_keys=True, ensure_ascii=False) != first_repr
+                    for r in m_evals[1:]
+                )
+                if has_payload_conflict:
+                    # Same evaluation ID but conflicting content -> ambiguous (fail closed)
+                    evidence_status = "ambiguous"
+                else:
+                    # Strict complete record equivalence: identical copies
+                    selected_eval = first
+        elif len(m_evals) == 1:
+            selected_eval = m_evals[0]
+        else:
+            evidence_status = "no_evidence"
+
+        if selected_eval is not None:
             curr_version = config.MODEL_VERSIONS.get(m_sport, "")
-            row_version = eval_row.get("model_version", "")
+            row_version = selected_eval.get("model_version", "")
 
             if row_version == curr_version:
                 is_qual, _ = qualify_current_version_evaluation(
-                    m, eval_row, snapshots_dict, settlements_dict
+                    m, selected_eval, snapshots_dict, settlements_dict
                 )
                 if is_qual:
                     evidence_status = "verified"
-                    selected_eval = eval_row
                 else:
                     evidence_status = "invalid"
-                    selected_eval = eval_row
             else:
                 evidence_status = "historical_version"
-                selected_eval = eval_row
-        else:
-            evidence_status = "no_evidence"
 
         comparison = {
             "actual_score": actual_score_str,
