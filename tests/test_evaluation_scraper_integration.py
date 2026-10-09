@@ -194,3 +194,119 @@ def test_basketball_evaluation_row(isolated_data_dir, monkeypatch):
     assert row["sport"] == "basketball"
     assert row["final_score"] == {"home": 108, "away": 101}
     assert row["actual_outcome"] == "home_win"
+
+
+# ---------------------------------------------------------------------------
+# Authoritative Finality Enforcement Tests for Materialization
+# ---------------------------------------------------------------------------
+
+def test_materialize_rejects_live_match_with_legacy_settlement(isolated_data_dir, monkeypatch):
+    """
+    6. Actual `_materialize_evaluation_rows()` rejects a live canonical match
+    with an existing historical settlement.
+    """
+    from utils.scraper import _materialize_evaluation_rows
+    from utils.daily_loader import enrich_match
+
+    # Create snapshot and historical settlement
+    m_upcoming = enrich_match(_match("m-live-hist"))
+    snapshot, created = capture_snapshot(m_upcoming)
+    
+    # We forcefully create a historical settlement using the direct API
+    m_finished = dict(m_upcoming, status="finished", score={"ft": [1, 0]})
+    settlement, _ = settle_snapshot(snapshot, m_finished)
+    
+    # Now the canonical match is somehow 'live' (or remains 'live' in some stale state)
+    canonical_live = dict(m_upcoming, status="live", score={"ft": [1, 0]})
+    
+    added = _materialize_evaluation_rows([canonical_live])
+    assert added == 0
+    assert len(get_evaluation_rows_for_match("m-live-hist")) == 0
+
+
+def test_materialize_rejects_settlement_with_different_score(isolated_data_dir, monkeypatch):
+    """
+    7. Actual `_materialize_evaluation_rows()` rejects an explicitly finished match
+    whose settlement has a different final score.
+    """
+    from utils.scraper import _materialize_evaluation_rows
+    from utils.daily_loader import enrich_match
+
+    m_upcoming = enrich_match(_match("m-diff-score"))
+    snapshot, created = capture_snapshot(m_upcoming)
+    
+    # Historical settlement score = 1-0
+    m_finished_1 = dict(m_upcoming, status="finished", score={"ft": [1, 0]})
+    settlement, _ = settle_snapshot(snapshot, m_finished_1)
+    
+    # Canonical match is finished but score = 1-1
+    canonical_finished = dict(m_upcoming, status="finished", score={"ft": [1, 1]})
+    added = _materialize_evaluation_rows([canonical_finished])
+    
+    assert added == 0
+    assert len(get_evaluation_rows_for_match("m-diff-score")) == 0
+
+
+def test_materialize_rejects_settlement_with_different_fingerprint_or_outcome(isolated_data_dir, monkeypatch):
+    """
+    8. Actual `_materialize_evaluation_rows()` rejects a settlement whose
+    result fingerprint or actual outcome disagrees with the canonical result.
+    """
+    from utils.scraper import _materialize_evaluation_rows
+    from utils.daily_loader import enrich_match
+
+    m_upcoming = enrich_match(_match("m-diff-fp"))
+    snapshot, created = capture_snapshot(m_upcoming)
+    
+    m_finished_1 = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
+    settlement, _ = settle_snapshot(snapshot, m_finished_1)
+    
+    # Modify settlement to have a tampered outcome but same score, to simulate legacy mismatch
+    settlement["actual_outcome"] = "draw"
+    
+    from utils.atomic_json import load_json_file, atomic_write_json
+    from utils.settlements import store_path
+    
+    # Manually tamper with the storage
+    store = load_json_file(store_path(), None)
+    store["settlements"][settlement["settlement_id"]] = settlement
+    atomic_write_json(store_path(), store)
+
+    canonical_finished = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
+    added = _materialize_evaluation_rows([canonical_finished])
+    
+    assert added == 0
+    assert len(get_evaluation_rows_for_match("m-diff-fp")) == 0
+
+
+def test_materialize_valid_legacy_settlement_exactly_once(isolated_data_dir, monkeypatch):
+    """
+    9. Valid canonical-finished settlement materializes its previously missing evaluation exactly once.
+    10. A second materialization pass creates zero duplicates.
+    11. An existing evaluation remains byte-for-byte unchanged.
+    """
+    from utils.scraper import _materialize_evaluation_rows
+    from utils.daily_loader import enrich_match
+
+    m_upcoming = enrich_match(_match("m-valid-hist"))
+    snapshot, created = capture_snapshot(m_upcoming)
+    
+    m_finished = dict(m_upcoming, status="finished", score={"ft": [2, 0]})
+    settlement, _ = settle_snapshot(snapshot, m_finished)
+    
+    # First materialization pass
+    canonical_finished = dict(m_upcoming, status="finished", score={"ft": [2, 0]})
+    added_first = _materialize_evaluation_rows([canonical_finished])
+    
+    assert added_first == 1
+    evals = get_evaluation_rows_for_match("m-valid-hist")
+    assert len(evals) == 1
+    eval_row_first = evals[0].copy()
+    
+    # Second materialization pass
+    added_second = _materialize_evaluation_rows([canonical_finished])
+    assert added_second == 0
+    
+    evals_second = get_evaluation_rows_for_match("m-valid-hist")
+    assert len(evals_second) == 1
+    assert evals_second[0] == eval_row_first

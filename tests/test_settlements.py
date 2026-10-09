@@ -459,15 +459,6 @@ def test_settlement_immutability(isolated_data_dir, make_match):
     assert second["settled_at"] == first["settled_at"]
 
 
-def test_materialize_evaluations_protection_dummy(isolated_data_dir, make_match):
-    """Elapsed time safeguards: a test to represent materialization protection conceptually."""
-    # The actual _materialize_evaluation_rows is in scraper.py, 
-    # but we represent the decoupling logic validation here.
-    m, snap = _snapshot(make_match)
-    m["status"] = "upcoming"
-    settlement, created = settle_snapshot(snap, m)
-    assert created is False
-
 
 def test_settlement_invalid_type_rejection(isolated_data_dir, make_match):
     """Immutability & Safety: ensure only int types pass through."""
@@ -475,5 +466,20 @@ def test_settlement_invalid_type_rejection(isolated_data_dir, make_match):
     m["status"] = "finished"
     m["score"] = {"ft": [2.0, 1.0]}
     settlement, created = settle_snapshot(snap, m)
+    assert created is False
+    assert settlement is None
+
+
+def test_settlement_cross_match_identity_rejection(isolated_data_dir, make_match):
+    """
+    Match Identity: Verify that a snapshot for match A cannot be settled 
+    using the canonical final result from match B.
+    """
+    m_a, snap_a = _snapshot(make_match, id="match-A")
+    m_b = dict(m_a, id="match-B", status="finished", score={"ft": [2, 0]})
+    
+    # Passing snapshot from A but canonical match B
+    settlement, created = settle_snapshot(snap_a, m_b)
+    
     assert created is False
     assert settlement is None

@@ -95,12 +95,9 @@ def gate_for(evaluation_rows: int, matched_snapshot_odds_matches: int) -> str:
 
 def _is_finished(match: dict) -> bool:
     """canonical 终态判定：finished 且含严格有效的全场比分。"""
-    from utils.daily_loader import add_time_status
-    from utils.match_lifecycle import valid_full_time_score
+    from utils.match_lifecycle import is_finalized_match
 
-    if add_time_status(dict(match)).get("status") != "finished":
-        return False
-    return valid_full_time_score(match.get("score"))
+    return is_finalized_match(match)
 
 
 def _is_valid_prematch(snapshot: dict) -> bool:

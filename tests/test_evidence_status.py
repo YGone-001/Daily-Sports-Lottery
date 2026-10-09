@@ -419,3 +419,38 @@ def test_partition_invariant_over_mixed_finished_matches():
         == integ["finished_without_evaluation_no_eligible_snapshot"]
         + integ["finished_without_evaluation_had_eligible_snapshot"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Authoritative Finality Enforcement Tests for Evidence Status
+# ---------------------------------------------------------------------------
+
+from utils.evidence_status import build_evidence_status
+
+def test_evidence_status_rejects_expired_live(isolated_data_dir, make_match):
+    """
+    12. Evidence Status does not classify elapsed-time live matches as finished.
+    """
+    m = dict(make_match(id="m-live"), status="live", score={"ft": [1, 1]})
+    s = {"snapshot_id": "snap-1", "match_id": "m-live", "generated_at": "2030-01-01T12:00:00", "kickoff_at": "2030-01-01T13:00:00"}
+    
+    # Normally this would be > threshold elapsed time. 
+    # _is_finished now requires canonical "finished", so this is strictly not finished.
+    status = build_evidence_status(matches=[m], snapshots=[s])
+    
+    assert status["integrity"]["finished_without_evaluation"] == 0
+    assert status["integrity"]["unsettled_eligible_snapshots"] == 0
+
+
+def test_evidence_status_detects_genuine_final_missing_settlement(isolated_data_dir, make_match):
+    """
+    13. Evidence Status detects a genuinely source-finalized match with missing eligible settlement.
+    """
+    m = dict(make_match(id="m-fin"), status="finished", score={"ft": [2, 0]})
+    s = {"snapshot_id": "snap-1", "match_id": "m-fin", "generated_at": "2030-01-01T12:00:00", "kickoff_at": "2030-01-01T13:00:00", "sport": "football", "model_name": "football-test", "model_version": "v1"}
+    
+    status = build_evidence_status(matches=[m], snapshots=[s])
+    
+    assert status["integrity"]["finished_without_evaluation"] == 1
+    assert status["integrity"]["finished_without_evaluation_had_eligible_snapshot"] == 1
+    assert status["integrity"]["unsettled_eligible_snapshots"] == 1

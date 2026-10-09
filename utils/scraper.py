@@ -400,6 +400,8 @@ def _materialize_evaluation_rows(matches: list[dict], now=None) -> int:
 
     本函数不跑预测模型、不读当前球队实力、不读当前盘口、不重新结算、不计算任何指标。
     """
+    from utils.settlements import extract_final_score, outcome_from_score, result_fingerprint
+
     added = 0
     visited: set[str] = set()
     for m in matches:
@@ -410,11 +412,35 @@ def _materialize_evaluation_rows(matches: list[dict], now=None) -> int:
             continue
         visited.add(match_id)
 
+        canonical_score = extract_final_score(m)
+        if not canonical_score:
+            continue
+
+        canonical_outcome = outcome_from_score(canonical_score)
+        canonical_fingerprint = result_fingerprint(canonical_score)
+
         for settlement in get_settlements_for_match(match_id):
             snapshot_id = settlement.get("snapshot_id")
             snapshot = get_snapshot(snapshot_id) if snapshot_id else None
             if not snapshot:
                 continue
+            
+            if snapshot.get("match_id") != match_id or settlement.get("match_id") != match_id:
+                print(f"[Auto-Sync] 匹配身份冲突 {match_id}/{snapshot_id}，拒绝物化")
+                continue
+                
+            if settlement.get("final_score") != canonical_score:
+                print(f"[Auto-Sync] 遗留结算比分与 canonical 不一致 {match_id}/{snapshot_id}，拒绝物化")
+                continue
+                
+            if settlement.get("actual_outcome") != canonical_outcome:
+                print(f"[Auto-Sync] 遗留结算胜负与 canonical 不一致 {match_id}/{snapshot_id}，拒绝物化")
+                continue
+                
+            if settlement.get("result_fingerprint") != canonical_fingerprint:
+                print(f"[Auto-Sync] 遗留结算指纹与 canonical 不一致 {match_id}/{snapshot_id}，拒绝物化")
+                continue
+
             try:
                 _row, created = capture_evaluation_row(snapshot, settlement, now=now)
             except EvaluationIntegrityError as exc:
