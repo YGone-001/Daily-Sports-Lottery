@@ -29,6 +29,7 @@ from utils.market_coverage import has_usable_market_odds
 from utils.match_identity import is_kickoff_time_known, same_event
 from utils.match_lifecycle import (
     MatchLifecycleConflict,
+    is_finalized_match,
     resolve_match_update,
     valid_full_time_score,
 )
@@ -364,7 +365,7 @@ def _settle_finished_matches(matches: list[dict], now=None) -> int:
         match_id = m.get("id")
         if not match_id:
             continue
-        if add_time_status(m, now).get("status") != "finished":
+        if not is_finalized_match(m):
             continue
 
         snapshots = get_snapshots_for_match(match_id)
@@ -404,6 +405,8 @@ def _materialize_evaluation_rows(matches: list[dict], now=None) -> int:
     for m in matches:
         match_id = m.get("id")
         if not match_id or match_id in visited:
+            continue
+        if not is_finalized_match(m):
             continue
         visited.add(match_id)
 

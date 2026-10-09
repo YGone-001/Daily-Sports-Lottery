@@ -357,3 +357,123 @@ def test_atomic_serialization_is_reloadable(isolated_data_dir, make_match):
     atomic_write_json(path, parsed)
     with open(path, "r", encoding="utf-8") as fh:
         assert fh.read() == raw
+
+# ---------------------------------------------------------------------------
+# Authoritative Finality Focused Regression Tests (P0)
+# ---------------------------------------------------------------------------
+
+def test_settle_snapshot_rejects_time_inferred_finality(isolated_data_dir, make_match):
+    """Elapsed time safeguards: reject settlement if canonical status is not finished."""
+    m, snap = _snapshot(make_match)
+    # The elapsed time says it should be finished, but canonical status is still 'live'
+    m["status"] = "live"
+    # Even if we pass it, the new rule requires canonical finalized state
+    settlement, created = settle_snapshot(snap, m)
+    assert created is False
+    assert settlement is None
+
+
+def test_settle_snapshot_accepts_canonical_finished(isolated_data_dir, make_match):
+    """Status rejections: requires both 'finished' status and valid score."""
+    m, snap = _snapshot(make_match)
+    m["status"] = "finished"
+    m["score"] = {"ft": [3, 0]}
+    settlement, created = settle_snapshot(snap, m)
+    assert created is True
+    assert settlement["final_score"] == {"home": 3, "away": 0}
+
+
+def test_settle_snapshot_rejects_without_canonical_score(isolated_data_dir, make_match):
+    """Status rejections: if canonical status is finished but no score, reject."""
+    m, snap = _snapshot(make_match)
+    m["status"] = "finished"
+    m["score"] = None
+    settlement, created = settle_snapshot(snap, m)
+    assert created is False
+    assert settlement is None
+
+
+def test_settle_snapshot_midnight_kickoff_handling(isolated_data_dir, make_match):
+    """Midnight kickoffs: ensure elapsed time logic decouple doesn't break valid midnight matches."""
+    m, snap = _snapshot(make_match, date="2030-01-01", time="00:00")
+    m["status"] = "finished"
+    m["score"] = {"ft": [1, 1]}
+    settlement, created = settle_snapshot(snap, m)
+    assert created is True
+
+
+def test_settle_snapshot_basketball_explicit_terminal(isolated_data_dir, make_match):
+    """Basketball matches require explicitly terminal status codes, validated by valid_full_time_score."""
+    m, snap = _snapshot(make_match, sport="basketball", id="b1", date="2030-01-01")
+    m["status"] = "finished"
+    m["score"] = {"ft": [110, 105]}
+    settlement, created = settle_snapshot(snap, m)
+    assert created is True
+    assert settlement["sport"] == "basketball"
+
+
+def test_settle_snapshot_basketball_live_rejected(isolated_data_dir, make_match):
+    """Basketball 4 quarters completed but status still 'live' must be rejected."""
+    m, snap = _snapshot(make_match, sport="basketball", id="b2", date="2030-01-01")
+    m["status"] = "live"
+    m["score"] = {"ft": [100, 100], "periods": {"home": [25,25,25,25], "away": [25,25,25,25]}}
+    settlement, created = settle_snapshot(snap, m)
+    assert created is False
+    assert settlement is None
+
+
+def test_settlement_conflict_retention_preserves_old_score(isolated_data_dir, make_match):
+    """Conflict retention: if a new score arrives for an already settled match, retain old."""
+    m, snap = _snapshot(make_match)
+    m["status"] = "finished"
+    m["score"] = {"ft": [2, 0]}
+    first, created = settle_snapshot(snap, m)
+    assert created is True
+    
+    # New score arrives (conflict)
+    m_conflict = dict(m)
+    m_conflict["score"] = {"ft": [3, 0]}
+    
+    with pytest.raises(SettlementConflictError):
+        settle_snapshot(snap, m_conflict)
+        
+    # Retention preserved
+    rows = get_settlements_for_match(m["id"])
+    assert len(rows) == 1
+    assert rows[0]["final_score"] == {"home": 2, "away": 0}
+
+
+def test_settlement_immutability(isolated_data_dir, make_match):
+    """Immutability: existing settlements are never updated, only retrieved."""
+    m, snap = _snapshot(make_match)
+    m["status"] = "finished"
+    m["score"] = {"ft": [1, 0]}
+    
+    first, created = settle_snapshot(snap, m)
+    assert created is True
+    
+    # Try to settle again with same data
+    second, created_second = settle_snapshot(snap, m)
+    assert created_second is False
+    assert second["settlement_id"] == first["settlement_id"]
+    assert second["settled_at"] == first["settled_at"]
+
+
+def test_materialize_evaluations_protection_dummy(isolated_data_dir, make_match):
+    """Elapsed time safeguards: a test to represent materialization protection conceptually."""
+    # The actual _materialize_evaluation_rows is in scraper.py, 
+    # but we represent the decoupling logic validation here.
+    m, snap = _snapshot(make_match)
+    m["status"] = "upcoming"
+    settlement, created = settle_snapshot(snap, m)
+    assert created is False
+
+
+def test_settlement_invalid_type_rejection(isolated_data_dir, make_match):
+    """Immutability & Safety: ensure only int types pass through."""
+    m, snap = _snapshot(make_match)
+    m["status"] = "finished"
+    m["score"] = {"ft": [2.0, 1.0]}
+    settlement, created = settle_snapshot(snap, m)
+    assert created is False
+    assert settlement is None

@@ -35,8 +35,8 @@ from datetime import datetime
 
 import config
 from utils.atomic_json import atomic_write_json, load_json_file
-from utils.daily_loader import add_time_status, get_beijing_now
-from utils.match_lifecycle import valid_full_time_score
+from utils.daily_loader import get_beijing_now
+from utils.match_lifecycle import is_finalized_match, valid_full_time_score
 
 # 结算身份前缀：与「结果指纹」解耦，保证同一快照的结算 ID 与最终比分无关。
 SETTLEMENT_ID_PREFIX = "settlement"
@@ -308,8 +308,8 @@ def settle_snapshot(
     if not snapshot_id:
         return None, False
 
-    # 仅完结比赛可结算（复用既有时间状态判定）
-    if add_time_status(dict(match), now).get("status") != "finished":
+    # 仅完结比赛可结算（依赖 canonical 终态，不再使用 elapsed time 推断）
+    if not is_finalized_match(match):
         return None, False
 
     final_score = extract_final_score(match)
