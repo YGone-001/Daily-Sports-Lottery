@@ -251,28 +251,62 @@ def test_settle_finished_matches_rejects_expired_live(isolated_data_dir, monkeyp
     assert len(get_evaluation_rows_for_match("m-b1")) == 0
     
 
-def test_direct_settle_snapshot_rejects_expired_live(isolated_data_dir, monkeypatch):
+def test_direct_settle_snapshot_rejects_expired_live_football(isolated_data_dir, monkeypatch):
     """
-    5. Direct `settle_snapshot()` rejects both expired-time live scenarios.
+    5. Direct `settle_snapshot()` rejects expired-time live football scenario.
     """
     from utils.daily_loader import enrich_match, get_match_datetime, add_time_status
     from utils.prediction_snapshots import capture_snapshot
     from utils.settlements import get_settlements_for_match
     from utils.evaluation_rows import get_evaluation_rows_for_match
     
-    mf = enrich_match(_match("m-dir-1"))
-    snap, _ = capture_snapshot(mf)
+    mf = enrich_match(_match("m-dir-f1"))
+    snap_f, _ = capture_snapshot(mf)
     
     kf_f = get_match_datetime(mf)
     now_f_24h = kf_f + timedelta(hours=24)
     
     live_mf = dict(mf, status="live", score={"ft": [1, 1]})
-    
     assert add_time_status(live_mf.copy(), now=now_f_24h).get("status") == "finished"
-    settlement, created = scraper.settle_snapshot(snap, live_mf)
-    assert created is False
-    assert len(get_settlements_for_match("m-dir-1")) == 0
-    assert len(get_evaluation_rows_for_match("m-dir-1")) == 0
+    settlement_f, created_f = scraper.settle_snapshot(snap_f, live_mf)
+    assert created_f is False
+    assert settlement_f is None
+    assert len(get_settlements_for_match("m-dir-f1")) == 0
+    assert len(get_evaluation_rows_for_match("m-dir-f1")) == 0
+
+def test_direct_settle_snapshot_rejects_expired_live_basketball(isolated_data_dir, monkeypatch):
+    """
+    5b. Direct `settle_snapshot()` rejects expired-time live basketball scenario.
+    """
+    from utils.daily_loader import enrich_match, get_match_datetime, add_time_status
+    from utils.prediction_snapshots import capture_snapshot
+    from utils.settlements import get_settlements_for_match
+    from utils.evaluation_rows import get_evaluation_rows_for_match
+
+    mb = enrich_match(_match("m-dir-b1", sport="basketball"))
+    snap_b, _ = capture_snapshot(mb)
+    
+    kf_b = get_match_datetime(mb)
+    now_b_136m = kf_b + timedelta(minutes=136)
+    now_b_24h = kf_b + timedelta(hours=24)
+    
+    live_mb = dict(mb, status="live", score={"ft": [100, 100], "periods": {"home": [25,25,25,25], "away": [25,25,25,25]}})
+    
+    # Kickoff + 136 minutes
+    assert add_time_status(live_mb.copy(), now=now_b_136m).get("status") == "finished"
+    settlement_b1, created_b1 = scraper.settle_snapshot(snap_b, live_mb)
+    assert created_b1 is False
+    assert settlement_b1 is None
+    assert len(get_settlements_for_match("m-dir-b1")) == 0
+    assert len(get_evaluation_rows_for_match("m-dir-b1")) == 0
+    
+    # Kickoff + 24 hours
+    assert add_time_status(live_mb.copy(), now=now_b_24h).get("status") == "finished"
+    settlement_b2, created_b2 = scraper.settle_snapshot(snap_b, live_mb)
+    assert created_b2 is False
+    assert settlement_b2 is None
+    assert len(get_settlements_for_match("m-dir-b1")) == 0
+    assert len(get_evaluation_rows_for_match("m-dir-b1")) == 0
 
 
 def test_scraper_refresh_full_path_rejects_expired_live(isolated_data_dir, monkeypatch):

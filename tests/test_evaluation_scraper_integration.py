@@ -342,3 +342,35 @@ def test_materialize_valid_legacy_settlement_exactly_once(isolated_data_dir, mon
     evals_second = get_evaluation_rows_for_match("m-valid-hist")
     assert len(evals_second) == 1
     assert evals_second[0] == eval_row_first
+
+
+def test_materialize_rejects_settlement_with_different_fingerprint_or_outcome(isolated_data_dir, monkeypatch):
+    """
+    Restore previously accepted regression identity:
+    Rejects a settlement whose result fingerprint or actual outcome disagrees 
+    with the canonical result.
+    """
+    from utils.scraper import _materialize_evaluation_rows
+    from utils.daily_loader import enrich_match
+    from utils.atomic_json import load_json_file, atomic_write_json
+    from utils.settlements import store_path
+
+    m_upcoming = enrich_match(_match("m-diff-both"))
+    snapshot, created = capture_snapshot(m_upcoming)
+    
+    m_finished_1 = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
+    settlement, _ = settle_snapshot(snapshot, m_finished_1)
+    
+    # Tamper with outcome to simulate mismatch
+    settlement["actual_outcome"] = "draw"
+    
+    # Manually tamper with the storage
+    store = load_json_file(store_path(), None)
+    store["settlements"][settlement["settlement_id"]] = settlement
+    atomic_write_json(store_path(), store)
+
+    canonical_finished = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
+    added = _materialize_evaluation_rows([canonical_finished])
+    
+    assert added == 0
+    assert len(get_evaluation_rows_for_match("m-diff-both")) == 0

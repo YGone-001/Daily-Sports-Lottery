@@ -461,6 +461,7 @@ def test_evidence_status_rejects_expired_live(isolated_data_dir, make_match):
     # Pipeline integrity must still be true (no missing evidence errors)
     assert status["integrity"]["finished_without_evaluation_no_eligible_snapshot"] == 0
     assert status["integrity"]["finished_without_evaluation_had_eligible_snapshot"] == 0
+    assert status["pipeline_integrity"] is True
 
 
 def test_evidence_status_detects_genuine_final_missing_settlement(isolated_data_dir, make_match):

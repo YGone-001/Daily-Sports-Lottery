@@ -505,3 +505,19 @@ def test_settlement_strict_identity_equality(isolated_data_dir, make_match):
     settlement, created = settle_snapshot(test_snap, test_match)
     assert created is True
     assert settlement is not None
+
+
+def test_settlement_cross_match_identity_rejection(isolated_data_dir, make_match):
+    """
+    Restore previously accepted regression identity: 
+    cross-match identity rejection.
+    """
+    from utils.settlements import get_settlements_for_match
+    m_a, snap_a = _snapshot(make_match, id="match-A")
+    m_b = dict(m_a, id="match-B", status="finished", score={"ft": [2, 0]})
+    
+    settlement, created = settle_snapshot(snap_a, m_b)
+    
+    assert created is False
+    assert settlement is None
+    assert len(get_settlements_for_match("match-B")) == 0
