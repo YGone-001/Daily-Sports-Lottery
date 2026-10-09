@@ -294,7 +294,7 @@ def test_direct_settle_snapshot_rejects_expired_live_basketball(isolated_data_di
     
     # Kickoff + 136 minutes
     assert add_time_status(live_mb.copy(), now=now_b_136m).get("status") == "finished"
-    settlement_b1, created_b1 = scraper.settle_snapshot(snap_b, live_mb)
+    settlement_b1, created_b1 = scraper.settle_snapshot(snap_b, live_mb, now=now_b_136m)
     assert created_b1 is False
     assert settlement_b1 is None
     assert len(get_settlements_for_match("m-dir-b1")) == 0
@@ -302,11 +302,36 @@ def test_direct_settle_snapshot_rejects_expired_live_basketball(isolated_data_di
     
     # Kickoff + 24 hours
     assert add_time_status(live_mb.copy(), now=now_b_24h).get("status") == "finished"
-    settlement_b2, created_b2 = scraper.settle_snapshot(snap_b, live_mb)
+    settlement_b2, created_b2 = scraper.settle_snapshot(snap_b, live_mb, now=now_b_24h)
     assert created_b2 is False
     assert settlement_b2 is None
     assert len(get_settlements_for_match("m-dir-b1")) == 0
     assert len(get_evaluation_rows_for_match("m-dir-b1")) == 0
+
+
+def test_direct_settle_snapshot_rejects_expired_live(isolated_data_dir, monkeypatch):
+    """
+    Restore original direct settle test identity: football +121 minutes.
+    """
+    from utils.daily_loader import enrich_match, get_match_datetime, add_time_status
+    from utils.prediction_snapshots import capture_snapshot
+    from utils.settlements import get_settlements_for_match
+    from utils.evaluation_rows import get_evaluation_rows_for_match
+    
+    mf = enrich_match(_match("m-dir-orig"))
+    snap, _ = capture_snapshot(mf)
+    
+    kf_f = get_match_datetime(mf)
+    fixed_now = kf_f + timedelta(minutes=121)
+    
+    live_mf = dict(mf, status="live", score={"ft": [1, 1]})
+    
+    assert add_time_status(live_mf.copy(), now=fixed_now).get("status") == "finished"
+    settlement, created = scraper.settle_snapshot(snap, live_mf, now=fixed_now)
+    assert created is False
+    assert settlement is None
+    assert len(get_settlements_for_match("m-dir-orig")) == 0
+    assert len(get_evaluation_rows_for_match("m-dir-orig")) == 0
 
 
 def test_scraper_refresh_full_path_rejects_expired_live(isolated_data_dir, monkeypatch):
