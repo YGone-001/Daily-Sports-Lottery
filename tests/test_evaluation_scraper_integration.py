@@ -247,27 +247,61 @@ def test_materialize_rejects_settlement_with_different_score(isolated_data_dir, 
     assert len(get_evaluation_rows_for_match("m-diff-score")) == 0
 
 
-def test_materialize_rejects_settlement_with_different_fingerprint_or_outcome(isolated_data_dir, monkeypatch):
+def test_materialize_rejects_outcome_mismatch(isolated_data_dir, monkeypatch):
     """
-    8. Actual `_materialize_evaluation_rows()` rejects a settlement whose
-    result fingerprint or actual outcome disagrees with the canonical result.
+    Correction D - Case 1: Outcome mismatch
+    canonical score = 2-1
+    settlement score = 2-1
+    settlement fingerprint = correct
+    settlement outcome = draw
     """
     from utils.scraper import _materialize_evaluation_rows
     from utils.daily_loader import enrich_match
-
-    m_upcoming = enrich_match(_match("m-diff-fp"))
-    snapshot, created = capture_snapshot(m_upcoming)
-    
-    m_finished_1 = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
-    settlement, _ = settle_snapshot(snapshot, m_finished_1)
-    
-    # Modify settlement to have a tampered outcome but same score, to simulate legacy mismatch
-    settlement["actual_outcome"] = "draw"
-    
     from utils.atomic_json import load_json_file, atomic_write_json
     from utils.settlements import store_path
+
+    m_upcoming = enrich_match(_match("m-diff-out"))
+    snapshot, _ = capture_snapshot(m_upcoming)
     
-    # Manually tamper with the storage
+    m_finished = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
+    settlement, _ = settle_snapshot(snapshot, m_finished)
+    
+    # Tamper with outcome only
+    settlement["actual_outcome"] = "draw"
+    
+    store = load_json_file(store_path(), None)
+    store["settlements"][settlement["settlement_id"]] = settlement
+    atomic_write_json(store_path(), store)
+
+    canonical_finished = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
+    added = _materialize_evaluation_rows([canonical_finished])
+    
+    assert added == 0
+    assert len(get_evaluation_rows_for_match("m-diff-out")) == 0
+
+
+def test_materialize_rejects_fingerprint_mismatch(isolated_data_dir, monkeypatch):
+    """
+    Correction D - Case 2: Fingerprint mismatch
+    canonical score = 2-1
+    settlement score = 2-1
+    settlement outcome = home_win
+    settlement fingerprint = invalid
+    """
+    from utils.scraper import _materialize_evaluation_rows
+    from utils.daily_loader import enrich_match
+    from utils.atomic_json import load_json_file, atomic_write_json
+    from utils.settlements import store_path
+
+    m_upcoming = enrich_match(_match("m-diff-fp"))
+    snapshot, _ = capture_snapshot(m_upcoming)
+    
+    m_finished = dict(m_upcoming, status="finished", score={"ft": [2, 1]})
+    settlement, _ = settle_snapshot(snapshot, m_finished)
+    
+    # Tamper with fingerprint only
+    settlement["result_fingerprint"] = "invalid_fingerprint_hash"
+    
     store = load_json_file(store_path(), None)
     store["settlements"][settlement["settlement_id"]] = settlement
     atomic_write_json(store_path(), store)
@@ -281,9 +315,7 @@ def test_materialize_rejects_settlement_with_different_fingerprint_or_outcome(is
 
 def test_materialize_valid_legacy_settlement_exactly_once(isolated_data_dir, monkeypatch):
     """
-    9. Valid canonical-finished settlement materializes its previously missing evaluation exactly once.
-    10. A second materialization pass creates zero duplicates.
-    11. An existing evaluation remains byte-for-byte unchanged.
+    Correction D - Case 3: Valid record
     """
     from utils.scraper import _materialize_evaluation_rows
     from utils.daily_loader import enrich_match
@@ -303,7 +335,7 @@ def test_materialize_valid_legacy_settlement_exactly_once(isolated_data_dir, mon
     assert len(evals) == 1
     eval_row_first = evals[0].copy()
     
-    # Second materialization pass
+    # Second materialization pass (zero on replay)
     added_second = _materialize_evaluation_rows([canonical_finished])
     assert added_second == 0
     

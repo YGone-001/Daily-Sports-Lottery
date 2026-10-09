@@ -205,8 +205,10 @@ def test_settle_finished_matches_rejects_expired_live(isolated_data_dir, monkeyp
     3. Rejects live basketball match 136 minutes after kickoff.
     4. Rejects live basketball match 24 hours after kickoff with 4 quarters.
     """
-    from utils.daily_loader import enrich_match, get_match_datetime
+    from utils.daily_loader import enrich_match, get_match_datetime, add_time_status
     from utils.prediction_snapshots import capture_snapshot
+    from utils.settlements import get_settlements_for_match
+    from utils.evaluation_rows import get_evaluation_rows_for_match
     
     # Pre-req: capture snapshots
     mf = enrich_match(_match("m-f1", sport="football"))
@@ -222,35 +224,55 @@ def test_settle_finished_matches_rejects_expired_live(isolated_data_dir, monkeyp
     
     # 1. Football 121 minutes
     now_f_121 = kf_f + timedelta(minutes=121)
+    assert add_time_status(live_mf.copy(), now=now_f_121).get("status") == "finished"
     assert scraper._settle_finished_matches([live_mf], now=now_f_121) == 0
+    assert len(get_settlements_for_match("m-f1")) == 0
+    assert len(get_evaluation_rows_for_match("m-f1")) == 0
     
     # 2. Football 24 hours
     now_f_24h = kf_f + timedelta(hours=24)
+    assert add_time_status(live_mf.copy(), now=now_f_24h).get("status") == "finished"
     assert scraper._settle_finished_matches([live_mf], now=now_f_24h) == 0
+    assert len(get_settlements_for_match("m-f1")) == 0
+    assert len(get_evaluation_rows_for_match("m-f1")) == 0
     
     # 3. Basketball 136 minutes
     now_b_136 = kf_b + timedelta(minutes=136)
+    assert add_time_status(live_mb.copy(), now=now_b_136).get("status") == "finished"
     assert scraper._settle_finished_matches([live_mb], now=now_b_136) == 0
+    assert len(get_settlements_for_match("m-b1")) == 0
+    assert len(get_evaluation_rows_for_match("m-b1")) == 0
     
     # 4. Basketball 24 hours
     now_b_24h = kf_b + timedelta(hours=24)
+    assert add_time_status(live_mb.copy(), now=now_b_24h).get("status") == "finished"
     assert scraper._settle_finished_matches([live_mb], now=now_b_24h) == 0
+    assert len(get_settlements_for_match("m-b1")) == 0
+    assert len(get_evaluation_rows_for_match("m-b1")) == 0
     
 
 def test_direct_settle_snapshot_rejects_expired_live(isolated_data_dir, monkeypatch):
     """
     5. Direct `settle_snapshot()` rejects both expired-time live scenarios.
-    (This is heavily redundantly tested, but covers the explicit instruction.)
     """
-    from utils.daily_loader import enrich_match
+    from utils.daily_loader import enrich_match, get_match_datetime, add_time_status
     from utils.prediction_snapshots import capture_snapshot
+    from utils.settlements import get_settlements_for_match
+    from utils.evaluation_rows import get_evaluation_rows_for_match
     
     mf = enrich_match(_match("m-dir-1"))
     snap, _ = capture_snapshot(mf)
     
+    kf_f = get_match_datetime(mf)
+    now_f_24h = kf_f + timedelta(hours=24)
+    
     live_mf = dict(mf, status="live", score={"ft": [1, 1]})
+    
+    assert add_time_status(live_mf.copy(), now=now_f_24h).get("status") == "finished"
     settlement, created = scraper.settle_snapshot(snap, live_mf)
     assert created is False
+    assert len(get_settlements_for_match("m-dir-1")) == 0
+    assert len(get_evaluation_rows_for_match("m-dir-1")) == 0
 
 
 def test_scraper_refresh_full_path_rejects_expired_live(isolated_data_dir, monkeypatch):
@@ -258,17 +280,45 @@ def test_scraper_refresh_full_path_rejects_expired_live(isolated_data_dir, monke
     14. The full `scraper.refresh()` path cannot create settlement or evaluation
     for a live scoreboard with elapsed time exceeding the sport-specific threshold.
     """
-    _fake_sources(monkeypatch, [_match("m-full-path")])
-    scraper.refresh(verbose=False) # gets snapshot
+    from utils.daily_loader import add_time_status, enrich_match, get_match_datetime
+    from utils.settlements import get_settlements_for_match
+    from utils.evaluation_rows import get_evaluation_rows_for_match
+    from datetime import datetime, timezone, timedelta
+
+    # Setup specific time
+    # Kickoff is 2030-03-01 12:00
+    m = _match("m-full-path", date="2030-03-01", time="12:00", status="upcoming")
     
-    live_mf = _match("m-full-path", status="live", score={"ft": [2, 0]})
-    # Mocking time logic inside fetcher/scraper via monkeypatch or just passing it
-    # We will just ensure that if the match is live, refresh doesn't settle it.
+    # Time 1: before kickoff
+    bj_tz = timezone(timedelta(hours=8))
+    clock = {"now": datetime(2030, 3, 1, 10, 0, 0, tzinfo=bj_tz)}
+    monkeypatch.setattr(scraper, "get_beijing_now", lambda: clock["now"])
+    
+    # 1. Capture prematch snapshot
+    _fake_sources(monkeypatch, [m])
+    scraper.refresh(verbose=False) 
+    
+    # Verify snapshot
+    from utils.prediction_snapshots import get_snapshots_for_match
+    assert len(get_snapshots_for_match("m-full-path")) == 1
+    
+    live_mf = _match("m-full-path", date="2030-03-01", time="12:00", status="live", score={"ft": [2, 0]})
+    enriched_live = enrich_match(live_mf)
+    
+    # Time 2: way after kickoff (> 2 hours), but still "live"
+    clock["now"] = datetime(2030, 3, 2, 0, 0, 0, tzinfo=bj_tz)
+    
+    # Prove legacy display would consider it finished
+    assert add_time_status(enriched_live, now=clock["now"]).get("status") == "finished"
+    
     _fake_sources(monkeypatch, [live_mf])
     
     result = scraper.refresh(verbose=False)
     assert result["settlements_added"] == 0
     assert result["evaluation_rows_added"] == 0
+    
+    assert len(get_settlements_for_match("m-full-path")) == 0
+    assert len(get_evaluation_rows_for_match("m-full-path")) == 0
 
 
 def test_scraper_refresh_midnight_kickoff(isolated_data_dir, monkeypatch):

@@ -470,16 +470,38 @@ def test_settlement_invalid_type_rejection(isolated_data_dir, make_match):
     assert settlement is None
 
 
-def test_settlement_cross_match_identity_rejection(isolated_data_dir, make_match):
+def test_settlement_strict_identity_equality(isolated_data_dir, make_match):
     """
-    Match Identity: Verify that a snapshot for match A cannot be settled 
-    using the canonical final result from match B.
+    Strict Match Identity Correction A:
+    A/A -> valid when other conditions qualify
+    A/B, A/missing, missing/A, empty/A, A/empty, whitespace/A, A/whitespace, non-string/A -> reject
     """
-    m_a, snap_a = _snapshot(make_match, id="match-A")
-    m_b = dict(m_a, id="match-B", status="finished", score={"ft": [2, 0]})
+    from utils.settlements import get_settlements_for_match
+    m_base, snap_base = _snapshot(make_match, id="match-A")
+    m_fin = dict(m_base, status="finished", score={"ft": [2, 0]})
     
-    # Passing snapshot from A but canonical match B
-    settlement, created = settle_snapshot(snap_a, m_b)
+    cases = [
+        ("match-A", "match-B"),
+        ("match-A", None),
+        (None, "match-A"),
+        ("", "match-A"),
+        ("match-A", ""),
+        ("   ", "match-A"),
+        ("match-A", "   "),
+        (123, "match-A"),
+    ]
     
-    assert created is False
-    assert settlement is None
+    for snap_id, can_id in cases:
+        test_snap = dict(snap_base, match_id=snap_id) if snap_id is not None else {k:v for k,v in snap_base.items() if k != "match_id"}
+        test_match = dict(m_fin, id=can_id) if can_id is not None else {k:v for k,v in m_fin.items() if k != "id"}
+        settlement, created = settle_snapshot(test_snap, test_match)
+        assert created is False
+        assert settlement is None
+        assert len(get_settlements_for_match(str(can_id))) == 0
+        
+    # A/A valid
+    test_snap = dict(snap_base, match_id="match-A")
+    test_match = dict(m_fin, id="match-A")
+    settlement, created = settle_snapshot(test_snap, test_match)
+    assert created is True
+    assert settlement is not None

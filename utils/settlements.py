@@ -311,7 +311,12 @@ def settle_snapshot(
     # 严防跨场结算：快照所属比赛与传入的 canonical 比赛必须是同一场
     snap_match_id = snapshot.get("match_id")
     canonical_match_id = match.get("id")
-    if snap_match_id and canonical_match_id and snap_match_id != canonical_match_id:
+    
+    if not isinstance(snap_match_id, str) or not isinstance(canonical_match_id, str):
+        return None, False
+    if not snap_match_id.strip() or not canonical_match_id.strip():
+        return None, False
+    if snap_match_id != canonical_match_id:
         return None, False
 
     # 仅完结比赛可结算（依赖 canonical 终态，不再使用 elapsed time 推断）

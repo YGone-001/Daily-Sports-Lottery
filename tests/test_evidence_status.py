@@ -429,17 +429,38 @@ from utils.evidence_status import build_evidence_status
 
 def test_evidence_status_rejects_expired_live(isolated_data_dir, make_match):
     """
-    12. Evidence Status does not classify elapsed-time live matches as finished.
+    Correction C: Evidence Status Expiry Regression.
     """
-    m = dict(make_match(id="m-live"), status="live", score={"ft": [1, 1]})
-    s = {"snapshot_id": "snap-1", "match_id": "m-live", "generated_at": "2030-01-01T12:00:00", "kickoff_at": "2030-01-01T13:00:00"}
+    from utils.daily_loader import enrich_match, add_time_status
+    from datetime import datetime, timezone, timedelta
     
-    # Normally this would be > threshold elapsed time. 
-    # _is_finished now requires canonical "finished", so this is strictly not finished.
+    m_base = make_match(id="m-live", date="2030-01-01", time="12:00", status="live", score={"ft": [1, 1]})
+    m = enrich_match(m_base)
+    
+    bj_tz = timezone(timedelta(hours=8))
+    fixed_now = datetime(2030, 1, 2, 12, 0, 0, tzinfo=bj_tz) # 24 hours later
+    
+    # Prove legacy display would infer finished
+    assert add_time_status(m.copy(), now=fixed_now).get("status") == "finished"
+    
+    s = {
+        "snapshot_id": "snap-1", 
+        "match_id": "m-live", 
+        "generated_at": "2030-01-01T11:00:00+00:00", 
+        "kickoff_at": "2030-01-01T12:00:00+00:00",
+        "sport": "football",
+        "model_name": "football-test",
+        "model_version": "v1"
+    }
+    
     status = build_evidence_status(matches=[m], snapshots=[s])
     
-    assert status["integrity"]["finished_without_evaluation"] == 0
     assert status["integrity"]["unsettled_eligible_snapshots"] == 0
+    assert status["integrity"]["finished_without_evaluation"] == 0
+    
+    # Pipeline integrity must still be true (no missing evidence errors)
+    assert status["integrity"]["finished_without_evaluation_no_eligible_snapshot"] == 0
+    assert status["integrity"]["finished_without_evaluation_had_eligible_snapshot"] == 0
 
 
 def test_evidence_status_detects_genuine_final_missing_settlement(isolated_data_dir, make_match):
