@@ -226,17 +226,31 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
     added = updated = 0
 
     for inc in incoming:
-        match_idx = -1
-        for i, old in enumerate(result):
-            if same_event(old, inc):
-                match_idx = i
-                break
-
         inc_mid = inc.get("id")
+        if inc_mid is not None:
+            if not isinstance(inc_mid, str):
+                raise CanonicalIdentityCollisionError("NONE", "MALFORMED_INCOMING_ID", "Incoming ID has invalid type")
+            inc_mid = inc_mid.strip()
+            if not inc_mid:
+                raise CanonicalIdentityCollisionError("NONE", "MALFORMED_INCOMING_ID", "Incoming ID is empty")
+
+        matching_indices = [i for i, old in enumerate(result) if same_event(old, inc)]
+        match_idx = -1
+
+        if len(matching_indices) > 1:
+            raise CanonicalIdentityCollisionError(str(inc_mid), "AMBIGUOUS_CANONICAL_OWNERSHIP", "Multiple matching Canonical records found")
+
         if inc_mid and inc_mid in id_owner:
             owner = id_owner[inc_mid]
             if not same_event(owner, inc):
-                raise CanonicalIdentityCollisionError(inc_mid, "INCOMING_ID_OWNER_MISMATCH", "Incoming ID belongs to a different matched event")
+                raise CanonicalIdentityCollisionError(inc_mid, "SAME_SOURCE_ALIAS_DIFFERENT_EVENT", "Source alias reused for different event")
+            if matching_indices:
+                match_idx = matching_indices[0]
+        else:
+            if len(matching_indices) == 1:
+                match_idx = matching_indices[0]
+                if inc_mid:
+                    id_owner[inc_mid] = result[match_idx]
 
         if match_idx >= 0:
             old = result[match_idx]
@@ -499,15 +513,13 @@ def _refresh_impl(verbose: bool = True) -> dict:
     # 0. Validate existing canonical identities BEFORE fetching
     data = load_json(DAILY_FILE)
     if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        raise CanonicalIdentityCollisionError("NONE", "MALFORMED_CANONICAL_ROOT", "Canonical root is not an object")
-
-    matches_list = data.get("matches")
-    if matches_list is None:
         matches_list = []
-    if not isinstance(matches_list, list):
-        raise CanonicalIdentityCollisionError("NONE", "MALFORMED_MATCHES_ARRAY", "matches is not an array")
+    else:
+        if not isinstance(data, dict):
+            raise CanonicalIdentityCollisionError("NONE", "MALFORMED_CANONICAL_ROOT", "Canonical root is not an object")
+        if "matches" in data and not isinstance(data["matches"], list):
+            raise CanonicalIdentityCollisionError("NONE", "MALFORMED_MATCHES_ARRAY", "matches is not an array")
+        matches_list = data.get("matches", [])
 
     seen_ids = set()
     for idx, m in enumerate(matches_list):
@@ -593,8 +605,7 @@ def _refresh_impl(verbose: bool = True) -> dict:
         return result
 
     # 5. 迁移既有 canonical 集合：剔除历史上被广泛抓取、且无盘口覆盖的赛事
-    data = load_json(DAILY_FILE) or {}
-    existing, legacy_removed = _prepare_existing_market_universe(data.get("matches", []))
+    existing, legacy_removed = _prepare_existing_market_universe(matches_list)
 
     # 6. 市场准入：已跟踪比赛接受更新；新候选必须具备可用盘口覆盖
     admitted, rejected = _admit_market_candidates(incoming, existing)
