@@ -211,6 +211,7 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
     使用 same_event 做去重，严格保持旧 canonical id，通过 resolve_match_update 实施状态机。
     返回 (merged, added, updated)。
     """
+    id_owner: dict[str, dict] = {}
     seen_ids = set()
     for m in existing:
         mid = m.get("id")
@@ -219,6 +220,7 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
         if mid in seen_ids:
             raise CanonicalIdentityCollisionError(mid, "PREEXISTING_DUPLICATE", "Duplicate ID in existing")
         seen_ids.add(mid)
+        id_owner[mid] = m
 
     result: list[dict] = [copy.deepcopy(m) for m in existing]
     added = updated = 0
@@ -230,6 +232,12 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
                 match_idx = i
                 break
 
+        inc_mid = inc.get("id")
+        if inc_mid and inc_mid in id_owner:
+            owner = id_owner[inc_mid]
+            if not same_event(owner, inc):
+                raise CanonicalIdentityCollisionError(inc_mid, "INCOMING_ID_OWNER_MISMATCH", "Incoming ID belongs to a different matched event")
+
         if match_idx >= 0:
             old = result[match_idx]
             before = copy.deepcopy(old)
@@ -239,7 +247,7 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
                 h_e, a_e = exc.existing_score[0], exc.existing_score[1]
                 h_i, a_i = exc.incoming_score[0], exc.incoming_score[1]
                 print(
-                    f"[Auto-Sync] 冲突 {exc.match_id}: "
+                    f"[Auto-Sync] 完赛结果冲突 {exc.match_id}: "
                     f"existing={h_e}-{a_e} incoming={h_i}-{a_i}; "
                     f"canonical result preserved"
                 )
@@ -258,7 +266,9 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
 
             if mid in seen_ids:
                 raise CanonicalIdentityCollisionError(mid, "INCOMING_SHARED_ID", "New event shares existing ID")
+
             seen_ids.add(mid)
+            id_owner[mid] = m
 
             m["market_tracked"] = True
             result.append(m)
@@ -487,15 +497,34 @@ def _refresh_impl(verbose: bool = True) -> dict:
     now = get_beijing_now()
 
     # 0. Validate existing canonical identities BEFORE fetching
-    data = load_json(DAILY_FILE) or {}
-    existing_for_check = data.get("matches", [])
+    data = load_json(DAILY_FILE)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise CanonicalIdentityCollisionError("NONE", "MALFORMED_CANONICAL_ROOT", "Canonical root is not an object")
+
+    matches_list = data.get("matches")
+    if matches_list is None:
+        matches_list = []
+    if not isinstance(matches_list, list):
+        raise CanonicalIdentityCollisionError("NONE", "MALFORMED_MATCHES_ARRAY", "matches is not an array")
+
     seen_ids = set()
-    for m in existing_for_check:
+    for idx, m in enumerate(matches_list):
+        if not isinstance(m, dict):
+            raise CanonicalIdentityCollisionError(f"index_{idx}", "MALFORMED_MATCH_ENTRY", "A match entry is not an object")
+
         mid = m.get("id")
+        if mid is None:
+            raise CanonicalIdentityCollisionError(f"index_{idx}", "AMBIGUOUS_SOURCE", "A match ID is missing")
+        if not isinstance(mid, str):
+            raise CanonicalIdentityCollisionError(f"index_{idx}", "MALFORMED_ID_TYPE", "A match ID has an invalid type")
+        mid = mid.strip()
         if not mid:
-            raise CanonicalIdentityCollisionError("NONE", "AMBIGUOUS_SOURCE", "Existing canonical record missing ID")
+            raise CanonicalIdentityCollisionError(f"index_{idx}", "AMBIGUOUS_SOURCE", "A match ID is empty or whitespace-only")
+
         if mid in seen_ids:
-            raise CanonicalIdentityCollisionError(mid, "PREEXISTING_DUPLICATE", "Pre-existing duplicate in Canonical collection")
+            raise CanonicalIdentityCollisionError(mid, "PREEXISTING_DUPLICATE", "Two matches share the same ID")
         seen_ids.add(mid)
 
     result = {
