@@ -9,6 +9,7 @@ import pytest
 import errno
 import urllib.request
 import requests
+import math
 
 import config
 from app import app, start_background_scraper
@@ -22,6 +23,7 @@ from utils.odds_snapshots import get_odds_history_for_match, record_odds_snapsho
 from utils.settlements import get_settlements_for_match, settle_snapshot
 from utils.evaluation_rows import get_all_evaluation_rows, capture_evaluation_row
 from utils.match_lifecycle import valid_full_time_score
+from utils.team_strength import expected_result
 
 class NetworkViolationError(RuntimeError):
     pass
@@ -58,8 +60,18 @@ def run_in_subprocess(data_dir, script_code):
     env["PYTHONPATH"] = os.path.dirname(os.path.dirname(__file__))
     return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+def cleanup_process(p, timeout=5):
+    """BF-03: Mandatory Process Cleanup"""
+    if p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(timeout=timeout)
+    assert p.poll() is not None
 
-# BE-07: AC-T01 HTTP 200/409 preserved
+# AC-T01
 def test_t01_simultaneous_http_requests(isolated_data_dir):
     client = app.test_client()
     barrier_entry = threading.Barrier(2)
@@ -95,7 +107,7 @@ def test_t01_simultaneous_http_requests(isolated_data_dir):
         assert sorted(results) == [200, 409]
 
 
-# BE-07: AC-T02 Actual scheduler busy handling preserved
+# BF-01: AC-T02 Actual scheduler busy handling preserved & asserted
 def test_t02_http_and_scheduler_overlap(isolated_data_dir, monkeypatch):
     client = app.test_client()
     job_func = [None]
@@ -110,6 +122,7 @@ def test_t02_http_and_scheduler_overlap(isolated_data_dir, monkeypatch):
     job = job_func[0]
     assert job is not None
 
+    # Scenario A: Scheduler succeeds
     scheduler_entry, scheduler_exit = threading.Event(), threading.Event()
     def mocked_refresh_a(*args, **kwargs):
         scheduler_entry.set()
@@ -134,6 +147,7 @@ def test_t02_http_and_scheduler_overlap(isolated_data_dir, monkeypatch):
             t1.join(timeout=5)
             assert not t1.is_alive()
 
+    # Scenario B: HTTP refresh holds lock, Scheduler skips
     http_entry, http_exit = threading.Event(), threading.Event()
     def mocked_refresh_b(*args, **kwargs):
         http_entry.set()
@@ -145,17 +159,26 @@ def test_t02_http_and_scheduler_overlap(isolated_data_dir, monkeypatch):
         t2 = threading.Thread(target=http_job)
         t2.start()
         assert http_entry.wait(timeout=5)
+
         with mock.patch("builtins.print") as mock_print:
             with mock.patch("time.sleep", side_effect=mock_sleep_a):
                 try: job()
                 except BreakLoop: pass
-            # We just verify it executes without crashing on busy
+
+            mock_print.assert_any_call("[Auto-Sync] 跳过: 另一个刷新进程正在运行 (RefreshBusyError)")
+
+            for call in mock_print.call_args_list:
+                args, _ = call
+                for arg in args:
+                    if isinstance(arg, str):
+                        assert "[Auto-Sync] 完成:" not in arg
+
         http_exit.set()
         t2.join(timeout=5)
         assert not t2.is_alive()
 
 
-# BE-02: Bound All Subprocess Handshakes (AC-T03)
+# AC-T03 Cross Process Same Data Dir
 def test_t03_cross_process_same_data_dir(isolated_data_dir):
     ready_file = str(isolated_data_dir / "ready.txt")
     script = f"""# -*- coding: utf-8 -*-
@@ -197,7 +220,6 @@ with acquire_refresh_lock():
 """
     p1 = run_in_subprocess(str(isolated_data_dir), hold_script)
     try:
-        # Bounded wait for ready_file
         deadline = time.time() + 5
         while time.time() < deadline:
             if os.path.exists(ready_file): break
@@ -211,15 +233,12 @@ with acquire_refresh_lock():
             assert "BUSY" in out
             assert "NET_VIOLATION" not in out
         finally:
-            if p2.poll() is None:
-                p2.terminate()
-                p2.wait(timeout=2)
+            cleanup_process(p2)
     finally:
-        p1.terminate()
-        p1.wait(timeout=5)
+        cleanup_process(p1)
 
 
-# BE-02: Bound All Subprocess Handshakes (AC-T04)
+# BF-02: AC-T04 Both Independent Processes Must Exit Successfully
 def test_t04_cross_process_different_data_dir(tmp_path):
     d1 = tmp_path / "d1"
     d2 = tmp_path / "d2"
@@ -228,16 +247,14 @@ def test_t04_cross_process_different_data_dir(tmp_path):
     os.makedirs(d1, exist_ok=True)
     os.makedirs(d2, exist_ok=True)
 
-    def make_script(d, r, wait_time):
+    def make_script(d, own_ready, other_ready):
         return f"""# -*- coding: utf-8 -*-
 import os, sys, time
 sys.path.insert(0, r"{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}")
 import config
 config.DATA_DIR = r"{str(d)}"
 
-def block(*args, **kwargs):
-    print("NET_VIOLATION")
-    sys.exit(2)
+def block(*args, **kwargs): sys.exit(2)
 import urllib.request, requests
 urllib.request.urlopen = block
 requests.get = block
@@ -246,27 +263,29 @@ requests.Session.get = block
 
 from utils.concurrency import acquire_refresh_lock
 with acquire_refresh_lock():
-    with open(r"{str(r)}", "w") as f: f.write("READY")
-    time.sleep({wait_time})
+    with open(r"{str(own_ready)}", "w") as f: f.write("READY")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if os.path.exists(r"{str(other_ready)}"): break
+        time.sleep(0.1)
+    if not os.path.exists(r"{str(other_ready)}"):
+        sys.exit(3)
 """
-    p1 = run_in_subprocess(str(d1), make_script(d1, r1, 10))
-    p2 = run_in_subprocess(str(d2), make_script(d2, r2, 2))
+    p1 = run_in_subprocess(str(d1), make_script(d1, r1, r2))
+    p2 = run_in_subprocess(str(d2), make_script(d2, r2, r1))
     try:
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            if os.path.exists(r1) and os.path.exists(r2): break
-            time.sleep(0.1)
+        out1, err1 = p1.communicate(timeout=10)
+        out2, err2 = p2.communicate(timeout=10)
+
+        assert p1.returncode == 0, f"P1 failed: {err1}"
+        assert p2.returncode == 0, f"P2 failed: {err2}"
         assert os.path.exists(r1) and os.path.exists(r2)
-
-        # p2 will exit in 2 seconds, p1 holds for 10
-        out2, err2 = p2.communicate(timeout=5)
-        assert p2.returncode == 0
     finally:
-        p1.terminate()
-        p1.wait(timeout=5)
+        cleanup_process(p1)
+        cleanup_process(p2)
 
 
-# BE-01: AC-T05 Restore Exception-Release Test
+# AC-T05 Restore Exception-Release Test
 def test_t05_exception_releases_held_lock(isolated_data_dir):
     class InjectionError(Exception): pass
 
@@ -278,21 +297,18 @@ def test_t05_exception_releases_held_lock(isolated_data_dir):
         with pytest.raises(InjectionError):
             scraper.refresh()
 
-    # Verify another thread can acquire
     results = []
     def acq_thread():
         try:
             with acquire_refresh_lock():
                 results.append("SUCCESS")
-        except Exception:
-            pass
+        except Exception: pass
     t = threading.Thread(target=acq_thread)
     t.start()
     t.join(timeout=2)
     assert not t.is_alive()
     assert results == ["SUCCESS"]
 
-    # Verify separate process can acquire
     script = f"""# -*- coding: utf-8 -*-
 import os, sys
 sys.path.insert(0, r"{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}")
@@ -309,12 +325,15 @@ with acquire_refresh_lock():
     print("SUCCESS")
 """
     p = run_in_subprocess(str(isolated_data_dir), script)
-    out, err = p.communicate(timeout=2)
-    assert p.returncode == 0
-    assert "SUCCESS" in out
+    try:
+        out, err = p.communicate(timeout=5)
+        assert p.returncode == 0
+        assert "SUCCESS" in out
+    finally:
+        cleanup_process(p)
 
 
-# BE-02: AC-T06 Bound Subprocess Handshakes
+# AC-T06 Crash releases lock
 def test_t06_process_crash_releases_lock(isolated_data_dir):
     ready_file = str(isolated_data_dir / "ready.txt")
     script = f"""# -*- coding: utf-8 -*-
@@ -340,13 +359,13 @@ with acquire_refresh_lock():
         p1.communicate(timeout=5)
         assert os.path.exists(ready_file)
     finally:
-        if p1.poll() is None: p1.terminate(); p1.wait(timeout=2)
+        cleanup_process(p1)
 
     with acquire_refresh_lock():
         pass
 
 
-# BE-07: AC-T07 Process-local thread exclusion preserved
+# AC-T07 Process-local thread exclusion preserved
 def test_t07_coordinator_edge_cases(isolated_data_dir):
     barrier_entry = threading.Barrier(2)
     barrier_exit = threading.Barrier(2)
@@ -380,7 +399,7 @@ def test_t07_coordinator_edge_cases(isolated_data_dir):
     with acquire_refresh_lock(): pass
 
 
-# BE-07: AC-T08 Three atomic replacement boundaries preserved
+# AC-T08 Three atomic replacement boundaries preserved
 def test_t08_atomic_replacement_failure_boundaries(isolated_data_dir):
     target = "test.json"
     save_json(target, {"v": 1})
@@ -407,7 +426,7 @@ def test_t08_atomic_replacement_failure_boundaries(isolated_data_dir):
     assert load_json(target) == {"v": 3}
 
 
-# BE-06: AC-T09 Deterministic Atomic Reader Concurrency
+# AC-T09 Deterministic Atomic Reader Concurrency
 def test_t09_concurrent_canonical_readers_under_atomic_writes(isolated_data_dir):
     barrier = threading.Barrier(2)
     writer_errs, reader_errs = [], []
@@ -438,7 +457,7 @@ def test_t09_concurrent_canonical_readers_under_atomic_writes(isolated_data_dir)
     assert "v" in load_json("test.json")
 
 
-# BE-03: AC-T10 Verify Exact Elo Results
+# AC-T10 Verify Exact Elo Results
 def test_t10_fresh_elo_contention(isolated_data_dir, make_match, monkeypatch):
     m = make_match(status="finished", score={"ft": [2, 0]})
     assert valid_full_time_score(m.get("score"))
@@ -451,10 +470,6 @@ def test_t10_fresh_elo_contention(isolated_data_dir, make_match, monkeypatch):
     elo_initial_away = prof_away["elo_rating"]
     match_count_home = prof_home.get("matches_played", 0)
     match_count_away = prof_away.get("matches_played", 0)
-
-    # Calculate expected Elo precisely
-    import math
-    from utils.team_strength import expected_result
 
     ha = config.MODEL_CONFIG["home_advantage_elo"]
     exp_h = expected_result(elo_initial_home + ha, elo_initial_away)
@@ -469,7 +484,7 @@ def test_t10_fresh_elo_contention(isolated_data_dir, make_match, monkeypatch):
     monkeypatch.setattr("utils.fetcher_500.fetch_live_basketball", lambda *a, **kw: [])
     monkeypatch.setattr("utils.fetcher_500.fetch_live_matches", lambda *a, **kw: [])
     monkeypatch.setattr("utils.fetcher_500.fetch_jczq_xml", lambda *a, **kw: [])
-    monkeypatch.setattr("utils.fetcher_500.fetch_finished_matches", lambda: [m])
+    monkeypatch.setattr("utils.fetcher_500.fetch_finished_matches", lambda *a, **kw: [m])
 
     entry_event, exit_event = threading.Event(), threading.Event()
     original_update = team_strength.update_from_result
@@ -526,7 +541,7 @@ def test_t10_fresh_elo_contention(isolated_data_dir, make_match, monkeypatch):
         assert team_strength.get_team_profile(m["home"]).get("matches_played", 0) == match_count_home + 1
 
 
-# BE-04: AC-T11 Strengthen Four-Store Immutable Evidence
+# BF-04: AC-T11 Full Four-Store ID-to-Payload Reconciliation
 def test_t11_immutable_evidence_preservation(isolated_data_dir, make_match, monkeypatch):
     m = make_match(id="old-m1", status="upcoming", odds={"home_win": 1.5})
 
@@ -542,30 +557,55 @@ def test_t11_immutable_evidence_preservation(isolated_data_dir, make_match, monk
     def extract_id_map(items, id_key):
         return {item[id_key]: json.dumps(item, sort_keys=True) for item in items}
 
-    map_snaps_before = extract_id_map(get_snapshots_for_match(m["id"]), "snapshot_id")
-    map_odds_before = extract_id_map(get_odds_history_for_match(m["id"]), "snapshot_id")
-    map_sett_before = extract_id_map(get_settlements_for_match(m["id"]), "settlement_id")
-    map_eval_before = extract_id_map(get_all_evaluation_rows(), "evaluation_id")
+    def read_full_store(filename, list_key):
+        return load_json(filename).get(list_key, {})
+
+    # Use actual underlying store structures
+    snaps_store = read_full_store("prediction_snapshots.json", "snapshots")
+    odds_store = read_full_store("odds_snapshots.json", "snapshots")
+    sett_store = read_full_store("settlements.json", "settlements")
+    eval_store = read_full_store("evaluation_rows.json", "rows")
+
+    map_snaps_before = extract_id_map(list(snaps_store.values()), "snapshot_id")
+    map_odds_before = extract_id_map(list(odds_store.values()), "snapshot_id")
+    map_sett_before = extract_id_map(list(sett_store.values()), "settlement_id")
+    map_eval_before = extract_id_map(list(eval_store.values()), "evaluation_id")
 
     assert len(map_snaps_before) >= 1
     assert len(map_odds_before) >= 1
     assert len(map_sett_before) >= 1
     assert len(map_eval_before) >= 1
 
-    # New match to trigger canonical admission
+    # Assert number of IDs equals number of records
+    assert len(map_snaps_before) == len(snaps_store)
+    assert len(map_odds_before) == len(odds_store)
+    assert len(map_sett_before) == len(sett_store)
+    assert len(map_eval_before) == len(eval_store)
+
+    # Check for missing IDs (None/empty string)
+    assert all(k for k in map_snaps_before.keys())
+    assert all(k for k in map_odds_before.keys())
+    assert all(k for k in map_sett_before.keys())
+    assert all(k for k in map_eval_before.keys())
+
     m2 = make_match(id="new-m2", home="A", away="B", status="upcoming", odds={"home_win": 2.0, "draw": 3.0, "away_win": 4.0})
     monkeypatch.setattr("utils.fetcher_500.fetch_live_basketball", lambda *a, **kw: [])
     monkeypatch.setattr("utils.fetcher_500.fetch_live_matches", lambda *a, **kw: [m2])
     monkeypatch.setattr("utils.fetcher_500.fetch_jczq_xml", lambda *a, **kw: [])
     monkeypatch.setattr("utils.fetcher_500.fetch_finished_matches", lambda *a, **kw: [])
 
-    scraper.refresh()
-    print("SNAPS AFTER:", get_snapshots_for_match(m2["id"]))
+    with mock.patch("builtins.print"):
+        scraper.refresh()
 
-    map_snaps_after = extract_id_map(get_snapshots_for_match(m["id"]), "snapshot_id")
-    map_odds_after = extract_id_map(get_odds_history_for_match(m["id"]), "snapshot_id")
-    map_sett_after = extract_id_map(get_settlements_for_match(m["id"]), "settlement_id")
-    map_eval_after = extract_id_map([e for e in get_all_evaluation_rows() if e.get("match_id") == m["id"]], "evaluation_id")
+    snaps_store_after = read_full_store("prediction_snapshots.json", "snapshots")
+    odds_store_after = read_full_store("odds_snapshots.json", "snapshots")
+    sett_store_after = read_full_store("settlements.json", "settlements")
+    eval_store_after = read_full_store("evaluation_rows.json", "rows")
+
+    map_snaps_after = extract_id_map(list(snaps_store_after.values()), "snapshot_id")
+    map_odds_after = extract_id_map(list(odds_store_after.values()), "snapshot_id")
+    map_sett_after = extract_id_map(list(sett_store_after.values()), "settlement_id")
+    map_eval_after = extract_id_map(list(eval_store_after.values()), "evaluation_id")
 
     # Verify existing retained and unchanged
     for k, v in map_snaps_before.items(): assert map_snaps_after[k] == v
@@ -573,15 +613,19 @@ def test_t11_immutable_evidence_preservation(isolated_data_dir, make_match, monk
     for k, v in map_sett_before.items(): assert map_sett_after[k] == v
     for k, v in map_eval_before.items(): assert map_eval_after[k] == v
 
-    # Assert duplicate IDs = 0
-    all_evals = get_all_evaluation_rows()
-    assert len([e["evaluation_id"] for e in all_evals]) == len(set([e["evaluation_id"] for e in all_evals]))
+    # Check duplicate IDs (lengths of sets matching lists)
+    assert len(snaps_store_after) == len(set(map_snaps_after.keys()))
+    assert len(odds_store_after) == len(set(map_odds_after.keys()))
+    assert len(sett_store_after) == len(set(map_sett_after.keys()))
+    assert len(eval_store_after) == len(set(map_eval_after.keys()))
 
     # Assert new canonical admission demonstrated
+    daily_m2 = next((m for m in load_json("daily_matches.json").get("matches", []) if m["id"] == "new-m2"), None)
+    assert daily_m2 is not None
     assert len(get_snapshots_for_match(m2["id"])) > 0
 
 
-# BE-07: AC-T12 Independent writer residual-risk exposure preserved
+# AC-T12 Independent writer residual-risk exposure preserved
 def test_t12_independent_writer_boundary(isolated_data_dir, make_match):
     m = make_match()
     entry_event, exit_event = threading.Event(), threading.Event()
@@ -599,7 +643,7 @@ def test_t12_independent_writer_boundary(isolated_data_dir, make_match):
     assert not t1.is_alive()
 
 
-# BE-07: AC-T13 All seven application stores unchanged on Busy preserved
+# AC-T13 All seven application stores unchanged on Busy preserved
 def test_t13_no_writes_on_busy(isolated_data_dir, make_match, monkeypatch):
     m = make_match(status="upcoming", odds={"home_win": 1.5})
     save_json("daily_matches.json", {"dates": ["2030-01-01"], "matches": [m]})
