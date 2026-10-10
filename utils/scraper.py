@@ -16,6 +16,7 @@ import copy
 import json
 from datetime import datetime
 
+from utils.concurrency import acquire_refresh_lock, RefreshBusyError
 from utils import fetcher_500
 from utils.daily_loader import (
     add_time_status,
@@ -454,7 +455,7 @@ def _materialize_evaluation_rows(matches: list[dict], now=None) -> int:
     return added
 
 
-def refresh(verbose: bool = True) -> dict:
+def _refresh_impl(verbose: bool = True) -> dict:
     """
     执行一次完整抓取刷新。
     返回统计信息。
@@ -590,10 +591,19 @@ def refresh(verbose: bool = True) -> dict:
     return result
 
 
+def refresh(verbose: bool = True) -> dict:
+    with acquire_refresh_lock():
+        return _refresh_impl(verbose=verbose)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  每日体彩数据抓取")
     print("=" * 60)
-    stats = refresh()
-    print()
-    print("结果:", stats)
+    import sys
+    try:
+        stats = refresh()
+        print("\n结果:", stats)
+    except RefreshBusyError as e:
+        print(f"\n[Busy] {e}")
+        sys.exit(1)

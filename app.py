@@ -233,8 +233,11 @@ def api_strategy():
 
 @app.route("/api/refresh", methods=["GET", "POST"])
 def api_refresh():
-    stats = scraper.refresh(verbose=False)
-    return jsonify(stats)
+    try:
+        stats = scraper.refresh(verbose=False)
+        return jsonify(stats)
+    except scraper.RefreshBusyError:
+        return jsonify({"status": "busy", "message": "Refresh in progress"}), 409
 
 
 @app.route("/api/status")
@@ -300,6 +303,8 @@ def start_background_scraper():
                 print(f"\n[Auto-Sync] {get_beijing_now().strftime('%H:%M:%S')} 开始抓取...")
                 stats = scraper.refresh(verbose=True)
                 print(f"[Auto-Sync] 完成: {stats.get('added')} 新增 / {stats.get('total')} 总计")
+            except scraper.RefreshBusyError:
+                print("[Auto-Sync] 跳过: 另一个刷新进程正在运行 (RefreshBusyError)")
             except Exception as exc:  # noqa: BLE001
                 print(f"[Auto-Sync] 异常: {exc}")
             time.sleep(config.SCRAPE_INTERVAL_SECONDS)

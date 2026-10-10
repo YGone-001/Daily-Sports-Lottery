@@ -39,10 +39,9 @@ def load_json(filename: str) -> dict:
 
 
 def save_json(filename: str, data: dict) -> None:
-    os.makedirs(config.DATA_DIR, exist_ok=True)
+    from utils.atomic_json import atomic_write_json
     filepath = _path(filename)
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(filepath, data)
 
 
 def get_beijing_now() -> datetime:
