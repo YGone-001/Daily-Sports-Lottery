@@ -179,6 +179,14 @@ def _admit_market_candidates(
     return admitted, rejected
 
 
+
+class CanonicalIdentityCollisionError(Exception):
+    """Raised when a canonical identity collision is detected before downstream writes."""
+    def __init__(self, match_id: str, category: str, message: str):
+        super().__init__(f"Collision [{category}] for ID {match_id}: {message}")
+        self.match_id = match_id
+        self.category = category
+
 def _record_changed(before: dict, after: dict) -> bool:
     """
     判定 canonical 记录是否真的发生变化（用于 updated 计数）。
@@ -199,10 +207,19 @@ def _record_changed(before: dict, after: dict) -> bool:
 
 def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int, int]:
     """
-    合并新旧赛事。
-    使用 same_event 跨源对账，严格保持旧 canonical id，通过 resolve_match_update 实施终态保护。
+    合并最新赛事。
+    使用 same_event 做去重，严格保持旧 canonical id，通过 resolve_match_update 实施状态机。
     返回 (merged, added, updated)。
     """
+    seen_ids = set()
+    for m in existing:
+        mid = m.get("id")
+        if not mid:
+            raise CanonicalIdentityCollisionError("NONE", "AMBIGUOUS_SOURCE", "Existing record missing ID")
+        if mid in seen_ids:
+            raise CanonicalIdentityCollisionError(mid, "PREEXISTING_DUPLICATE", "Duplicate ID in existing")
+        seen_ids.add(mid)
+
     result: list[dict] = [copy.deepcopy(m) for m in existing]
     added = updated = 0
 
@@ -222,7 +239,7 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
                 h_e, a_e = exc.existing_score[0], exc.existing_score[1]
                 h_i, a_i = exc.incoming_score[0], exc.incoming_score[1]
                 print(
-                    f"[Auto-Sync] 完赛结果冲突 {exc.match_id}: "
+                    f"[Auto-Sync] 冲突 {exc.match_id}: "
                     f"existing={h_e}-{a_e} incoming={h_i}-{a_i}; "
                     f"canonical result preserved"
                 )
@@ -234,8 +251,15 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
                 updated += 1
         else:
             m = dict(inc)
-            if not m.get("id"):
-                m["id"] = f"{m.get('sport','f')}-{m.get('date')}-{len(result) + added}"
+            mid = m.get("id")
+            if not mid:
+                mid = f"{m.get('sport','f')}-{m.get('date')}-{len(result) + added}"
+                m["id"] = mid
+
+            if mid in seen_ids:
+                raise CanonicalIdentityCollisionError(mid, "INCOMING_SHARED_ID", "New event shares existing ID")
+            seen_ids.add(mid)
+
             m["market_tracked"] = True
             result.append(m)
             added += 1
@@ -425,19 +449,19 @@ def _materialize_evaluation_rows(matches: list[dict], now=None) -> int:
             snapshot = get_snapshot(snapshot_id) if snapshot_id else None
             if not snapshot:
                 continue
-            
+
             if snapshot.get("match_id") != match_id or settlement.get("match_id") != match_id:
                 print(f"[Auto-Sync] 匹配身份冲突 {match_id}/{snapshot_id}，拒绝物化")
                 continue
-                
+
             if settlement.get("final_score") != canonical_score:
                 print(f"[Auto-Sync] 遗留结算比分与 canonical 不一致 {match_id}/{snapshot_id}，拒绝物化")
                 continue
-                
+
             if settlement.get("actual_outcome") != canonical_outcome:
                 print(f"[Auto-Sync] 遗留结算胜负与 canonical 不一致 {match_id}/{snapshot_id}，拒绝物化")
                 continue
-                
+
             if settlement.get("result_fingerprint") != canonical_fingerprint:
                 print(f"[Auto-Sync] 遗留结算指纹与 canonical 不一致 {match_id}/{snapshot_id}，拒绝物化")
                 continue
@@ -461,6 +485,19 @@ def _refresh_impl(verbose: bool = True) -> dict:
     返回统计信息。
     """
     now = get_beijing_now()
+
+    # 0. Validate existing canonical identities BEFORE fetching
+    data = load_json(DAILY_FILE) or {}
+    existing_for_check = data.get("matches", [])
+    seen_ids = set()
+    for m in existing_for_check:
+        mid = m.get("id")
+        if not mid:
+            raise CanonicalIdentityCollisionError("NONE", "AMBIGUOUS_SOURCE", "Existing canonical record missing ID")
+        if mid in seen_ids:
+            raise CanonicalIdentityCollisionError(mid, "PREEXISTING_DUPLICATE", "Pre-existing duplicate in Canonical collection")
+        seen_ids.add(mid)
+
     result = {
         "started_at": now.isoformat(),
         "sources": {},
