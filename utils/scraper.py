@@ -211,9 +211,11 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
     使用 same_event 做去重，严格保持旧 canonical id，通过 resolve_match_update 实施状态机。
     返回 (merged, added, updated)。
     """
+    result: list[dict] = [copy.deepcopy(m) for m in existing]
+
     id_owner: dict[str, dict] = {}
     seen_ids = set()
-    for m in existing:
+    for m in result:
         mid = m.get("id")
         if not mid:
             raise CanonicalIdentityCollisionError("NONE", "AMBIGUOUS_SOURCE", "Existing record missing ID")
@@ -222,10 +224,14 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
         seen_ids.add(mid)
         id_owner[mid] = m
 
-    result: list[dict] = [copy.deepcopy(m) for m in existing]
     added = updated = 0
 
-    for inc in incoming:
+    from utils.match_identity import competition_event_key, team_event_key
+
+    for inc_idx, inc in enumerate(incoming):
+        if not isinstance(inc, dict):
+            raise CanonicalIdentityCollisionError(f"inc_index_{inc_idx}", "MALFORMED_INCOMING_RECORD", "Incoming record is not a dictionary")
+
         inc_mid = inc.get("id")
         if inc_mid is not None:
             if not isinstance(inc_mid, str):
@@ -233,6 +239,9 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
             inc_mid = inc_mid.strip()
             if not inc_mid:
                 raise CanonicalIdentityCollisionError("NONE", "MALFORMED_INCOMING_ID", "Incoming ID is empty")
+        else:
+            if not competition_event_key(inc) and not team_event_key(inc):
+                raise CanonicalIdentityCollisionError("NONE", "INADEQUATE_EVENT_IDENTITY", "Incoming match has missing ID and inadequate event identity fields")
 
         matching_indices = [i for i, old in enumerate(result) if same_event(old, inc)]
         match_idx = -1
