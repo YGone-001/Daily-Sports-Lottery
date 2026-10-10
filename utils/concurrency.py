@@ -26,7 +26,7 @@ def acquire_refresh_lock():
     """
     data_dir = config.DATA_DIR
     os.makedirs(data_dir, exist_ok=True)
-    
+
     # 1. In-process thread exclusion
     thread_guard = _get_thread_guard(data_dir)
     if not thread_guard.acquire(blocking=False):
@@ -37,7 +37,7 @@ def acquire_refresh_lock():
         # 2. Cross-process OS exclusion
         lockfile = os.path.join(data_dir, ".refresh.lock")
         fd = os.open(lockfile, os.O_RDWR | os.O_CREAT, 0o666)
-        
+
         # Ensure at least 1 byte exists for Windows byte-range locking
         st = os.fstat(fd)
         if st.st_size == 0:
