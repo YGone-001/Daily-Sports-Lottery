@@ -64,17 +64,19 @@ def acquire_refresh_lock():
         yield
 
     finally:
-        if fd is not None:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            finally:
-                os.close(fd)
-        thread_guard.release()
+        try:
+            if fd is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+        finally:
+            thread_guard.release()
