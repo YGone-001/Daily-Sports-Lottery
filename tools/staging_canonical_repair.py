@@ -446,6 +446,38 @@ JOURNAL_STATES = [
 ]
 
 
+
+def group_attempts(entries: List[dict]) -> List[List[dict]]:
+    """
+    Partition journal entries into discrete attempts.
+    An attempt starts with PREPARED where action != 'ROLLED_BACK_TO_RAW_ARCHIVE'.
+    A rollback entry (PREPARED with action == 'ROLLED_BACK_TO_RAW_ARCHIVE')
+    belongs to the attempt that declared COMMIT_INTENT_DURABLE.
+    """
+    attempts: List[List[dict]] = []
+    current_attempt: List[dict] = []
+
+    for entry in entries:
+        st = entry.get("state")
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        action = payload.get("action")
+
+        if st == "PREPARED" and action != "ROLLED_BACK_TO_RAW_ARCHIVE":
+            if current_attempt:
+                attempts.append(current_attempt)
+            current_attempt = [entry]
+        else:
+            if not current_attempt:
+                current_attempt = [entry]
+            else:
+                current_attempt.append(entry)
+
+    if current_attempt:
+        attempts.append(current_attempt)
+
+    return attempts
+
+
 class StagingJournal:
     """
     Append-only disposition journal. Lazy filesystem initialization ensures
@@ -497,7 +529,7 @@ class StagingJournal:
         expected_migration_id: Optional[str] = None,
         expected_hashes: Optional[dict] = None,
     ) -> None:
-        """Enforce strict journal transition consistency, identity binding, and ordering."""
+        """Enforce strict journal transition consistency, identity binding, and ordering across attempts."""
         if not entries:
             return
 
@@ -506,25 +538,26 @@ class StagingJournal:
             if entry.get("state") == "CORRUPTED_LINE":
                 raise RecoveryStateError(f"Corrupted journal line detected: line {entry.get('line_no')}")
 
-        # 2. First entry must be PREPARED
-        if entries[0].get("state") != "PREPARED":
+        # 2. First entry of journal must be non-rollback PREPARED
+        first_payload = entries[0].get("payload") if isinstance(entries[0].get("payload"), dict) else {}
+        if entries[0].get("state") != "PREPARED" or first_payload.get("action") == "ROLLED_BACK_TO_RAW_ARCHIVE":
             raise RecoveryStateError(f"Journal must begin with PREPARED, got '{entries[0].get('state')}'")
 
-        expected_order = JOURNAL_STATES
-        last_index = -1
-        seen_states = set()
+        # 3. Validate global cross-entry invariants
         first_mig_id = None
         seen_dataset_identity = None
-
-        prep_source_hash = None
-        rec_a_hash = None
-        rec_b_hash = None
-        intent_projected_hash = None
-        intent_candidate_hash = None
+        first_intent_hashes = None
+        completion_count = 0
+        required_intent_fields = [
+            "source_file_sha256",
+            "projected_file_sha256",
+            "candidate_record_sha256",
+            "record_a_sha256",
+            "record_b_sha256",
+        ]
 
         for idx, entry in enumerate(entries):
             st = entry.get("state")
-
             if st not in JOURNAL_STATES:
                 raise RecoveryStateError(f"Unknown state '{st}' in journal")
 
@@ -553,23 +586,81 @@ class StagingJournal:
                 elif ds_id != seen_dataset_identity:
                     raise RecoveryStateError(f"Mismatched dataset identity across entries: '{ds_id}' != '{seen_dataset_identity}'")
 
-            # Check transition order
-            state_idx = expected_order.index(st)
+            # Track COMPLETION_RECORDED
+            if st == "COMPLETION_RECORDED":
+                completion_count += 1
+                if completion_count > 1:
+                    raise RecoveryStateError("Duplicate COMPLETION_RECORDED entry in journal")
 
-            if idx == 0:
-                # First entry is PREPARED (already verified)
-                last_index = 0
-            else:
-                prev_st = entries[idx - 1].get("state")
+            # Check intent hash consistency across all COMMIT_INTENT_DURABLE entries
+            if st == "COMMIT_INTENT_DURABLE":
+                for f_name in required_intent_fields:
+                    val = payload.get(f_name)
+                    if not val or not isinstance(val, str) or not val.strip():
+                        raise RecoveryStateError(f"Missing required intent hash field '{f_name}' in COMMIT_INTENT_DURABLE")
 
-                # Handle rollback
+                if first_intent_hashes is None:
+                    first_intent_hashes = {k: payload.get(k) for k in required_intent_fields}
+                else:
+                    for k in required_intent_fields:
+                        if payload.get(k) != first_intent_hashes[k]:
+                            raise RecoveryStateError(
+                                f"Conflicting {k} in subsequent COMMIT_INTENT_DURABLE: '{payload.get(k)}' != '{first_intent_hashes[k]}'"
+                            )
+
+                if expected_hashes:
+                    for k in required_intent_fields:
+                        if k in expected_hashes and payload.get(k) != expected_hashes[k]:
+                            raise RecoveryStateError(
+                                f"Intent {k} mismatch against expected hashes: '{payload.get(k)}' != '{expected_hashes[k]}'"
+                            )
+
+        # 4. Partition into discrete attempts and validate attempt progression
+        attempts = group_attempts(entries)
+        expected_order = JOURNAL_STATES
+
+        for att_idx, attempt_entries in enumerate(attempts):
+            if not attempt_entries or attempt_entries[0].get("state") != "PREPARED":
+                raise RecoveryStateError(f"Attempt {att_idx} must begin with PREPARED")
+
+            att_first_payload = attempt_entries[0].get("payload") if isinstance(attempt_entries[0].get("payload"), dict) else {}
+            if att_first_payload.get("action") == "ROLLED_BACK_TO_RAW_ARCHIVE":
+                raise RecoveryStateError(f"Attempt {att_idx} cannot begin with rollback action")
+
+            prep_source_hash = None
+            pre_store_hashes = att_first_payload.get("pre_store_hashes")
+            if isinstance(pre_store_hashes, dict):
+                prep_source_hash = pre_store_hashes.get("daily_matches.json")
+
+            rec_a_hash = None
+            rec_b_hash = None
+            intent_projected_hash = None
+            last_index = 0
+            has_commit_intent = False
+            has_rollback = False
+
+            for idx, entry in enumerate(attempt_entries[1:], 1):
+                st = entry.get("state")
+                payload = entry.get("payload")
+                prev_st = attempt_entries[idx - 1].get("state")
+
+                # Handle rollback within attempt
                 if st == "PREPARED" and payload.get("action") == "ROLLED_BACK_TO_RAW_ARCHIVE":
                     if prev_st != "COMMIT_INTENT_DURABLE":
                         raise RecoveryStateError(
                             f"Invalid rollback reset to PREPARED: previous state was '{prev_st}', expected 'COMMIT_INTENT_DURABLE'"
                         )
-                    last_index = 0
+                    if idx != len(attempt_entries) - 1:
+                        raise RecoveryStateError(
+                            f"Rollback to PREPARED must be terminal in attempt {att_idx}"
+                        )
+                    has_rollback = True
                     continue
+
+                if st == "PREPARED":
+                    raise RecoveryStateError("Duplicate PREPARED inside attempt")
+
+                state_idx = expected_order.index(st)
 
                 if state_idx < last_index:
                     raise RecoveryStateError(
@@ -586,70 +677,55 @@ class StagingJournal:
 
                 last_index = state_idx
 
-            # State-specific payload checks
-            if st == "PREPARED":
-                pre_store_hashes = payload.get("pre_store_hashes")
-                if pre_store_hashes and isinstance(pre_store_hashes, dict):
-                    prep_source_hash = pre_store_hashes.get("daily_matches.json")
+                if st == "EVIDENCE_VERIFIED":
+                    rec_a_hash = payload.get("rec_a_hash")
+                    rec_b_hash = payload.get("rec_b_hash")
 
-            elif st == "EVIDENCE_VERIFIED":
-                rec_a_hash = payload.get("rec_a_hash")
-                rec_b_hash = payload.get("rec_b_hash")
+                elif st == "COMMIT_INTENT_DURABLE":
+                    has_commit_intent = True
+                    intent_projected_hash = payload.get("projected_file_sha256")
 
-            elif st == "COMMIT_INTENT_DURABLE":
-                required_intent_fields = [
-                    "source_file_sha256",
-                    "projected_file_sha256",
-                    "candidate_record_sha256",
-                    "record_a_sha256",
-                    "record_b_sha256",
-                ]
-                for f_name in required_intent_fields:
-                    val = payload.get(f_name)
-                    if not val or not isinstance(val, str) or not val.strip():
-                        raise RecoveryStateError(f"Missing required intent hash field '{f_name}' in COMMIT_INTENT_DURABLE")
+                    if prep_source_hash and payload.get("source_file_sha256") != prep_source_hash:
+                        raise RecoveryStateError(
+                            f"Intent source_file_sha256 mismatch with PREPARED baseline: "
+                            f"'{payload.get('source_file_sha256')}' != '{prep_source_hash}'"
+                        )
+                    if rec_a_hash and payload.get("record_a_sha256") != rec_a_hash:
+                        raise RecoveryStateError(
+                            f"Intent record_a_sha256 mismatch with EVIDENCE_VERIFIED: "
+                            f"'{payload.get('record_a_sha256')}' != '{rec_a_hash}'"
+                        )
+                    if rec_b_hash and payload.get("record_b_sha256") != rec_b_hash:
+                        raise RecoveryStateError(
+                            f"Intent record_b_sha256 mismatch with EVIDENCE_VERIFIED: "
+                            f"'{payload.get('record_b_sha256')}' != '{rec_b_hash}'"
+                        )
 
-                intent_projected_hash = payload.get("projected_file_sha256")
-                intent_candidate_hash = payload.get("candidate_record_sha256")
+                elif st == "PROJECTION_COMMITTED":
+                    daily_h = payload.get("daily_matches_sha256")
+                    if not daily_h or not isinstance(daily_h, str) or not daily_h.strip():
+                        raise RecoveryStateError("Missing daily_matches_sha256 in PROJECTION_COMMITTED")
+                    if intent_projected_hash and daily_h != intent_projected_hash:
+                        raise RecoveryStateError(
+                            f"Mismatched projected file hash in PROJECTION_COMMITTED: '{daily_h}' != '{intent_projected_hash}'"
+                        )
 
-                # Verify internal consistency against PREPARED and EVIDENCE_VERIFIED
-                if prep_source_hash and payload.get("source_file_sha256") != prep_source_hash:
+            # Enforce non-final attempt boundary constraints
+            if att_idx < len(attempts) - 1:
+                if last_index >= expected_order.index("PROJECTION_COMMITTED"):
                     raise RecoveryStateError(
-                        f"Intent source_file_sha256 mismatch with PREPARED baseline: "
-                        f"'{payload.get('source_file_sha256')}' != '{prep_source_hash}'"
+                        f"Attempt {att_idx} committed projection; subsequent retry attempt is illegal"
                     )
-                if rec_a_hash and payload.get("record_a_sha256") != rec_a_hash:
+                if has_commit_intent and not has_rollback:
                     raise RecoveryStateError(
-                        f"Intent record_a_sha256 mismatch with EVIDENCE_VERIFIED: "
-                        f"'{payload.get('record_a_sha256')}' != '{rec_a_hash}'"
-                    )
-                if rec_b_hash and payload.get("record_b_sha256") != rec_b_hash:
-                    raise RecoveryStateError(
-                        f"Intent record_b_sha256 mismatch with EVIDENCE_VERIFIED: "
-                        f"'{payload.get('record_b_sha256')}' != '{rec_b_hash}'"
-                    )
-
-                if expected_hashes:
-                    for k in required_intent_fields:
-                        if k in expected_hashes and payload.get(k) != expected_hashes[k]:
-                            raise RecoveryStateError(
-                                f"Intent {k} mismatch against expected hashes: '{payload.get(k)}' != '{expected_hashes[k]}'"
-                            )
-
-            elif st == "PROJECTION_COMMITTED":
-                daily_h = payload.get("daily_matches_sha256")
-                if not daily_h or not isinstance(daily_h, str) or not daily_h.strip():
-                    raise RecoveryStateError("Missing daily_matches_sha256 in PROJECTION_COMMITTED")
-                if intent_projected_hash and daily_h != intent_projected_hash:
-                    raise RecoveryStateError(
-                        f"Mismatched projected file hash in PROJECTION_COMMITTED: '{daily_h}' != '{intent_projected_hash}'"
+                        f"Attempt {att_idx} declared COMMIT_INTENT_DURABLE without rollback; unrecovered crash cannot start new attempt"
                     )
 
-            elif st == "COMPLETION_RECORDED":
-                if "COMPLETION_RECORDED" in seen_states:
-                    raise RecoveryStateError("Duplicate COMPLETION_RECORDED entry in journal")
+        # If COMPLETION_RECORDED is present, ensure it is the last entry of the final attempt
+        if completion_count == 1:
+            if entries[-1].get("state") != "COMPLETION_RECORDED":
+                raise RecoveryStateError("COMPLETION_RECORDED must be the final entry of the journal")
 
-            seen_states.add(st)
 
     def get_latest_valid_state(self) -> Optional[str]:
         entries = self.read_entries()
@@ -880,8 +956,6 @@ class StagingCanonicalMigrator:
             raise PreconditionViolationError(f"Unknown or unbound dataset identity: {bound_identity}")
 
         assert_safe_path(self.working_dir, context="working_dir staging_apply", staging_root=self.staging_root)
-        os.makedirs(self.archive_dir, exist_ok=True)
-        os.makedirs(self.output_dir, exist_ok=True)
 
         daily_file = os.path.join(self.working_dir, "daily_matches.json")
         expected_projected_file_hash = baseline_manifest["projected_file_sha256"]
@@ -898,53 +972,16 @@ class StagingCanonicalMigrator:
                 len(current_matches) == 192
                 and current_daily_hash == expected_projected_file_hash
             ):
-                # Verify complete already-applied invariants:
-                # A. Target match
-                targets = [m for m in current_matches if m.get("id") == TARGET_CANONICAL_ID]
-                if len(targets) != 1:
-                    raise PreconditionViolationError("Expected exactly 1 target match in projected state")
-                cand_hash = hash_record(targets[0])
-                if cand_hash != EXPECTED_CANDIDATE_SHA256:
-                    raise PreconditionViolationError("Candidate record hash mismatch in projected state")
-                if not valid_full_time_score(targets[0].get("score")):
-                    raise PreconditionViolationError("Invalid final score in projected state")
-
-                # B. Verify all 6 non-Canonical stores match baseline!
-                current_store_hashes = self.get_store_hashes(self.working_dir)
-                for store in NON_CANONICAL_STORES:
-                    exp_h = baseline_manifest.get(store)
-                    if exp_h and current_store_hashes.get(store) != exp_h:
-                        raise ImmutableStoreMutationError(
-                            f"Already-applied check failed: store '{store}' mutated!"
-                        )
-
-                # C. Verify unrelated Canonical records match baseline
-                archive_raw = os.path.join(self.archive_dir, "daily_matches_raw.json")
-                if not os.path.exists(archive_raw):
-                    raise PreconditionViolationError("Forensic archive missing in projected state")
-                raw_data = read_json_strict(archive_raw)
-                raw_unrelated = [m for m in raw_data.get("matches", []) if m.get("id") != TARGET_CANONICAL_ID]
-                curr_unrelated = [m for m in current_matches if m.get("id") != TARGET_CANONICAL_ID]
-                if serialize_record(raw_unrelated) != serialize_record(curr_unrelated):
-                    raise PreconditionViolationError("Unrelated Canonical records altered in projected state")
-
-                # D. Verify journal completion
-                j_entries = self.journal.read_entries()
-                self.journal.validate_chain(j_entries, expected_migration_id=migration_id)
-                if self.journal.get_latest_valid_state() != "COMPLETION_RECORDED":
-                    raise PreconditionViolationError("Journal does not have COMPLETION_RECORDED")
-
-                # E. Verify archive manifest
-                if not os.path.exists(os.path.join(self.archive_dir, "forensic_manifest.json")):
-                    raise PreconditionViolationError("Forensic archive manifest missing")
+                # Verify complete already-applied invariants via unified verification
+                self.verify_completed_dataset(migration_id=migration_id, dataset_identity=bound_identity)
 
                 return {
                     "status": "ALREADY_APPLIED_NO_OP",
                     "total_matches": 192,
                     "target_occurrences": 1,
-                    "candidate_sha256": cand_hash,
+                    "candidate_sha256": EXPECTED_CANDIDATE_SHA256,
                     "projected_file_sha256": current_daily_hash,
-                    "message": "Store is already in post-migration projected state. No operation performed.",
+                    "message": "Store is already in post-migration projected state. Verified completed state invariants.",
                 }
 
             if fault_inject == "before_prepare":
@@ -969,15 +1006,38 @@ class StagingCanonicalMigrator:
                         f"Source store '{store}' hash mismatch against baseline manifest binding"
                     )
 
-            # Check journal state consistency and intent binding
+            # Check journal state consistency and handle multi-attempt scoping
             existing_entries = self.journal.read_entries()
             self.journal.validate_chain(existing_entries, expected_migration_id=migration_id)
+
+            attempt_num = 1
+            action = "INITIAL_PREPARED"
+            if existing_entries:
+                attempts = group_attempts(existing_entries)
+                last_attempt = attempts[-1]
+                last_st = last_attempt[-1].get("state")
+                last_act = (last_attempt[-1].get("payload") or {}).get("action")
+
+                if last_st in ("PROJECTION_COMMITTED", "POSTCONDITIONS_VERIFIED", "COMPLETION_RECORDED"):
+                    raise RecoveryStateError("Migration has already committed projection; new attempt cannot be started")
+                if last_st == "COMMIT_INTENT_DURABLE":
+                    raise RecoveryStateError("Previous attempt declared COMMIT_INTENT_DURABLE without rollback; run staging_recover first")
+
+                prior_attempts = [
+                    e.get("payload", {}).get("attempt", 1)
+                    for e in existing_entries
+                    if isinstance(e.get("payload"), dict)
+                ]
+                attempt_num = max(prior_attempts, default=1) + 1
+                action = "RETRY_PREPARED"
 
             self.journal.append_entry("PREPARED", {
                 "migration_id": migration_id,
                 "dataset_identity": bound_identity,
                 "working_dir": self.working_dir,
                 "pre_store_hashes": pre_store_hashes,
+                "attempt": attempt_num,
+                "action": action,
             })
 
             if fault_inject == "before_archive":
@@ -1017,6 +1077,7 @@ class StagingCanonicalMigrator:
 
             self.journal.append_entry("EVIDENCE_VERIFIED", {
                 "migration_id": migration_id,
+                "attempt": attempt_num,
                 "rec_a_hash": rec_a_hash,
                 "rec_b_hash": rec_b_hash,
                 "target_indices": [idx_a, idx_b],
@@ -1025,32 +1086,41 @@ class StagingCanonicalMigrator:
             if fault_inject == "during_archive":
                 raise FaultInjectionError("Fault injection: during_archive")
 
-            # Create forensic archive
+            # Create or reuse forensic archive
             raw_archive_path = os.path.join(self.archive_dir, "daily_matches_raw.json")
-            with open(daily_file, "rb") as src, open(raw_archive_path, "wb") as dst:
-                raw_bytes = src.read()
-                dst.write(raw_bytes)
-                dst.flush()
-                os.fsync(dst.fileno())
+            if os.path.exists(raw_archive_path):
+                # Verify existing archive before reusing
+                self.verify_forensic_archive(
+                    baseline_source_hash=pre_store_hashes["daily_matches.json"],
+                    expected_migration_id=migration_id,
+                    expected_dataset_identity=bound_identity,
+                )
+            else:
+                os.makedirs(self.archive_dir, exist_ok=True)
+                with open(daily_file, "rb") as src, open(raw_archive_path, "wb") as dst:
+                    raw_bytes = src.read()
+                    dst.write(raw_bytes)
+                    dst.flush()
+                    os.fsync(dst.fileno())
 
-            write_json_atomic(os.path.join(self.archive_dir, "record_a.json"), rec_a, staging_root=self.staging_root)
-            write_json_atomic(os.path.join(self.archive_dir, "record_b.json"), rec_b, staging_root=self.staging_root)
+                write_json_atomic(os.path.join(self.archive_dir, "record_a.json"), rec_a, staging_root=self.staging_root)
+                write_json_atomic(os.path.join(self.archive_dir, "record_b.json"), rec_b, staging_root=self.staging_root)
 
-            archive_manifest = {
-                "migration_id": migration_id,
-                "dataset_identity": bound_identity,
-                "source_file_sha256": sha256_file(raw_archive_path),
-                "record_a_sha256": rec_a_hash,
-                "record_b_sha256": rec_b_hash,
-                "record_a_index": idx_a,
-                "record_b_index": idx_b,
-                "archived_at": datetime.now(timezone.utc).isoformat(),
-            }
-            write_json_atomic(
-                os.path.join(self.archive_dir, "forensic_manifest.json"),
-                archive_manifest,
-                staging_root=self.staging_root,
-            )
+                archive_manifest = {
+                    "migration_id": migration_id,
+                    "dataset_identity": bound_identity,
+                    "source_file_sha256": sha256_file(raw_archive_path),
+                    "record_a_sha256": rec_a_hash,
+                    "record_b_sha256": rec_b_hash,
+                    "record_a_index": idx_a,
+                    "record_b_index": idx_b,
+                    "archived_at": datetime.now(timezone.utc).isoformat(),
+                }
+                write_json_atomic(
+                    os.path.join(self.archive_dir, "forensic_manifest.json"),
+                    archive_manifest,
+                    staging_root=self.staging_root,
+                )
 
             if fault_inject == "after_archive_before_verify":
                 raise FaultInjectionError("Fault injection: after_archive_before_verify")
@@ -1064,6 +1134,7 @@ class StagingCanonicalMigrator:
             # Phase 3: AUTHORIZED_FOR_STAGING_SIMULATION
             self.journal.append_entry("AUTHORIZED_FOR_STAGING_SIMULATION", {
                 "migration_id": migration_id,
+                "attempt": attempt_num,
                 "simulation": True,
                 "human_approval": "NOT_GRANTED",
                 "projection_status": "PROPOSED_NOT_APPROVED",
@@ -1111,6 +1182,7 @@ class StagingCanonicalMigrator:
             # Phase 4: COMMIT_INTENT_DURABLE
             self.journal.append_entry("COMMIT_INTENT_DURABLE", {
                 "migration_id": migration_id,
+                "attempt": attempt_num,
                 "dataset_identity": bound_identity,
                 "target_id": TARGET_CANONICAL_ID,
                 "source_file_sha256": pre_store_hashes["daily_matches.json"],
@@ -1140,6 +1212,7 @@ class StagingCanonicalMigrator:
 
             self.journal.append_entry("PROJECTION_COMMITTED", {
                 "migration_id": migration_id,
+                "attempt": attempt_num,
                 "daily_matches_sha256": sha256_file(daily_file),
             })
 
@@ -1168,6 +1241,7 @@ class StagingCanonicalMigrator:
 
             self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
                 "migration_id": migration_id,
+                "attempt": attempt_num,
                 "post_inspect": post_inspect,
             })
 
@@ -1177,6 +1251,7 @@ class StagingCanonicalMigrator:
             # Phase 7: COMPLETION_RECORDED
             result_payload = {
                 "migration_id": migration_id,
+                "attempt": attempt_num,
                 "dataset_identity": bound_identity,
                 "status": "SUCCESS",
                 "before_total": 193,
@@ -1192,6 +1267,7 @@ class StagingCanonicalMigrator:
 
             self.journal.append_entry("COMPLETION_RECORDED", result_payload)
 
+            os.makedirs(self.output_dir, exist_ok=True)
             result_file = os.path.join(self.output_dir, "staging-apply-result.json")
             write_json_atomic(result_file, result_payload, staging_root=self.staging_root)
 
@@ -1284,6 +1360,134 @@ class StagingCanonicalMigrator:
         if manifest.get("record_b_sha256") != EXPECTED_RECORD_B_SHA256:
             raise RecoveryStateError("Forensic manifest record_b_sha256 mismatch")
 
+    def verify_completed_dataset(
+        self,
+        migration_id: Optional[str] = None,
+        dataset_identity: Optional[str] = None,
+    ) -> dict:
+        """
+        Enforce all completed-state invariants across staging-apply (idempotency check),
+        staging-verify, and staging-recover (completed state check).
+        """
+        marker = verify_staging_workspace(self.staging_root)
+        bound_identity = dataset_identity or marker.get("dataset_identity") or "EXPECTED_EPOCH_1_FIXTURE"
+        if bound_identity == "EXPECTED_EPOCH_1_FIXTURE":
+            baseline_manifest = EPOCH_1_BASELINE_MANIFEST
+        elif bound_identity == "EXPLICIT_SYNTHETIC_TEST_FIXTURE":
+            baseline_manifest = marker.get("baseline_manifest", {})
+            if not baseline_manifest:
+                raise PreconditionViolationError("Missing baseline_manifest in synthetic test fixture marker")
+        else:
+            raise PreconditionViolationError(f"Unknown or unbound dataset identity: {bound_identity}")
+
+        expected_source_file_hash = baseline_manifest["daily_matches.json"]
+        expected_projected_file_hash = baseline_manifest["projected_file_sha256"]
+
+        daily_file = os.path.join(self.working_dir, "daily_matches.json")
+        if not os.path.exists(daily_file):
+            raise RecoveryStateError("Canonical active file missing: daily_matches.json")
+
+        actual_projected_hash = sha256_file(daily_file)
+        if actual_projected_hash != expected_projected_file_hash:
+            raise RecoveryStateError(
+                f"Active file hash does not match expected projected hash: '{actual_projected_hash}' != '{expected_projected_file_hash}'"
+            )
+
+        daily_data = read_json_strict(daily_file)
+        matches = daily_data.get("matches", [])
+        if len(matches) != 192:
+            raise RecoveryStateError(f"Expected 192 matches in completed dataset, got {len(matches)}")
+
+        all_ids = [m.get("id") for m in matches]
+        counts = Counter(all_ids)
+        dup_ids = [k for k, v in counts.items() if v > 1]
+        if dup_ids:
+            raise RecoveryStateError(f"Duplicate IDs detected in completed dataset: {dup_ids}")
+        if len(set(all_ids)) != 192:
+            raise RecoveryStateError(f"Unique IDs count is not 192: {len(set(all_ids))}")
+
+        target_records = [m for m in matches if m.get("id") == TARGET_CANONICAL_ID]
+        if len(target_records) != 1:
+            raise RecoveryStateError(f"Expected exactly 1 target match in completed dataset, got {len(target_records)}")
+
+        target_rec = target_records[0]
+        cand_hash = hash_record(target_rec)
+        if cand_hash != EXPECTED_CANDIDATE_SHA256:
+            raise RecoveryStateError(f"Candidate record hash mismatch in completed dataset: '{cand_hash}' != '{EXPECTED_CANDIDATE_SHA256}'")
+
+        if not valid_full_time_score(target_rec.get("score")):
+            raise RecoveryStateError("Invalid full time score in candidate record in completed dataset")
+
+        # Check 6 non-Canonical stores unchanged against baseline manifest
+        store_hashes = self.get_store_hashes(self.working_dir)
+        for store in NON_CANONICAL_STORES:
+            exp_h = baseline_manifest.get(store)
+            act_h = store_hashes.get(store)
+            if exp_h and act_h != exp_h:
+                raise ImmutableStoreMutationError(
+                    f"Immutable store '{store}' mutated: '{act_h}' != '{exp_h}'"
+                )
+
+        # Check journal
+        j_entries = self.journal.read_entries()
+        self.journal.validate_chain(j_entries, expected_migration_id=migration_id)
+        if self.journal.get_latest_valid_state() != "COMPLETION_RECORDED":
+            raise RecoveryStateError("Journal latest valid state is not COMPLETION_RECORDED")
+        completions = [e for e in j_entries if e.get("state") == "COMPLETION_RECORDED"]
+        if len(completions) != 1:
+            raise RecoveryStateError(f"Expected exactly 1 COMPLETION_RECORDED entry, got {len(completions)}")
+
+        # Check complete forensic archive integrity (K-ARC-01..08)
+        resolved_migration_id = migration_id or completions[0].get("payload", {}).get("migration_id") or DEFAULT_MIGRATION_ID
+        self.verify_forensic_archive(
+            baseline_source_hash=expected_source_file_hash,
+            expected_migration_id=resolved_migration_id,
+            expected_dataset_identity=bound_identity,
+        )
+
+        # Check unrelated Canonical records match raw archive byte-for-byte in serialized form
+        raw_archive = os.path.join(self.archive_dir, "daily_matches_raw.json")
+        raw_data = read_json_strict(raw_archive)
+        raw_unrelated = [m for m in raw_data.get("matches", []) if m.get("id") != TARGET_CANONICAL_ID]
+        curr_unrelated = [m for m in matches if m.get("id") != TARGET_CANONICAL_ID]
+        if serialize_record(raw_unrelated) != serialize_record(curr_unrelated):
+            raise RecoveryStateError("Unrelated Canonical records altered in projected state")
+
+        inspect_report = self.inspect_dataset(self.working_dir)
+        return inspect_report
+
+    def staging_verify(self, raise_on_error: bool = False) -> dict:
+        """
+        Verify post-migration staging dataset against the full completed-state specification.
+        """
+        try:
+            marker = verify_staging_workspace(self.staging_root)
+            bound_identity = marker.get("dataset_identity")
+            dataset_report = self.verify_completed_dataset(dataset_identity=bound_identity)
+            return {
+                "verified": True,
+                "projected_hash_match": True,
+                "target_match_ok": True,
+                "stores_ok": True,
+                "journal_ok": True,
+                "archive_ok": True,
+                "dataset_report": dataset_report,
+            }
+        except Exception as exc:
+            if raise_on_error:
+                raise
+            return {
+                "verified": False,
+                "projected_hash_match": False,
+                "target_match_ok": False,
+                "stores_ok": False,
+                "journal_ok": False,
+                "archive_ok": False,
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
+
+
     def staging_recover(self) -> dict:
         """
         Evaluate journal and filesystem state under a single lock without recursive locking.
@@ -1350,6 +1554,7 @@ class StagingCanonicalMigrator:
                 )
 
                 if latest_state == "COMPLETION_RECORDED":
+                    self.verify_completed_dataset(migration_id=intent_mig_id, dataset_identity=bound_identity)
                     return {
                         "status": "ALREADY_COMPLETED_NO_OP",
                         "action": "ALREADY_COMPLETED",
@@ -1432,6 +1637,9 @@ class StagingCanonicalMigrator:
                     if not raw_archive_exists:
                         raise RecoveryStateError("Missing raw archive to roll back from COMMIT_INTENT_DURABLE")
 
+                    if sha256_file(raw_archive) != baseline_source_hash:
+                        raise RecoveryStateError("Raw archive hash corrupted; cannot roll back")
+
                     restore_from_archive_atomic(
                         raw_archive,
                         daily_file,
@@ -1441,6 +1649,7 @@ class StagingCanonicalMigrator:
                     self.journal.append_entry("PREPARED", {
                         "migration_id": intent_mig_id,
                         "action": "ROLLED_BACK_TO_RAW_ARCHIVE",
+                        "attempt": intent_entry.get("payload", {}).get("attempt", 1) if intent_entry else 1,
                     })
                     return {
                         "status": "RECOVERED_ROLLED_BACK",
@@ -1527,66 +1736,9 @@ def main(args: Optional[List[str]] = None) -> int:
         elif parsed.subcommand == "staging-verify":
             assert_safe_path(parsed.staging_dir, context="staging-verify staging-dir")
             migrator = StagingCanonicalMigrator(staging_root=parsed.staging_dir, writable=False)
-            marker = verify_staging_workspace(migrator.staging_root)
-            bound_identity = marker.get("dataset_identity")
-            baseline_manifest = EPOCH_1_BASELINE_MANIFEST if bound_identity == "EXPECTED_EPOCH_1_FIXTURE" else marker.get("baseline_manifest", {})
-
-            res = migrator.inspect_dataset(migrator.working_dir)
-
-            expected_projected_hash = baseline_manifest.get("projected_file_sha256")
-            actual_projected_hash = res["store_hashes"].get("daily_matches.json")
-            projected_hash_match = (actual_projected_hash == expected_projected_hash)
-
-            # Check target record
-            daily_data = read_json_strict(os.path.join(migrator.working_dir, "daily_matches.json"))
-            matches = daily_data.get("matches", [])
-            target_records = [m for m in matches if m.get("id") == TARGET_CANONICAL_ID]
-            target_match_ok = (
-                len(target_records) == 1
-                and hash_record(target_records[0]) == EXPECTED_CANDIDATE_SHA256
-                and valid_full_time_score(target_records[0].get("score"))
-            )
-
-            # Check 6 non-Canonical stores
-            stores_ok = True
-            for s in NON_CANONICAL_STORES:
-                exp_h = baseline_manifest.get(s)
-                if exp_h and res["store_hashes"].get(s) != exp_h:
-                    stores_ok = False
-                    break
-
-            # Check journal
-            j_entries = migrator.journal.read_entries()
-            migrator.journal.validate_chain(j_entries)
-            journal_ok = (migrator.journal.get_latest_valid_state() == "COMPLETION_RECORDED")
-
-            # Check archive
-            raw_archive = os.path.join(migrator.archive_dir, "daily_matches_raw.json")
-            archive_ok = os.path.exists(raw_archive) and sha256_file(raw_archive) == baseline_manifest.get("daily_matches.json")
-
-            is_valid = (
-                res["total_matches"] == 192
-                and res["unique_ids_count"] == 192
-                and res["target_occurrences"] == 1
-                and len(res["duplicate_ids"]) == 0
-                and projected_hash_match
-                and target_match_ok
-                and stores_ok
-                and journal_ok
-                and archive_ok
-            )
-
-            audit_report = {
-                "verified": is_valid,
-                "projected_hash_match": projected_hash_match,
-                "target_match_ok": target_match_ok,
-                "stores_ok": stores_ok,
-                "journal_ok": journal_ok,
-                "archive_ok": archive_ok,
-                "dataset_report": res,
-            }
+            audit_report = migrator.staging_verify(raise_on_error=False)
             print(json.dumps(audit_report, indent=2, ensure_ascii=False))
-            return 0 if is_valid else 1
+            return 0 if audit_report.get("verified") else 1
 
         elif parsed.subcommand == "staging-recover":
             assert_safe_path(parsed.staging_dir, context="staging-recover staging-dir")

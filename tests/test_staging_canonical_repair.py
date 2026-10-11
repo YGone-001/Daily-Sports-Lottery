@@ -1465,3 +1465,421 @@ def test_j_jrn_12_invalid_rollback_reset(tmp_path):
     ]
     with pytest.raises(RecoveryStateError, match="Invalid rollback reset to PREPARED"):
         journal.validate_chain(entries)
+
+
+# =============================================================================
+# Phase K Release Candidate Regression Suite: K-RET-01 through K-RET-12
+# =============================================================================
+
+def test_k_ret_01_retry_after_pre_commit_prepared(tmp_path):
+    """K-RET-01: Retry after pre-commit interruption at PREPARED succeeds cleanly."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="before_archive")
+
+    entries_after_fault = migrator.journal.read_entries()
+    assert len(entries_after_fault) == 1
+    assert entries_after_fault[0]["state"] == "PREPARED"
+
+    # Retry staging-apply
+    res = migrator.staging_apply(simulation=True)
+    assert res["status"] == "SUCCESS"
+    assert res["after_total"] == 192
+
+    all_entries = migrator.journal.read_entries()
+    assert len(all_entries) == 8  # 1 from attempt 1 + 7 from attempt 2
+    migrator.journal.validate_chain(all_entries)
+    assert migrator.journal.get_latest_valid_state() == "COMPLETION_RECORDED"
+
+
+def test_k_ret_02_retry_after_pre_commit_evidence_verified(tmp_path):
+    """K-RET-02: Retry after pre-commit interruption at EVIDENCE_VERIFIED succeeds cleanly."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="during_archive")
+
+    entries_after_fault = migrator.journal.read_entries()
+    assert len(entries_after_fault) == 2
+    assert entries_after_fault[-1]["state"] == "EVIDENCE_VERIFIED"
+
+    # Retry staging-apply
+    res = migrator.staging_apply(simulation=True)
+    assert res["status"] == "SUCCESS"
+
+    all_entries = migrator.journal.read_entries()
+    migrator.journal.validate_chain(all_entries)
+    assert migrator.journal.get_latest_valid_state() == "COMPLETION_RECORDED"
+
+
+def test_k_ret_03_retry_after_pre_commit_authorized(tmp_path):
+    """K-RET-03: Retry after pre-commit interruption at AUTHORIZED_FOR_STAGING_SIMULATION succeeds."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="before_commit_intent")
+
+    entries_after_fault = migrator.journal.read_entries()
+    assert len(entries_after_fault) == 3
+    assert entries_after_fault[-1]["state"] == "AUTHORIZED_FOR_STAGING_SIMULATION"
+
+    # Retry staging-apply
+    res = migrator.staging_apply(simulation=True)
+    assert res["status"] == "SUCCESS"
+
+    all_entries = migrator.journal.read_entries()
+    migrator.journal.validate_chain(all_entries)
+    assert migrator.journal.get_latest_valid_state() == "COMPLETION_RECORDED"
+
+
+def test_k_ret_04_retry_after_rollback_from_commit_intent(tmp_path):
+    """K-RET-04: Full lifecycle: attempt 1 commits intent, fails, rolls back, attempt 2 succeeds."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_commit_intent")
+
+    # File is baseline, recovery rolls back cleanly
+    rec_res = migrator.staging_recover()
+    assert rec_res["status"] == "RECOVERED_ROLLED_BACK"
+
+    entries_after_rec = migrator.journal.read_entries()
+    assert len(entries_after_rec) == 5
+    assert entries_after_rec[-1]["state"] == "PREPARED"
+    assert entries_after_rec[-1]["payload"].get("action") == "ROLLED_BACK_TO_RAW_ARCHIVE"
+
+    # Retry staging-apply succeeds and reuses verified archive
+    res = migrator.staging_apply(simulation=True)
+    assert res["status"] == "SUCCESS"
+    assert res["after_total"] == 192
+
+    all_entries = migrator.journal.read_entries()
+    assert len(all_entries) == 12  # 5 from attempt 1 + 7 from attempt 2
+    migrator.journal.validate_chain(all_entries)
+    assert migrator.journal.get_latest_valid_state() == "COMPLETION_RECORDED"
+
+
+def test_k_ret_05_retry_rejected_if_commit_intent_without_rollback(tmp_path):
+    """K-RET-05: Direct retry after unrecovered COMMIT_INTENT_DURABLE crash is rejected."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_commit_intent")
+
+    # Attempting to call staging-apply directly without recovery first fails closed
+    with pytest.raises(RecoveryStateError, match="Previous attempt declared COMMIT_INTENT_DURABLE without rollback"):
+        migrator.staging_apply(simulation=True)
+
+
+def test_k_ret_06_retry_rejected_if_projection_committed(tmp_path):
+    """K-RET-06: Starting new attempt after PROJECTION_COMMITTED is rejected."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s",
+                "projected_file_sha256": "p",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+        {"state": "PROJECTION_COMMITTED", "payload": {"migration_id": "MIG-01", "daily_matches_sha256": "p"}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "RETRY_PREPARED"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="committed projection; subsequent retry attempt is illegal"):
+        journal.validate_chain(entries)
+
+
+def test_k_ret_07_retry_rejected_if_completion_recorded(tmp_path):
+    """K-RET-07: Starting new attempt after COMPLETION_RECORDED is rejected."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s",
+                "projected_file_sha256": "p",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+        {"state": "PROJECTION_COMMITTED", "payload": {"migration_id": "MIG-01", "daily_matches_sha256": "p"}},
+        {"state": "POSTCONDITIONS_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "COMPLETION_RECORDED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="committed projection; subsequent retry attempt is illegal"):
+        journal.validate_chain(entries)
+
+
+def test_k_ret_08_multi_attempt_mismatched_migration_id(tmp_path):
+    """K-RET-08: Multi-attempt journal with conflicting migration_id is rejected."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-02", "action": "RETRY_PREPARED"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Conflicting migration_id in journal"):
+        journal.validate_chain(entries)
+
+
+def test_k_ret_09_multi_attempt_conflicting_intent_hashes(tmp_path):
+    """K-RET-09: Multi-attempt journal with conflicting intent hashes is rejected."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s1",
+                "projected_file_sha256": "p1",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "ROLLED_BACK_TO_RAW_ARCHIVE"}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "RETRY_PREPARED"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s2",  # Conflicting source hash!
+                "projected_file_sha256": "p1",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+    ]
+    with pytest.raises(RecoveryStateError, match="Conflicting source_file_sha256 in subsequent COMMIT_INTENT_DURABLE"):
+        journal.validate_chain(entries)
+
+
+def test_k_ret_10_multi_attempt_corrupted_line(tmp_path):
+    """K-RET-10: Multi-attempt journal containing a corrupted line fails closed."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "CORRUPTED_LINE", "line_no": 2},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "RETRY_PREPARED"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Corrupted journal line detected"):
+        journal.validate_chain(entries)
+
+
+def test_k_ret_11_multi_attempt_internal_regression(tmp_path):
+    """K-RET-11: Multi-attempt journal with internal regression in attempt 2 is rejected."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "RETRY_PREPARED"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},  # Regression in attempt 2
+    ]
+    with pytest.raises(RecoveryStateError, match="Journal state regression detected"):
+        journal.validate_chain(entries)
+
+
+def test_k_ret_12_multi_attempt_internal_skip(tmp_path):
+    """K-RET-12: Multi-attempt journal skipping intermediate state in attempt 2 is rejected."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "RETRY_PREPARED"}},
+        # Skips EVIDENCE_VERIFIED
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Journal state skipped intermediate state"):
+        journal.validate_chain(entries)
+
+
+# =============================================================================
+# Phase K Forensic Archive Matrix Suite: K-ARC-01 through K-ARC-08
+# =============================================================================
+
+def setup_completed_staging_workspace(root: str) -> StagingCanonicalMigrator:
+    ws = create_synthetic_staging_workspace(root)
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+    res = migrator.staging_apply(simulation=True)
+    assert res["status"] == "SUCCESS"
+    assert migrator.staging_verify()["verified"] is True
+    return migrator
+
+
+def test_k_arc_01_archive_dir_missing(tmp_path):
+    """K-ARC-01: Archive directory missing causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    shutil.rmtree(migrator.archive_dir)
+
+    # 1. staging_verify
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "Forensic archive directory missing" in v_res["error"]
+
+    # 2. staging_apply idempotency check fails closed
+    with pytest.raises(RecoveryStateError, match="Forensic archive directory missing"):
+        migrator.staging_apply(simulation=True)
+
+    # 3. staging_recover fails closed
+    with pytest.raises(RecoveryStateError, match="Forensic archive directory missing"):
+        migrator.staging_recover()
+
+
+def test_k_arc_02_daily_matches_raw_missing(tmp_path):
+    """K-ARC-02: daily_matches_raw.json missing causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    os.unlink(os.path.join(migrator.archive_dir, "daily_matches_raw.json"))
+
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "daily_matches_raw.json" in v_res["error"]
+
+    with pytest.raises(RecoveryStateError, match="daily_matches_raw.json"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(RecoveryStateError, match="daily_matches_raw.json"):
+        migrator.staging_recover()
+
+
+def test_k_arc_03_daily_matches_raw_corrupted(tmp_path):
+    """K-ARC-03: daily_matches_raw.json corrupted bytes causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    raw_path = os.path.join(migrator.archive_dir, "daily_matches_raw.json")
+    with open(raw_path, "ab") as f:
+        f.write(b"CORRUPTION_BYTES")
+
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "raw hash mismatch" in v_res["error"]
+
+    with pytest.raises(RecoveryStateError, match="raw hash mismatch"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(RecoveryStateError, match="raw hash mismatch"):
+        migrator.staging_recover()
+
+
+def test_k_arc_04_forensic_manifest_missing_or_corrupt(tmp_path):
+    """K-ARC-04: forensic_manifest.json missing or corrupt causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    man_path = os.path.join(migrator.archive_dir, "forensic_manifest.json")
+    with open(man_path, "w", encoding="utf-8") as f:
+        f.write("{ invalid json")
+
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "Forensic manifest corrupted" in v_res["error"]
+
+    with pytest.raises(RecoveryStateError, match="Forensic manifest corrupted"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(RecoveryStateError, match="Forensic manifest corrupted"):
+        migrator.staging_recover()
+
+
+def test_k_arc_05_forensic_manifest_metadata_mismatch(tmp_path):
+    """K-ARC-05: forensic_manifest.json metadata mismatch causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    man_path = os.path.join(migrator.archive_dir, "forensic_manifest.json")
+    with open(man_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["migration_id"] = "FORGED_MIGRATION_ID"
+    with open(man_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "migration_id mismatch" in v_res["error"]
+
+    with pytest.raises(RecoveryStateError, match="migration_id mismatch"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(RecoveryStateError, match="migration_id mismatch"):
+        migrator.staging_recover()
+
+
+def test_k_arc_06_record_a_missing_or_corrupt(tmp_path):
+    """K-ARC-06: record_a.json missing or content corrupted causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    rec_a_path = os.path.join(migrator.archive_dir, "record_a.json")
+    with open(rec_a_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["home"] = "TAMPERED_TEAM"
+    with open(rec_a_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "record_a hash mismatch" in v_res["error"]
+
+    with pytest.raises(RecoveryStateError, match="record_a hash mismatch"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(RecoveryStateError, match="record_a hash mismatch"):
+        migrator.staging_recover()
+
+
+def test_k_arc_07_record_b_missing_or_corrupt(tmp_path):
+    """K-ARC-07: record_b.json missing or content corrupted causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    rec_b_path = os.path.join(migrator.archive_dir, "record_b.json")
+    with open(rec_b_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["score"]["ft"] = [9, 9]
+    with open(rec_b_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "record_b hash mismatch" in v_res["error"]
+
+    with pytest.raises(RecoveryStateError, match="record_b hash mismatch"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(RecoveryStateError, match="record_b hash mismatch"):
+        migrator.staging_recover()
+
+
+def test_k_arc_08_manifest_record_hash_mismatch(tmp_path):
+    """K-ARC-08: forensic_manifest.json record hash fields mismatch causes failure across verify, apply, recover."""
+    migrator = setup_completed_staging_workspace(str(tmp_path / "ws"))
+    man_path = os.path.join(migrator.archive_dir, "forensic_manifest.json")
+    with open(man_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["record_a_sha256"] = "wrong_sha256_hash_here"
+    with open(man_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    v_res = migrator.staging_verify(raise_on_error=False)
+    assert v_res["verified"] is False
+    assert "record_a_sha256 mismatch" in v_res["error"]
+
+    with pytest.raises(RecoveryStateError, match="record_a_sha256 mismatch"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(RecoveryStateError, match="record_a_sha256 mismatch"):
+        migrator.staging_recover()
