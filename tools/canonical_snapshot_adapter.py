@@ -76,6 +76,9 @@ from tools.staging_canonical_repair import (
     acquire_staging_lock,
     group_attempts,
     StagingJournal,
+    init_staging_workspace,
+    verify_staging_workspace,
+    STAGING_MARKER_FILENAME,
 )
 
 
@@ -85,6 +88,11 @@ from tools.staging_canonical_repair import (
 
 class SnapshotAdapterError(StagingMigrationError):
     """Base exception for snapshot adapter operations."""
+    pass
+
+
+class CompletedStateVerificationError(SnapshotAdapterError):
+    """Raised when completed-state invariants fail verification."""
     pass
 
 
@@ -204,17 +212,27 @@ def generate_snapshot_manifest(
     snapshot_classification: str,
     snapshot_source_description: str,
     dataset_identity: str,
-    source_git_sha: str = "24cbf38ca93a0827622a3a97d0e8f04183e0556f",
+    source_git_sha: Optional[str] = None,
+    captured_at: Optional[str] = None,
+    capture_consistency_status: Optional[str] = None,
+    manifest_verification_status: str = "MANIFEST_GENERATED",
     staging_root: Optional[str] = None,
 ) -> dict:
     """
     Generate an authoritative snapshot manifest by inspecting a frozen isolated data directory.
     Fails closed if files are missing or safety boundaries are violated.
+    Separates MANIFEST_GENERATED from independently verified trust states.
     """
     assert_safe_path(data_dir, context="data_dir for manifest generation", staging_root=staging_root)
 
     if snapshot_classification not in SNAPSHOT_CLASSIFICATIONS:
         raise SnapshotClassificationError(f"Unknown snapshot classification: '{snapshot_classification}'")
+
+    if snapshot_classification not in ALLOWED_CLASSIFICATIONS_PHASE_M:
+        raise SnapshotClassificationError(
+            f"Snapshot classification '{snapshot_classification}' is NOT AUTHORIZED in Phase M. "
+            f"Allowed classifications: {ALLOWED_CLASSIFICATIONS_PHASE_M}"
+        )
 
     daily_path = os.path.join(data_dir, "daily_matches.json")
     if not os.path.exists(daily_path):
@@ -245,6 +263,17 @@ def generate_snapshot_manifest(
         store_hashes[store] = sha256_file(p)
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    actual_captured_at = captured_at or now_iso
+    actual_git_sha = source_git_sha or "UNKNOWN_SOURCE_GIT_SHA"
+
+    if capture_consistency_status is not None:
+        actual_consistency = capture_consistency_status
+    elif snapshot_classification == "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE":
+        actual_consistency = "SYNTHETIC_GENERATED"
+    elif snapshot_classification == "PRESERVED_EPOCH1_FIXTURE":
+        actual_consistency = "HISTORICAL_EPOCH1_PRESERVED"
+    else:
+        actual_consistency = "CAPTURE_CONSISTENCY_UNVERIFIED"
 
     manifest = {
         "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
@@ -252,9 +281,9 @@ def generate_snapshot_manifest(
         "snapshot_classification": snapshot_classification,
         "snapshot_source_description": snapshot_source_description,
         "dataset_identity": dataset_identity,
-        "captured_at": now_iso,
-        "capture_consistency_status": "QUIESCENT_CONSISTENT",
-        "source_git_sha": source_git_sha,
+        "captured_at": actual_captured_at,
+        "capture_consistency_status": actual_consistency,
+        "source_git_sha": actual_git_sha,
         "daily_matches_sha256": store_hashes["daily_matches.json"],
         "team_strength_sha256": store_hashes["team_strength.json"],
         "calibrated_sha256": store_hashes["calibrated.json"],
@@ -270,7 +299,7 @@ def generate_snapshot_manifest(
         "field_mapping_policy_id": FIELD_MAPPING_POLICY_ID,
         "field_mapping_policy_sha256": FIELD_MAPPING_POLICY_SHA256,
         "manifest_generated_at": now_iso,
-        "manifest_verification_status": "VERIFIED",
+        "manifest_verification_status": manifest_verification_status,
     }
     return manifest
 
@@ -283,8 +312,9 @@ def verify_snapshot_manifest(
 ) -> dict:
     """
     Validate snapshot manifest schema, policy bindings, and byte hashes against disk.
-    Strictly enforces Phase M classification boundary:
-    rejects FUTURE_OWNER_APPROVED_FROZEN_SNAPSHOT unless explicit bypass is given.
+    Strictly enforces Phase M classification boundary and byte-level target fingerprints.
+    Rejects FUTURE_OWNER_APPROVED_FROZEN_SNAPSHOT, LIVE_PRODUCTION_RUNTIME_SNAPSHOT,
+    and unknown classifications unconditionally in Phase M.
     """
     assert_safe_path(data_dir, context="data_dir for manifest verification", staging_root=staging_root)
 
@@ -302,12 +332,12 @@ def verify_snapshot_manifest(
             f"Unsupported manifest_schema_version: {manifest['manifest_schema_version']} != {MANIFEST_SCHEMA_VERSION}"
         )
 
-    # 3. Verify snapshot classification
+    # 3. Verify snapshot classification strictly (no bypass in Phase M)
     classification = manifest["snapshot_classification"]
     if classification not in SNAPSHOT_CLASSIFICATIONS:
         raise SnapshotClassificationError(f"Unknown snapshot classification: '{classification}'")
 
-    if not allow_unapproved_classification and classification not in ALLOWED_CLASSIFICATIONS_PHASE_M:
+    if classification not in ALLOWED_CLASSIFICATIONS_PHASE_M:
         raise SnapshotClassificationError(
             f"Snapshot classification '{classification}' is NOT AUTHORIZED in Phase M. "
             f"Allowed classifications: {ALLOWED_CLASSIFICATIONS_PHASE_M}"
@@ -329,7 +359,7 @@ def verify_snapshot_manifest(
             f"Mismatched policy SHA-256: expected '{FIELD_MAPPING_POLICY_SHA256}', got '{manifest['field_mapping_policy_sha256']}'"
         )
 
-    # 6. Verify target canonical ID and record fingerprints
+    # 6. Verify target canonical ID and record fingerprints against actual daily_matches.json bytes
     if manifest["target_canonical_id"] != TARGET_CANONICAL_ID:
         raise PreconditionViolationError(
             f"Mismatched target_canonical_id: {manifest['target_canonical_id']} != {TARGET_CANONICAL_ID}"
@@ -342,6 +372,56 @@ def verify_snapshot_manifest(
         raise PreconditionViolationError(
             f"Record B hash mismatch in manifest: {manifest['target_record_b_sha256']} != {EXPECTED_RECORD_B_SHA256}"
         )
+
+    daily_path = os.path.join(data_dir, "daily_matches.json")
+    if not os.path.exists(daily_path):
+        raise SnapshotManifestError(f"Missing daily_matches.json in {data_dir}")
+
+    daily_data = read_json_strict(daily_path)
+    matches = daily_data.get("matches", [])
+    if len(matches) != manifest["total_matches"]:
+        raise SnapshotManifestError(
+            f"daily_matches.json record count mismatch: {len(matches)} != manifest {manifest['total_matches']}"
+        )
+
+    all_ids = []
+    for m in matches:
+        if not isinstance(m, dict):
+            raise PreconditionViolationError("Malformed non-dict match record in daily_matches.json")
+        mid = m.get("id")
+        if not mid or not isinstance(mid, str) or not mid.strip():
+            raise PreconditionViolationError("Malformed or empty match ID detected in daily_matches.json")
+        all_ids.append(mid)
+
+    counts = Counter(all_ids)
+    unrelated_dups = {k: v for k, v in counts.items() if v > 1 and k != TARGET_CANONICAL_ID}
+    if unrelated_dups:
+        raise PreconditionViolationError(f"Unrelated duplicate IDs detected: {unrelated_dups}")
+
+    unique_ids_count = len(counts)
+    if unique_ids_count != manifest["unique_canonical_ids"]:
+        raise SnapshotManifestError(
+            f"Unique IDs count mismatch: {unique_ids_count} != manifest {manifest['unique_canonical_ids']}"
+        )
+
+    target_matches = [(i, m) for i, m in enumerate(matches) if m.get("id") == TARGET_CANONICAL_ID]
+    if len(target_matches) != 2:
+        if len(target_matches) > 2:
+            raise PreconditionViolationError(f"Unexpected third target duplicate found ({len(target_matches)})")
+        else:
+            raise PreconditionViolationError(
+                f"Expected exactly 2 target occurrences, found {len(target_matches)}"
+            )
+
+    idx_a, rec_a = target_matches[0]
+    idx_b, rec_b = target_matches[1]
+    rec_a_hash = hash_record(rec_a)
+    rec_b_hash = hash_record(rec_b)
+
+    if rec_a_hash != EXPECTED_RECORD_A_SHA256:
+        raise PreconditionViolationError(f"Record A hash mismatch in source daily_matches.json: {rec_a_hash} != {EXPECTED_RECORD_A_SHA256}")
+    if rec_b_hash != EXPECTED_RECORD_B_SHA256:
+        raise PreconditionViolationError(f"Record B hash mismatch in source daily_matches.json: {rec_b_hash} != {EXPECTED_RECORD_B_SHA256}")
 
     # 7. Verify all seven stores on disk against manifest SHA-256
     for store in NON_CANONICAL_STORES + ["daily_matches.json"]:
@@ -360,27 +440,21 @@ def verify_snapshot_manifest(
                 f"Store '{store}' hash mismatch against manifest: actual {actual_hash} != manifest {expected_hash}"
             )
 
-    # 8. Verify daily_matches record count and unique ID count
-    daily_data = read_json_strict(os.path.join(data_dir, "daily_matches.json"))
-    matches = daily_data.get("matches", [])
-    if len(matches) != manifest["total_matches"]:
-        raise SnapshotManifestError(
-            f"daily_matches.json record count mismatch: {len(matches)} != manifest {manifest['total_matches']}"
-        )
+    verified_manifest = copy.deepcopy(manifest)
+    verified_manifest["manifest_verification_status"] = "VERIFIED"
+    return verified_manifest
 
-    all_ids = [m.get("id") for m in matches if isinstance(m, dict)]
-    counts = Counter(all_ids)
-    unrelated_dups = {k: v for k, v in counts.items() if v > 1 and k != TARGET_CANONICAL_ID}
-    if unrelated_dups:
-        raise PreconditionViolationError(f"Unrelated duplicate IDs detected: {unrelated_dups}")
 
-    unique_ids_count = len(counts)
-    if unique_ids_count != manifest["unique_canonical_ids"]:
-        raise SnapshotManifestError(
-            f"Unique IDs count mismatch: {unique_ids_count} != manifest {manifest['unique_canonical_ids']}"
-        )
+def hash_manifest(manifest: dict) -> str:
+    """
+    Compute deterministic SHA-256 identity hash of snapshot manifest.
+    Excludes ephemeral verification lifecycle status so identity remains invariant across verification transitions.
+    """
+    m_copy = {k: v for k, v in manifest.items() if k != "manifest_verification_status"}
+    m_str = json.dumps(m_copy, ensure_ascii=False, sort_keys=True)
+    return sha256_bytes(m_str.encode("utf-8"))
 
-    return manifest
+
 
 
 # =============================================================================
@@ -534,11 +608,21 @@ class SnapshotCanonicalAdapter:
     ):
         self.staging_root = assert_safe_path(staging_root, context="staging_root")
         self.manifest = manifest
+        self.writable = writable
         self.input_dir = os.path.join(self.staging_root, "input", "data")
         self.working_dir = os.path.join(self.staging_root, "working", "data")
         self.archive_dir = os.path.join(self.staging_root, "archive")
         self.journal_dir = os.path.join(self.staging_root, "journal")
         self.output_dir = os.path.join(self.staging_root, "output")
+
+        if self.writable:
+            # Writing operations strictly require verified staging workspace marker
+            marker_file = os.path.join(self.staging_root, STAGING_MARKER_FILENAME)
+            if not os.path.exists(marker_file):
+                raise PreconditionViolationError(
+                    f"Unmarked workspace rejected before writes: missing '{STAGING_MARKER_FILENAME}' in '{self.staging_root}'"
+                )
+            verify_staging_workspace(self.staging_root)
 
         self.journal = StagingJournal(
             os.path.join(self.journal_dir, "snapshot_adaptation_journal.jsonl"),
@@ -626,10 +710,291 @@ class SnapshotCanonicalAdapter:
             "downstream_references": downstream,
         }
 
-    def preview_projection(self) -> dict:
+    def validate_journal_chain(
+        self,
+        entries: List[dict],
+        expected_migration_id: Optional[str] = None,
+        expected_snapshot_id: Optional[str] = None,
+        expected_manifest_sha256: Optional[str] = None,
+    ) -> None:
+        """Enforce journal transition consistency, cross-attempt snapshot identity binding, and ordering."""
+        self.journal.validate_chain(entries, expected_migration_id=expected_migration_id)
+        if not entries:
+            return
+
+        first_snap_id = None
+        first_manifest_sha256 = None
+        first_proj_hash = None
+        first_immut_hashes = None
+        last_attempt = None
+
+        for idx, entry in enumerate(entries):
+            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+
+            # Validate attempt sequence
+            att = payload.get("attempt")
+            if isinstance(att, int):
+                if last_attempt is not None and att < last_attempt:
+                    raise RecoveryStateError(
+                        f"Non-monotonic attempt sequence: attempt {att} < {last_attempt}"
+                    )
+                last_attempt = att
+
+            # Validate snapshot_id binding
+            snap_id = payload.get("snapshot_id")
+            if snap_id:
+                if first_snap_id is None:
+                    first_snap_id = snap_id
+                elif snap_id != first_snap_id:
+                    raise RecoveryStateError(
+                        f"Cross-snapshot retry rejected: changed snapshot_id '{snap_id}' != '{first_snap_id}'"
+                    )
+                if expected_snapshot_id and snap_id != expected_snapshot_id:
+                    raise RecoveryStateError(
+                        f"Journal snapshot_id mismatch: '{snap_id}' != '{expected_snapshot_id}'"
+                    )
+
+            # Validate manifest_sha256 binding
+            m_sha = payload.get("manifest_sha256")
+            if m_sha:
+                if first_manifest_sha256 is None:
+                    first_manifest_sha256 = m_sha
+                elif m_sha != first_manifest_sha256:
+                    raise RecoveryStateError(
+                        f"Cross-snapshot retry rejected: source manifest changed across attempts: '{m_sha}' != '{first_manifest_sha256}'"
+                    )
+                if expected_manifest_sha256 and m_sha != expected_manifest_sha256:
+                    raise RecoveryStateError(
+                        f"Journal manifest_sha256 mismatch: '{m_sha}' != '{expected_manifest_sha256}'"
+                    )
+
+            # Validate projected_file_sha256 binding
+            proj_h = payload.get("projected_file_sha256")
+            if proj_h:
+                if first_proj_hash is None:
+                    first_proj_hash = proj_h
+                elif proj_h != first_proj_hash:
+                    raise RecoveryStateError(
+                        f"Conflicting projected_file_sha256 in journal: '{proj_h}' != '{first_proj_hash}'"
+                    )
+
+            # Validate immutable_store_hashes binding
+            immut = payload.get("immutable_store_hashes")
+            if isinstance(immut, dict):
+                if first_immut_hashes is None:
+                    first_immut_hashes = immut
+                elif immut != first_immut_hashes:
+                    raise RecoveryStateError(
+                        "Conflicting immutable_store_hashes in journal across attempts"
+                    )
+
+    def verify_completed_dataset(
+        self,
+        migration_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Shared, strict completed-state verifier.
+        Validates all 20 completed-state invariants:
+        - Workspace marker
+        - Approved snapshot classification
+        - Snapshot identity and manifest binding
+        - Approved field mapping policy
+        - Source archive integrity (raw file, records A & B, forensic manifest)
+        - Record A and Record B fingerprints
+        - Candidate record fingerprint
+        - Expected projected file hash derived from bound source archive and approved policy
+        - Actual active projected whole-file hash matches expected
+        - Exactly one target occurrence
+        - Canonical uniqueness
+        - All N - 2 unrelated matches preserved in exact order
+        - Metadata preserved (total updated to N - 1; last_refresh and sources unchanged)
+        - All six non-Canonical stores unchanged against manifest
+        - Journal chain complete and valid, ending in exactly one terminal COMPLETION_RECORDED
+        """
+        # 1. Verified staging workspace marker
+        verify_staging_workspace(self.staging_root)
+
+        # 2. Approved snapshot classification
+        classification = self.manifest.get("snapshot_classification")
+        if classification not in ALLOWED_CLASSIFICATIONS_PHASE_M:
+            raise SnapshotClassificationError(
+                f"Snapshot classification '{classification}' is NOT AUTHORIZED in Phase M"
+            )
+
+        # 3. Snapshot identity and manifest binding
+        snapshot_id = self.manifest.get("snapshot_id")
+        dataset_identity = self.manifest.get("dataset_identity")
+        if not snapshot_id or not str(snapshot_id).strip():
+            raise SnapshotIdentityError("Snapshot manifest has empty snapshot_id")
+        if not dataset_identity or not str(dataset_identity).strip():
+            raise SnapshotIdentityError("Snapshot manifest has empty dataset_identity")
+
+        manifest_sha256 = hash_manifest(self.manifest)
+
+        # 4. Exact approved field mapping policy
+        if self.manifest.get("field_mapping_policy_id") != FIELD_MAPPING_POLICY_ID:
+            raise PolicyMismatchError(
+                f"Field mapping policy ID mismatch: {self.manifest.get('field_mapping_policy_id')} != {FIELD_MAPPING_POLICY_ID}"
+            )
+        if self.manifest.get("field_mapping_policy_sha256") != FIELD_MAPPING_POLICY_SHA256:
+            raise PolicyMismatchError(
+                f"Field mapping policy SHA-256 mismatch: {self.manifest.get('field_mapping_policy_sha256')} != {FIELD_MAPPING_POLICY_SHA256}"
+            )
+
+        # 5. Original source archive integrity
+        archive_manifest = self.verify_forensic_archive(
+            baseline_source_hash=self.manifest.get("daily_matches_sha256"),
+            expected_migration_id=migration_id or DEFAULT_MIGRATION_ID,
+            expected_snapshot_id=snapshot_id,
+        )
+
+        raw_archive = os.path.join(self.archive_dir, "daily_matches_raw.json")
+        raw_daily = read_json_strict(raw_archive)
+        raw_matches = raw_daily.get("matches", [])
+        source_total = self.manifest.get("total_matches", len(raw_matches))
+
+        # 6. Candidate fingerprint & expected projected whole-file hash derived from source archive & policy
+        rec_a_data = read_json_strict(os.path.join(self.archive_dir, "record_a.json"))
+        rec_b_data = read_json_strict(os.path.join(self.archive_dir, "record_b.json"))
+        candidate, diff = build_approved_candidate_projection(rec_a_data, rec_b_data)
+
+        expected_projected_daily, stats = project_snapshot_dataset(raw_daily, candidate)
+        proj_str = json.dumps(expected_projected_daily, ensure_ascii=False, indent=2, sort_keys=True)
+        if os.name == "nt":
+            proj_str = proj_str.replace("\n", "\r\n")
+        expected_projected_hash = sha256_bytes(proj_str.encode("utf-8"))
+
+        # 7. Actual active projected whole-file check
+        daily_file = os.path.join(self.working_dir, "daily_matches.json")
+        if not os.path.exists(daily_file):
+            raise CompletedStateVerificationError(f"daily_matches.json missing from {self.working_dir}")
+
+        actual_projected_hash = sha256_file(daily_file)
+        if actual_projected_hash != expected_projected_hash:
+            raise CompletedStateVerificationError(
+                f"Active file hash does not match expected projected hash: actual {actual_projected_hash} != expected {expected_projected_hash}"
+            )
+
+        # 8. Active file dataset invariants
+        active_daily = read_json_strict(daily_file)
+        active_matches = active_daily.get("matches", [])
+        expected_projected_total = source_total - 1
+
+        if len(active_matches) != expected_projected_total:
+            raise CompletedStateVerificationError(
+                f"Projected total matches mismatch: active {len(active_matches)} != expected {expected_projected_total}"
+            )
+
+        active_ids = [m.get("id") for m in active_matches if isinstance(m, dict)]
+        if len(active_ids) != len(set(active_ids)):
+            raise CompletedStateVerificationError("Duplicate canonical IDs detected in active projected file")
+
+        target_matches = [m for m in active_matches if isinstance(m, dict) and m.get("id") == TARGET_CANONICAL_ID]
+        if len(target_matches) != 1:
+            raise CompletedStateVerificationError(
+                f"Expected exactly 1 target canonical occurrence, found {len(target_matches)}"
+            )
+
+        if hash_record(target_matches[0]) != EXPECTED_CANDIDATE_SHA256:
+            raise CompletedStateVerificationError("Candidate record fingerprint altered in completed dataset")
+
+        # 9. All unrelated records preserved in exact order
+        unrelated_raw = [m for m in raw_matches if m.get("id") != TARGET_CANONICAL_ID]
+        unrelated_active = [m for m in active_matches if m.get("id") != TARGET_CANONICAL_ID]
+        if len(unrelated_raw) != len(unrelated_active):
+            raise UnrelatedMatchLossError(
+                f"Unrelated matches count mismatch: {len(unrelated_active)} != {len(unrelated_raw)}"
+            )
+        for i, (orig_m, act_m) in enumerate(zip(unrelated_raw, unrelated_active)):
+            if orig_m != act_m:
+                raise UnrelatedMatchLossError(
+                    f"Unrelated match altered at index {i}: ID '{orig_m.get('id')}'"
+                )
+
+        # 10. Top-level metadata preservation
+        if "meta" in raw_daily and isinstance(raw_daily["meta"], dict):
+            if "meta" not in active_daily or not isinstance(active_daily["meta"], dict):
+                raise CompletedStateVerificationError("meta block missing from active daily_matches.json")
+            if active_daily["meta"].get("total") != expected_projected_total:
+                raise CompletedStateVerificationError(
+                    f"meta.total mismatch: {active_daily['meta'].get('total')} != {expected_projected_total}"
+                )
+            if "last_refresh" in raw_daily["meta"]:
+                if active_daily["meta"].get("last_refresh") != raw_daily["meta"]["last_refresh"]:
+                    raise CompletedStateVerificationError("meta.last_refresh was altered")
+            if "sources" in raw_daily["meta"]:
+                if active_daily["meta"].get("sources") != raw_daily["meta"]["sources"]:
+                    raise CompletedStateVerificationError("meta.sources was altered")
+
+        # 11. Six non-Canonical stores unchanged
+        current_store_hashes = self.get_store_hashes(self.working_dir)
+        for store in NON_CANONICAL_STORES:
+            exp_h = self.manifest.get(f"{store.split('.')[0]}_sha256")
+            act_h = current_store_hashes.get(store)
+            if act_h != exp_h:
+                raise ImmutableStoreMutationError(
+                    f"Immutable store '{store}' hash mismatch in completed dataset: {act_h} != {exp_h}"
+                )
+
+        # 12. Journal chain complete and valid
+        entries = self.journal.read_entries()
+        if not entries:
+            raise CompletedStateVerificationError("Journal is missing or empty")
+
+        self.validate_journal_chain(
+            entries,
+            expected_migration_id=migration_id,
+            expected_snapshot_id=snapshot_id,
+            expected_manifest_sha256=manifest_sha256,
+        )
+
+        last_entry = entries[-1]
+        if last_entry.get("state") != "COMPLETION_RECORDED":
+            raise CompletedStateVerificationError(
+                f"Journal final state is '{last_entry.get('state')}', expected COMPLETION_RECORDED"
+            )
+
+        completion_count = sum(1 for e in entries if e.get("state") == "COMPLETION_RECORDED")
+        if completion_count != 1:
+            raise CompletedStateVerificationError(
+                f"Expected exactly 1 COMPLETION_RECORDED entry, found {completion_count}"
+            )
+
+        last_payload = last_entry.get("payload", {})
+        if last_payload.get("migration_id") != (migration_id or DEFAULT_MIGRATION_ID):
+            raise CompletedStateVerificationError("Journal migration_id mismatch")
+        if last_payload.get("snapshot_id") != snapshot_id:
+            raise CompletedStateVerificationError("Journal snapshot_id mismatch")
+        if last_payload.get("dataset_identity") != dataset_identity:
+            raise CompletedStateVerificationError("Journal dataset_identity mismatch")
+
+        return {
+            "status": "COMPLETED_STATE_VERIFIED",
+            "verified_invariants": 20,
+            "snapshot_id": snapshot_id,
+            "dataset_identity": dataset_identity,
+            "manifest_sha256": manifest_sha256,
+            "projected_file_sha256": actual_projected_hash,
+            "expected_projected_file_sha256": expected_projected_hash,
+            "candidate_record_sha256": EXPECTED_CANDIDATE_SHA256,
+            "source_total_matches": source_total,
+            "projected_total_matches": expected_projected_total,
+            "unique_ids_count": expected_projected_total,
+            "target_occurrences": 1,
+            "unrelated_records_preserved": len(unrelated_raw),
+            "immutable_stores_preserved": len(NON_CANONICAL_STORES),
+            "journal_entries_count": len(entries),
+            "verification_timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def staging_verify(self) -> dict:
+        """Execute real completed-state verification on dataset."""
+        return self.verify_completed_dataset()
+
+    def preview_projection(self, write_output: bool = True) -> dict:
         """
         Produce candidate projection preview, field diff, and projected hash without touching source files.
-        Writes preview files only to self.output_dir.
+        Writes preview files only to self.output_dir when write_output is True and adapter is writable.
         """
         assert_safe_path(self.working_dir, context="working_dir preview", staging_root=self.staging_root)
         verify_snapshot_manifest(self.manifest, self.working_dir, staging_root=self.staging_root)
@@ -656,10 +1021,6 @@ class SnapshotCanonicalAdapter:
             projected_json_str = projected_json_str.replace("\n", "\r\n")
         projected_file_sha256 = sha256_bytes(projected_json_str.encode("utf-8"))
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        preview_path = os.path.join(self.output_dir, "canonical-projection-preview.json")
-        diff_path = os.path.join(self.output_dir, "canonical-field-diff.json")
-
         preview_data = {
             "staging_only": True,
             "production_execution_authorized": False,
@@ -680,8 +1041,12 @@ class SnapshotCanonicalAdapter:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        write_json_atomic(preview_path, preview_data, staging_root=self.staging_root)
-        write_json_atomic(diff_path, diff, staging_root=self.staging_root)
+        if write_output and self.writable:
+            os.makedirs(self.output_dir, exist_ok=True)
+            preview_path = os.path.join(self.output_dir, "canonical-projection-preview.json")
+            diff_path = os.path.join(self.output_dir, "canonical-field-diff.json")
+            write_json_atomic(preview_path, preview_data, staging_root=self.staging_root)
+            write_json_atomic(diff_path, diff, staging_root=self.staging_root)
 
         return preview_data
 
@@ -754,30 +1119,23 @@ class SnapshotCanonicalAdapter:
         daily_file = os.path.join(self.working_dir, "daily_matches.json")
 
         with acquire_staging_lock(self.working_dir, staging_root=self.staging_root):
-            # Check for already applied state (idempotency)
+            # Check for already applied state (MC-02 strict completed-state idempotency)
             if os.path.exists(daily_file):
                 current_daily = read_json_strict(daily_file)
                 current_matches = current_daily.get("matches", [])
-                current_daily_hash = sha256_file(daily_file)
-
                 target_matches = [m for m in current_matches if isinstance(m, dict) and m.get("id") == TARGET_CANONICAL_ID]
                 if len(target_matches) == 1 and len(current_matches) == projected_expected_total:
-                    post_inspect = self.inspect_dataset(self.working_dir)
-                    if post_inspect["target_occurrences"] == 1 and post_inspect["total_matches"] == projected_expected_total:
-                        pre_store_hashes = self.get_store_hashes(self.working_dir)
-                        for store in NON_CANONICAL_STORES:
-                            exp_h = self.manifest.get(f"{store.split('.')[0]}_sha256")
-                            if exp_h and pre_store_hashes[store] != exp_h:
-                                raise ImmutableStoreMutationError(f"Immutable store '{store}' altered!")
-                        return {
-                            "status": "ALREADY_APPLIED_NO_OP",
-                            "total_matches": projected_expected_total,
-                            "unique_ids_count": projected_expected_total,
-                            "target_occurrences": 1,
-                            "candidate_sha256": EXPECTED_CANDIDATE_SHA256,
-                            "projected_file_sha256": current_daily_hash,
-                            "message": "Store is already in post-migration projected state. Verified invariants.",
-                        }
+                    # Require full completed-state verification before returning no-op
+                    verified_state = self.verify_completed_dataset(migration_id=migration_id)
+                    return {
+                        "status": "ALREADY_APPLIED_NO_OP",
+                        "total_matches": projected_expected_total,
+                        "unique_ids_count": projected_expected_total,
+                        "target_occurrences": 1,
+                        "candidate_sha256": EXPECTED_CANDIDATE_SHA256,
+                        "projected_file_sha256": verified_state["projected_file_sha256"],
+                        "message": "Store is already in post-migration projected state. Verified invariants.",
+                    }
 
             # 1. Not already applied: verify complete snapshot manifest against source files
             manifest = verify_snapshot_manifest(self.manifest, self.working_dir, staging_root=self.staging_root)
@@ -787,6 +1145,9 @@ class SnapshotCanonicalAdapter:
             expected_source_hash = manifest["daily_matches_sha256"]
             source_total = manifest["total_matches"]
             projected_expected_total = source_total - 1
+
+            self.manifest = manifest
+            manifest_sha256 = hash_manifest(manifest)
 
             if fault_inject == "before_prepare":
                 raise FaultInjectionError("Fault injection: before_prepare")
@@ -811,7 +1172,12 @@ class SnapshotCanonicalAdapter:
 
             # Check journal state consistency and handle multi-attempt scoping
             existing_entries = self.journal.read_entries()
-            self.journal.validate_chain(existing_entries, expected_migration_id=migration_id)
+            self.validate_journal_chain(
+                existing_entries,
+                expected_migration_id=migration_id,
+                expected_snapshot_id=snapshot_id,
+                expected_manifest_sha256=manifest_sha256,
+            )
 
             attempt_num = 1
             action = "INITIAL_PREPARED"
@@ -836,6 +1202,7 @@ class SnapshotCanonicalAdapter:
                 "migration_id": migration_id,
                 "snapshot_id": snapshot_id,
                 "dataset_identity": dataset_identity,
+                "manifest_sha256": manifest_sha256,
                 "working_dir": self.working_dir,
                 "pre_store_hashes": pre_store_hashes,
                 "attempt": attempt_num,
@@ -880,6 +1247,9 @@ class SnapshotCanonicalAdapter:
             self.journal.append_entry("EVIDENCE_VERIFIED", {
                 "migration_id": migration_id,
                 "attempt": attempt_num,
+                "snapshot_id": snapshot_id,
+                "dataset_identity": dataset_identity,
+                "manifest_sha256": manifest_sha256,
                 "rec_a_hash": rec_a_hash,
                 "rec_b_hash": rec_b_hash,
                 "target_indices": [idx_a, idx_b],
@@ -938,9 +1308,13 @@ class SnapshotCanonicalAdapter:
             self.journal.append_entry("AUTHORIZED_FOR_STAGING_SIMULATION", {
                 "migration_id": migration_id,
                 "attempt": attempt_num,
+                "snapshot_id": snapshot_id,
+                "dataset_identity": dataset_identity,
+                "manifest_sha256": manifest_sha256,
                 "simulation": True,
                 "owner_approval": "APPROVED",
                 "field_mapping_policy_id": FIELD_MAPPING_POLICY_ID,
+                "field_mapping_policy_sha256": FIELD_MAPPING_POLICY_SHA256,
                 "projection_status": "APPROVED_BY_OWNER_DECISION_A",
             })
 
@@ -985,12 +1359,14 @@ class SnapshotCanonicalAdapter:
                 "attempt": attempt_num,
                 "snapshot_id": snapshot_id,
                 "dataset_identity": dataset_identity,
+                "manifest_sha256": manifest_sha256,
                 "target_id": TARGET_CANONICAL_ID,
                 "source_file_sha256": pre_store_hashes["daily_matches.json"],
                 "projected_file_sha256": projected_file_hash,
                 "candidate_record_sha256": cand_hash,
                 "record_a_sha256": rec_a_hash,
                 "record_b_sha256": rec_b_hash,
+                "field_mapping_policy_sha256": FIELD_MAPPING_POLICY_SHA256,
                 "immutable_store_hashes": {k: v for k, v in pre_store_hashes.items() if k != "daily_matches.json"},
                 "source_total": source_total,
                 "projected_total": projected_expected_total,
@@ -1015,6 +1391,9 @@ class SnapshotCanonicalAdapter:
 
             self.journal.append_entry("PROJECTION_COMMITTED", {
                 "migration_id": migration_id,
+                "snapshot_id": snapshot_id,
+                "dataset_identity": dataset_identity,
+                "manifest_sha256": manifest_sha256,
                 "daily_matches_sha256": sha256_file(daily_file),
             })
 
@@ -1049,6 +1428,9 @@ class SnapshotCanonicalAdapter:
 
             self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
                 "migration_id": migration_id,
+                "snapshot_id": snapshot_id,
+                "dataset_identity": dataset_identity,
+                "manifest_sha256": manifest_sha256,
                 "post_inspect": post_inspect,
             })
 
@@ -1060,6 +1442,7 @@ class SnapshotCanonicalAdapter:
                 "migration_id": migration_id,
                 "snapshot_id": snapshot_id,
                 "dataset_identity": dataset_identity,
+                "manifest_sha256": manifest_sha256,
                 "source_total_matches": source_total,
                 "projected_total_matches": projected_expected_total,
                 "unique_canonical_ids": projected_expected_total,
@@ -1091,16 +1474,18 @@ class SnapshotCanonicalAdapter:
     def staging_recover(self) -> dict:
         """
         Evaluate journal and filesystem state under a single lock without recursive locking.
+        Classifies active file into EXPECTED_SOURCE, EXPECTED_PROJECTED, or UNKNOWN.
         Recovers interrupted transactions safely and fails closed on inconsistent state.
         """
         assert_safe_path(self.working_dir, context="working_dir staging_recover", staging_root=self.staging_root)
+        verify_staging_workspace(self.staging_root)
 
         with acquire_staging_lock(self.working_dir, staging_root=self.staging_root):
             entries = self.journal.read_entries()
             if not entries:
                 return {"status": "NO_JOURNAL_ENTRIES", "action": "NOTHING_TO_RECOVER"}
 
-            self.journal.validate_chain(entries)
+            self.validate_journal_chain(entries)
 
             latest_state = self.journal.get_latest_valid_state()
             daily_file = os.path.join(self.working_dir, "daily_matches.json")
@@ -1111,15 +1496,17 @@ class SnapshotCanonicalAdapter:
 
             # Check immutable stores against PREPARED entry
             prep_entry = next((e for e in entries if e.get("state") == "PREPARED"), None)
-            baseline_source_hash = None
             prep_payload = prep_entry.get("payload", {}) if prep_entry else {}
             migration_id = prep_payload.get("migration_id", DEFAULT_MIGRATION_ID)
             snapshot_id = prep_payload.get("snapshot_id", self.manifest.get("snapshot_id", ""))
             dataset_identity = prep_payload.get("dataset_identity", "")
+            manifest_sha256 = prep_payload.get("manifest_sha256")
 
+            expected_source_hash = self.manifest.get("daily_matches_sha256")
             if prep_entry:
                 pre_hashes = prep_payload.get("pre_store_hashes", {})
-                baseline_source_hash = pre_hashes.get("daily_matches.json")
+                if "daily_matches.json" in pre_hashes:
+                    expected_source_hash = pre_hashes["daily_matches.json"]
                 current_hashes = self.get_store_hashes(self.working_dir)
                 for store in NON_CANONICAL_STORES:
                     if store in pre_hashes and current_hashes.get(store) != pre_hashes[store]:
@@ -1140,25 +1527,73 @@ class SnapshotCanonicalAdapter:
                 intent_mig_id = i_p.get("migration_id", migration_id)
                 projected_total = i_p.get("projected_total", projected_total)
 
-            # If already completed
+            # Derive expected projected file hash from archive & policy if available
+            derived_projected_hash = intent_projected_hash
+            if raw_archive_exists:
+                try:
+                    rec_a_data = read_json_strict(os.path.join(self.archive_dir, "record_a.json"))
+                    rec_b_data = read_json_strict(os.path.join(self.archive_dir, "record_b.json"))
+                    candidate, _ = build_approved_candidate_projection(rec_a_data, rec_b_data)
+                    proj_daily, _ = project_snapshot_dataset(read_json_strict(raw_archive), candidate)
+                    proj_str = json.dumps(proj_daily, ensure_ascii=False, indent=2, sort_keys=True)
+                    if os.name == "nt":
+                        proj_str = proj_str.replace("\n", "\r\n")
+                    derived_projected_hash = sha256_bytes(proj_str.encode("utf-8"))
+                except Exception:
+                    pass
+
+            expected_projected_hash = derived_projected_hash or intent_projected_hash
+
+            # Classify file state cryptographically (MC-03)
+            if current_daily_hash == expected_source_hash:
+                file_state = "EXPECTED_SOURCE"
+            elif expected_projected_hash and current_daily_hash == expected_projected_hash:
+                file_state = "EXPECTED_PROJECTED"
+            else:
+                file_state = "UNKNOWN"
+
+            # 1. COMPLETION_RECORDED: require full completed-state verification
             if latest_state == "COMPLETION_RECORDED":
+                try:
+                    self.verify_completed_dataset(migration_id=intent_mig_id)
+                except Exception as exc:
+                    raise RecoveryStateError(
+                        f"COMPLETION_RECORDED recovery failed completed-state verification: {exc}"
+                    ) from exc
                 return {
                     "status": "ALREADY_COMPLETED_NO_OP",
                     "action": "NONE",
                     "latest_state": "COMPLETION_RECORDED",
                 }
 
-            # If at POSTCONDITIONS_VERIFIED, complete forward
+            # 2. POSTCONDITIONS_VERIFIED: verify active file is exact expected projected file
             if latest_state == "POSTCONDITIONS_VERIFIED":
+                if file_state != "EXPECTED_PROJECTED":
+                    raise RecoveryStateError(
+                        f"POSTCONDITIONS_VERIFIED recovery requires active file to match expected projected hash, got {file_state} ({current_daily_hash})"
+                    )
                 self.verify_forensic_archive(
-                    baseline_source_hash=baseline_source_hash,
+                    baseline_source_hash=expected_source_hash,
                     expected_migration_id=intent_mig_id,
                     expected_snapshot_id=snapshot_id,
                 )
+                current_hashes = self.get_store_hashes(self.working_dir)
+                for store in NON_CANONICAL_STORES:
+                    exp_h = self.manifest.get(f"{store.split('.')[0]}_sha256")
+                    if exp_h and current_hashes.get(store) != exp_h:
+                        raise ImmutableStoreMutationError(f"Immutable store '{store}' altered during crash")
+
+                post_inspect = self.inspect_dataset(self.working_dir)
+                if post_inspect["total_matches"] != projected_total:
+                    raise PreconditionViolationError(f"Postcondition failed: total {post_inspect['total_matches']} != {projected_total}")
+                if post_inspect["target_occurrences"] != 1:
+                    raise PreconditionViolationError(f"Postcondition failed: target occurrences {post_inspect['target_occurrences']} != 1")
+
                 self.journal.append_entry("COMPLETION_RECORDED", {
                     "migration_id": intent_mig_id,
                     "snapshot_id": snapshot_id,
                     "dataset_identity": dataset_identity,
+                    "manifest_sha256": manifest_sha256,
                     "projected_total_matches": projected_total,
                     "status": "COMPLETED_VIA_RECOVERY",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -1168,89 +1603,131 @@ class SnapshotCanonicalAdapter:
                     "action": "APPENDED_COMPLETION_RECORDED",
                 }
 
-            # If file has projected hash or journal has PROJECTION_COMMITTED
-            if current_daily_hash == intent_projected_hash:
+            # 3. PROJECTION_COMMITTED
+            if latest_state == "PROJECTION_COMMITTED":
+                if file_state != "EXPECTED_PROJECTED":
+                    raise RecoveryStateError(
+                        f"PROJECTION_COMMITTED recovery requires active file to match expected projected hash, got {file_state} ({current_daily_hash})"
+                    )
                 self.verify_forensic_archive(
-                    baseline_source_hash=baseline_source_hash,
+                    baseline_source_hash=expected_source_hash,
                     expected_migration_id=intent_mig_id,
                     expected_snapshot_id=snapshot_id,
                 )
-                if latest_state != "PROJECTION_COMMITTED":
-                    self.journal.append_entry("PROJECTION_COMMITTED", {
-                        "migration_id": intent_mig_id,
-                        "daily_matches_sha256": current_daily_hash,
-                    })
+                current_hashes = self.get_store_hashes(self.working_dir)
+                for store in NON_CANONICAL_STORES:
+                    exp_h = self.manifest.get(f"{store.split('.')[0]}_sha256")
+                    if exp_h and current_hashes.get(store) != exp_h:
+                        raise ImmutableStoreMutationError(f"Immutable store '{store}' altered during crash")
 
                 post_inspect = self.inspect_dataset(self.working_dir)
                 if post_inspect["total_matches"] != projected_total:
-                    raise PreconditionViolationError(
-                        f"Recovery postcondition failed: total {post_inspect['total_matches']} != {projected_total}"
-                    )
+                    raise PreconditionViolationError(f"Recovery postcondition failed: total {post_inspect['total_matches']} != {projected_total}")
                 if post_inspect["target_occurrences"] != 1:
-                    raise PreconditionViolationError(
-                        f"Recovery postcondition failed: target occurrences {post_inspect['target_occurrences']} != 1"
-                    )
+                    raise PreconditionViolationError(f"Recovery postcondition failed: target occurrences {post_inspect['target_occurrences']} != 1")
 
                 self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
                     "migration_id": intent_mig_id,
+                    "snapshot_id": snapshot_id,
+                    "dataset_identity": dataset_identity,
+                    "manifest_sha256": manifest_sha256,
                     "post_inspect": post_inspect,
                 })
-
                 self.journal.append_entry("COMPLETION_RECORDED", {
                     "migration_id": intent_mig_id,
                     "snapshot_id": snapshot_id,
                     "dataset_identity": dataset_identity,
+                    "manifest_sha256": manifest_sha256,
                     "projected_total_matches": projected_total,
                     "status": "COMPLETED_VIA_RECOVERY",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 })
-
                 return {
                     "status": "RECOVERED_FORWARD_COMPLETED",
                     "action": "COMMITTED_PROJECTION_AND_VERIFIED",
                 }
 
-            # If file has source hash
-            if current_daily_hash == baseline_source_hash:
-                if latest_state in ("PROJECTION_COMMITTED", "POSTCONDITIONS_VERIFIED"):
-                    raise RecoveryStateError(
-                        "Contradictory state: journal indicates committed projection but file has baseline hash."
-                    )
-
-                if latest_state == "COMMIT_INTENT_DURABLE":
-                    if not raw_archive_exists:
-                        raise RecoveryStateError("Missing raw archive to roll back from COMMIT_INTENT_DURABLE")
-
+            # 4. COMMIT_INTENT_DURABLE
+            if latest_state == "COMMIT_INTENT_DURABLE":
+                if file_state == "EXPECTED_PROJECTED":
                     self.verify_forensic_archive(
-                        baseline_source_hash=baseline_source_hash,
+                        baseline_source_hash=expected_source_hash,
                         expected_migration_id=intent_mig_id,
                         expected_snapshot_id=snapshot_id,
                     )
-
+                    self.journal.append_entry("PROJECTION_COMMITTED", {
+                        "migration_id": intent_mig_id,
+                        "snapshot_id": snapshot_id,
+                        "dataset_identity": dataset_identity,
+                        "manifest_sha256": manifest_sha256,
+                        "daily_matches_sha256": current_daily_hash,
+                    })
+                    post_inspect = self.inspect_dataset(self.working_dir)
+                    if post_inspect["total_matches"] != projected_total:
+                        raise PreconditionViolationError(f"Recovery postcondition failed: total {post_inspect['total_matches']} != {projected_total}")
+                    if post_inspect["target_occurrences"] != 1:
+                        raise PreconditionViolationError(f"Recovery postcondition failed: target occurrences {post_inspect['target_occurrences']} != 1")
+                    self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
+                        "migration_id": intent_mig_id,
+                        "snapshot_id": snapshot_id,
+                        "dataset_identity": dataset_identity,
+                        "manifest_sha256": manifest_sha256,
+                        "post_inspect": post_inspect,
+                    })
+                    self.journal.append_entry("COMPLETION_RECORDED", {
+                        "migration_id": intent_mig_id,
+                        "snapshot_id": snapshot_id,
+                        "dataset_identity": dataset_identity,
+                        "manifest_sha256": manifest_sha256,
+                        "projected_total_matches": projected_total,
+                        "status": "COMPLETED_VIA_RECOVERY",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    return {
+                        "status": "RECOVERED_FORWARD_COMPLETED",
+                        "action": "COMMITTED_PROJECTION_AND_VERIFIED",
+                    }
+                elif file_state == "EXPECTED_SOURCE":
+                    if not raw_archive_exists:
+                        raise RecoveryStateError("Missing raw archive to roll back from COMMIT_INTENT_DURABLE")
+                    self.verify_forensic_archive(
+                        baseline_source_hash=expected_source_hash,
+                        expected_migration_id=intent_mig_id,
+                        expected_snapshot_id=snapshot_id,
+                    )
                     restore_from_archive_atomic(
                         raw_archive,
                         daily_file,
-                        expected_hash=baseline_source_hash,
+                        expected_hash=expected_source_hash,
                         staging_root=self.staging_root,
                     )
                     self.journal.append_entry("PREPARED", {
                         "migration_id": intent_mig_id,
                         "snapshot_id": snapshot_id,
+                        "dataset_identity": dataset_identity,
+                        "manifest_sha256": manifest_sha256,
                         "action": "ROLLED_BACK_TO_RAW_ARCHIVE",
                     })
                     return {
                         "status": "RECOVERED_ROLLED_BACK",
                         "action": "RESTORED_ARCHIVE_PRE_COMMIT",
                     }
+                else:
+                    raise RecoveryStateError(
+                        f"COMMIT_INTENT_DURABLE recovery failed closed: active file has unknown hash '{current_daily_hash}'"
+                    )
 
-                # Pre-commit states
-                return {
-                    "status": "RECOVERED_PRE_COMMIT_CLEAN",
-                    "action": "SAFE_RESET",
-                    "latest_state": latest_state,
-                }
+            # 5. Pre-commit states
+            if file_state != "EXPECTED_SOURCE":
+                raise RecoveryStateError(
+                    f"Pre-commit recovery requires active file to match expected source hash, got {file_state} ({current_daily_hash})"
+                )
 
-            raise RecoveryStateError("Unhandled recovery decision branch: file hash matches neither source nor projected")
+            return {
+                "status": "RECOVERED_PRE_COMMIT_CLEAN",
+                "action": "SAFE_RESET",
+                "latest_state": latest_state,
+            }
 
 
 # =============================================================================
@@ -1271,6 +1748,7 @@ def create_synthetic_drift_fixture(
     assert_safe_path(staging_root, context="synthetic fixture staging_root")
     assert_safe_path(source_data_dir, context="synthetic fixture source_data_dir")
 
+    init_staging_workspace(staging_root, dataset_identity="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
     working_data = os.path.join(staging_root, "working", "data")
     os.makedirs(working_data, exist_ok=True)
 
@@ -1359,6 +1837,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify = subparsers.add_parser("staging-verify", help="Verify post-migration invariants on completed dataset")
 
     p_gen = subparsers.add_parser("generate-manifest", help="Generate snapshot manifest from isolated data directory")
+    p_gen.add_argument("--data-dir", help="Path to data directory for manifest generation")
     p_gen.add_argument("--snapshot-id", required=True, help="Snapshot identifier")
     p_gen.add_argument("--classification", required=True, help="Snapshot classification")
     p_gen.add_argument("--description", default="Snapshot manifest", help="Source description")
@@ -1401,9 +1880,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             out_str = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
             if args.output:
-                with open(args.output, "w", encoding="utf-8") as f:
-                    f.write(out_str)
-                print(f"Manifest written to {args.output}")
+                if not args.staging_root:
+                    print("Error: --staging-root is required when specifying --output", file=sys.stderr)
+                    return 1
+                verify_staging_workspace(args.staging_root)
+                safe_output = assert_safe_path(
+                    args.output,
+                    context="generate-manifest output",
+                    staging_root=args.staging_root,
+                )
+                write_json_atomic(safe_output, manifest, staging_root=args.staging_root)
+                print(f"Manifest written to {safe_output}")
             else:
                 print(out_str)
             return 0
@@ -1420,28 +1907,43 @@ def main(argv: Optional[List[str]] = None) -> int:
             if os.path.exists(default_manifest_path):
                 manifest_data = read_json_strict(default_manifest_path)
 
-        adapter = SnapshotCanonicalAdapter(
-            staging_root=args.staging_root,
-            manifest=manifest_data,
-        )
-
         if args.command == "inspect-snapshot":
+            adapter = SnapshotCanonicalAdapter(
+                staging_root=args.staging_root,
+                manifest=manifest_data,
+                writable=False,
+            )
             target_data = args.data_dir or adapter.working_dir
             res = adapter.inspect_dataset(target_data)
             print(json.dumps(res, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
 
         elif args.command == "preview-projection":
-            res = adapter.preview_projection()
+            adapter = SnapshotCanonicalAdapter(
+                staging_root=args.staging_root,
+                manifest=manifest_data,
+                writable=True,
+            )
+            res = adapter.preview_projection(write_output=True)
             print(json.dumps(res, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
 
         elif args.command == "validate-projection":
-            preview = adapter.preview_projection()
+            adapter = SnapshotCanonicalAdapter(
+                staging_root=args.staging_root,
+                manifest=manifest_data,
+                writable=False,
+            )
+            preview = adapter.preview_projection(write_output=False)
             print(f"Validation successful. Candidate SHA-256: {preview['candidate_record_sha256']}")
             return 0
 
         elif args.command == "staging-apply":
+            adapter = SnapshotCanonicalAdapter(
+                staging_root=args.staging_root,
+                manifest=manifest_data,
+                writable=True,
+            )
             res = adapter.staging_apply(
                 simulation=args.simulation,
                 fault_inject=args.fault_inject,
@@ -1451,16 +1953,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         elif args.command == "staging-recover":
+            adapter = SnapshotCanonicalAdapter(
+                staging_root=args.staging_root,
+                manifest=manifest_data,
+                writable=True,
+            )
             res = adapter.staging_recover()
             print(json.dumps(res, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
 
         elif args.command == "staging-verify":
-            res = adapter.inspect_dataset(adapter.working_dir)
+            adapter = SnapshotCanonicalAdapter(
+                staging_root=args.staging_root,
+                manifest=manifest_data,
+                writable=False,
+            )
+            res = adapter.staging_verify()
             print(json.dumps(res, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
 
     except Exception as exc:
+        if argv is not None:
+            raise
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 

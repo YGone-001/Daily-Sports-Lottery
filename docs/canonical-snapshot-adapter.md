@@ -68,14 +68,20 @@ Manifests bind an isolated dataset snapshot cryptographically. Every manifest mu
   "field_mapping_policy_id": "POLICY-OWNER-DECISION-A-20261011",
   "field_mapping_policy_sha256": "5bb33bb20e5ff30ba37d40026e6efd4e5f725a3a7850dfd7f6fa66d92965bf19",
   "manifest_generated_at": "2026-10-11T14:30:00Z",
-  "manifest_verification_status": "VERIFIED"
+  "manifest_verification_status": "MANIFEST_GENERATED"
 }
 ```
+
+### Snapshot Manifest Provenance Semantics
+1. **Initial Generation**: Fresh manifests generated via `generate-manifest` record `"manifest_verification_status": "MANIFEST_GENERATED"`. Fresh generation does not self-claim pre-verified trust.
+2. **Preflight Verification**: When verified against actual disk files by `verify_snapshot_manifest`, status transitions to `"VERIFIED"`.
+3. **Deterministic Identity**: Manifest identity hash (`hash_manifest`) computes deterministic SHA-256 over all functional fields excluding ephemeral verification lifecycle status, ensuring cross-attempt identity binding remains consistent.
 
 ### Snapshot Classifications
 1. `PRESERVED_EPOCH1_FIXTURE`: Pinned historical baseline ($193$ matches).
 2. `EXPLICIT_SYNTHETIC_DRIFT_FIXTURE`: Isolated synthetic test fixtures ($210$ matches with synthetic events).
-3. `FUTURE_OWNER_APPROVED_FROZEN_SNAPSHOT`: Reserved for future production execution; **strictly prohibited** from execution in Phase M.
+3. `FUTURE_OWNER_APPROVED_FROZEN_SNAPSHOT`: Reserved for future production execution; **strictly prohibited and unconditionally rejected** in Phase M.
+4. `LIVE_PRODUCTION_RUNTIME_SNAPSHOT`: Unapproved live production runtime snapshot; **strictly prohibited and unconditionally rejected**.
 
 ---
 
@@ -152,6 +158,11 @@ python -m tools.canonical_snapshot_adapter staging-apply \
 python -m tools.canonical_snapshot_adapter staging-recover \
   --staging-root /path/to/staging_root \
   --manifest /path/to/snapshot_manifest.json
+
+# Verify completed dataset postconditions and invariants (read-only)
+python -m tools.canonical_snapshot_adapter staging-verify \
+  --staging-root /path/to/staging_root \
+  --manifest /path/to/snapshot_manifest.json
 ```
 
 ---
@@ -163,3 +174,71 @@ The adapter enforces strict safety boundaries via `assert_safe_path`:
 - **Evidence Epochs**: Strictly rejects `EPOCH_0` and `EPOCH_1` preserved archives.
 - **Source Repository**: Strictly rejects the git checkout directory as mutable data storage.
 - **Production Flags**: Passing `--allow-production` immediately raises `ProtectedPathViolationError`.
+- **Staging Marker Requirement**: All writable operations strictly require verified `staging_marker.json` initialized in the isolated staging root before any writes or directories can be created.
+- **Read-Only Zero-Write Invariant**: Inspection subcommands (`inspect-snapshot`, `validate-projection`, `staging-verify`) run with `writable=False`, guaranteeing zero file writes and zero directory creations.
+
+---
+
+## 9. Completed-State Verification and Strict Idempotency
+
+The adapter implements a shared, strict completed-state verifier (`verify_completed_dataset`) enforcing all 20 invariants:
+
+1. **Workspace Marker**: Verified `staging_marker.json` present.
+2. **Approved Snapshot Classification**: In `ALLOWED_CLASSIFICATIONS_PHASE_M`.
+3. **Snapshot Identity & Manifest Binding**: Non-empty `snapshot_id`, `dataset_identity`.
+4. **Field Mapping Policy**: Exactly matches approved Owner Decision A policy ID and SHA-256.
+5. **Source Archive Integrity**: Verified intact `daily_matches_raw.json`, `record_a.json`, `record_b.json`, and `forensic_manifest.json`.
+6. **Derived Expected Whole-File Hash**: Independently computed by applying approved candidate projection to raw archived matches without trusting active file state.
+7. **Active Projected File Check**: Active `daily_matches.json` matches derived expected hash byte-for-byte.
+8. **Projected Cardinality**: Exactly $N - 1$ total matches.
+9. **Target Retention**: Exactly $1$ occurrence of `TARGET_CANONICAL_ID`.
+10. **Target Candidate Integrity**: Active candidate record hash matches `EXPECTED_CANDIDATE_SHA256`.
+11. **Original Ordering**: Unrelated match relative ordering preserved.
+12. **Unrelated Match Preservation**: Zero unrelated matches lost or mutated.
+13. **Unknown Top-Level Keys**: Preserved exactly from source archive.
+14. **Metadata Total**: `meta.total` matches $N - 1$.
+15. **Metadata Refresh**: `meta.last_refresh` preserved byte-for-byte.
+16. **Metadata Sources**: `meta.sources` preserved byte-for-byte.
+17. **Six Non-Canonical Stores**: Byte-identical to pre-migration baseline.
+18. **Journal Chain Validity**: Ordered, monotonic, unbroken state sequence.
+19. **Terminal Completion**: Exactly one `COMPLETION_RECORDED` entry.
+20. **Cross-Attempt Binding**: Identical `snapshot_id`, `manifest_sha256`, and target record hashes.
+
+### Strict Idempotency
+When `staging_apply` is called on an already migrated dataset ($N - 1$ records with 1 target occurrence), it triggers full completed-state verification and returns `ALREADY_APPLIED_NO_OP` with:
+- Zero Canonical file modifications (`st_mtime_ns` and byte contents unchanged).
+- Zero journal appends.
+- Zero archive re-generations.
+
+---
+
+## 10. Recovery State Classification and Crash Recovery
+
+The crash recovery engine (`staging_recover`) evaluates durable journal records and classifies active disk files cryptographically under single exclusive OS lock:
+
+### Cryptographic File State Classification
+- `EXPECTED_SOURCE`: Active file hash matches source manifest `daily_matches_sha256`.
+- `EXPECTED_PROJECTED`: Active file hash matches derived projected hash.
+- `UNKNOWN`: Active file hash does not match source or projected hash.
+
+### Recovery State Transitions
+1. **`COMPLETION_RECORDED`**:
+   - Executes full 20-invariant verification (`verify_completed_dataset`).
+   - Returns `ALREADY_COMPLETED_NO_OP` without file modification.
+   - If active file is corrupted or archive missing, fails closed with `RecoveryStateError`.
+2. **`POSTCONDITIONS_VERIFIED`**:
+   - Verifies active file is `EXPECTED_PROJECTED`.
+   - Re-verifies all 6 non-canonical stores and forensic archive.
+   - Appends `COMPLETION_RECORDED` and returns `RECOVERED_FORWARD_COMPLETED`.
+   - Fails closed if active file hash is not `EXPECTED_PROJECTED`.
+3. **`PROJECTION_COMMITTED`**:
+   - Verifies active file is `EXPECTED_PROJECTED`.
+   - Re-verifies postconditions, appends `POSTCONDITIONS_VERIFIED` and `COMPLETION_RECORDED`.
+   - Returns `RECOVERED_FORWARD_COMPLETED`.
+4. **`COMMIT_INTENT_DURABLE`**:
+   - If active file is `EXPECTED_PROJECTED`: advances forward to completion (`RECOVERED_FORWARD_COMPLETED`).
+   - If active file is `EXPECTED_SOURCE`: restores safely from forensic raw archive, appends rollback `PREPARED`, and returns `RECOVERED_ROLLED_BACK`.
+   - If active file is `UNKNOWN`: **fails closed** immediately with `RecoveryStateError` under lock, preventing data overwrite.
+5. **Pre-Commit States (`PREPARED`, `EVIDENCE_VERIFIED`, `AUTHORIZED_FOR_STAGING_SIMULATION`)**:
+   - Verifies active file is `EXPECTED_SOURCE`.
+   - Returns `RECOVERED_PRE_COMMIT_CLEAN` with zero file modifications.

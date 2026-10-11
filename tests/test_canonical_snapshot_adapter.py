@@ -18,6 +18,7 @@ import os
 import shutil
 import sys
 import tempfile
+from typing import Any, Dict, List, Optional, Tuple
 import pytest
 
 from tools.canonical_snapshot_adapter import (
@@ -28,12 +29,14 @@ from tools.canonical_snapshot_adapter import (
     SnapshotIdentityError,
     PolicyMismatchError,
     UnrelatedMatchLossError,
+    CompletedStateVerificationError,
     MANIFEST_SCHEMA_VERSION,
     ALLOWED_CLASSIFICATIONS_PHASE_M,
     FIELD_MAPPING_POLICY_ID,
     FIELD_MAPPING_POLICY_SHA256,
     generate_snapshot_manifest,
     verify_snapshot_manifest,
+    hash_manifest,
     build_approved_candidate_projection,
     project_snapshot_dataset,
     create_synthetic_drift_fixture,
@@ -56,6 +59,9 @@ from tools.staging_canonical_repair import (
     ImmutableStoreMutationError,
     FaultInjectionError,
     DEFAULT_MIGRATION_ID,
+    STAGING_MARKER_FILENAME,
+    init_staging_workspace,
+    verify_staging_workspace,
     read_json_strict,
     write_json_atomic,
     sha256_file,
@@ -122,6 +128,7 @@ def build_isolated_workspace_fixture(
     extra_top_key: bool = False,
 ) -> Tuple[str, dict]:
     """Helper to build an isolated test staging workspace with exactly match_count matches."""
+    init_staging_workspace(root_dir, dataset_identity=dataset_identity)
     working_data = os.path.join(root_dir, "working", "data")
     os.makedirs(working_data, exist_ok=True)
 
@@ -987,3 +994,668 @@ def test_m_neg_30_production_execution_option_requested():
     """M-NEG-30: Rejects production execution option (--allow-production)."""
     with pytest.raises(ProtectedPathViolationError, match="SAFETY VIOLATION: Production option"):
         adapter_main(["--allow-production", "--staging-root", "some_path", "staging-apply"])
+
+
+# =============================================================================
+# MC-IDEM: Strict Completed-State Idempotency Matrix (MC-IDEM-01 .. MC-IDEM-10)
+# =============================================================================
+
+def test_mc_idem_01_valid_noop_on_unchanged_completed_dataset(tmp_path):
+    """MC-IDEM-01: Valid no-op on unchanged completed dataset."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    res1 = adapter.staging_apply(simulation=True)
+    assert res1["status"] == "MIGRATION_COMPLETED"
+
+    daily_path = os.path.join(working_data, "daily_matches.json")
+    stat_before = os.stat(daily_path)
+    journal_path = adapter.journal.journal_file
+    with open(journal_path, "r", encoding="utf-8") as f:
+        journal_content_before = f.read()
+
+    # Second execution must be strict verified no-op
+    res2 = adapter.staging_apply(simulation=True)
+    assert res2["status"] == "ALREADY_APPLIED_NO_OP"
+    assert res2["total_matches"] == 209
+    assert res2["target_occurrences"] == 1
+    assert res2["candidate_sha256"] == EXPECTED_CANDIDATE_SHA256
+
+    # Verify no file writes and no journal appends
+    stat_after = os.stat(daily_path)
+    assert stat_before.st_mtime_ns == stat_after.st_mtime_ns
+    assert stat_before.st_size == stat_after.st_size
+    with open(journal_path, "r", encoding="utf-8") as f:
+        journal_content_after = f.read()
+    assert journal_content_before == journal_content_after
+
+    # Verify via staging_verify CLI handler
+    verify_res = adapter.staging_verify()
+    assert verify_res["status"] == "COMPLETED_STATE_VERIFIED"
+    assert verify_res["verified_invariants"] == 20
+
+
+def test_mc_idem_02_reject_altered_unrelated_match(tmp_path):
+    """MC-IDEM-02: Rejects completed dataset with altered unrelated match."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Tamper with unrelated match
+    daily_path = os.path.join(working_data, "daily_matches.json")
+    daily_data = read_json_strict(daily_path)
+    daily_data["matches"][0]["home"] = "TAMPERED_HOME_TEAM"
+    write_json_atomic(daily_path, daily_data, staging_root=staging_root)
+
+    with pytest.raises(CompletedStateVerificationError):
+        adapter.staging_apply(simulation=True)
+
+    with pytest.raises(CompletedStateVerificationError):
+        adapter.staging_verify()
+
+
+def test_mc_idem_03_reject_altered_target_candidate_record(tmp_path):
+    """MC-IDEM-03: Rejects completed dataset with altered target candidate record."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Tamper with the single target record
+    daily_path = os.path.join(working_data, "daily_matches.json")
+    daily_data = read_json_strict(daily_path)
+    for m in daily_data["matches"]:
+        if m.get("id") == TARGET_CANONICAL_ID:
+            m["odds"] = {"home_win": 99.9}
+            break
+    write_json_atomic(daily_path, daily_data, staging_root=staging_root)
+
+    with pytest.raises(CompletedStateVerificationError, match="Active file hash does not match expected projected hash"):
+        adapter.staging_apply(simulation=True)
+
+
+def test_mc_idem_04_reject_missing_forensic_archive(tmp_path):
+    """MC-IDEM-04: Rejects completed dataset with missing forensic archive."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Delete raw archive
+    os.remove(os.path.join(staging_root, "archive", "daily_matches_raw.json"))
+
+    with pytest.raises(Exception):
+        adapter.staging_apply(simulation=True)
+
+
+def test_mc_idem_05_reject_corrupted_record_a_in_archive(tmp_path):
+    """MC-IDEM-05: Rejects completed dataset with corrupted Record A in forensic archive."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Tamper with archived record_a.json
+    rec_a_path = os.path.join(staging_root, "archive", "record_a.json")
+    rec_a_data = read_json_strict(rec_a_path)
+    rec_a_data["away"] = "TAMPERED_AWAY"
+    write_json_atomic(rec_a_path, rec_a_data, staging_root=staging_root)
+
+    with pytest.raises(Exception):
+        adapter.staging_apply(simulation=True)
+
+
+def test_mc_idem_06_reject_corrupted_record_b_in_archive(tmp_path):
+    """MC-IDEM-06: Rejects completed dataset with corrupted Record B in forensic archive."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Tamper with archived record_b.json
+    rec_b_path = os.path.join(staging_root, "archive", "record_b.json")
+    rec_b_data = read_json_strict(rec_b_path)
+    rec_b_data["home"] = "TAMPERED_HOME"
+    write_json_atomic(rec_b_path, rec_b_data, staging_root=staging_root)
+
+    with pytest.raises(Exception):
+        adapter.staging_apply(simulation=True)
+
+
+def test_mc_idem_07_reject_deleted_journal(tmp_path):
+    """MC-IDEM-07: Rejects completed dataset with deleted journal."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Delete journal file
+    os.remove(adapter.journal.journal_file)
+
+    with pytest.raises(CompletedStateVerificationError, match="Journal is missing or empty"):
+        adapter.staging_apply(simulation=True)
+
+
+def test_mc_idem_08_reject_incomplete_journal(tmp_path):
+    """MC-IDEM-08: Rejects completed dataset with incomplete journal missing COMPLETION_RECORDED."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Drop COMPLETION_RECORDED from journal
+    entries = adapter.journal.read_entries()
+    entries = [e for e in entries if e.get("state") != "COMPLETION_RECORDED"]
+    journal_path = adapter.journal.journal_file
+    with open(journal_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    with pytest.raises(CompletedStateVerificationError, match="expected COMPLETION_RECORDED"):
+        adapter.staging_apply(simulation=True)
+
+
+def test_mc_idem_09_reject_snapshot_id_mismatch(tmp_path):
+    """MC-IDEM-09: Rejects completed dataset with mismatched snapshot_id in manifest."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Create new adapter with modified snapshot_id
+    mismatched_manifest = copy.deepcopy(manifest)
+    mismatched_manifest["snapshot_id"] = "DIFFERENT-SNAPSHOT-ID-999"
+    adapter2 = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=mismatched_manifest)
+
+    with pytest.raises(Exception):
+        adapter2.staging_apply(simulation=True)
+
+
+def test_mc_idem_10_reject_drifted_non_canonical_store(tmp_path):
+    """MC-IDEM-10: Rejects completed dataset with drifted non-canonical store."""
+    staging_root = str(tmp_path / "staging_idem")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Alter team_strength.json
+    ts_path = os.path.join(working_data, "team_strength.json")
+    write_json_atomic(ts_path, {"MUTATED_STORE": 123}, staging_root=staging_root)
+
+    with pytest.raises(ImmutableStoreMutationError, match="Immutable store 'team_strength.json' hash mismatch"):
+        adapter.staging_apply(simulation=True)
+
+
+# =============================================================================
+# MC-REC: Recovery State Classification & Failure Modes (MC-REC-01 .. MC-REC-10)
+# =============================================================================
+
+def test_mc_rec_01_completed_journal_with_corrupted_active_file(tmp_path):
+    """MC-REC-01: Fails closed when journal is completed but active daily_matches is corrupted."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    daily_path = os.path.join(working_data, "daily_matches.json")
+    with open(daily_path, "w", encoding="utf-8") as f:
+        f.write('{"matches": ["CORRUPTED"]}')
+
+    with pytest.raises(RecoveryStateError, match="COMPLETION_RECORDED recovery failed completed-state verification"):
+        adapter.staging_recover()
+
+
+def test_mc_rec_02_completed_journal_with_missing_forensic_archive(tmp_path):
+    """MC-REC-02: Fails closed when journal is completed but forensic archive is missing."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    os.remove(os.path.join(staging_root, "archive", "daily_matches_raw.json"))
+
+    with pytest.raises(RecoveryStateError, match="COMPLETION_RECORDED recovery failed completed-state verification"):
+        adapter.staging_recover()
+
+
+def test_mc_rec_03_completed_journal_with_modified_non_canonical_store(tmp_path):
+    """MC-REC-03: Fails closed when journal is completed but non-canonical store is modified."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    calib_path = os.path.join(working_data, "calibrated.json")
+    write_json_atomic(calib_path, ["CORRUPTED_STORE"], staging_root=staging_root)
+
+    with pytest.raises(ImmutableStoreMutationError, match="Immutable store calibrated.json altered during crash"):
+        adapter.staging_recover()
+
+
+def test_mc_rec_04_postconditions_verified_with_corrupted_active_file(tmp_path):
+    """MC-REC-04: Fails closed when POSTCONDITIONS_VERIFIED has corrupted active file hash."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_completion")
+
+    daily_path = os.path.join(working_data, "daily_matches.json")
+    with open(daily_path, "w", encoding="utf-8") as f:
+        f.write('{"matches": ["CORRUPTED_POSTCONDITIONS"]}')
+
+    with pytest.raises(RecoveryStateError, match="POSTCONDITIONS_VERIFIED recovery requires active file to match expected projected hash"):
+        adapter.staging_recover()
+
+
+def test_mc_rec_05_postconditions_verified_with_valid_projected_file(tmp_path):
+    """MC-REC-05: Advances to COMPLETION_RECORDED when interrupted at POSTCONDITIONS_VERIFIED."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_completion")
+
+    rec_res = adapter.staging_recover()
+    assert rec_res["status"] == "RECOVERED_FORWARD_COMPLETED"
+    assert rec_res["action"] == "APPENDED_COMPLETION_RECORDED"
+
+    entries = adapter.journal.read_entries()
+    assert entries[-1]["state"] == "COMPLETION_RECORDED"
+
+
+def test_mc_rec_06_projection_committed_recovery(tmp_path):
+    """MC-REC-06: Recovers safely from PROJECTION_COMMITTED with valid projected file."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_completion")
+
+    # Drop POSTCONDITIONS_VERIFIED from journal to leave PROJECTION_COMMITTED
+    entries = [e for e in adapter.journal.read_entries() if e.get("state") != "POSTCONDITIONS_VERIFIED"]
+    journal_path = adapter.journal.journal_file
+    with open(journal_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    rec_res = adapter.staging_recover()
+    assert rec_res["status"] == "RECOVERED_FORWARD_COMPLETED"
+    assert rec_res["action"] == "COMMITTED_PROJECTION_AND_VERIFIED"
+
+
+def test_mc_rec_07_commit_intent_durable_with_projected_hash_active(tmp_path):
+    """MC-REC-07: Recovers forward when COMMIT_INTENT_DURABLE has active projected file."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    # Replace daily_matches with projected content
+    rec_a = read_json_strict(os.path.join(staging_root, "archive", "record_a.json"))
+    rec_b = read_json_strict(os.path.join(staging_root, "archive", "record_b.json"))
+    cand, _ = build_approved_candidate_projection(rec_a, rec_b)
+    raw_daily = read_json_strict(os.path.join(staging_root, "archive", "daily_matches_raw.json"))
+    proj_daily, _ = project_snapshot_dataset(raw_daily, cand)
+    daily_path = os.path.join(working_data, "daily_matches.json")
+    write_json_atomic(daily_path, proj_daily, staging_root=staging_root)
+
+    rec_res = adapter.staging_recover()
+    assert rec_res["status"] == "RECOVERED_FORWARD_COMPLETED"
+    assert rec_res["action"] == "COMMITTED_PROJECTION_AND_VERIFIED"
+
+
+def test_mc_rec_08_commit_intent_durable_with_source_hash_active(tmp_path):
+    """MC-REC-08: Rolls back to source when COMMIT_INTENT_DURABLE has active source file."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    rec_res = adapter.staging_recover()
+    assert rec_res["status"] == "RECOVERED_ROLLED_BACK"
+    assert rec_res["action"] == "RESTORED_ARCHIVE_PRE_COMMIT"
+
+    # Retry succeeds
+    retry_res = adapter.staging_apply(simulation=True)
+    assert retry_res["status"] == "MIGRATION_COMPLETED"
+
+
+def test_mc_rec_09_commit_intent_durable_with_unknown_hash_active(tmp_path):
+    """MC-REC-09: Fails closed when active file hash is UNKNOWN under COMMIT_INTENT_DURABLE."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    # Put unknown garbage into daily_matches.json
+    daily_path = os.path.join(working_data, "daily_matches.json")
+    with open(daily_path, "w", encoding="utf-8") as f:
+        f.write('{"UNKNOWN_DRIFT": 999}')
+
+    with pytest.raises(RecoveryStateError, match="active file has unknown hash"):
+        adapter.staging_recover()
+
+
+def test_mc_rec_10_repeated_recovery_idempotent(tmp_path):
+    """MC-REC-10: Repeated recovery attempts are safe and idempotent under single OS lock."""
+    staging_root = str(tmp_path / "staging_rec")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    rec_res1 = adapter.staging_recover()
+    assert rec_res1["status"] == "RECOVERED_ROLLED_BACK"
+
+    rec_res2 = adapter.staging_recover()
+    assert rec_res2["status"] == "RECOVERED_PRE_COMMIT_CLEAN"
+
+
+# =============================================================================
+# MC-PATH: Protected Path & Read-Only Safety Matrix (MC-PATH-01 .. MC-PATH-10)
+# =============================================================================
+
+def test_mc_path_01_manifest_output_escaping_staging_root(tmp_path):
+    """MC-PATH-01: Rejects manifest --output escaping staging root."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    outside_output = str(tmp_path / "outside_manifest.json")
+
+    with pytest.raises(ProtectedPathViolationError, match="escapes staging root"):
+        adapter_main([
+            "--staging-root", staging_root,
+            "generate-manifest",
+            "--data-dir", working_data,
+            "--snapshot-id", "SNAP-ESC",
+            "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+            "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+            "--output", outside_output,
+        ])
+
+
+def test_mc_path_02_manifest_output_into_prod_data(tmp_path):
+    """MC-PATH-02: Rejects manifest --output targeting production DATA_DIR."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    prod_output = os.path.join(PROD_REPO_ROOT, "data", "compromised_manifest.json")
+
+    with pytest.raises(ProtectedPathViolationError):
+        adapter_main([
+            "--staging-root", staging_root,
+            "generate-manifest",
+            "--data-dir", working_data,
+            "--snapshot-id", "SNAP-PROD",
+            "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+            "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+            "--output", prod_output,
+        ])
+
+
+def test_mc_path_03_manifest_output_into_epoch1(tmp_path):
+    """MC-PATH-03: Rejects manifest --output targeting preserved EPOCH_1."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    epoch1_output = os.path.join(EPOCH_1_ROOT, "compromised_manifest.json")
+
+    with pytest.raises(ProtectedPathViolationError):
+        adapter_main([
+            "--staging-root", staging_root,
+            "generate-manifest",
+            "--data-dir", working_data,
+            "--snapshot-id", "SNAP-EPOCH1",
+            "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+            "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+            "--output", epoch1_output,
+        ])
+
+
+def test_mc_path_04_manifest_output_into_git_checkout(tmp_path):
+    """MC-PATH-04: Rejects manifest --output targeting git source checkout."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    checkout_output = os.path.join(SOURCE_REPO_ROOT, "compromised_manifest.json")
+
+    with pytest.raises(ProtectedPathViolationError):
+        adapter_main([
+            "--staging-root", staging_root,
+            "generate-manifest",
+            "--data-dir", working_data,
+            "--snapshot-id", "SNAP-SRC",
+            "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+            "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+            "--output", checkout_output,
+        ])
+
+
+def test_mc_path_05_manifest_output_traversal_dotdot(tmp_path):
+    """MC-PATH-05: Rejects manifest --output with path traversal outside staging root."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    dotdot_output = os.path.join(staging_root, "..", "escaped_manifest.json")
+
+    with pytest.raises(ProtectedPathViolationError, match="escapes staging root"):
+        adapter_main([
+            "--staging-root", staging_root,
+            "generate-manifest",
+            "--data-dir", working_data,
+            "--snapshot-id", "SNAP-DOTDOT",
+            "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+            "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+            "--output", dotdot_output,
+        ])
+
+
+def test_mc_path_06_manifest_output_junction_escape(tmp_path):
+    """MC-PATH-06: Rejects manifest --output when directory resolves outside staging root."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    outside_dir = str(tmp_path / "outside_dir")
+    os.makedirs(outside_dir, exist_ok=True)
+    outside_file = os.path.join(outside_dir, "manifest.json")
+
+    with pytest.raises(ProtectedPathViolationError, match="escapes staging root"):
+        adapter_main([
+            "--staging-root", staging_root,
+            "generate-manifest",
+            "--data-dir", working_data,
+            "--snapshot-id", "SNAP-JUNC",
+            "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+            "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+            "--output", outside_file,
+        ])
+
+
+def test_mc_path_07_manifest_output_symlink_redirect(tmp_path):
+    """MC-PATH-07: Rejects manifest --output targeting external path via redirect."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    foreign_dir = str(tmp_path / "foreign")
+    os.makedirs(foreign_dir, exist_ok=True)
+    foreign_file = os.path.join(foreign_dir, "redirect_target.json")
+
+    with pytest.raises(ProtectedPathViolationError):
+        adapter_main([
+            "--staging-root", staging_root,
+            "generate-manifest",
+            "--data-dir", working_data,
+            "--snapshot-id", "SNAP-SYM",
+            "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+            "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+            "--output", foreign_file,
+        ])
+
+
+def test_mc_path_08_unmarked_staging_workspace_rejection(tmp_path):
+    """MC-PATH-08: Rejects writable operations against unmarked workspace before any writes."""
+    unmarked_root = str(tmp_path / "unmarked_root")
+    os.makedirs(unmarked_root, exist_ok=True)
+
+    with pytest.raises(PreconditionViolationError, match="Unmarked workspace rejected before writes"):
+        SnapshotCanonicalAdapter(staging_root=unmarked_root, manifest={}, writable=True)
+
+
+def test_mc_path_09_inspection_zero_write_assertion(tmp_path):
+    """MC-PATH-09: Read-only inspection (writable=False) creates zero files and zero directories."""
+    read_only_root = str(tmp_path / "read_only_test")
+    data_dir = os.path.join(read_only_root, "data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    before_entries = set(os.listdir(read_only_root))
+
+    # Initialize adapter with writable=False
+    adapter = SnapshotCanonicalAdapter(staging_root=read_only_root, manifest={}, writable=False)
+    assert not os.path.exists(os.path.join(read_only_root, "input"))
+    assert not os.path.exists(os.path.join(read_only_root, "archive"))
+    assert not os.path.exists(os.path.join(read_only_root, "journal"))
+    assert not os.path.exists(os.path.join(read_only_root, "output"))
+
+    after_entries = set(os.listdir(read_only_root))
+    assert before_entries == after_entries
+
+
+def test_mc_path_10_atomic_valid_staging_output(tmp_path):
+    """MC-PATH-10: Writes valid manifest atomically inside marked staging root with zero leftover temps."""
+    staging_root = str(tmp_path / "staging_path")
+    working_data, _ = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    out_file = os.path.join(staging_root, "valid_output_manifest.json")
+
+    code = adapter_main([
+        "--staging-root", staging_root,
+        "generate-manifest",
+        "--data-dir", working_data,
+        "--snapshot-id", "SNAP-ATOMIC",
+        "--classification", "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+        "--dataset-identity", "TEST_FIXTURE_IDENTITY",
+        "--output", out_file,
+    ])
+    assert code == 0
+    assert os.path.exists(out_file)
+
+    manifest_loaded = read_json_strict(out_file)
+    assert manifest_loaded["snapshot_id"] == "SNAP-ATOMIC"
+    assert manifest_loaded["manifest_verification_status"] == "MANIFEST_GENERATED"
+
+    # Verify no temp files left behind
+    for fname in os.listdir(staging_root):
+        assert not fname.endswith(".tmp")
+
+
+# =============================================================================
+# MC-JRN: Journal Cross-Attempt Identity Binding Matrix (MC-JRN-01 .. MC-JRN-06)
+# =============================================================================
+
+def test_mc_jrn_01_same_snapshot_valid_retry(tmp_path):
+    """MC-JRN-01: Permits retry on the same snapshot with identical identity bindings."""
+    staging_root = str(tmp_path / "staging_jrn")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    rec = adapter.staging_recover()
+    assert rec["status"] == "RECOVERED_ROLLED_BACK"
+
+    # Retry on the exact same snapshot succeeds
+    retry_res = adapter.staging_apply(simulation=True)
+    assert retry_res["status"] == "MIGRATION_COMPLETED"
+
+    entries = adapter.journal.read_entries()
+    attempts = [e.get("payload", {}).get("attempt") for e in entries if isinstance(e.get("payload"), dict) and "attempt" in e.get("payload")]
+    assert 1 in attempts
+    assert 2 in attempts
+
+
+def test_mc_jrn_02_changed_snapshot_id_rejected(tmp_path):
+    """MC-JRN-02: Rejects cross-attempt retry with changed snapshot_id."""
+    staging_root = str(tmp_path / "staging_jrn")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "snapshot_id": "SNAP-ORIG", "attempt": 1}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "snapshot_id": "SNAP-CHANGED", "attempt": 2}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Cross-snapshot retry rejected: changed snapshot_id"):
+        adapter.validate_journal_chain(entries, expected_migration_id="MIG-1")
+
+
+def test_mc_jrn_03_changed_manifest_sha_rejected(tmp_path):
+    """MC-JRN-03: Rejects cross-attempt retry with changed manifest_sha256."""
+    staging_root = str(tmp_path / "staging_jrn")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "manifest_sha256": "aaaa" * 16, "attempt": 1}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "manifest_sha256": "bbbb" * 16, "attempt": 2}},
+    ]
+    with pytest.raises(RecoveryStateError, match="source manifest changed across attempts"):
+        adapter.validate_journal_chain(entries, expected_migration_id="MIG-1")
+
+
+def test_mc_jrn_04_changed_projected_hash_rejected(tmp_path):
+    """MC-JRN-04: Rejects conflicting projected_file_sha256 across entries."""
+    staging_root = str(tmp_path / "staging_jrn")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-1",
+                "source_file_sha256": "src1",
+                "projected_file_sha256": "proj1" * 8,
+                "candidate_record_sha256": "cand1",
+                "record_a_sha256": "a1",
+                "record_b_sha256": "b1",
+            },
+        },
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-1",
+                "source_file_sha256": "src1",
+                "projected_file_sha256": "proj2" * 8,
+                "candidate_record_sha256": "cand1",
+                "record_a_sha256": "a1",
+                "record_b_sha256": "b1",
+            },
+        },
+    ]
+    with pytest.raises(RecoveryStateError, match="Conflicting projected_file_sha256"):
+        adapter.validate_journal_chain(entries, expected_migration_id="MIG-1")
+
+
+def test_mc_jrn_05_changed_immutable_store_hash_rejected(tmp_path):
+    """MC-JRN-05: Rejects conflicting immutable store hashes across entries."""
+    staging_root = str(tmp_path / "staging_jrn")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "immutable_store_hashes": {"team_strength.json": "ts1" * 16}}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "immutable_store_hashes": {"team_strength.json": "ts2" * 16}}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Conflicting immutable_store_hashes in journal across attempts"):
+        adapter.validate_journal_chain(entries, expected_migration_id="MIG-1")
+
+
+def test_mc_jrn_06_conflicting_attempt_history_rejected(tmp_path):
+    """MC-JRN-06: Rejects out-of-order or corrupt attempt numbering."""
+    staging_root = str(tmp_path / "staging_jrn")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "attempt": 2}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-1", "attempt": 1}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Non-monotonic attempt sequence"):
+        adapter.validate_journal_chain(entries, expected_migration_id="MIG-1")
