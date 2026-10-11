@@ -263,10 +263,40 @@ def generate_snapshot_manifest(
         store_hashes[store] = sha256_file(p)
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    actual_captured_at = captured_at or now_iso
-    actual_git_sha = source_git_sha or "UNKNOWN_SOURCE_GIT_SHA"
 
-    if capture_consistency_status is not None:
+    # Determine captured_at without fabricating or defaulting to current manifest generation time
+    if captured_at is not None and str(captured_at).strip():
+        actual_captured_at = captured_at
+    else:
+        evidence_manifest_time = None
+        for candidate_path in [
+            os.path.join(data_dir, "manifest.json"),
+            os.path.join(os.path.dirname(data_dir), "manifest.json"),
+        ]:
+            if os.path.exists(candidate_path):
+                try:
+                    ev_data = read_json_strict(candidate_path)
+                    if isinstance(ev_data, dict) and "creation_time" in ev_data:
+                        evidence_manifest_time = ev_data["creation_time"]
+                        break
+                except Exception:
+                    pass
+
+        if evidence_manifest_time:
+            actual_captured_at = evidence_manifest_time
+        elif snapshot_classification == "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE":
+            actual_captured_at = "SYNTHETIC_FIXTURE_NOT_HISTORICAL"
+        else:
+            actual_captured_at = "UNKNOWN_HISTORICAL_CAPTURE_TIME"
+
+    # Determine source_git_sha without inventing Git provenance
+    if source_git_sha is not None and str(source_git_sha).strip():
+        actual_git_sha = source_git_sha
+    else:
+        actual_git_sha = "UNKNOWN_SOURCE_GIT_SHA"
+
+    # Determine capture_consistency_status without automatically inferring quiescence
+    if capture_consistency_status is not None and str(capture_consistency_status).strip():
         actual_consistency = capture_consistency_status
     elif snapshot_classification == "EXPLICIT_SYNTHETIC_DRIFT_FIXTURE":
         actual_consistency = "SYNTHETIC_GENERATED"
@@ -716,6 +746,7 @@ class SnapshotCanonicalAdapter:
         expected_migration_id: Optional[str] = None,
         expected_snapshot_id: Optional[str] = None,
         expected_manifest_sha256: Optional[str] = None,
+        expected_dataset_identity: Optional[str] = None,
     ) -> None:
         """Enforce journal transition consistency, cross-attempt snapshot identity binding, and ordering."""
         self.journal.validate_chain(entries, expected_migration_id=expected_migration_id)
@@ -724,6 +755,7 @@ class SnapshotCanonicalAdapter:
 
         first_snap_id = None
         first_manifest_sha256 = None
+        first_dataset_id = None
         first_proj_hash = None
         first_immut_hashes = None
         last_attempt = None
@@ -752,6 +784,20 @@ class SnapshotCanonicalAdapter:
                 if expected_snapshot_id and snap_id != expected_snapshot_id:
                     raise RecoveryStateError(
                         f"Journal snapshot_id mismatch: '{snap_id}' != '{expected_snapshot_id}'"
+                    )
+
+            # Validate dataset_identity binding
+            ds_id = payload.get("dataset_identity")
+            if ds_id:
+                if first_dataset_id is None:
+                    first_dataset_id = ds_id
+                elif ds_id != first_dataset_id:
+                    raise RecoveryStateError(
+                        f"Cross-snapshot retry rejected: changed dataset_identity '{ds_id}' != '{first_dataset_id}'"
+                    )
+                if expected_dataset_identity and ds_id != expected_dataset_identity:
+                    raise RecoveryStateError(
+                        f"Journal dataset_identity mismatch: '{ds_id}' != '{expected_dataset_identity}'"
                     )
 
             # Validate manifest_sha256 binding
@@ -946,6 +992,7 @@ class SnapshotCanonicalAdapter:
             expected_migration_id=migration_id,
             expected_snapshot_id=snapshot_id,
             expected_manifest_sha256=manifest_sha256,
+            expected_dataset_identity=dataset_identity,
         )
 
         last_entry = entries[-1]
@@ -1055,6 +1102,7 @@ class SnapshotCanonicalAdapter:
         baseline_source_hash: str,
         expected_migration_id: str,
         expected_snapshot_id: str,
+        expected_dataset_identity: Optional[str] = None,
     ) -> dict:
         """Verify the cryptographic integrity of archived evidence before reuse or recovery."""
         raw_archive = os.path.join(self.archive_dir, "daily_matches_raw.json")
@@ -1083,18 +1131,80 @@ class SnapshotCanonicalAdapter:
         if b_hash != EXPECTED_RECORD_B_SHA256:
             raise RecoveryStateError(f"Archived record_b hash corrupted: {b_hash}")
 
+        # Find target occurrences in raw archive and verify positions
+        raw_daily = read_json_strict(raw_archive)
+        raw_matches = raw_daily.get("matches", []) if isinstance(raw_daily, dict) else []
+        target_indices = [
+            i for i, m in enumerate(raw_matches)
+            if isinstance(m, dict) and m.get("id") == TARGET_CANONICAL_ID
+        ]
+        if len(target_indices) != 2:
+            raise RecoveryStateError(
+                f"Forensic raw archive contains {len(target_indices)} target occurrences, expected 2"
+            )
+        actual_idx_a, actual_idx_b = target_indices[0], target_indices[1]
+
+        # Verify that records at those positions match archived records A and B
+        if hash_record(raw_matches[actual_idx_a]) != a_hash:
+            raise RecoveryStateError("Forensic archive raw match at record_a position does not match record_a")
+        if hash_record(raw_matches[actual_idx_b]) != b_hash:
+            raise RecoveryStateError("Forensic archive raw match at record_b position does not match record_b")
+
+        # Derive expected dataset identity from bound snapshot transaction if not explicitly passed
+        target_dataset_id = expected_dataset_identity or self.manifest.get("dataset_identity")
+        if not target_dataset_id or not str(target_dataset_id).strip():
+            raise RecoveryStateError("Missing expected_dataset_identity for forensic archive verification")
+
         archive_manifest = read_json_strict(manifest_file)
-        if archive_manifest.get("migration_id") != expected_migration_id:
+        if not isinstance(archive_manifest, dict):
+            raise RecoveryStateError("Forensic manifest is not a JSON object")
+
+        # Required fields in forensic manifest - do not silently accept missing fields
+        required_fields = [
+            "migration_id",
+            "snapshot_id",
+            "dataset_identity",
+            "source_file_sha256",
+            "record_a_sha256",
+            "record_b_sha256",
+            "record_a_index",
+            "record_b_index",
+        ]
+        for field in required_fields:
+            if field not in archive_manifest or archive_manifest[field] is None:
+                raise RecoveryStateError(f"Forensic manifest missing required field: '{field}'")
+
+        if archive_manifest["migration_id"] != expected_migration_id:
             raise RecoveryStateError(
-                f"Forensic manifest migration_id mismatch: '{archive_manifest.get('migration_id')}' != '{expected_migration_id}'"
+                f"Forensic manifest migration_id mismatch: '{archive_manifest['migration_id']}' != '{expected_migration_id}'"
             )
-        if archive_manifest.get("snapshot_id") != expected_snapshot_id:
+        if archive_manifest["snapshot_id"] != expected_snapshot_id:
             raise RecoveryStateError(
-                f"Forensic manifest snapshot_id mismatch: '{archive_manifest.get('snapshot_id')}' != '{expected_snapshot_id}'"
+                f"Forensic manifest snapshot_id mismatch: '{archive_manifest['snapshot_id']}' != '{expected_snapshot_id}'"
             )
-        if archive_manifest.get("source_file_sha256") != baseline_source_hash:
+        if archive_manifest["dataset_identity"] != target_dataset_id:
             raise RecoveryStateError(
-                f"Forensic manifest source_file_sha256 mismatch: '{archive_manifest.get('source_file_sha256')}' != '{baseline_source_hash}'"
+                f"Forensic manifest dataset_identity mismatch: '{archive_manifest['dataset_identity']}' != '{target_dataset_id}'"
+            )
+        if archive_manifest["source_file_sha256"] != baseline_source_hash:
+            raise RecoveryStateError(
+                f"Forensic manifest source_file_sha256 mismatch: '{archive_manifest['source_file_sha256']}' != '{baseline_source_hash}'"
+            )
+        if archive_manifest["record_a_sha256"] != a_hash:
+            raise RecoveryStateError(
+                f"Forensic manifest record_a_sha256 mismatch: '{archive_manifest['record_a_sha256']}' != '{a_hash}'"
+            )
+        if archive_manifest["record_b_sha256"] != b_hash:
+            raise RecoveryStateError(
+                f"Forensic manifest record_b_sha256 mismatch: '{archive_manifest['record_b_sha256']}' != '{b_hash}'"
+            )
+        if archive_manifest["record_a_index"] != actual_idx_a:
+            raise RecoveryStateError(
+                f"Forensic manifest record_a_index mismatch: {archive_manifest['record_a_index']} != {actual_idx_a}"
+            )
+        if archive_manifest["record_b_index"] != actual_idx_b:
+            raise RecoveryStateError(
+                f"Forensic manifest record_b_index mismatch: {archive_manifest['record_b_index']} != {actual_idx_b}"
             )
 
         return archive_manifest
@@ -1266,6 +1376,7 @@ class SnapshotCanonicalAdapter:
                     baseline_source_hash=pre_store_hashes["daily_matches.json"],
                     expected_migration_id=migration_id,
                     expected_snapshot_id=snapshot_id,
+                    expected_dataset_identity=dataset_identity,
                 )
             else:
                 os.makedirs(self.archive_dir, exist_ok=True)
@@ -1476,86 +1587,143 @@ class SnapshotCanonicalAdapter:
         Evaluate journal and filesystem state under a single lock without recursive locking.
         Classifies active file into EXPECTED_SOURCE, EXPECTED_PROJECTED, or UNKNOWN.
         Recovers interrupted transactions safely and fails closed on inconsistent state.
+        Binds recovery strictly to the supplied snapshot manifest and validates journal bindings.
         """
         assert_safe_path(self.working_dir, context="working_dir staging_recover", staging_root=self.staging_root)
         verify_staging_workspace(self.staging_root)
 
         with acquire_staging_lock(self.working_dir, staging_root=self.staging_root):
+            # 1. Validate the supplied snapshot manifest's classification and required identity fields
+            if not isinstance(self.manifest, dict):
+                raise SnapshotManifestError("Snapshot manifest must be a JSON dictionary")
+
+            classification = self.manifest.get("snapshot_classification")
+            if classification not in ALLOWED_CLASSIFICATIONS_PHASE_M:
+                raise SnapshotClassificationError(
+                    f"Snapshot classification '{classification}' is NOT AUTHORIZED in Phase M"
+                )
+
+            expected_snapshot_id = self.manifest.get("snapshot_id")
+            expected_dataset_identity = self.manifest.get("dataset_identity")
+            if not expected_snapshot_id or not str(expected_snapshot_id).strip():
+                raise SnapshotIdentityError("Snapshot manifest has empty or missing snapshot_id")
+            if not expected_dataset_identity or not str(expected_dataset_identity).strip():
+                raise SnapshotIdentityError("Snapshot manifest has empty or missing dataset_identity")
+
+            if self.manifest.get("field_mapping_policy_id") != FIELD_MAPPING_POLICY_ID:
+                raise PolicyMismatchError(
+                    f"Field mapping policy ID mismatch: {self.manifest.get('field_mapping_policy_id')} != {FIELD_MAPPING_POLICY_ID}"
+                )
+            if self.manifest.get("field_mapping_policy_sha256") != FIELD_MAPPING_POLICY_SHA256:
+                raise PolicyMismatchError(
+                    f"Field mapping policy SHA-256 mismatch: {self.manifest.get('field_mapping_policy_sha256')} != {FIELD_MAPPING_POLICY_SHA256}"
+                )
+            if self.manifest.get("target_canonical_id") != TARGET_CANONICAL_ID:
+                raise PreconditionViolationError(
+                    f"Target canonical ID mismatch: {self.manifest.get('target_canonical_id')} != {TARGET_CANONICAL_ID}"
+                )
+            if self.manifest.get("target_record_a_sha256") != EXPECTED_RECORD_A_SHA256:
+                raise PreconditionViolationError(
+                    f"Target record A hash mismatch: {self.manifest.get('target_record_a_sha256')} != {EXPECTED_RECORD_A_SHA256}"
+                )
+            if self.manifest.get("target_record_b_sha256") != EXPECTED_RECORD_B_SHA256:
+                raise PreconditionViolationError(
+                    f"Target record B hash mismatch: {self.manifest.get('target_record_b_sha256')} != {EXPECTED_RECORD_B_SHA256}"
+                )
+
+            # 2. Compute exact manifest identity hash
+            expected_manifest_sha256 = hash_manifest(self.manifest)
+            expected_source_hash = self.manifest.get("daily_matches_sha256")
+            if not expected_source_hash:
+                raise SnapshotManifestError("Snapshot manifest missing daily_matches_sha256")
+
             entries = self.journal.read_entries()
             if not entries:
                 return {"status": "NO_JOURNAL_ENTRIES", "action": "NOTHING_TO_RECOVER"}
 
-            self.validate_journal_chain(entries)
+            prep_entry = next((e for e in entries if e.get("state") == "PREPARED"), None)
+            if not prep_entry:
+                raise RecoveryStateError("Journal missing required PREPARED entry")
+
+            prep_payload = prep_entry.get("payload")
+            if not isinstance(prep_payload, dict):
+                raise RecoveryStateError("PREPARED entry payload is malformed")
+
+            # 6. Reject any missing required transaction-binding field rather than silently skipping
+            required_prep_fields = [
+                "migration_id",
+                "snapshot_id",
+                "dataset_identity",
+                "manifest_sha256",
+                "pre_store_hashes",
+            ]
+            for field in required_prep_fields:
+                val = prep_payload.get(field)
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    raise RecoveryStateError(f"Journal PREPARED entry missing required transaction-binding field: '{field}'")
+
+            migration_id = prep_payload["migration_id"]
+            journal_snapshot_id = prep_payload["snapshot_id"]
+            journal_dataset_identity = prep_payload["dataset_identity"]
+            journal_manifest_sha256 = prep_payload["manifest_sha256"]
+            pre_hashes = prep_payload["pre_store_hashes"]
+
+            # 3. Validate journal against expected migration ID, snapshot ID, manifest SHA-256, and dataset identity
+            if journal_snapshot_id != expected_snapshot_id:
+                raise RecoveryStateError(
+                    f"Journal snapshot_id mismatch: '{journal_snapshot_id}' != expected '{expected_snapshot_id}'"
+                )
+            if journal_dataset_identity != expected_dataset_identity:
+                raise RecoveryStateError(
+                    f"Journal dataset_identity mismatch: '{journal_dataset_identity}' != expected '{expected_dataset_identity}'"
+                )
+            if journal_manifest_sha256 != expected_manifest_sha256:
+                raise RecoveryStateError(
+                    f"Journal manifest_sha256 mismatch: '{journal_manifest_sha256}' != expected '{expected_manifest_sha256}'"
+                )
+
+            self.validate_journal_chain(
+                entries,
+                expected_migration_id=migration_id,
+                expected_snapshot_id=expected_snapshot_id,
+                expected_manifest_sha256=expected_manifest_sha256,
+                expected_dataset_identity=expected_dataset_identity,
+            )
+
+            # 4. Bind source file hashes and all six immutable-store hashes to the same snapshot
+            if not isinstance(pre_hashes, dict):
+                raise RecoveryStateError("pre_store_hashes must be a dictionary")
+
+            if "daily_matches.json" not in pre_hashes or pre_hashes["daily_matches.json"] != expected_source_hash:
+                raise RecoveryStateError(
+                    f"Journal daily_matches.json hash mismatch against manifest: {pre_hashes.get('daily_matches.json')} != {expected_source_hash}"
+                )
+
+            current_hashes = self.get_store_hashes(self.working_dir)
+            for store in NON_CANONICAL_STORES:
+                manifest_store_key = f"{store.split('.')[0]}_sha256"
+                exp_store_hash = self.manifest.get(manifest_store_key)
+                if not exp_store_hash:
+                    raise SnapshotManifestError(f"Manifest missing hash for immutable store '{store}'")
+                if store not in pre_hashes or pre_hashes[store] is None:
+                    raise RecoveryStateError(
+                        f"Journal pre_store_hashes missing immutable store: '{store}'"
+                    )
+                if pre_hashes[store] != exp_store_hash:
+                    raise RecoveryStateError(
+                        f"Journal pre_store_hashes for '{store}' does not match manifest binding: {pre_hashes.get(store)} != {exp_store_hash}"
+                    )
+                if current_hashes.get(store) != exp_store_hash:
+                    raise ImmutableStoreMutationError(
+                        f"CRITICAL: Immutable store {store} altered during crash! {exp_store_hash} != {current_hashes.get(store)}"
+                    )
 
             latest_state = self.journal.get_latest_valid_state()
-            daily_file = os.path.join(self.working_dir, "daily_matches.json")
-            current_daily_hash = sha256_file(daily_file) if os.path.exists(daily_file) else "MISSING"
-
-            raw_archive = os.path.join(self.archive_dir, "daily_matches_raw.json")
-            raw_archive_exists = os.path.exists(raw_archive)
-
-            # Check immutable stores against PREPARED entry
-            prep_entry = next((e for e in entries if e.get("state") == "PREPARED"), None)
-            prep_payload = prep_entry.get("payload", {}) if prep_entry else {}
-            migration_id = prep_payload.get("migration_id", DEFAULT_MIGRATION_ID)
-            snapshot_id = prep_payload.get("snapshot_id", self.manifest.get("snapshot_id", ""))
-            dataset_identity = prep_payload.get("dataset_identity", "")
-            manifest_sha256 = prep_payload.get("manifest_sha256")
-
-            expected_source_hash = self.manifest.get("daily_matches_sha256")
-            if prep_entry:
-                pre_hashes = prep_payload.get("pre_store_hashes", {})
-                if "daily_matches.json" in pre_hashes:
-                    expected_source_hash = pre_hashes["daily_matches.json"]
-                current_hashes = self.get_store_hashes(self.working_dir)
-                for store in NON_CANONICAL_STORES:
-                    if store in pre_hashes and current_hashes.get(store) != pre_hashes[store]:
-                        raise ImmutableStoreMutationError(
-                            f"CRITICAL: Immutable store {store} altered during crash! "
-                            f"{pre_hashes[store]} != {current_hashes.get(store)}"
-                        )
-
-            # Locate intent entry
-            intent_entry = next((e for e in reversed(entries) if e.get("state") == "COMMIT_INTENT_DURABLE"), None)
-            intent_projected_hash = None
-            intent_mig_id = migration_id
-            projected_total = self.manifest.get("total_matches", 193) - 1
-
-            if intent_entry:
-                i_p = intent_entry.get("payload", {})
-                intent_projected_hash = i_p.get("projected_file_sha256")
-                intent_mig_id = i_p.get("migration_id", migration_id)
-                projected_total = i_p.get("projected_total", projected_total)
-
-            # Derive expected projected file hash from archive & policy if available
-            derived_projected_hash = intent_projected_hash
-            if raw_archive_exists:
-                try:
-                    rec_a_data = read_json_strict(os.path.join(self.archive_dir, "record_a.json"))
-                    rec_b_data = read_json_strict(os.path.join(self.archive_dir, "record_b.json"))
-                    candidate, _ = build_approved_candidate_projection(rec_a_data, rec_b_data)
-                    proj_daily, _ = project_snapshot_dataset(read_json_strict(raw_archive), candidate)
-                    proj_str = json.dumps(proj_daily, ensure_ascii=False, indent=2, sort_keys=True)
-                    if os.name == "nt":
-                        proj_str = proj_str.replace("\n", "\r\n")
-                    derived_projected_hash = sha256_bytes(proj_str.encode("utf-8"))
-                except Exception:
-                    pass
-
-            expected_projected_hash = derived_projected_hash or intent_projected_hash
-
-            # Classify file state cryptographically (MC-03)
-            if current_daily_hash == expected_source_hash:
-                file_state = "EXPECTED_SOURCE"
-            elif expected_projected_hash and current_daily_hash == expected_projected_hash:
-                file_state = "EXPECTED_PROJECTED"
-            else:
-                file_state = "UNKNOWN"
 
             # 1. COMPLETION_RECORDED: require full completed-state verification
             if latest_state == "COMPLETION_RECORDED":
                 try:
-                    self.verify_completed_dataset(migration_id=intent_mig_id)
+                    self.verify_completed_dataset(migration_id=migration_id)
                 except Exception as exc:
                     raise RecoveryStateError(
                         f"COMPLETION_RECORDED recovery failed completed-state verification: {exc}"
@@ -1566,6 +1734,88 @@ class SnapshotCanonicalAdapter:
                     "latest_state": "COMPLETION_RECORDED",
                 }
 
+            daily_file = os.path.join(self.working_dir, "daily_matches.json")
+            current_daily_hash = sha256_file(daily_file) if os.path.exists(daily_file) else "MISSING"
+
+            raw_archive = os.path.join(self.archive_dir, "daily_matches_raw.json")
+            raw_archive_exists = os.path.exists(raw_archive)
+
+            # Locate intent entry
+            intent_entry = next((e for e in reversed(entries) if e.get("state") == "COMMIT_INTENT_DURABLE"), None)
+            intent_projected_hash = None
+            intent_mig_id = migration_id
+            projected_total = self.manifest.get("total_matches", 193) - 1
+
+            if intent_entry:
+                i_p = intent_entry.get("payload")
+                if not isinstance(i_p, dict):
+                    raise RecoveryStateError("COMMIT_INTENT_DURABLE payload is malformed")
+
+                required_intent_fields = [
+                    "migration_id",
+                    "snapshot_id",
+                    "dataset_identity",
+                    "manifest_sha256",
+                    "projected_file_sha256",
+                ]
+                for field in required_intent_fields:
+                    val = i_p.get(field)
+                    if val is None or (isinstance(val, str) and not val.strip()):
+                        raise RecoveryStateError(f"COMMIT_INTENT_DURABLE missing required transaction field: '{field}'")
+
+                if i_p["snapshot_id"] != expected_snapshot_id:
+                    raise RecoveryStateError(
+                        f"Intent snapshot_id mismatch: '{i_p['snapshot_id']}' != expected '{expected_snapshot_id}'"
+                    )
+                if i_p["dataset_identity"] != expected_dataset_identity:
+                    raise RecoveryStateError(
+                        f"Intent dataset_identity mismatch: '{i_p['dataset_identity']}' != expected '{expected_dataset_identity}'"
+                    )
+                if i_p["manifest_sha256"] != expected_manifest_sha256:
+                    raise RecoveryStateError(
+                        f"Intent manifest_sha256 mismatch: '{i_p['manifest_sha256']}' != expected '{expected_manifest_sha256}'"
+                    )
+
+                intent_projected_hash = i_p["projected_file_sha256"]
+                intent_mig_id = i_p["migration_id"]
+                projected_total = i_p.get("projected_total", projected_total)
+
+            expected_projected_hash = None
+            if raw_archive_exists:
+                self.verify_forensic_archive(
+                    baseline_source_hash=expected_source_hash,
+                    expected_migration_id=intent_mig_id,
+                    expected_snapshot_id=expected_snapshot_id,
+                    expected_dataset_identity=expected_dataset_identity,
+                )
+                rec_a_data = read_json_strict(os.path.join(self.archive_dir, "record_a.json"))
+                rec_b_data = read_json_strict(os.path.join(self.archive_dir, "record_b.json"))
+                candidate, _ = build_approved_candidate_projection(rec_a_data, rec_b_data)
+                proj_daily, _ = project_snapshot_dataset(read_json_strict(raw_archive), candidate)
+                proj_str = json.dumps(proj_daily, ensure_ascii=False, indent=2, sort_keys=True)
+                if os.name == "nt":
+                    proj_str = proj_str.replace("\n", "\r\n")
+                derived_projected_hash = sha256_bytes(proj_str.encode("utf-8"))
+
+                # 5. Require projected hash from durable intent to equal independently derived projected hash
+                if intent_projected_hash and intent_projected_hash != derived_projected_hash:
+                    raise RecoveryStateError(
+                        f"Durable intent projected hash mismatch with independently derived projection: "
+                        f"intent '{intent_projected_hash}' != derived '{derived_projected_hash}'"
+                    )
+                expected_projected_hash = derived_projected_hash
+            elif intent_projected_hash:
+                if current_daily_hash != expected_source_hash:
+                    raise RecoveryStateError("Missing raw archive to derive projected hash for COMMIT_INTENT_DURABLE")
+
+            # Classify file state cryptographically (MC-03)
+            if current_daily_hash == expected_source_hash:
+                file_state = "EXPECTED_SOURCE"
+            elif expected_projected_hash and current_daily_hash == expected_projected_hash:
+                file_state = "EXPECTED_PROJECTED"
+            else:
+                file_state = "UNKNOWN"
+
             # 2. POSTCONDITIONS_VERIFIED: verify active file is exact expected projected file
             if latest_state == "POSTCONDITIONS_VERIFIED":
                 if file_state != "EXPECTED_PROJECTED":
@@ -1575,14 +1825,9 @@ class SnapshotCanonicalAdapter:
                 self.verify_forensic_archive(
                     baseline_source_hash=expected_source_hash,
                     expected_migration_id=intent_mig_id,
-                    expected_snapshot_id=snapshot_id,
+                    expected_snapshot_id=expected_snapshot_id,
+                    expected_dataset_identity=expected_dataset_identity,
                 )
-                current_hashes = self.get_store_hashes(self.working_dir)
-                for store in NON_CANONICAL_STORES:
-                    exp_h = self.manifest.get(f"{store.split('.')[0]}_sha256")
-                    if exp_h and current_hashes.get(store) != exp_h:
-                        raise ImmutableStoreMutationError(f"Immutable store '{store}' altered during crash")
-
                 post_inspect = self.inspect_dataset(self.working_dir)
                 if post_inspect["total_matches"] != projected_total:
                     raise PreconditionViolationError(f"Postcondition failed: total {post_inspect['total_matches']} != {projected_total}")
@@ -1591,10 +1836,15 @@ class SnapshotCanonicalAdapter:
 
                 self.journal.append_entry("COMPLETION_RECORDED", {
                     "migration_id": intent_mig_id,
-                    "snapshot_id": snapshot_id,
-                    "dataset_identity": dataset_identity,
-                    "manifest_sha256": manifest_sha256,
+                    "snapshot_id": expected_snapshot_id,
+                    "dataset_identity": expected_dataset_identity,
+                    "manifest_sha256": expected_manifest_sha256,
                     "projected_total_matches": projected_total,
+                    "unique_canonical_ids": projected_total,
+                    "target_id": TARGET_CANONICAL_ID,
+                    "target_occurrences": 1,
+                    "candidate_sha256": EXPECTED_CANDIDATE_SHA256,
+                    "projected_file_sha256": expected_projected_hash,
                     "status": "COMPLETED_VIA_RECOVERY",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 })
@@ -1612,14 +1862,9 @@ class SnapshotCanonicalAdapter:
                 self.verify_forensic_archive(
                     baseline_source_hash=expected_source_hash,
                     expected_migration_id=intent_mig_id,
-                    expected_snapshot_id=snapshot_id,
+                    expected_snapshot_id=expected_snapshot_id,
+                    expected_dataset_identity=expected_dataset_identity,
                 )
-                current_hashes = self.get_store_hashes(self.working_dir)
-                for store in NON_CANONICAL_STORES:
-                    exp_h = self.manifest.get(f"{store.split('.')[0]}_sha256")
-                    if exp_h and current_hashes.get(store) != exp_h:
-                        raise ImmutableStoreMutationError(f"Immutable store '{store}' altered during crash")
-
                 post_inspect = self.inspect_dataset(self.working_dir)
                 if post_inspect["total_matches"] != projected_total:
                     raise PreconditionViolationError(f"Recovery postcondition failed: total {post_inspect['total_matches']} != {projected_total}")
@@ -1628,17 +1873,22 @@ class SnapshotCanonicalAdapter:
 
                 self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
                     "migration_id": intent_mig_id,
-                    "snapshot_id": snapshot_id,
-                    "dataset_identity": dataset_identity,
-                    "manifest_sha256": manifest_sha256,
+                    "snapshot_id": expected_snapshot_id,
+                    "dataset_identity": expected_dataset_identity,
+                    "manifest_sha256": expected_manifest_sha256,
                     "post_inspect": post_inspect,
                 })
                 self.journal.append_entry("COMPLETION_RECORDED", {
                     "migration_id": intent_mig_id,
-                    "snapshot_id": snapshot_id,
-                    "dataset_identity": dataset_identity,
-                    "manifest_sha256": manifest_sha256,
+                    "snapshot_id": expected_snapshot_id,
+                    "dataset_identity": expected_dataset_identity,
+                    "manifest_sha256": expected_manifest_sha256,
                     "projected_total_matches": projected_total,
+                    "unique_canonical_ids": projected_total,
+                    "target_id": TARGET_CANONICAL_ID,
+                    "target_occurrences": 1,
+                    "candidate_sha256": EXPECTED_CANDIDATE_SHA256,
+                    "projected_file_sha256": expected_projected_hash,
                     "status": "COMPLETED_VIA_RECOVERY",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 })
@@ -1653,13 +1903,14 @@ class SnapshotCanonicalAdapter:
                     self.verify_forensic_archive(
                         baseline_source_hash=expected_source_hash,
                         expected_migration_id=intent_mig_id,
-                        expected_snapshot_id=snapshot_id,
+                        expected_snapshot_id=expected_snapshot_id,
+                        expected_dataset_identity=expected_dataset_identity,
                     )
                     self.journal.append_entry("PROJECTION_COMMITTED", {
                         "migration_id": intent_mig_id,
-                        "snapshot_id": snapshot_id,
-                        "dataset_identity": dataset_identity,
-                        "manifest_sha256": manifest_sha256,
+                        "snapshot_id": expected_snapshot_id,
+                        "dataset_identity": expected_dataset_identity,
+                        "manifest_sha256": expected_manifest_sha256,
                         "daily_matches_sha256": current_daily_hash,
                     })
                     post_inspect = self.inspect_dataset(self.working_dir)
@@ -1669,17 +1920,22 @@ class SnapshotCanonicalAdapter:
                         raise PreconditionViolationError(f"Recovery postcondition failed: target occurrences {post_inspect['target_occurrences']} != 1")
                     self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
                         "migration_id": intent_mig_id,
-                        "snapshot_id": snapshot_id,
-                        "dataset_identity": dataset_identity,
-                        "manifest_sha256": manifest_sha256,
+                        "snapshot_id": expected_snapshot_id,
+                        "dataset_identity": expected_dataset_identity,
+                        "manifest_sha256": expected_manifest_sha256,
                         "post_inspect": post_inspect,
                     })
                     self.journal.append_entry("COMPLETION_RECORDED", {
                         "migration_id": intent_mig_id,
-                        "snapshot_id": snapshot_id,
-                        "dataset_identity": dataset_identity,
-                        "manifest_sha256": manifest_sha256,
+                        "snapshot_id": expected_snapshot_id,
+                        "dataset_identity": expected_dataset_identity,
+                        "manifest_sha256": expected_manifest_sha256,
                         "projected_total_matches": projected_total,
+                        "unique_canonical_ids": projected_total,
+                        "target_id": TARGET_CANONICAL_ID,
+                        "target_occurrences": 1,
+                        "candidate_sha256": EXPECTED_CANDIDATE_SHA256,
+                        "projected_file_sha256": expected_projected_hash,
                         "status": "COMPLETED_VIA_RECOVERY",
                         "completed_at": datetime.now(timezone.utc).isoformat(),
                     })
@@ -1693,7 +1949,8 @@ class SnapshotCanonicalAdapter:
                     self.verify_forensic_archive(
                         baseline_source_hash=expected_source_hash,
                         expected_migration_id=intent_mig_id,
-                        expected_snapshot_id=snapshot_id,
+                        expected_snapshot_id=expected_snapshot_id,
+                        expected_dataset_identity=expected_dataset_identity,
                     )
                     restore_from_archive_atomic(
                         raw_archive,
@@ -1703,9 +1960,10 @@ class SnapshotCanonicalAdapter:
                     )
                     self.journal.append_entry("PREPARED", {
                         "migration_id": intent_mig_id,
-                        "snapshot_id": snapshot_id,
-                        "dataset_identity": dataset_identity,
-                        "manifest_sha256": manifest_sha256,
+                        "snapshot_id": expected_snapshot_id,
+                        "dataset_identity": expected_dataset_identity,
+                        "manifest_sha256": expected_manifest_sha256,
+                        "pre_store_hashes": pre_hashes,
                         "action": "ROLLED_BACK_TO_RAW_ARCHIVE",
                     })
                     return {

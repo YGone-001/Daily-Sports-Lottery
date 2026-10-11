@@ -242,3 +242,34 @@ The crash recovery engine (`staging_recover`) evaluates durable journal records 
 5. **Pre-Commit States (`PREPARED`, `EVIDENCE_VERIFIED`, `AUTHORIZED_FOR_STAGING_SIMULATION`)**:
    - Verifies active file is `EXPECTED_SOURCE`.
    - Returns `RECOVERED_PRE_COMMIT_CLEAN` with zero file modifications.
+
+---
+
+## 11. Final Integrity Closure Patch Verification Bindings
+
+### 11.1 Complete Forensic Manifest Verification (`verify_forensic_archive`)
+Forensic archival verification enforces strict multi-field cryptographic binding prior to any state transition or completion journal append:
+1. `forensic_manifest.migration_id == expected_migration_id`
+2. `forensic_manifest.snapshot_id == expected_snapshot_id`
+3. `forensic_manifest.dataset_identity == expected_dataset_identity` (derived from the active snapshot transaction binding)
+4. `forensic_manifest.source_file_sha256 == expected_source_hash`
+5. `forensic_manifest.record_a_sha256 == actual_verified_record_a_hash`
+6. `forensic_manifest.record_b_sha256 == actual_verified_record_b_hash`
+7. `forensic_manifest.record_a_index` and `forensic_manifest.record_b_index` match the exact verified indices in the original source dataset.
+
+Any tampered hash, index discrepancy, or missing field fails closed with `RecoveryStateError`, ensuring zero writes and zero corrupt completion appends.
+
+### 11.2 Strict Snapshot Transaction Binding in Recovery (`staging_recover`)
+Recovery operations are strictly bound to the supplied snapshot manifest:
+1. **Manifest Integrity & Classification**: Validates manifest schema, identity, and policy SHA before inspecting journal entries.
+2. **Journal Chain Binding**: Validates every journal entry against expected `migration_id`, `snapshot_id`, `dataset_identity`, and canonical `manifest_sha256`. Cross-snapshot recovery attempts fail closed immediately.
+3. **Immutable Store Pre-Hash Verification**: Verifies that `pre_store_hashes` in the `PREPARED` entry contains all six non-canonical stores, matches the bound manifest hashes, and matches the live disk hashes.
+4. **Independent Intent Verification**: When `COMMIT_INTENT_DURABLE` is present, the expected projected file hash is independently re-derived from the archived raw source and verified against `intent_projected_hash`.
+5. **Fail-Closed Unknown States**: Active file state is classified against expected source and derived projection hashes. Any unrecognized state immediately halts under lock without file modification.
+
+### 11.3 Historical Capture Metadata Semantics
+Metadata provenance distinguishes capture time from manifest generation time:
+- `manifest_generated_at`: ISO 8601 UTC timestamp of when `generate_snapshot_manifest` was executed.
+- `captured_at`: Historical capture timestamp. For historical evidence (e.g. `EPOCH_1`), it is populated only when explicitly passed or extracted from the evidence bundle's `manifest.json` (`creation_time`). When omitted, it defaults to `UNKNOWN_HISTORICAL_CAPTURE_TIME` and is never fabricated or defaulted to `manifest_generated_at`.
+- `source_git_sha`: Explicitly recorded as `UNKNOWN_SOURCE_GIT_SHA` when historical repository provenance is untracked.
+- Synthetic fixtures explicitly record `capture_consistency_status = "SYNTHETIC_GENERATED"` and `captured_at = "SYNTHETIC_FIXTURE_NOT_HISTORICAL"`.

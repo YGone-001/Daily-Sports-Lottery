@@ -1659,3 +1659,445 @@ def test_mc_jrn_06_conflicting_attempt_history_rejected(tmp_path):
     ]
     with pytest.raises(RecoveryStateError, match="Non-monotonic attempt sequence"):
         adapter.validate_journal_chain(entries, expected_migration_id="MIG-1")
+
+
+# =============================================================================
+# CLOSE-ARC: Complete Forensic Manifest Verification (CLOSE-ARC-01 .. CLOSE-ARC-06)
+# =============================================================================
+
+def test_close_arc_01_tampered_record_a_sha256_in_forensic_manifest(tmp_path):
+    """CLOSE-ARC-01: Rejects tampered record_a_sha256 in forensic manifest."""
+    staging_root = str(tmp_path / "staging_arc_01")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    f_manifest_path = os.path.join(staging_root, "archive", "forensic_manifest.json")
+    f_man = read_json_strict(f_manifest_path)
+    f_man["record_a_sha256"] = "0" * 64
+    write_json_atomic(f_manifest_path, f_man, staging_root=staging_root)
+
+    with pytest.raises(RecoveryStateError, match="record_a_sha256 mismatch"):
+        adapter.verify_forensic_archive(
+            baseline_source_hash=manifest["daily_matches_sha256"],
+            expected_migration_id=DEFAULT_MIGRATION_ID,
+            expected_snapshot_id=manifest["snapshot_id"],
+            expected_dataset_identity=manifest["dataset_identity"],
+        )
+
+
+def test_close_arc_02_tampered_record_b_sha256_in_forensic_manifest(tmp_path):
+    """CLOSE-ARC-02: Rejects tampered record_b_sha256 in forensic manifest."""
+    staging_root = str(tmp_path / "staging_arc_02")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    f_manifest_path = os.path.join(staging_root, "archive", "forensic_manifest.json")
+    f_man = read_json_strict(f_manifest_path)
+    f_man["record_b_sha256"] = "f" * 64
+    write_json_atomic(f_manifest_path, f_man, staging_root=staging_root)
+
+    with pytest.raises(RecoveryStateError, match="record_b_sha256 mismatch"):
+        adapter.verify_forensic_archive(
+            baseline_source_hash=manifest["daily_matches_sha256"],
+            expected_migration_id=DEFAULT_MIGRATION_ID,
+            expected_snapshot_id=manifest["snapshot_id"],
+            expected_dataset_identity=manifest["dataset_identity"],
+        )
+
+
+def test_close_arc_03_tampered_dataset_identity(tmp_path):
+    """CLOSE-ARC-03: Rejects tampered dataset_identity in forensic manifest."""
+    staging_root = str(tmp_path / "staging_arc_03")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    f_manifest_path = os.path.join(staging_root, "archive", "forensic_manifest.json")
+    f_man = read_json_strict(f_manifest_path)
+    f_man["dataset_identity"] = "FORGED_IDENTITY"
+    write_json_atomic(f_manifest_path, f_man, staging_root=staging_root)
+
+    with pytest.raises(RecoveryStateError, match="dataset_identity mismatch"):
+        adapter.verify_forensic_archive(
+            baseline_source_hash=manifest["daily_matches_sha256"],
+            expected_migration_id=DEFAULT_MIGRATION_ID,
+            expected_snapshot_id=manifest["snapshot_id"],
+            expected_dataset_identity=manifest["dataset_identity"],
+        )
+
+
+def test_close_arc_04_incorrect_record_ab_indices(tmp_path):
+    """CLOSE-ARC-04: Rejects incorrect Record A/B indices in forensic manifest."""
+    staging_root = str(tmp_path / "staging_arc_04")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    f_manifest_path = os.path.join(staging_root, "archive", "forensic_manifest.json")
+    f_man = read_json_strict(f_manifest_path)
+    f_man["record_a_index"] = 999
+    write_json_atomic(f_manifest_path, f_man, staging_root=staging_root)
+
+    with pytest.raises(RecoveryStateError, match="record_a_index mismatch"):
+        adapter.verify_forensic_archive(
+            baseline_source_hash=manifest["daily_matches_sha256"],
+            expected_migration_id=DEFAULT_MIGRATION_ID,
+            expected_snapshot_id=manifest["snapshot_id"],
+            expected_dataset_identity=manifest["dataset_identity"],
+        )
+
+
+def test_close_arc_05_valid_original_archive_and_manifest_pass(tmp_path):
+    """CLOSE-ARC-05: Valid original archive and manifest pass all verification checks."""
+    staging_root = str(tmp_path / "staging_arc_05")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    verified = adapter.verify_forensic_archive(
+        baseline_source_hash=manifest["daily_matches_sha256"],
+        expected_migration_id=DEFAULT_MIGRATION_ID,
+        expected_snapshot_id=manifest["snapshot_id"],
+        expected_dataset_identity=manifest["dataset_identity"],
+    )
+    assert verified["snapshot_id"] == manifest["snapshot_id"]
+    assert verified["dataset_identity"] == manifest["dataset_identity"]
+    assert verified["record_a_sha256"] == EXPECTED_RECORD_A_SHA256
+    assert verified["record_b_sha256"] == EXPECTED_RECORD_B_SHA256
+    assert verified["record_a_index"] == 55
+    assert verified["record_b_index"] == 56
+
+
+def test_close_arc_06_all_completed_state_entry_points_reject_corruption(tmp_path):
+    """CLOSE-ARC-06: All completed-state entry points reject forensic archive corruption with zero writes."""
+    staging_root = str(tmp_path / "staging_arc_06")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    # Corrupt forensic manifest
+    f_manifest_path = os.path.join(staging_root, "archive", "forensic_manifest.json")
+    f_man = read_json_strict(f_manifest_path)
+    f_man["record_b_sha256"] = "corrupted" * 6
+    write_json_atomic(f_manifest_path, f_man, staging_root=staging_root)
+
+    daily_file = os.path.join(working_data, "daily_matches.json")
+    daily_hash_before = sha256_file(daily_file)
+    journal_len_before = len(adapter.journal.read_entries())
+
+    # Entry point 1: verify_completed_dataset
+    with pytest.raises(RecoveryStateError, match="record_b_sha256 mismatch"):
+        adapter.verify_completed_dataset()
+
+    # Entry point 2: staging_verify
+    with pytest.raises(RecoveryStateError, match="record_b_sha256 mismatch"):
+        adapter.staging_verify()
+
+    # Entry point 3: staging_apply (idempotency path)
+    with pytest.raises(RecoveryStateError, match="record_b_sha256 mismatch"):
+        adapter.staging_apply(simulation=True)
+
+    # Entry point 4: staging_recover
+    with pytest.raises(RecoveryStateError):
+        adapter.staging_recover()
+
+    # Verify zero Canonical writes and zero completion journal appends
+    assert sha256_file(daily_file) == daily_hash_before
+    assert len(adapter.journal.read_entries()) == journal_len_before
+
+
+# =============================================================================
+# CLOSE-REC: Recovery Snapshot Identity Binding Matrix (CLOSE-REC-01 .. CLOSE-REC-10)
+# =============================================================================
+
+def test_close_rec_01_valid_original_snapshot_recovery(tmp_path):
+    """CLOSE-REC-01: Valid original snapshot recovery rolls back safely and allows clean retry."""
+    staging_root = str(tmp_path / "staging_rec_01")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    rec = adapter.staging_recover()
+    assert rec["status"] == "RECOVERED_ROLLED_BACK"
+
+    # Retry completes safely
+    res = adapter.staging_apply(simulation=True)
+    assert res["status"] == "MIGRATION_COMPLETED"
+
+
+def test_close_rec_02_changed_snapshot_id_after_crash(tmp_path):
+    """CLOSE-REC-02: Rejects recovery if supplied snapshot_id changed after crash."""
+    staging_root = str(tmp_path / "staging_rec_02")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    # Tamper manifest snapshot_id
+    adapter.manifest["snapshot_id"] = "TAMPERED_SNAP_ID"
+    journal_len_before = len(adapter.journal.read_entries())
+
+    with pytest.raises(RecoveryStateError, match="Journal snapshot_id mismatch"):
+        adapter.staging_recover()
+
+    assert len(adapter.journal.read_entries()) == journal_len_before
+
+
+def test_close_rec_03_changed_dataset_identity_after_crash(tmp_path):
+    """CLOSE-REC-03: Rejects recovery if supplied dataset_identity changed after crash."""
+    staging_root = str(tmp_path / "staging_rec_03")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    adapter.manifest["dataset_identity"] = "TAMPERED_DATASET_IDENTITY"
+    journal_len_before = len(adapter.journal.read_entries())
+
+    with pytest.raises(RecoveryStateError, match="Journal dataset_identity mismatch"):
+        adapter.staging_recover()
+
+    assert len(adapter.journal.read_entries()) == journal_len_before
+
+
+def test_close_rec_04_changed_manifest_hash_after_crash(tmp_path):
+    """CLOSE-REC-04: Rejects recovery if supplied manifest hash changed after crash."""
+    staging_root = str(tmp_path / "staging_rec_04")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    # Change description to mutate manifest hash
+    adapter.manifest["snapshot_source_description"] = "ALTERED_MANIFEST_DESCRIPTION"
+    journal_len_before = len(adapter.journal.read_entries())
+
+    with pytest.raises(RecoveryStateError, match="Journal manifest_sha256 mismatch"):
+        adapter.staging_recover()
+
+    assert len(adapter.journal.read_entries()) == journal_len_before
+
+
+def test_close_rec_05_missing_required_journal_snapshot_identity(tmp_path):
+    """CLOSE-REC-05: Fails closed when journal PREPARED entry is missing snapshot_id."""
+    staging_root = str(tmp_path / "staging_rec_05")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    # Remove snapshot_id from PREPARED entry
+    entries = adapter.journal.read_entries()
+    del entries[0]["payload"]["snapshot_id"]
+    journal_path = adapter.journal.journal_file
+    with open(journal_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    with pytest.raises(RecoveryStateError, match="missing required transaction-binding field"):
+        adapter.staging_recover()
+
+
+def test_close_rec_06_missing_immutable_store_hash_binding(tmp_path):
+    """CLOSE-REC-06: Fails closed when journal pre_store_hashes is missing an immutable store."""
+    staging_root = str(tmp_path / "staging_rec_06")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    # Remove team_strength.json from pre_store_hashes
+    entries = adapter.journal.read_entries()
+    del entries[0]["payload"]["pre_store_hashes"]["team_strength.json"]
+    journal_path = adapter.journal.journal_file
+    with open(journal_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    with pytest.raises(RecoveryStateError, match="pre_store_hashes missing immutable store"):
+        adapter.staging_recover()
+
+
+def test_close_rec_07_durable_projected_hash_differs_from_independently_derived_projection(tmp_path):
+    """CLOSE-REC-07: Fails closed when durable intent projected hash does not match derived projection."""
+    staging_root = str(tmp_path / "staging_rec_07")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    # Tamper projected_file_sha256 in COMMIT_INTENT_DURABLE entry
+    entries = adapter.journal.read_entries()
+    for e in entries:
+        if e.get("state") == "COMMIT_INTENT_DURABLE":
+            e["payload"]["projected_file_sha256"] = "e" * 64
+    journal_path = adapter.journal.journal_file
+    with open(journal_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    with pytest.raises(RecoveryStateError, match="Durable intent projected hash mismatch with independently derived projection"):
+        adapter.staging_recover()
+
+
+def test_close_rec_08_unknown_active_file_hash_still_fails_closed(tmp_path):
+    """CLOSE-REC-08: Fails closed when active file hash is unknown under recovery."""
+    staging_root = str(tmp_path / "staging_rec_08")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_file_replace")
+
+    daily_file = os.path.join(working_data, "daily_matches.json")
+    with open(daily_file, "w", encoding="utf-8") as f:
+        f.write('{"UNKNOWN_CORRUPTION": 1}')
+
+    journal_len_before = len(adapter.journal.read_entries())
+    with pytest.raises(RecoveryStateError, match="active file has unknown hash"):
+        adapter.staging_recover()
+
+    assert len(adapter.journal.read_entries()) == journal_len_before
+
+
+def test_close_rec_09_valid_completed_recovery_remains_zero_write(tmp_path):
+    """CLOSE-REC-09: Valid completed recovery is strictly zero-write."""
+    staging_root = str(tmp_path / "staging_rec_09")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    adapter.staging_apply(simulation=True)
+
+    daily_file = os.path.join(working_data, "daily_matches.json")
+    hash_before = sha256_file(daily_file)
+    entries_before = len(adapter.journal.read_entries())
+
+    rec = adapter.staging_recover()
+    assert rec["status"] == "ALREADY_COMPLETED_NO_OP"
+    assert rec["action"] == "NONE"
+
+    assert sha256_file(daily_file) == hash_before
+    assert len(adapter.journal.read_entries()) == entries_before
+
+
+def test_close_rec_10_valid_interrupted_transaction_completes_safely(tmp_path):
+    """CLOSE-REC-10: Valid interrupted transaction at POSTCONDITIONS_VERIFIED recovers forward safely."""
+    staging_root = str(tmp_path / "staging_rec_10")
+    working_data, manifest = build_isolated_workspace_fixture(staging_root, match_count=210, classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE")
+    adapter = SnapshotCanonicalAdapter(staging_root=staging_root, manifest=manifest)
+    with pytest.raises(FaultInjectionError):
+        adapter.staging_apply(simulation=True, fault_inject="before_completion")
+
+    rec = adapter.staging_recover()
+    assert rec["status"] == "RECOVERED_FORWARD_COMPLETED"
+    assert rec["action"] == "APPENDED_COMPLETION_RECORDED"
+
+    # Verifies dataset invariants
+    verified = adapter.staging_verify()
+    assert verified["status"] == "COMPLETED_STATE_VERIFIED"
+    assert verified["verified_invariants"] == 20
+
+
+# =============================================================================
+# CLOSE-META: Historical Capture Metadata & Provenance Matrix (CLOSE-META-01 .. CLOSE-META-04)
+# =============================================================================
+
+def test_close_meta_01_absent_captured_at_defaults_to_unknown_and_differs_from_generated_at(tmp_path):
+    """CLOSE-META-01: Absent captured_at defaults to explicit unknown and differs from generated_at."""
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir, exist_ok=True)
+    # Write empty stores for manifest generation
+    for store in NON_CANONICAL_STORES:
+        write_json_atomic(os.path.join(data_dir, store), {})
+    write_json_atomic(os.path.join(data_dir, "daily_matches.json"), {
+        "matches": [copy.deepcopy(RECORD_A_FIXTURE), copy.deepcopy(RECORD_B_FIXTURE)]
+    })
+
+    manifest = generate_snapshot_manifest(
+        data_dir=data_dir,
+        snapshot_id="SNAP-TEST-NO-CAPTURED",
+        snapshot_classification="PRESERVED_EPOCH1_FIXTURE",
+        snapshot_source_description="Test without captured_at",
+        dataset_identity="TEST_IDENTITY",
+        captured_at=None,
+    )
+    assert manifest["captured_at"] == "UNKNOWN_HISTORICAL_CAPTURE_TIME"
+    assert manifest["captured_at"] != manifest["manifest_generated_at"]
+    assert manifest["source_git_sha"] == "UNKNOWN_SOURCE_GIT_SHA"
+    assert manifest["capture_consistency_status"] == "HISTORICAL_EPOCH1_PRESERVED"
+
+
+def test_close_meta_02_explicit_captured_at_preserved(tmp_path):
+    """CLOSE-META-02: Explicitly supplied captured_at is preserved."""
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir, exist_ok=True)
+    for store in NON_CANONICAL_STORES:
+        write_json_atomic(os.path.join(data_dir, store), {})
+    write_json_atomic(os.path.join(data_dir, "daily_matches.json"), {
+        "matches": [copy.deepcopy(RECORD_A_FIXTURE), copy.deepcopy(RECORD_B_FIXTURE)]
+    })
+
+    explicit_time = "2026-10-10T15:30:00+08:00"
+    manifest = generate_snapshot_manifest(
+        data_dir=data_dir,
+        snapshot_id="SNAP-TEST-EXPLICIT-CAPTURED",
+        snapshot_classification="PRESERVED_EPOCH1_FIXTURE",
+        snapshot_source_description="Test with explicit captured_at",
+        dataset_identity="TEST_IDENTITY",
+        captured_at=explicit_time,
+    )
+    assert manifest["captured_at"] == explicit_time
+    assert manifest["captured_at"] != manifest["manifest_generated_at"]
+
+
+def test_close_meta_03_epoch1_preserves_evidence_manifest_creation_time(tmp_path):
+    """CLOSE-META-03: Reads historical creation_time from adjacent preserved evidence manifest."""
+    parent_dir = str(tmp_path / "epoch1_root")
+    data_dir = os.path.join(parent_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    for store in NON_CANONICAL_STORES:
+        write_json_atomic(os.path.join(data_dir, store), {})
+    write_json_atomic(os.path.join(data_dir, "daily_matches.json"), {
+        "matches": [copy.deepcopy(RECORD_A_FIXTURE), copy.deepcopy(RECORD_B_FIXTURE)]
+    })
+
+    # Evidence manifest in parent
+    historical_time = "2026-10-11T01:40:59.922528+08:00"
+    write_json_atomic(os.path.join(parent_dir, "manifest.json"), {
+        "creation_time": historical_time
+    })
+
+    manifest = generate_snapshot_manifest(
+        data_dir=data_dir,
+        snapshot_id="SNAP-EPOCH1-AUTO-TIME",
+        snapshot_classification="PRESERVED_EPOCH1_FIXTURE",
+        snapshot_source_description="EPOCH_1 auto read creation_time",
+        dataset_identity="TEST_IDENTITY",
+        captured_at=None,
+    )
+    assert manifest["captured_at"] == historical_time
+    assert manifest["captured_at"] != manifest["manifest_generated_at"]
+
+
+def test_close_meta_04_synthetic_provenance_clearly_marked(tmp_path):
+    """CLOSE-META-04: Synthetic drift manifests clearly mark synthetic provenance."""
+    data_dir = str(tmp_path / "data")
+    os.makedirs(data_dir, exist_ok=True)
+    for store in NON_CANONICAL_STORES:
+        write_json_atomic(os.path.join(data_dir, store), {})
+    write_json_atomic(os.path.join(data_dir, "daily_matches.json"), {
+        "matches": [copy.deepcopy(RECORD_A_FIXTURE), copy.deepcopy(RECORD_B_FIXTURE)]
+    })
+
+    manifest = generate_snapshot_manifest(
+        data_dir=data_dir,
+        snapshot_id="SNAP-SYNTH",
+        snapshot_classification="EXPLICIT_SYNTHETIC_DRIFT_FIXTURE",
+        snapshot_source_description="Synthetic fixture test",
+        dataset_identity="TEST_IDENTITY",
+        captured_at=None,
+    )
+    assert manifest["capture_consistency_status"] == "SYNTHETIC_GENERATED"
+    assert manifest["captured_at"] == "SYNTHETIC_FIXTURE_NOT_HISTORICAL"
+    assert manifest["captured_at"] != manifest["manifest_generated_at"]
