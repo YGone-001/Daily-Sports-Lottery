@@ -106,7 +106,12 @@ class StagingLockError(StagingMigrationError):
     pass
 
 
-class ImmutableStoreMutationError(StagingMigrationError):
+class RecoveryStateError(StagingMigrationError):
+    """Raised when recovery cannot be safely resolved."""
+    pass
+
+
+class ImmutableStoreMutationError(RecoveryStateError):
     """Raised when a non-Canonical store has been altered."""
     pass
 
@@ -115,10 +120,6 @@ class FaultInjectionError(StagingMigrationError):
     """Raised by deliberate fault-injection hooks for testing."""
     pass
 
-
-class RecoveryStateError(StagingMigrationError):
-    """Raised when recovery cannot be safely resolved."""
-    pass
 
 
 # =============================================================================
@@ -490,49 +491,165 @@ class StagingJournal:
                     entries.append({"state": "CORRUPTED_LINE", "line_no": line_no, "raw": line, "error": str(exc)})
         return entries
 
-    def validate_chain(self, entries: List[dict], expected_migration_id: Optional[str] = None) -> None:
+    def validate_chain(
+        self,
+        entries: List[dict],
+        expected_migration_id: Optional[str] = None,
+        expected_hashes: Optional[dict] = None,
+    ) -> None:
         """Enforce strict journal transition consistency, identity binding, and ordering."""
         if not entries:
             return
+
+        # 1. Immediate scan for corrupted JSON lines
+        for entry in entries:
+            if entry.get("state") == "CORRUPTED_LINE":
+                raise RecoveryStateError(f"Corrupted journal line detected: line {entry.get('line_no')}")
+
+        # 2. First entry must be PREPARED
+        if entries[0].get("state") != "PREPARED":
+            raise RecoveryStateError(f"Journal must begin with PREPARED, got '{entries[0].get('state')}'")
 
         expected_order = JOURNAL_STATES
         last_index = -1
         seen_states = set()
         first_mig_id = None
+        seen_dataset_identity = None
+
+        prep_source_hash = None
+        rec_a_hash = None
+        rec_b_hash = None
+        intent_projected_hash = None
+        intent_candidate_hash = None
 
         for idx, entry in enumerate(entries):
             st = entry.get("state")
-            if st == "CORRUPTED_LINE":
-                raise RecoveryStateError(f"Corrupted journal line detected: line {entry.get('line_no')}")
 
             if st not in JOURNAL_STATES:
                 raise RecoveryStateError(f"Unknown state '{st}' in journal")
 
-            payload = entry.get("payload", {})
-            mig_id = payload.get("migration_id")
-            if mig_id:
-                if first_mig_id is None:
-                    first_mig_id = mig_id
-                elif mig_id != first_mig_id:
-                    raise RecoveryStateError(f"Inconsistent migration ID in journal: '{mig_id}' != '{first_mig_id}'")
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                raise RecoveryStateError(f"Entry {idx} payload must be a JSON object")
 
-            if expected_migration_id and mig_id and mig_id != expected_migration_id:
+            # Validate migration_id
+            mig_id = payload.get("migration_id")
+            if not mig_id or not isinstance(mig_id, str) or not mig_id.strip():
+                raise RecoveryStateError(f"Entry {idx} '{st}' is missing required non-empty migration_id")
+
+            if first_mig_id is None:
+                first_mig_id = mig_id
+            elif mig_id != first_mig_id:
+                raise RecoveryStateError(f"Conflicting migration_id in journal: '{mig_id}' != '{first_mig_id}'")
+
+            if expected_migration_id and mig_id != expected_migration_id:
                 raise RecoveryStateError(f"Mismatched migration ID: expected '{expected_migration_id}', got '{mig_id}'")
 
-            # Check sequential order (no regression, no duplicate completions)
+            # Validate dataset_identity consistency
+            ds_id = payload.get("dataset_identity")
+            if ds_id:
+                if seen_dataset_identity is None:
+                    seen_dataset_identity = ds_id
+                elif ds_id != seen_dataset_identity:
+                    raise RecoveryStateError(f"Mismatched dataset identity across entries: '{ds_id}' != '{seen_dataset_identity}'")
+
+            # Check transition order
             state_idx = expected_order.index(st)
-            if state_idx < last_index:
-                # Regression check (e.g. rolled back reset entry is permitted if PREPARED)
+
+            if idx == 0:
+                # First entry is PREPARED (already verified)
+                last_index = 0
+            else:
+                prev_st = entries[idx - 1].get("state")
+
+                # Handle rollback
                 if st == "PREPARED" and payload.get("action") == "ROLLED_BACK_TO_RAW_ARCHIVE":
+                    if prev_st != "COMMIT_INTENT_DURABLE":
+                        raise RecoveryStateError(
+                            f"Invalid rollback reset to PREPARED: previous state was '{prev_st}', expected 'COMMIT_INTENT_DURABLE'"
+                        )
                     last_index = 0
                     continue
-                raise RecoveryStateError(f"Journal state regression detected: '{st}' after '{entries[idx - 1].get('state')}'")
 
-            if st == "COMPLETION_RECORDED" and st in seen_states:
-                raise RecoveryStateError("Duplicate COMPLETION_RECORDED entry in journal")
+                if state_idx < last_index:
+                    raise RecoveryStateError(
+                        f"Journal state regression detected: '{st}' after '{prev_st}'"
+                    )
+                if state_idx == last_index:
+                    raise RecoveryStateError(
+                        f"Journal duplicate state transition detected: '{st}' after '{prev_st}'"
+                    )
+                if state_idx > last_index + 1:
+                    raise RecoveryStateError(
+                        f"Journal state skipped intermediate state: expected '{expected_order[last_index + 1]}', got '{st}'"
+                    )
+
+                last_index = state_idx
+
+            # State-specific payload checks
+            if st == "PREPARED":
+                pre_store_hashes = payload.get("pre_store_hashes")
+                if pre_store_hashes and isinstance(pre_store_hashes, dict):
+                    prep_source_hash = pre_store_hashes.get("daily_matches.json")
+
+            elif st == "EVIDENCE_VERIFIED":
+                rec_a_hash = payload.get("rec_a_hash")
+                rec_b_hash = payload.get("rec_b_hash")
+
+            elif st == "COMMIT_INTENT_DURABLE":
+                required_intent_fields = [
+                    "source_file_sha256",
+                    "projected_file_sha256",
+                    "candidate_record_sha256",
+                    "record_a_sha256",
+                    "record_b_sha256",
+                ]
+                for f_name in required_intent_fields:
+                    val = payload.get(f_name)
+                    if not val or not isinstance(val, str) or not val.strip():
+                        raise RecoveryStateError(f"Missing required intent hash field '{f_name}' in COMMIT_INTENT_DURABLE")
+
+                intent_projected_hash = payload.get("projected_file_sha256")
+                intent_candidate_hash = payload.get("candidate_record_sha256")
+
+                # Verify internal consistency against PREPARED and EVIDENCE_VERIFIED
+                if prep_source_hash and payload.get("source_file_sha256") != prep_source_hash:
+                    raise RecoveryStateError(
+                        f"Intent source_file_sha256 mismatch with PREPARED baseline: "
+                        f"'{payload.get('source_file_sha256')}' != '{prep_source_hash}'"
+                    )
+                if rec_a_hash and payload.get("record_a_sha256") != rec_a_hash:
+                    raise RecoveryStateError(
+                        f"Intent record_a_sha256 mismatch with EVIDENCE_VERIFIED: "
+                        f"'{payload.get('record_a_sha256')}' != '{rec_a_hash}'"
+                    )
+                if rec_b_hash and payload.get("record_b_sha256") != rec_b_hash:
+                    raise RecoveryStateError(
+                        f"Intent record_b_sha256 mismatch with EVIDENCE_VERIFIED: "
+                        f"'{payload.get('record_b_sha256')}' != '{rec_b_hash}'"
+                    )
+
+                if expected_hashes:
+                    for k in required_intent_fields:
+                        if k in expected_hashes and payload.get(k) != expected_hashes[k]:
+                            raise RecoveryStateError(
+                                f"Intent {k} mismatch against expected hashes: '{payload.get(k)}' != '{expected_hashes[k]}'"
+                            )
+
+            elif st == "PROJECTION_COMMITTED":
+                daily_h = payload.get("daily_matches_sha256")
+                if not daily_h or not isinstance(daily_h, str) or not daily_h.strip():
+                    raise RecoveryStateError("Missing daily_matches_sha256 in PROJECTION_COMMITTED")
+                if intent_projected_hash and daily_h != intent_projected_hash:
+                    raise RecoveryStateError(
+                        f"Mismatched projected file hash in PROJECTION_COMMITTED: '{daily_h}' != '{intent_projected_hash}'"
+                    )
+
+            elif st == "COMPLETION_RECORDED":
+                if "COMPLETION_RECORDED" in seen_states:
+                    raise RecoveryStateError("Duplicate COMPLETION_RECORDED entry in journal")
 
             seen_states.add(st)
-            last_index = state_idx
 
     def get_latest_valid_state(self) -> Optional[str]:
         entries = self.read_entries()
@@ -1018,6 +1135,9 @@ class StagingCanonicalMigrator:
             # Phase 5: PROJECTION_COMMITTED
             write_json_atomic(daily_file, projected_data, staging_root=self.staging_root)
 
+            if fault_inject == "after_replace_before_committed":
+                raise FaultInjectionError("Fault injection: after_replace_before_committed")
+
             self.journal.append_entry("PROJECTION_COMMITTED", {
                 "migration_id": migration_id,
                 "daily_matches_sha256": sha256_file(daily_file),
@@ -1077,6 +1197,93 @@ class StagingCanonicalMigrator:
 
             return result_payload
 
+    def verify_forensic_archive(
+        self,
+        baseline_source_hash: str,
+        expected_migration_id: str,
+        expected_dataset_identity: Optional[str] = None,
+    ) -> None:
+        """
+        Verify complete integrity of the forensic archive before forward recovery:
+        1. Archive directory exists.
+        2. daily_matches_raw.json exists and full-file SHA-256 == baseline source hash.
+        3. forensic_manifest.json exists and is valid JSON dict.
+        4. record_a.json exists and hash_record(rec_a) == EXPECTED_RECORD_A_SHA256 and matches manifest.
+        5. record_b.json exists and hash_record(rec_b) == EXPECTED_RECORD_B_SHA256 and matches manifest.
+        6. Manifest migration_id == expected_migration_id.
+        7. Manifest dataset_identity == expected_dataset_identity (if provided).
+        8. Manifest source_file_sha256 == baseline_source_hash.
+        """
+        if not os.path.isdir(self.archive_dir):
+            raise RecoveryStateError(f"Forensic archive directory missing: {self.archive_dir}")
+
+        raw_archive = os.path.join(self.archive_dir, "daily_matches_raw.json")
+        if not os.path.exists(raw_archive):
+            raise RecoveryStateError("Forensic archive raw file missing: daily_matches_raw.json")
+
+        raw_hash = sha256_file(raw_archive)
+        if raw_hash != baseline_source_hash:
+            raise RecoveryStateError(
+                f"Forensic archive raw hash mismatch: '{raw_hash}' != '{baseline_source_hash}'"
+            )
+
+        manifest_path = os.path.join(self.archive_dir, "forensic_manifest.json")
+        if not os.path.exists(manifest_path):
+            raise RecoveryStateError("Forensic manifest missing: forensic_manifest.json")
+
+        try:
+            manifest = read_json_strict(manifest_path)
+        except Exception as exc:
+            raise RecoveryStateError(f"Forensic manifest corrupted: {exc}")
+
+        if not isinstance(manifest, dict):
+            raise RecoveryStateError("Forensic manifest must be a JSON object")
+
+        if manifest.get("migration_id") != expected_migration_id:
+            raise RecoveryStateError(
+                f"Forensic manifest migration_id mismatch: '{manifest.get('migration_id')}' != '{expected_migration_id}'"
+            )
+
+        if expected_dataset_identity and manifest.get("dataset_identity") != expected_dataset_identity:
+            raise RecoveryStateError(
+                f"Forensic manifest dataset_identity mismatch: '{manifest.get('dataset_identity')}' != '{expected_dataset_identity}'"
+            )
+
+        if manifest.get("source_file_sha256") != baseline_source_hash:
+            raise RecoveryStateError(
+                f"Forensic manifest source_file_sha256 mismatch: '{manifest.get('source_file_sha256')}' != '{baseline_source_hash}'"
+            )
+
+        rec_a_path = os.path.join(self.archive_dir, "record_a.json")
+        if not os.path.exists(rec_a_path):
+            raise RecoveryStateError("Forensic archive record_a.json missing")
+        try:
+            rec_a = read_json_strict(rec_a_path)
+        except Exception as exc:
+            raise RecoveryStateError(f"Forensic archive record_a.json corrupted: {exc}")
+        rec_a_hash = hash_record(rec_a)
+        if rec_a_hash != EXPECTED_RECORD_A_SHA256:
+            raise RecoveryStateError(
+                f"Forensic archive record_a hash mismatch: '{rec_a_hash}' != '{EXPECTED_RECORD_A_SHA256}'"
+            )
+        if manifest.get("record_a_sha256") != EXPECTED_RECORD_A_SHA256:
+            raise RecoveryStateError("Forensic manifest record_a_sha256 mismatch")
+
+        rec_b_path = os.path.join(self.archive_dir, "record_b.json")
+        if not os.path.exists(rec_b_path):
+            raise RecoveryStateError("Forensic archive record_b.json missing")
+        try:
+            rec_b = read_json_strict(rec_b_path)
+        except Exception as exc:
+            raise RecoveryStateError(f"Forensic archive record_b.json corrupted: {exc}")
+        rec_b_hash = hash_record(rec_b)
+        if rec_b_hash != EXPECTED_RECORD_B_SHA256:
+            raise RecoveryStateError(
+                f"Forensic archive record_b hash mismatch: '{rec_b_hash}' != '{EXPECTED_RECORD_B_SHA256}'"
+            )
+        if manifest.get("record_b_sha256") != EXPECTED_RECORD_B_SHA256:
+            raise RecoveryStateError("Forensic manifest record_b_sha256 mismatch")
+
     def staging_recover(self) -> dict:
         """
         Evaluate journal and filesystem state under a single lock without recursive locking.
@@ -1102,9 +1309,11 @@ class StagingCanonicalMigrator:
             # Check immutable stores against PREPARED entry
             prep_entry = next((e for e in entries if e.get("state") == "PREPARED"), None)
             baseline_source_hash = None
+            bound_identity = None
             if prep_entry:
                 pre_hashes = prep_entry.get("payload", {}).get("pre_store_hashes", {})
                 baseline_source_hash = pre_hashes.get("daily_matches.json")
+                bound_identity = prep_entry.get("payload", {}).get("dataset_identity")
                 current_store_hashes = self.get_store_hashes(self.working_dir)
                 for s in NON_CANONICAL_STORES:
                     if s in pre_hashes and current_store_hashes.get(s) != pre_hashes[s]:
@@ -1115,7 +1324,7 @@ class StagingCanonicalMigrator:
             # Extract intended projected file hash if COMMIT_INTENT_DURABLE reached
             intent_entry = next((e for e in reversed(entries) if e.get("state") == "COMMIT_INTENT_DURABLE"), None)
             intended_projected_hash = intent_entry["payload"].get("projected_file_sha256") if intent_entry else None
-            intent_mig_id = intent_entry["payload"].get("migration_id") if intent_entry else DEFAULT_MIGRATION_ID
+            intent_mig_id = intent_entry["payload"].get("migration_id") if intent_entry else (prep_entry.get("payload", {}).get("migration_id") if prep_entry else DEFAULT_MIGRATION_ID)
 
             # Classify Canonical File State into: EXPECTED_BASELINE, EXPECTED_PROJECTED, UNKNOWN
             if baseline_source_hash and current_daily_hash == baseline_source_hash:
@@ -1133,12 +1342,53 @@ class StagingCanonicalMigrator:
 
             # If file is EXPECTED_PROJECTED: complete forward under current lock
             if file_state == "EXPECTED_PROJECTED":
-                if latest_state in ("COMPLETION_RECORDED", "POSTCONDITIONS_VERIFIED"):
+                # J-02: Mandatory forensic archive verification before forward recovery
+                self.verify_forensic_archive(
+                    baseline_source_hash=baseline_source_hash,
+                    expected_migration_id=intent_mig_id,
+                    expected_dataset_identity=bound_identity,
+                )
+
+                if latest_state == "COMPLETION_RECORDED":
                     return {
-                        "status": "RECOVERED_COMPLETE",
+                        "status": "ALREADY_COMPLETED_NO_OP",
                         "action": "ALREADY_COMPLETED",
-                        "latest_state": latest_state,
+                        "latest_state": "COMPLETION_RECORDED",
+                        "migration_id": intent_mig_id,
                     }
+
+                if latest_state == "POSTCONDITIONS_VERIFIED":
+                    result_payload = {
+                        "migration_id": intent_mig_id,
+                        "status": "RECOVERED_COMPLETED_FORWARD",
+                        "action": "RECORDED_COMPLETION",
+                        "after_total": 192,
+                        "unique_ids": 192,
+                        "projection_status": "PROPOSED_NOT_APPROVED",
+                    }
+                    self.journal.append_entry("COMPLETION_RECORDED", result_payload)
+                    return result_payload
+
+                if latest_state == "PROJECTION_COMMITTED":
+                    post_inspect = self.inspect_dataset(self.working_dir)
+                    if post_inspect["total_matches"] != 192 or post_inspect["unique_ids_count"] != 192 or post_inspect["target_occurrences"] != 1:
+                        raise RecoveryStateError("Postconditions invalid after projection replacement")
+
+                    self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
+                        "migration_id": intent_mig_id,
+                        "post_inspect": post_inspect,
+                    })
+
+                    result_payload = {
+                        "migration_id": intent_mig_id,
+                        "status": "RECOVERED_COMPLETED_FORWARD",
+                        "action": "VERIFIED_POSTCONDITIONS_AND_RECORDED_COMPLETION",
+                        "after_total": 192,
+                        "unique_ids": 192,
+                        "projection_status": "PROPOSED_NOT_APPROVED",
+                    }
+                    self.journal.append_entry("COMPLETION_RECORDED", result_payload)
+                    return result_payload
 
                 if latest_state == "COMMIT_INTENT_DURABLE":
                     self.journal.append_entry("PROJECTION_COMMITTED", {
@@ -1146,29 +1396,33 @@ class StagingCanonicalMigrator:
                         "daily_matches_sha256": current_daily_hash,
                     })
 
-                # Verify postconditions directly under current lock
-                post_inspect = self.inspect_dataset(self.working_dir)
-                if post_inspect["total_matches"] != 192 or post_inspect["unique_ids_count"] != 192:
-                    raise RecoveryStateError("Postconditions invalid after projection replacement")
+                    post_inspect = self.inspect_dataset(self.working_dir)
+                    if post_inspect["total_matches"] != 192 or post_inspect["unique_ids_count"] != 192 or post_inspect["target_occurrences"] != 1:
+                        raise RecoveryStateError("Postconditions invalid after projection replacement")
 
-                self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
-                    "migration_id": intent_mig_id,
-                    "post_inspect": post_inspect,
-                })
+                    self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
+                        "migration_id": intent_mig_id,
+                        "post_inspect": post_inspect,
+                    })
 
-                result_payload = {
-                    "migration_id": intent_mig_id,
-                    "status": "RECOVERED_COMPLETED_FORWARD",
-                    "after_total": 192,
-                    "unique_ids": 192,
-                    "projection_status": "PROPOSED_NOT_APPROVED",
-                }
-                self.journal.append_entry("COMPLETION_RECORDED", result_payload)
-                return result_payload
+                    result_payload = {
+                        "migration_id": intent_mig_id,
+                        "status": "RECOVERED_COMPLETED_FORWARD",
+                        "action": "COMMITTED_PROJECTION_AND_RECORDED_COMPLETION",
+                        "after_total": 192,
+                        "unique_ids": 192,
+                        "projection_status": "PROPOSED_NOT_APPROVED",
+                    }
+                    self.journal.append_entry("COMPLETION_RECORDED", result_payload)
+                    return result_payload
+
+                raise RecoveryStateError(
+                    f"Unexpected journal state '{latest_state}' when active file is already projected."
+                )
 
             # If file is EXPECTED_BASELINE:
             if file_state == "EXPECTED_BASELINE":
-                if latest_state in ("COMPLETION_RECORDED", "PROJECTION_COMMITTED"):
+                if latest_state in ("COMPLETION_RECORDED", "PROJECTION_COMMITTED", "POSTCONDITIONS_VERIFIED"):
                     raise RecoveryStateError(
                         "Contradictory state: journal indicates committed projection but file has baseline hash."
                     )

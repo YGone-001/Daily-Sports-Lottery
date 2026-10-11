@@ -21,6 +21,7 @@ import pytest
 
 from tools.staging_canonical_repair import (
     StagingCanonicalMigrator,
+    StagingJournal,
     ProtectedPathViolationError,
     PreconditionViolationError,
     StagingLockError,
@@ -834,9 +835,21 @@ def test_ic_reg_07_journal_consistency_and_state_sequence(tmp_path):
     ws = create_synthetic_staging_workspace(str(tmp_path / "seq_ws"))
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
 
-    # Regression entry: COMMIT_INTENT_DURABLE followed by EVIDENCE_VERIFIED
+    # Linear progression followed by regression to EVIDENCE_VERIFIED
     migrator.journal.append_entry("PREPARED", {"migration_id": "MIG-01"})
-    migrator.journal.append_entry("COMMIT_INTENT_DURABLE", {"migration_id": "MIG-01"})
+    migrator.journal.append_entry("EVIDENCE_VERIFIED", {"migration_id": "MIG-01"})
+    migrator.journal.append_entry("AUTHORIZED_FOR_STAGING_SIMULATION", {"migration_id": "MIG-01"})
+    migrator.journal.append_entry(
+        "COMMIT_INTENT_DURABLE",
+        {
+            "migration_id": "MIG-01",
+            "source_file_sha256": "hash_s",
+            "projected_file_sha256": "hash_p",
+            "candidate_record_sha256": "hash_c",
+            "record_a_sha256": "hash_a",
+            "record_b_sha256": "hash_b",
+        },
+    )
     migrator.journal.append_entry("EVIDENCE_VERIFIED", {"migration_id": "MIG-01"})
 
     with pytest.raises(RecoveryStateError, match="Journal state regression detected"):
@@ -981,3 +994,474 @@ def test_ic_reg_15_legitimate_second_run_remains_zero_write_noop(tmp_path):
     assert daily_hash_before == daily_hash_after
     assert daily_mtime_before == daily_mtime_after
     assert journal_len_before == journal_len_after
+
+
+# =============================================================================
+# Phase J Recovery Criteria: J-REC-01 through J-REC-13
+# =============================================================================
+
+def test_j_rec_01_archive_dir_deleted(tmp_path):
+    """J-REC-01: Deleted archive dir before recovery raises RecoveryStateError, files and journal untouched."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec01_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    archive_dir = migrator.archive_dir
+    assert os.path.exists(archive_dir)
+    shutil.rmtree(archive_dir)
+
+    daily_mtime_before = os.path.getmtime(ws["daily_matches_path"])
+    daily_hash_before = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    journal_len_before = len(migrator.journal.read_entries())
+
+    with pytest.raises(RecoveryStateError, match="Forensic archive directory missing"):
+        migrator.staging_recover()
+
+    assert os.path.getmtime(ws["daily_matches_path"]) == daily_mtime_before
+    assert hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest() == daily_hash_before
+    assert len(migrator.journal.read_entries()) == journal_len_before
+
+
+def test_j_rec_02_raw_archive_missing(tmp_path):
+    """J-REC-02: Missing daily_matches_raw.json raises RecoveryStateError."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec02_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    raw_file = os.path.join(migrator.archive_dir, "daily_matches_raw.json")
+    os.remove(raw_file)
+
+    with pytest.raises(RecoveryStateError, match="Forensic archive raw file missing"):
+        migrator.staging_recover()
+
+
+def test_j_rec_03_raw_archive_corrupted(tmp_path):
+    """J-REC-03: Byte-corrupted daily_matches_raw.json raises RecoveryStateError."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec03_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    raw_file = os.path.join(migrator.archive_dir, "daily_matches_raw.json")
+    with open(raw_file, "ab") as f:
+        f.write(b" ")
+
+    with pytest.raises(RecoveryStateError, match="Forensic archive raw hash mismatch"):
+        migrator.staging_recover()
+
+
+def test_j_rec_04_manifest_missing(tmp_path):
+    """J-REC-04: Missing forensic_manifest.json raises RecoveryStateError."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec04_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    manifest_file = os.path.join(migrator.archive_dir, "forensic_manifest.json")
+    os.remove(manifest_file)
+
+    with pytest.raises(RecoveryStateError, match="Forensic manifest missing"):
+        migrator.staging_recover()
+
+
+def test_j_rec_05_record_a_missing_or_mismatched(tmp_path):
+    """J-REC-05: Missing or hash-mismatched record_a.json raises RecoveryStateError."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec05_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    rec_a_path = os.path.join(migrator.archive_dir, "record_a.json")
+    with open(rec_a_path, "w", encoding="utf-8") as f:
+        json.dump({"tampered": True, "id": TARGET_CANONICAL_ID}, f)
+
+    with pytest.raises(RecoveryStateError, match="record_a hash mismatch"):
+        migrator.staging_recover()
+
+
+def test_j_rec_06_record_b_missing_or_mismatched(tmp_path):
+    """J-REC-06: Missing or hash-mismatched record_b.json raises RecoveryStateError."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec06_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    rec_b_path = os.path.join(migrator.archive_dir, "record_b.json")
+    with open(rec_b_path, "w", encoding="utf-8") as f:
+        json.dump({"tampered": True, "id": TARGET_CANONICAL_ID}, f)
+
+    with pytest.raises(RecoveryStateError, match="record_b hash mismatch"):
+        migrator.staging_recover()
+
+
+def test_j_rec_07_immutable_store_modified_in_recovery(tmp_path):
+    """J-REC-07: Modified non-Canonical store during recovery raises RecoveryStateError."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec07_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    store_file = os.path.join(ws["working_data"], "calibrated.json")
+    with open(store_file, "a", encoding="utf-8") as f:
+        f.write(" ")
+
+    with pytest.raises(RecoveryStateError):
+        migrator.staging_recover()
+
+
+def test_j_rec_08_corrupted_active_canonical_classified_unknown(tmp_path):
+    """J-REC-08: Corrupted active Canonical file classified UNKNOWN, raises RecoveryStateError with zero writes."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec08_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    # Corrupt daily_matches.json to unknown hash
+    with open(ws["daily_matches_path"], "w", encoding="utf-8") as f:
+        f.write('{"matches": [], "meta": {"corrupted": true}}')
+
+    daily_mtime_before = os.path.getmtime(ws["daily_matches_path"])
+    daily_hash_before = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    journal_len_before = len(migrator.journal.read_entries())
+
+    with pytest.raises(RecoveryStateError, match="UNKNOWN state"):
+        migrator.staging_recover()
+
+    assert os.path.getmtime(ws["daily_matches_path"]) == daily_mtime_before
+    assert hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest() == daily_hash_before
+    assert len(migrator.journal.read_entries()) == journal_len_before
+
+
+def test_j_rec_09_crash_after_postconditions_verified(tmp_path):
+    """J-REC-09: Crash after POSTCONDITIONS_VERIFIED recovers forward, appends COMPLETION_RECORDED."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec09_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="before_completion")
+
+    entries_before = migrator.journal.read_entries()
+    assert entries_before[-1]["state"] == "POSTCONDITIONS_VERIFIED"
+
+    rec = migrator.staging_recover()
+    assert rec["status"] == "RECOVERED_COMPLETED_FORWARD"
+    assert rec["action"] == "RECORDED_COMPLETION"
+
+    entries_after = migrator.journal.read_entries()
+    assert len(entries_after) == len(entries_before) + 1
+    assert entries_after[-1]["state"] == "COMPLETION_RECORDED"
+
+    # Re-running recovery is a zero-write no-op
+    rec2 = migrator.staging_recover()
+    assert rec2["status"] == "ALREADY_COMPLETED_NO_OP"
+    assert len(migrator.journal.read_entries()) == len(entries_after)
+
+
+def test_j_rec_10_re_recovery_after_completion_noop(tmp_path):
+    """J-REC-10: Recovery on already completed migration returns ALREADY_COMPLETED_NO_OP with 0 writes/appends."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec10_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    res = migrator.staging_apply(simulation=True)
+    assert res["status"] == "SUCCESS"
+
+    daily_mtime_before = os.path.getmtime(ws["daily_matches_path"])
+    daily_hash_before = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    journal_len_before = len(migrator.journal.read_entries())
+
+    rec = migrator.staging_recover()
+    assert rec["status"] == "ALREADY_COMPLETED_NO_OP"
+    assert rec["latest_state"] == "COMPLETION_RECORDED"
+
+    assert os.path.getmtime(ws["daily_matches_path"]) == daily_mtime_before
+    assert hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest() == daily_hash_before
+    assert len(migrator.journal.read_entries()) == journal_len_before
+
+
+def test_j_rec_11_concurrent_recovery_lock_contention(tmp_path):
+    """J-REC-11: Concurrent recovery lock contention raises StagingLockError, directory unharmed."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec11_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_file_replace")
+
+    with acquire_staging_lock(ws["working_data"], staging_root=ws["root"]):
+        with pytest.raises(StagingLockError, match="Staging lock busy or denied"):
+            migrator.staging_recover()
+
+
+def test_j_rec_12_tampered_staging_marker_rejected(tmp_path):
+    """J-REC-12: Tampered staging marker file raises PreconditionViolationError."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec12_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    marker_path = os.path.join(ws["root"], STAGING_MARKER_FILENAME)
+    with open(marker_path, "w", encoding="utf-8") as f:
+        f.write('{"tampered": true}')
+
+    with pytest.raises(PreconditionViolationError):
+        migrator.staging_recover()
+
+
+def test_j_rec_13_crash_after_intent_before_committed(tmp_path):
+    """J-REC-13: Crash after file replacement before PROJECTION_COMMITTED recovers forward under lock."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "rec13_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_replace_before_committed")
+
+    entries_before = migrator.journal.read_entries()
+    assert entries_before[-1]["state"] == "COMMIT_INTENT_DURABLE"
+
+    rec = migrator.staging_recover()
+    assert rec["status"] == "RECOVERED_COMPLETED_FORWARD"
+    assert rec["after_total"] == 192
+    assert rec["unique_ids"] == 192
+
+    entries_after = migrator.journal.read_entries()
+    states_after = [e["state"] for e in entries_after]
+    assert states_after[-3:] == ["PROJECTION_COMMITTED", "POSTCONDITIONS_VERIFIED", "COMPLETION_RECORDED"]
+
+    # Verify active Canonical store
+    data = json.load(open(ws["daily_matches_path"], "r", encoding="utf-8"))
+    assert len(data["matches"]) == 192
+    targets = [m for m in data["matches"] if m.get("id") == TARGET_CANONICAL_ID]
+    assert len(targets) == 1
+    assert hash_record(targets[0]) == EXPECTED_CANDIDATE_SHA256
+
+
+# =============================================================================
+# Phase J Journal Criteria: J-JRN-01 through J-JRN-12
+# =============================================================================
+
+def test_j_jrn_01_missing_prepared(tmp_path):
+    """J-JRN-01: Journal missing PREPARED initial entry raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    bad_entries = [
+        {"state": "COMMIT_INTENT_DURABLE", "payload": {"migration_id": "MIG-01"}}
+    ]
+    with pytest.raises(RecoveryStateError, match="Journal must begin with PREPARED"):
+        journal.validate_chain(bad_entries)
+
+
+def test_j_jrn_02_skipped_intermediate_state(tmp_path):
+    """J-JRN-02: Journal with skipped state raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    bad_entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "PROJECTION_COMMITTED", "payload": {"migration_id": "MIG-01", "daily_matches_sha256": "hash"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="skipped intermediate state"):
+        journal.validate_chain(bad_entries)
+
+
+def test_j_jrn_03_missing_migration_id(tmp_path):
+    """J-JRN-03: Journal with missing migration_id raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    bad_entries = [
+        {"state": "PREPARED", "payload": {}},
+    ]
+    with pytest.raises(RecoveryStateError, match="missing required non-empty migration_id"):
+        journal.validate_chain(bad_entries)
+
+
+def test_j_jrn_04_conflicting_migration_id(tmp_path):
+    """J-JRN-04: Journal with conflicting migration_id raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    bad_entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-02"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Conflicting migration_id"):
+        journal.validate_chain(bad_entries)
+
+
+def test_j_jrn_05_duplicate_completion_recorded(tmp_path):
+    """J-JRN-05: Journal with duplicate COMPLETION_RECORDED raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s",
+                "projected_file_sha256": "p",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+        {"state": "PROJECTION_COMMITTED", "payload": {"migration_id": "MIG-01", "daily_matches_sha256": "p"}},
+        {"state": "POSTCONDITIONS_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "COMPLETION_RECORDED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "COMPLETION_RECORDED", "payload": {"migration_id": "MIG-01"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Duplicate COMPLETION_RECORDED|duplicate state transition"):
+        journal.validate_chain(entries)
+
+
+def test_j_jrn_06_corrupt_json_line(tmp_path):
+    """J-JRN-06: Journal with corrupt JSON line raises RecoveryStateError."""
+    journal_file = str(tmp_path / "corrupt_j.jsonl")
+    with open(journal_file, "w", encoding="utf-8") as f:
+        f.write('{"state": "PREPARED", "payload": {"migration_id": "MIG-01"}}\n')
+        f.write('CORRUPT NOT JSON LINE\n')
+
+    journal = StagingJournal(journal_file)
+    entries = journal.read_entries()
+    with pytest.raises(RecoveryStateError, match="Corrupted journal line detected"):
+        journal.validate_chain(entries)
+
+
+def test_j_jrn_07_unknown_state_name(tmp_path):
+    """J-JRN-07: Journal with unknown state name raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "MAGIC_UNRECOGNIZED_STATE", "payload": {"migration_id": "MIG-01"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Unknown state"):
+        journal.validate_chain(entries)
+
+
+def test_j_jrn_08_mismatched_dataset_identity(tmp_path):
+    """J-JRN-08: Journal with mismatched dataset identity raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "dataset_identity": "ID_A"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01", "dataset_identity": "ID_B"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Mismatched dataset identity"):
+        journal.validate_chain(entries)
+
+
+def test_j_jrn_09_missing_intent_hashes(tmp_path):
+    """J-JRN-09: Journal with missing intent hashes in COMMIT_INTENT_DURABLE raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s",
+                # missing projected_file_sha256
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+    ]
+    with pytest.raises(RecoveryStateError, match="Missing required intent hash field"):
+        journal.validate_chain(entries)
+
+
+def test_j_jrn_10_mismatched_intent_hash(tmp_path):
+    """J-JRN-10: Journal with mismatched intent hash raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "pre_store_hashes": {"daily_matches.json": "correct_source"}}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "wrong_source_hash",
+                "projected_file_sha256": "p",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+    ]
+    with pytest.raises(RecoveryStateError, match="Intent source_file_sha256 mismatch"):
+        journal.validate_chain(entries)
+
+    # Also test mismatched projected hash in PROJECTION_COMMITTED
+    entries2 = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s",
+                "projected_file_sha256": "expected_p",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+        {"state": "PROJECTION_COMMITTED", "payload": {"migration_id": "MIG-01", "daily_matches_sha256": "wrong_p"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Mismatched projected file hash in PROJECTION_COMMITTED"):
+        journal.validate_chain(entries2)
+
+
+def test_j_jrn_11_valid_rollback_record(tmp_path):
+    """J-JRN-11: Journal with valid rollback record validates successfully."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s",
+                "projected_file_sha256": "p",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "ROLLED_BACK_TO_RAW_ARCHIVE"}},
+    ]
+    # Must validate without raising
+    journal.validate_chain(entries)
+
+
+def test_j_jrn_12_invalid_rollback_reset(tmp_path):
+    """J-JRN-12: Journal with invalid rollback record raises RecoveryStateError."""
+    journal = StagingJournal(str(tmp_path / "j.jsonl"))
+    # Rollback after PROJECTION_COMMITTED is invalid
+    entries = [
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "EVIDENCE_VERIFIED", "payload": {"migration_id": "MIG-01"}},
+        {"state": "AUTHORIZED_FOR_STAGING_SIMULATION", "payload": {"migration_id": "MIG-01"}},
+        {
+            "state": "COMMIT_INTENT_DURABLE",
+            "payload": {
+                "migration_id": "MIG-01",
+                "source_file_sha256": "s",
+                "projected_file_sha256": "p",
+                "candidate_record_sha256": "c",
+                "record_a_sha256": "a",
+                "record_b_sha256": "b",
+            },
+        },
+        {"state": "PROJECTION_COMMITTED", "payload": {"migration_id": "MIG-01", "daily_matches_sha256": "p"}},
+        {"state": "PREPARED", "payload": {"migration_id": "MIG-01", "action": "ROLLED_BACK_TO_RAW_ARCHIVE"}},
+    ]
+    with pytest.raises(RecoveryStateError, match="Invalid rollback reset to PREPARED"):
+        journal.validate_chain(entries)
