@@ -5,9 +5,12 @@ Comprehensive automated test suite for Guarded Historical Canonical Staging Migr
 Covers:
 - Positive Acceptance Criteria: I-POS-01 through I-POS-24
 - Negative and Fault-Injection Criteria: I-NEG-01 through I-NEG-25
-- Path safety boundaries and Windows lock contention
+- Phase I-C Regression Suite: IC-REG-01 through IC-REG-15
+- Path safety boundaries, junction escapes, and Windows lock contention
 - Portable synthetic fixtures runnable offline anywhere
 """
+from __future__ import annotations
+
 import copy
 import hashlib
 import json
@@ -24,15 +27,27 @@ from tools.staging_canonical_repair import (
     ImmutableStoreMutationError,
     FaultInjectionError,
     RecoveryStateError,
+    StagingMigrationError,
     assert_safe_path,
+    canonicalize_path,
+    is_subpath_or_equal,
     build_candidate_projection,
     hash_record,
     serialize_record,
+    init_staging_workspace,
+    verify_staging_workspace,
+    restore_from_archive_atomic,
     TARGET_CANONICAL_ID,
     EXPECTED_RECORD_A_SHA256,
     EXPECTED_RECORD_B_SHA256,
     EXPECTED_CANDIDATE_SHA256,
     NON_CANONICAL_STORES,
+    PROTECTED_ROOTS,
+    SOURCE_REPO_ROOT,
+    PROD_REPO_ROOT,
+    EPOCH_0_ROOT,
+    EPOCH_1_ROOT,
+    STAGING_MARKER_FILENAME,
     acquire_staging_lock,
 )
 
@@ -86,10 +101,15 @@ RECORD_B_FIXTURE = {
 }
 
 
-def create_synthetic_staging_workspace(root_dir: str) -> dict:
+def create_synthetic_staging_workspace(
+    root_dir: str,
+    create_marker: bool = True,
+    dataset_identity: str = "EXPLICIT_SYNTHETIC_TEST_FIXTURE",
+) -> dict:
     """
     Construct a complete, portable synthetic staging workspace with 193 records,
     Record A at index 55, Record B at index 56, and all 6 non-Canonical stores.
+    Also initializes staging_marker.json with bound baseline manifest.
     """
     input_data = os.path.join(root_dir, "input", "data")
     working_data = os.path.join(root_dir, "working", "data")
@@ -166,7 +186,7 @@ def create_synthetic_staging_workspace(root_dir: str) -> dict:
         },
     }
 
-    # Write to input and working
+    # 3. Write to input and working
     for path_dir in (input_data, working_data):
         with open(os.path.join(path_dir, "daily_matches.json"), "w", encoding="utf-8") as f:
             json.dump(daily_payload, f, ensure_ascii=False, indent=2, sort_keys=True)
@@ -174,11 +194,45 @@ def create_synthetic_staging_workspace(root_dir: str) -> dict:
             with open(os.path.join(path_dir, sname), "w", encoding="utf-8") as f:
                 json.dump(sdata, f, ensure_ascii=False, indent=2, sort_keys=True)
 
+    # 4. Calculate baseline manifest and projected file hash
+    daily_matches_path = os.path.join(working_data, "daily_matches.json")
+    source_daily_hash = hashlib.sha256(open(daily_matches_path, "rb").read()).hexdigest()
+
+    cand, _ = build_candidate_projection(RECORD_A_FIXTURE, RECORD_B_FIXTURE)
+    projected_matches = matches[:55] + [cand] + matches[57:]
+    projected_payload = {
+        "matches": projected_matches,
+        "meta": copy.deepcopy(daily_payload["meta"]),
+    }
+    projected_payload["meta"]["total"] = 192
+    projected_str = json.dumps(projected_payload, ensure_ascii=False, indent=2, sort_keys=True)
+    if os.name == "nt":
+        projected_str = projected_str.replace("\n", "\r\n")
+    projected_daily_hash = hashlib.sha256(projected_str.encode("utf-8")).hexdigest()
+
+    manifest = {
+        "daily_matches.json": source_daily_hash,
+        "projected_file_sha256": projected_daily_hash,
+    }
+    for sname in stores:
+        store_path = os.path.join(working_data, sname)
+        manifest[sname] = hashlib.sha256(open(store_path, "rb").read()).hexdigest()
+
+    if create_marker:
+        init_staging_workspace(
+            staging_root=root_dir,
+            dataset_identity=dataset_identity,
+            baseline_manifest=manifest,
+        )
+
     return {
         "root": root_dir,
         "input_data": input_data,
         "working_data": working_data,
-        "daily_matches_path": os.path.join(working_data, "daily_matches.json"),
+        "daily_matches_path": daily_matches_path,
+        "manifest": manifest,
+        "source_daily_hash": source_daily_hash,
+        "projected_daily_hash": projected_daily_hash,
     }
 
 
@@ -303,12 +357,15 @@ def test_idempotency_second_run_is_noop(tmp_path):
 # =============================================================================
 
 def test_neg_01_wrong_canonical_source_hash(tmp_path):
-    """I-NEG-01: Reject if expected source hash does not match."""
+    """I-NEG-01: Reject if expected source hash does not match baseline manifest."""
     ws = create_synthetic_staging_workspace(str(tmp_path / "ws"))
-    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+    # Tamper with the daily_matches.json file so its hash differs from manifest binding
+    with open(ws["daily_matches_path"], "a", encoding="utf-8") as f:
+        f.write(" ")
 
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
     with pytest.raises(PreconditionViolationError, match="Canonical source hash mismatch"):
-        migrator.staging_apply(simulation=True, expected_source_sha="0000000000000000000000000000000000000000000000000000000000000000")
+        migrator.staging_apply(simulation=True)
 
 
 def test_neg_02_wrong_record_a_hash(tmp_path):
@@ -318,7 +375,12 @@ def test_neg_02_wrong_record_a_hash(tmp_path):
         d = json.load(f)
     d["matches"][55]["home"] = "篡改球队"
     with open(ws["daily_matches_path"], "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    # Update manifest daily_matches.json hash to match so it reaches Record A check
+    new_h = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    ws["manifest"]["daily_matches.json"] = new_h
+    init_staging_workspace(ws["root"], "EXPLICIT_SYNTHETIC_TEST_FIXTURE", ws["manifest"])
 
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
     with pytest.raises(PreconditionViolationError, match="Record A hash mismatch"):
@@ -332,7 +394,12 @@ def test_neg_03_wrong_record_b_hash(tmp_path):
         d = json.load(f)
     d["matches"][56]["away"] = "篡改球队"
     with open(ws["daily_matches_path"], "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    # Update manifest daily_matches.json hash to match so it reaches Record B check
+    new_h = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    ws["manifest"]["daily_matches.json"] = new_h
+    init_staging_workspace(ws["root"], "EXPLICIT_SYNTHETIC_TEST_FIXTURE", ws["manifest"])
 
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
     with pytest.raises(PreconditionViolationError, match="Record B hash mismatch"):
@@ -346,7 +413,7 @@ def test_neg_04_missing_target_record(tmp_path):
         d = json.load(f)
     d["matches"] = [m for m in d["matches"] if m.get("id") != TARGET_CANONICAL_ID]
     with open(ws["daily_matches_path"], "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2, sort_keys=True)
 
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
     with pytest.raises(PreconditionViolationError):
@@ -360,7 +427,7 @@ def test_neg_05_unexpected_third_target_duplicate(tmp_path):
         d = json.load(f)
     d["matches"].append(copy.deepcopy(RECORD_A_FIXTURE))
     with open(ws["daily_matches_path"], "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2, sort_keys=True)
 
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
     with pytest.raises(PreconditionViolationError):
@@ -374,7 +441,11 @@ def test_neg_06_unrelated_duplicate_id(tmp_path):
         d = json.load(f)
     d["matches"][0]["id"] = d["matches"][1]["id"]  # Duplicate unrelated ID
     with open(ws["daily_matches_path"], "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    new_h = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    ws["manifest"]["daily_matches.json"] = new_h
+    init_staging_workspace(ws["root"], "EXPLICIT_SYNTHETIC_TEST_FIXTURE", ws["manifest"])
 
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
     with pytest.raises(PreconditionViolationError, match="Unrelated duplicate IDs detected"):
@@ -399,7 +470,11 @@ def test_neg_08_malformed_final_score(tmp_path):
         d = json.load(f)
     d["matches"][56]["score"] = {"ft": [-1, 2]}  # Invalid negative score
     with open(ws["daily_matches_path"], "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    new_h = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    ws["manifest"]["daily_matches.json"] = new_h
+    init_staging_workspace(ws["root"], "EXPLICIT_SYNTHETIC_TEST_FIXTURE", ws["manifest"])
 
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
     with pytest.raises(PreconditionViolationError, match="Record B hash mismatch"):
@@ -422,19 +497,17 @@ def test_neg_10_through_15_modified_stores(tmp_path):
         ws = create_synthetic_staging_workspace(str(tmp_path / f"ws_{store}"))
         migrator = StagingCanonicalMigrator(staging_root=ws["root"])
 
-        # Mutate the store file during the apply process before postcondition check
-        target_store_file = os.path.join(ws["working_data"], store)
-
-        # We can use fault-inject before postconditions to mutate
+        # Fault-inject after PREPARED / before postconditions
         with pytest.raises(FaultInjectionError):
             migrator.staging_apply(simulation=True, fault_inject="before_postconditions")
 
-        # Mutate the file
+        # Mutate the store file
+        target_store_file = os.path.join(ws["working_data"], store)
         with open(target_store_file, "a", encoding="utf-8") as f:
             f.write(" ")
 
-        # Run recovery, which checks store invariants
-        with pytest.raises(Exception):
+        # Run recovery, which detects the mutation and raises ImmutableStoreMutationError
+        with pytest.raises(ImmutableStoreMutationError, match="mutated prior to recovery"):
             migrator.staging_recover()
 
 
@@ -525,31 +598,36 @@ def test_neg_22_reused_migration_id(tmp_path):
     ws = create_synthetic_staging_workspace(str(tmp_path / "ws"))
     migrator = StagingCanonicalMigrator(staging_root=ws["root"])
 
-    # First apply
-    migrator.staging_apply(simulation=True, migration_id="MIG-TEST-001")
+    # Simulate interruption after commit intent
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, migration_id="MIG-TEST-001", fault_inject="after_commit_intent")
 
-    # Manually append an intent with conflicting target hash using same migration_id
-    migrator.journal.append_entry("COMMIT_INTENT_DURABLE", {
-        "migration_id": "MIG-TEST-001",
-        "projected_file_sha256": "CONFLICTING_HASH_12345",
-    })
+    # Recover to clean state
+    rec = migrator.staging_recover()
+    assert rec["status"] == "RECOVERED_ROLLED_BACK"
 
-    # Restore 193 match file to trigger another apply
-    shutil.copyfile(
-        os.path.join(ws["root"], "archive", "daily_matches_raw.json"),
-        ws["daily_matches_path"],
-    )
+    # Modify the previously recorded intent in the journal to have a conflicting target hash
+    journal_path = os.path.join(ws["root"], "journal", "disposition_journal.jsonl")
+    entries = migrator.journal.read_entries()
+    for e in entries:
+        if e.get("state") == "COMMIT_INTENT_DURABLE":
+            e["payload"]["projected_file_sha256"] = "CONFLICTING_TARGET_HASH"
+    with open(journal_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n")
 
-    with pytest.raises(PreconditionViolationError, match="Reused migration ID with different target hash"):
+    # Re-running staging_apply with same migration_id detects conflicting intent
+    with pytest.raises(PreconditionViolationError, match="Reused migration ID"):
         migrator.staging_apply(simulation=True, migration_id="MIG-TEST-001")
 
 
 def test_neg_23_protected_production_path_rejected():
     """I-NEG-23: Reject production repo paths."""
     prod_paths = [
-        r"C:\Users\YGone\Desktop\program\Daily-Sports-Lottery",
-        r"C:\Users\YGone\Desktop\program\Daily-Sports-Lottery\data",
-        r"c:/users/ygone/desktop/program/daily-sports-lottery/data",
+        PROD_REPO_ROOT,
+        os.path.join(PROD_REPO_ROOT, "data"),
+        PROD_REPO_ROOT.lower(),
+        PROD_REPO_ROOT.replace("\\", "/"),
     ]
     for p in prod_paths:
         with pytest.raises(ProtectedPathViolationError):
@@ -559,8 +637,10 @@ def test_neg_23_protected_production_path_rejected():
 def test_neg_24_protected_evidence_epoch_rejected():
     """I-NEG-24: Reject evidence epoch paths."""
     epoch_paths = [
-        r"C:\Users\YGone\Desktop\program\_quiescent_evidence_backup_20261010_224710",
-        r"C:\Users\YGone\Desktop\_quiescent_evidence_backup_epoch1_20261011_014059",
+        EPOCH_0_ROOT,
+        EPOCH_1_ROOT,
+        os.path.join(EPOCH_0_ROOT, "data"),
+        os.path.join(EPOCH_1_ROOT, "data"),
     ]
     for p in epoch_paths:
         with pytest.raises(ProtectedPathViolationError):
@@ -568,10 +648,23 @@ def test_neg_24_protected_evidence_epoch_rejected():
 
 
 def test_neg_25_path_traversal_and_junction_escape(tmp_path):
-    """I-NEG-25: Reject path traversal attempts resolving into protected roots."""
-    traversal_path = str(tmp_path) + r"\..\..\Desktop\program\Daily-Sports-Lottery\data"
+    """I-NEG-25: Reject path traversal attempts resolving into protected roots and escaping staging root."""
+    # 1. Traversal resolving into production repo
+    traversal_path = os.path.join(PROD_REPO_ROOT, "data", "..")
     with pytest.raises(ProtectedPathViolationError):
         assert_safe_path(traversal_path)
+
+    # 2. Traversal resolving into epoch backup
+    epoch_traversal = os.path.join(EPOCH_1_ROOT, "data", "..")
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(epoch_traversal)
+
+    # 3. Traversal escaping staging root
+    staging_ws = str(tmp_path / "escape_ws")
+    os.makedirs(staging_ws, exist_ok=True)
+    escaping_path = os.path.join(staging_ws, "..", "escaped_outside")
+    with pytest.raises(ProtectedPathViolationError, match="escapes staging root"):
+        assert_safe_path(escaping_path, staging_root=staging_ws)
 
 
 # =============================================================================
@@ -584,7 +677,7 @@ def test_cli_lifecycle(tmp_path):
 
     ws = create_synthetic_staging_workspace(str(tmp_path / "cli_ws"))
 
-    # 1. inspect
+    # 1. inspect (read-only)
     rc = main(["inspect", "--data-dir", ws["working_data"]])
     assert rc == 0
 
@@ -604,3 +697,287 @@ def test_cli_lifecycle(tmp_path):
     rc = main(["staging-recover", "--staging-dir", ws["root"]])
     assert rc == 0
 
+
+# =============================================================================
+# Phase I-C Regression Suite: IC-REG-01 through IC-REG-15
+# =============================================================================
+
+def test_ic_reg_01_production_path_bypass_attempt(tmp_path):
+    """IC-REG-01: Rigorous rejection of production repo, epoch backups, and source repo."""
+    # Direct production roots
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(PROD_REPO_ROOT)
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(os.path.join(PROD_REPO_ROOT, "data"))
+
+    # Source repo checkout (dsl-inc-i)
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(SOURCE_REPO_ROOT)
+
+    # Epoch backup paths
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(EPOCH_0_ROOT)
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(EPOCH_1_ROOT)
+
+    # Any subpath containing _quiescent_evidence_backup
+    fake_epoch = str(tmp_path / "_quiescent_evidence_backup_custom" / "data")
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(fake_epoch)
+
+
+def test_ic_reg_02_read_only_inspect_creates_no_files_or_dirs(tmp_path):
+    """IC-REG-02: inspect_dataset is strictly read-only and creates zero files or directories."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "inspect_ws"))
+
+    def get_fs_state(root):
+        state = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fn in filenames:
+                fp = os.path.join(dirpath, fn)
+                state[os.path.relpath(fp, root)] = os.path.getmtime(fp)
+        return state
+
+    pre_state = get_fs_state(ws["root"])
+
+    # Run inspect
+    res = StagingCanonicalMigrator.inspect_dataset(ws["working_data"])
+    assert res["total_matches"] == 193
+    assert res["unique_ids_count"] == 192
+    assert res["target_occurrences"] == 2
+
+    post_state = get_fs_state(ws["root"])
+    assert pre_state == post_state, "inspect_dataset must not create or modify ANY file or directory!"
+
+
+def test_ic_reg_03_file_and_record_hash_separation():
+    """IC-REG-03: Whole-file hashes and record hashes are strictly distinguished."""
+    cand, _ = build_candidate_projection(RECORD_A_FIXTURE, RECORD_B_FIXTURE)
+    rec_hash = hash_record(cand)
+    assert rec_hash == EXPECTED_CANDIDATE_SHA256
+
+    # Entire file containing candidate has a completely different hash from individual record hash
+    wrapper_bytes = json.dumps({"matches": [cand]}, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+    file_hash = hashlib.sha256(wrapper_bytes).hexdigest()
+    assert rec_hash != file_hash, "Record hash and file hash must never be conflated!"
+
+
+def test_ic_reg_04_single_lock_recovery_no_recursion(tmp_path):
+    """IC-REG-04: Recovery executes under a single lock and never deadlocks or calls itself recursively."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "lock_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    # Fault-inject to leave dirty state
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_commit_intent")
+
+    # Single-lock recovery succeeds without deadlock or recursion
+    rec = migrator.staging_recover()
+    assert rec["status"] == "RECOVERED_ROLLED_BACK"
+
+
+def test_ic_reg_05_explicit_file_state_classification(tmp_path):
+    """IC-REG-05: Recovery classifies Canonical file into baseline, projected, or unknown state."""
+    # 1. State 1: EXPECTED_BASELINE
+    ws1 = create_synthetic_staging_workspace(str(tmp_path / "state_ws1"))
+    migrator1 = StagingCanonicalMigrator(staging_root=ws1["root"])
+    migrator1.journal.append_entry("PREPARED", {
+        "migration_id": "MIG-20261011-CANONICAL-500L-1362422",
+        "pre_store_hashes": migrator1.get_store_hashes(ws1["working_data"]),
+    })
+    rec1 = migrator1.staging_recover()
+    assert rec1["status"] == "RECOVERED_PRE_COMMIT_CLEAN"
+
+    # 2. State 2: EXPECTED_PROJECTED
+    ws2 = create_synthetic_staging_workspace(str(tmp_path / "state_ws2"))
+    migrator2 = StagingCanonicalMigrator(staging_root=ws2["root"])
+    with pytest.raises(FaultInjectionError):
+        migrator2.staging_apply(simulation=True, fault_inject="after_file_replace")
+    rec2 = migrator2.staging_recover()
+    assert rec2["status"] == "RECOVERED_COMPLETED_FORWARD"
+
+    # 3. State 3: UNKNOWN -> fails closed
+    ws3 = create_synthetic_staging_workspace(str(tmp_path / "state_ws3"))
+    migrator3 = StagingCanonicalMigrator(staging_root=ws3["root"])
+    with pytest.raises(FaultInjectionError):
+        migrator3.staging_apply(simulation=True, fault_inject="after_file_replace")
+    with open(ws3["daily_matches_path"], "a", encoding="utf-8") as f:
+        f.write("\n/* UNKNOWN_CORRUPTION */")
+    with pytest.raises(RecoveryStateError, match="UNKNOWN state"):
+        migrator3.staging_recover()
+
+
+def test_ic_reg_06_atomic_recovery_write_and_verification(tmp_path):
+    """IC-REG-06: Atomic recovery restoration with flush, sync, and post-replacement hash validation."""
+    staging_root = str(tmp_path / "atomic_ws")
+    os.makedirs(staging_root, exist_ok=True)
+    archive_file = os.path.join(staging_root, "source.json")
+    target_file = os.path.join(staging_root, "target.json")
+
+    content = b'{"atomic": true}'
+    expected_h = hashlib.sha256(content).hexdigest()
+    with open(archive_file, "wb") as f:
+        f.write(content)
+
+    # Successful atomic restore
+    restore_from_archive_atomic(archive_file, target_file, expected_hash=expected_h, staging_root=staging_root)
+    assert os.path.exists(target_file)
+    assert open(target_file, "rb").read() == content
+
+    # Tampered expected hash raises RecoveryStateError
+    with pytest.raises(RecoveryStateError, match="hash mismatch"):
+        restore_from_archive_atomic(archive_file, target_file, expected_hash="0000000000", staging_root=staging_root)
+
+
+def test_ic_reg_07_journal_consistency_and_state_sequence(tmp_path):
+    """IC-REG-07: Journal state machine enforces strict linear sequencing and no state regressions."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "seq_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    # Regression entry: COMMIT_INTENT_DURABLE followed by EVIDENCE_VERIFIED
+    migrator.journal.append_entry("PREPARED", {"migration_id": "MIG-01"})
+    migrator.journal.append_entry("COMMIT_INTENT_DURABLE", {"migration_id": "MIG-01"})
+    migrator.journal.append_entry("EVIDENCE_VERIFIED", {"migration_id": "MIG-01"})
+
+    with pytest.raises(RecoveryStateError, match="Journal state regression detected"):
+        migrator.staging_recover()
+
+
+def test_ic_reg_08_lock_gated_idempotency_verification(tmp_path):
+    """IC-REG-08: Idempotency verification executes under exclusive lock and verifies all invariants."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "idem_lock_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    res1 = migrator.staging_apply(simulation=True)
+    assert res1["status"] == "SUCCESS"
+
+    # Second run inside lock returns ALREADY_APPLIED_NO_OP
+    res2 = migrator.staging_apply(simulation=True)
+    assert res2["status"] == "ALREADY_APPLIED_NO_OP"
+
+
+def test_ic_reg_09_strengthened_staging_verify_checks(tmp_path):
+    """IC-REG-09: Strengthened staging-verify checks whole-file hash, candidate record, stores, archive, and journal."""
+    from tools.staging_canonical_repair import main
+
+    ws = create_synthetic_staging_workspace(str(tmp_path / "verify_ws"))
+
+    # Before migration: verify fails (returncode != 0)
+    assert main(["staging-verify", "--staging-dir", ws["root"]]) != 0
+
+    # Apply migration
+    assert main(["staging-apply", "--staging-dir", ws["root"], "--simulation"]) == 0
+
+    # After migration: verify passes
+    assert main(["staging-verify", "--staging-dir", ws["root"]]) == 0
+
+
+def test_ic_reg_10_mandatory_baseline_binding_rejection(tmp_path):
+    """IC-REG-10: Staging apply rejects unbound dataset identities or baseline manifest mismatches."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "unbound_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    # Try applying with an unknown dataset identity
+    with pytest.raises(PreconditionViolationError, match="Unknown or unbound dataset identity"):
+        migrator.staging_apply(simulation=True, dataset_identity="RANDOM_UNBOUND_DATASET")
+
+
+def test_ic_reg_11_unmarked_staging_workspace_rejected(tmp_path):
+    """IC-REG-11: Unmarked workspace without staging_marker.json is strictly rejected."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "unmarked_ws"), create_marker=False)
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(PreconditionViolationError, match="Missing staging workspace marker"):
+        migrator.dry_run()
+
+    with pytest.raises(PreconditionViolationError, match="Missing staging workspace marker"):
+        migrator.staging_apply(simulation=True)
+
+    with pytest.raises(PreconditionViolationError, match="Missing staging workspace marker"):
+        migrator.staging_recover()
+
+
+def test_ic_reg_12_windows_junction_escape_rejected(tmp_path):
+    """IC-REG-12: Reject Windows NTFS junction escapes into protected roots and outside staging root."""
+    if os.name == "nt":
+        import _winapi
+        junction_dir = str(tmp_path / "junctions")
+        os.makedirs(junction_dir, exist_ok=True)
+        link_to_prod = os.path.join(junction_dir, "link_to_prod")
+        _winapi.CreateJunction(PROD_REPO_ROOT, link_to_prod)
+
+        with pytest.raises(ProtectedPathViolationError, match="resolves inside protected root"):
+            assert_safe_path(link_to_prod)
+
+        # Also test junction escape outside staging root
+        target_outside = str(tmp_path / "outside_dir")
+        os.makedirs(target_outside, exist_ok=True)
+        staging_dir = str(tmp_path / "staging_box")
+        os.makedirs(staging_dir, exist_ok=True)
+        link_outside = os.path.join(staging_dir, "junction_escape")
+        _winapi.CreateJunction(target_outside, link_outside)
+
+        with pytest.raises(ProtectedPathViolationError, match="escapes staging root"):
+            assert_safe_path(link_outside, staging_root=staging_dir)
+
+
+def test_ic_reg_13_immutable_store_mutation_rejected_in_recovery(tmp_path):
+    """IC-REG-13: Mutation of any immutable store is detected and rejected during recovery."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "store_mut_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    with pytest.raises(FaultInjectionError):
+        migrator.staging_apply(simulation=True, fault_inject="after_commit_intent")
+
+    # Mutate team_strength.json
+    store_file = os.path.join(ws["working_data"], "team_strength.json")
+    with open(store_file, "a", encoding="utf-8") as f:
+        f.write(" ")
+
+    with pytest.raises(ImmutableStoreMutationError, match="mutated prior to recovery"):
+        migrator.staging_recover()
+
+
+def test_ic_reg_14_unrelated_record_tampering_rejected_in_idempotency(tmp_path):
+    """IC-REG-14: Tampering with unrelated records invalidates idempotency and fails closed."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "tamper_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    res1 = migrator.staging_apply(simulation=True)
+    assert res1["status"] == "SUCCESS"
+
+    # Modify an unrelated match record in the working data
+    daily_file = ws["daily_matches_path"]
+    with open(daily_file, "r", encoding="utf-8") as f:
+        daily_data = json.load(f)
+    daily_data["matches"][0]["home"] = "TAMPERED_TEAM_NAME"
+    with open(daily_file, "w", encoding="utf-8") as f:
+        json.dump(daily_data, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    # Re-running apply must NOT return ALREADY_APPLIED_NO_OP because file hash does not match
+    with pytest.raises(PreconditionViolationError):
+        migrator.staging_apply(simulation=True)
+
+
+def test_ic_reg_15_legitimate_second_run_remains_zero_write_noop(tmp_path):
+    """IC-REG-15: Legitimate second execution is a zero-write no-op with zero journal changes."""
+    ws = create_synthetic_staging_workspace(str(tmp_path / "noop_ws"))
+    migrator = StagingCanonicalMigrator(staging_root=ws["root"])
+
+    res1 = migrator.staging_apply(simulation=True)
+    assert res1["status"] == "SUCCESS"
+
+    daily_mtime_before = os.path.getmtime(ws["daily_matches_path"])
+    daily_hash_before = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    journal_len_before = len(migrator.journal.read_entries())
+
+    res2 = migrator.staging_apply(simulation=True)
+    assert res2["status"] == "ALREADY_APPLIED_NO_OP"
+
+    daily_mtime_after = os.path.getmtime(ws["daily_matches_path"])
+    daily_hash_after = hashlib.sha256(open(ws["daily_matches_path"], "rb").read()).hexdigest()
+    journal_len_after = len(migrator.journal.read_entries())
+
+    assert daily_hash_before == daily_hash_after
+    assert daily_mtime_before == daily_mtime_after
+    assert journal_len_before == journal_len_after
