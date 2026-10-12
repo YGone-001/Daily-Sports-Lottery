@@ -26,6 +26,11 @@ from utils.daily_loader import (
     save_json,
 )
 from utils.evaluation_rows import EvaluationIntegrityError, capture_evaluation_row
+from utils.ingestion_identity import (
+    CanonicalIdentityCollisionError,
+    validate_canonical_uniqueness,
+    validate_ingestion_identity,
+)
 from utils.market_coverage import has_usable_market_odds
 from utils.match_identity import is_kickoff_time_known, same_event
 from utils.match_lifecycle import (
@@ -179,13 +184,9 @@ def _admit_market_candidates(
     return admitted, rejected
 
 
+# Canonical 身份冲突异常由 utils.ingestion_identity 统一定义，这里通过上面的 import
+# 重新导出，保持既有调用方 `from utils.scraper import CanonicalIdentityCollisionError` 可用。
 
-class CanonicalIdentityCollisionError(Exception):
-    """Raised when a canonical identity collision is detected before downstream writes."""
-    def __init__(self, match_id: str, category: str, message: str):
-        super().__init__(f"Collision [{category}] for ID {match_id}: {message}")
-        self.match_id = match_id
-        self.category = category
 
 def _record_changed(before: dict, after: dict) -> bool:
     """
@@ -210,7 +211,13 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
     合并最新赛事。
     使用 same_event 做去重，严格保持旧 canonical id，通过 resolve_match_update 实施状态机。
     返回 (merged, added, updated)。
+
+    入口先执行**摄取身份预检**（``utils.ingestion_identity.validate_ingestion_identity``）：
+    批次内任何无法唯一确定 Canonical 归属的情况都整体拒绝，且该预检在**任何持久化写入之前**，
+    因此直接调用本函数的调用方同样受到 fail-closed 保护。
     """
+    validate_ingestion_identity(existing, incoming)
+
     result: list[dict] = [copy.deepcopy(m) for m in existing]
 
     id_owner: dict[str, dict] = {}
@@ -616,13 +623,28 @@ def _refresh_impl(verbose: bool = True) -> dict:
     # 5. 迁移既有 canonical 集合：剔除历史上被广泛抓取、且无盘口覆盖的赛事
     existing, legacy_removed = _prepare_existing_market_universe(matches_list)
 
+    # 5b. ★ Canonical 身份摄取预检（fail closed）
+    #     执行位置：候选构造完成之后，市场准入与**所有**下游持久化写入之前。
+    #     该预检顺序无关，且不修改任何输入；一旦发现无法唯一确定归属的批次，
+    #     直接抛出 CanonicalIdentityCollisionError -> 整批拒绝、零持久化写入。
+    validate_ingestion_identity(existing, incoming)
+
     # 6. 市场准入：已跟踪比赛接受更新；新候选必须具备可用盘口覆盖
     admitted, rejected = _admit_market_candidates(incoming, existing)
     result["sources"]["market_tracked_removed"] = legacy_removed
     result["sources"]["market_rejected"] = rejected
 
-    # 7. 合并为 canonical 跟踪集合
+    # 7. 合并为 canonical 跟踪集合（_merge 内部再次执行同一预检，属幂等附加防线）
     merged, added, updated = _merge(existing, admitted)
+
+    # 7b. Canonical ID 唯一性证明（附加防线）
+    #     在第一个下游持久化写入之前执行。不替代既有启动守卫（既有重复 ID 继续
+    #     fail closed），也不自动修复任何历史重复。
+    validate_canonical_uniqueness(
+        merged,
+        previous_ids=[m.get("id") for m in existing],
+        expected_total=len(existing) + added,
+    )
 
     # 8. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准）
     odds_snapshots_added = _capture_odds_history(merged, now=now)
