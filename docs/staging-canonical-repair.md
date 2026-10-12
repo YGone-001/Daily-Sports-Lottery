@@ -23,13 +23,51 @@ The `staging_canonical_repair.py` tool provides an auditable, deterministic, fai
 
 ## 2. Protected Path Boundaries
 
-The tool evaluates all target paths against normalized canonical paths and immediately raises `ProtectedPathViolationError` if any target path resolves into:
-- Production repository root (`program\Daily-Sports-Lottery`)
-- Production data directory (`program\Daily-Sports-Lottery\data`)
-- Historical evidence epoch archives (`_quiescent_evidence_backup_*`)
-- Path traversal sequences or junction escapes attempting to bypass directory boundaries.
+The tool resolves every target path to a canonical form (`os.path.realpath` +
+`os.path.normcase`, so symlinks, NTFS junctions and Windows case-folding are all
+resolved first) and immediately raises `ProtectedPathViolationError` if it
+resolves into any of:
+
+| Protected root | Purpose |
+| :--- | :--- |
+| `LEGACY_PROD_REPO_ROOT` (`program\Daily-Sports-Lottery`) | Historical production checkout. A *declaration*: matched by path prefix whether or not the directory exists on this host. |
+| `program\_quiescent_evidence_backup_20261010_224710` | Preserved evidence epoch 0 (immutable history). |
+| `_quiescent_evidence_backup_epoch1_20261011_014059` | Preserved evidence epoch 1 (immutable history). |
+| `SOURCE_REPO_ROOT` (dynamic) | The live Git checkout executing this code, resolved from `__file__`; also covers `SOURCE_DATA_DIR` (`<checkout>/data`) and every descendant. |
+| Any path component starting with `_quiescent_evidence_backup` | Catch-all for relocated evidence epochs. |
+
+The legacy roots are historical, machine-specific declarations and are **never
+re-pointed at the current checkout** — doing so would silently move the
+protection boundary. The dynamic roots are what protect whichever machine is
+actually running the tool, with no assumption about its directory layout.
+
+Containment is evaluated **tri-state** (`containment_relation`): `True` inside,
+`False` definitively outside (e.g. a different Windows drive), and `None`
+undeterminable. An undeterminable relation is **refused** rather than reported
+as "outside", so an unresolvable path can never silently receive write
+authorization.
+
+Also rejected: path-traversal sequences and junction/symlink escapes that would
+bypass a directory boundary, and any target that escapes the declared staging
+root.
 
 No override flag (e.g. `--allow-production`) is permitted.
+
+### Windows regression coverage
+
+`tests/test_staging_canonical_repair.py::test_ic_reg_12_windows_junction_escape_rejected`
+creates **real NTFS junctions** under `tmp_path` (never at a protected location)
+and asserts the specific rejection reason for three cases: a junction into the
+live protected checkout (including reaching `<checkout>/data` *through* it), a
+junction into a legacy protected root when that location exists, and a junction
+escaping the staging root. Junctions are removed with `os.rmdir` in a `finally`
+block; `shutil.rmtree` is never used because on this Python version a junction is
+not reported as a link and rmtree would recurse into the protected target.
+
+The test carries an explicit `skipif(os.name != "nt", ...)` marker. It is
+**skipped on Linux and must run on Windows** — `.github/workflows/ci.yml` fails
+the Windows job if that test is skipped or does not report `PASSED`. A green
+Linux-only run is never accepted as cross-platform evidence.
 
 ---
 

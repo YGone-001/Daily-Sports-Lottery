@@ -9,11 +9,14 @@ duplicate records in isolated staging replicas.
 STRICT CONSTRAINTS:
 - NEVER runs against production directories or evidence epoch archives.
 - STRICTLY rejects protected paths:
-    * Production repo: Daily-Sports-Lottery and all descendants
-    * Production DATA_DIR: Daily-Sports-Lottery/data
+    * Legacy production checkout and all descendants, including its data/
+      directory (historical, machine-specific *declaration* -- see below)
     * EPOCH_0: _quiescent_evidence_backup_20261010_224710
     * EPOCH_1: _quiescent_evidence_backup_epoch1_20261011_014059
-    * Source Git checkout: dsl-inc-i and all descendants
+    * The live source Git checkout hosting this code, resolved dynamically
+      from __file__, and all descendants
+- Path containment is tri-state; an undeterminable relation fails closed
+  rather than silently receiving write authorization.
 - Requires verified staging workspace marker and dataset binding.
 - Operates under a 7-phase crash-recovery state machine.
 - Preserves all 6 non-Canonical stores with byte-level immutability.
@@ -33,19 +36,69 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Pinned Protected Paths
-PROD_REPO_ROOT = r"C:\Users\YGone\Desktop\program\Daily-Sports-Lottery"
-EPOCH_0_ROOT = r"C:\Users\YGone\Desktop\program\_quiescent_evidence_backup_20261010_224710"
-EPOCH_1_ROOT = r"C:\Users\YGone\Desktop\_quiescent_evidence_backup_epoch1_20261011_014059"
+# =============================================================================
+# Protected Paths
+# =============================================================================
+#
+# Every protected root exists to stop one specific class of accidental write.
+# Two kinds are distinguished on purpose:
+#
+#   LEGACY roots  -- historical, machine-specific locations recorded when the
+#                    evidence epochs were captured.  They are *declarations*:
+#                    a target is refused when it resolves into one of them,
+#                    whether or not the directory currently exists on this
+#                    host.  They must never be re-pointed at the current
+#                    checkout -- doing so would silently move the protection
+#                    boundary and could authorise writes that were previously
+#                    refused.
+#
+#   DYNAMIC roots -- the checkout that is actually executing this code,
+#                    resolved from __file__.  These are what protect whichever
+#                    machine is really running the tool, with no assumption
+#                    about its directory layout.
+LEGACY_PROD_REPO_ROOT = r"C:\Users\YGone\Desktop\program\Daily-Sports-Lottery"
+LEGACY_EPOCH_0_ROOT = r"C:\Users\YGone\Desktop\program\_quiescent_evidence_backup_20261010_224710"
+LEGACY_EPOCH_1_ROOT = r"C:\Users\YGone\Desktop\_quiescent_evidence_backup_epoch1_20261011_014059"
 
-# Source repository root (the git checkout hosting this code)
+#: Backwards-compatible names.  ``tools/canonical_snapshot_adapter.py`` and the
+#: test suites import these; the semantics are unchanged.
+PROD_REPO_ROOT = LEGACY_PROD_REPO_ROOT
+EPOCH_0_ROOT = LEGACY_EPOCH_0_ROOT
+EPOCH_1_ROOT = LEGACY_EPOCH_1_ROOT
+
+#: The live checkout hosting this code (dynamic, never hardcoded) and its
+#: Canonical data directory.
 SOURCE_REPO_ROOT = os.path.realpath(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
+SOURCE_DATA_DIR = os.path.join(SOURCE_REPO_ROOT, "data")
 
-PROTECTED_ROOTS = [
-    PROD_REPO_ROOT,
-    EPOCH_0_ROOT,
-    EPOCH_1_ROOT,
+#: Declared legacy roots, checked as a group.  Membership is unchanged from the
+#: historical contract; ``PROTECTED_ROOTS`` remains the compatible alias.
+LEGACY_PROTECTED_ROOTS = [
+    LEGACY_PROD_REPO_ROOT,
+    LEGACY_EPOCH_0_ROOT,
+    LEGACY_EPOCH_1_ROOT,
 ]
+
+PROTECTED_ROOTS = LEGACY_PROTECTED_ROOTS
+
+#: Complete inventory of protected roots and the security purpose each serves.
+PROTECTED_ROOT_PURPOSES = {
+    LEGACY_PROD_REPO_ROOT: "legacy production checkout (historical declaration)",
+    LEGACY_EPOCH_0_ROOT: "preserved evidence epoch 0 (immutable history)",
+    LEGACY_EPOCH_1_ROOT: "preserved evidence epoch 1 (immutable history)",
+    SOURCE_REPO_ROOT: "live source Git checkout hosting this code (dynamic)",
+    SOURCE_DATA_DIR: "live Canonical data directory of that checkout (dynamic)",
+}
+
+
+def existing_protected_roots() -> List[str]:
+    """
+    Protected roots that currently exist as directories on this host.
+
+    A declared root that does not exist is still protected -- it simply cannot
+    be used as a real filesystem target (for example by an NTFS junction).
+    """
+    return [root for root in PROTECTED_ROOT_PURPOSES if root and os.path.isdir(root)]
 
 NON_CANONICAL_STORES = [
     "team_strength.json",
@@ -127,7 +180,15 @@ class FaultInjectionError(StagingMigrationError):
 # =============================================================================
 
 def canonicalize_path(path: str) -> str:
-    """Resolve and normalize path handling symlinks, junctions, and Windows case."""
+    """
+    Resolve and normalize a path using the host filesystem's own semantics.
+
+    ``os.path.abspath`` anchors relative paths, ``os.path.realpath`` resolves
+    symlinks and (on Windows) NTFS junctions/reparse points, and ``os.path.normcase``
+    applies the platform's case rule -- case-folding on Windows, a no-op on
+    POSIX where paths are case-sensitive.  A path that cannot be resolved raises
+    ``ProtectedPathViolationError`` rather than being passed through.
+    """
     if not path:
         return ""
     try:
@@ -135,6 +196,41 @@ def canonicalize_path(path: str) -> str:
         return os.path.normcase(os.path.normpath(real))
     except Exception as exc:
         raise ProtectedPathViolationError(f"Cannot resolve path '{path}': {exc}")
+
+
+def containment_relation(target_path: str, parent_path: str) -> Optional[bool]:
+    """
+    Tri-state directory-boundary containment.
+
+    ``True``  -- ``target_path`` is ``parent_path`` or lives beneath it.
+    ``False`` -- containment is impossible (e.g. different Windows drives).
+    ``None``  -- the relation cannot be established at all.
+
+    ``None`` exists so that security gates can fail closed.  A boolean
+    predicate alone would have to report an unresolvable relation as "outside",
+    which is precisely the answer that silently authorises a write.
+    """
+    try:
+        target_norm = canonicalize_path(target_path)
+        parent_norm = canonicalize_path(parent_path)
+    except ProtectedPathViolationError:
+        return None
+
+    if not target_norm or not parent_norm:
+        return None
+
+    if target_norm == parent_norm:
+        return True
+
+    try:
+        common = os.path.commonpath([target_norm, parent_norm])
+    except ValueError:
+        # Different Windows drives, or UNC vs. drive-letter paths: neither can
+        # ever contain the other, so this is a definite "outside".
+        return False
+    except OSError:
+        return None
+    return common == parent_norm
 
 
 def is_subpath_or_equal(target_path: str, parent_path: str) -> bool:
@@ -160,16 +256,24 @@ def assert_safe_path(
     Validate that target_path does NOT resolve into any protected production,
     evidence epoch, or source repository path.
     Also validates that target_path does not escape staging_root if provided.
+
+    Containment against every protected root is evaluated tri-state; a relation
+    that cannot be established is refused rather than treated as "outside".
     """
     if not target_path:
         raise ProtectedPathViolationError(f"Empty {context} provided.")
 
     norm = canonicalize_path(target_path)
-    norm_lower = norm.lower()
 
-    # 1. Check direct protected roots (production and preserved evidence epochs)
-    for prot in PROTECTED_ROOTS:
-        if is_subpath_or_equal(norm, prot):
+    # 1. Check declared legacy protected roots (production + evidence epochs)
+    for prot in LEGACY_PROTECTED_ROOTS:
+        relation = containment_relation(norm, prot)
+        if relation is None:
+            raise ProtectedPathViolationError(
+                f"SAFETY VIOLATION: cannot determine whether {context} '{target_path}' "
+                f"resolves inside protected root '{prot}'; refusing (fail closed)."
+            )
+        if relation:
             raise ProtectedPathViolationError(
                 f"SAFETY VIOLATION: {context} '{target_path}' resolves inside protected root '{prot}'"
             )
@@ -182,16 +286,25 @@ def assert_safe_path(
                 f"SAFETY VIOLATION: {context} '{target_path}' resolves into preserved evidence epoch!"
             )
 
-    # 3. Reject staging paths placed inside the source Git checkout (dsl-inc-i)
-    if not allow_source_repo and is_subpath_or_equal(norm, SOURCE_REPO_ROOT):
-        raise ProtectedPathViolationError(
-            f"SAFETY VIOLATION: {context} '{target_path}' is inside source repository checkout '{SOURCE_REPO_ROOT}'"
-        )
+    # 3. Reject staging paths placed inside the live source Git checkout
+    if not allow_source_repo:
+        relation = containment_relation(norm, SOURCE_REPO_ROOT)
+        if relation is None:
+            raise ProtectedPathViolationError(
+                f"SAFETY VIOLATION: cannot determine whether {context} '{target_path}' "
+                f"resolves inside source repository checkout '{SOURCE_REPO_ROOT}'; "
+                "refusing (fail closed)."
+            )
+        if relation:
+            raise ProtectedPathViolationError(
+                f"SAFETY VIOLATION: {context} '{target_path}' is inside source repository checkout '{SOURCE_REPO_ROOT}'"
+            )
 
     # 4. If staging_root is specified, verify target_path does not escape staging_root
     if staging_root:
         staging_norm = canonicalize_path(staging_root)
-        if not is_subpath_or_equal(norm, staging_norm):
+        relation = containment_relation(norm, staging_norm)
+        if relation is not True:
             raise ProtectedPathViolationError(
                 f"SAFETY VIOLATION: {context} '{target_path}' escapes staging root '{staging_root}'"
             )

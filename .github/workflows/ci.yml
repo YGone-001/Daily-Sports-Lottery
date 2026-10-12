@@ -1,10 +1,15 @@
 name: CI
 
-# Minimal offline CI: no production data, no sports-data scraping, no
-# credentials.  The repair CLI cannot mutate anything here -- every test
-# operates on synthetic fixtures under pytest's temporary directories, and a
-# production mutation additionally requires an Ed25519 owner approval signed
-# with a key that is never present in CI.
+# Cross-platform offline CI: Ubuntu and Windows, Python 3.12.
+#
+# No production data, no sports-data scraping, no credentials and no private
+# signing keys are present here.  Every test builds synthetic fixtures under
+# pytest's temporary directories, and a production mutation additionally
+# requires an Ed25519 owner approval signed with a key that CI never holds.
+#
+# The Windows runner is mandatory, not decorative: NTFS junction resolution is
+# a Windows-only code path, so a green Linux-only run must never be taken as
+# cross-platform acceptance.
 
 on:
   push:
@@ -22,12 +27,13 @@ concurrency:
 
 jobs:
   offline-tests:
-    name: Offline pytest suite (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Offline pytest suite (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.12"]
 
     steps:
@@ -49,11 +55,52 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run the complete offline test suite
+        shell: bash
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-        run: python -m pytest -q
+        run: |
+          set -o pipefail
+          python -m pytest -q -rs 2>&1 | tee "${RUNNER_TEMP:-/tmp}/pytest-output.txt"
 
-      - name: Confirm no Canonical production data was modified
+      - name: Report pytest totals
+        if: always()
+        shell: bash
+        run: |
+          OUTPUT="${RUNNER_TEMP:-/tmp}/pytest-output.txt"
+          if [ -f "$OUTPUT" ]; then
+            SUMMARY="$(tail -n 1 "$OUTPUT")"
+          else
+            SUMMARY="no pytest output produced (the test step failed before writing it)"
+          fi
+          echo "pytest [${{ matrix.os }} / Python ${{ matrix.python-version }}]: ${SUMMARY}"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### pytest - ${{ matrix.os }} / Python ${{ matrix.python-version }}"
+              echo '```'
+              echo "${SUMMARY}"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Windows NTFS junction regression must execute on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -v -rs tests/test_staging_canonical_repair.py -k "ic_reg_12_windows_junction_escape_rejected" 2>&1 | tee "${RUNNER_TEMP:-/tmp}/junction-output.txt"
+          if grep -q "SKIPPED" "${RUNNER_TEMP:-/tmp}/junction-output.txt"; then
+            echo "::error::Windows junction regression was skipped on Windows"
+            exit 1
+          fi
+          if ! grep -q "PASSED" "${RUNNER_TEMP:-/tmp}/junction-output.txt"; then
+            echo "::error::Windows junction regression did not run"
+            exit 1
+          fi
+          echo "Windows NTFS junction regression executed and passed."
+
+      - name: Confirm no repository-tracked Canonical data was modified
+        if: always()
+        shell: bash
         run: |
           if [ -n "$(git status --porcelain -- data)" ]; then
             echo "::error::data/ was modified by the test run"

@@ -44,12 +44,16 @@ from tools.staging_canonical_repair import (
     EXPECTED_CANDIDATE_SHA256,
     NON_CANONICAL_STORES,
     PROTECTED_ROOTS,
+    LEGACY_PROTECTED_ROOTS,
+    LEGACY_PROD_REPO_ROOT,
     SOURCE_REPO_ROOT,
+    SOURCE_DATA_DIR,
     PROD_REPO_ROOT,
     EPOCH_0_ROOT,
     EPOCH_1_ROOT,
     STAGING_MARKER_FILENAME,
     acquire_staging_lock,
+    containment_relation,
 )
 
 # Canonical Record A from historical evidence
@@ -910,28 +914,171 @@ def test_ic_reg_11_unmarked_staging_workspace_rejected(tmp_path):
         migrator.staging_recover()
 
 
-def test_ic_reg_12_windows_junction_escape_rejected(tmp_path):
-    """IC-REG-12: Reject Windows NTFS junction escapes into protected roots and outside staging root."""
-    if os.name == "nt":
+# NTFS junctions are a Windows-only capability.  This regression must run on a
+# real Windows host (and CI enforces that it does not skip there); simulating it
+# on POSIX would prove nothing about the reparse-point resolution being tested.
+requires_windows_junctions = pytest.mark.skipif(
+    os.name != "nt",
+    reason=(
+        "NTFS junction creation requires Windows (_winapi.CreateJunction); "
+        "the junction regression is executed on the windows-latest CI runner."
+    ),
+)
+
+
+def _remove_junction(path: str) -> None:
+    """
+    Remove a junction reparse point without ever touching its target.
+
+    ``os.rmdir`` maps to ``RemoveDirectoryW``, which deletes the reparse point
+    itself.  ``shutil.rmtree`` must never be used here: on this Python version a
+    junction is not reported as a link, so rmtree would recurse through it and
+    could delete the protected directory it points at.
+    """
+    try:
+        os.rmdir(path)
+        return
+    except OSError:
+        pass
+    try:
         import _winapi
-        junction_dir = str(tmp_path / "junctions")
-        os.makedirs(junction_dir, exist_ok=True)
-        link_to_prod = os.path.join(junction_dir, "link_to_prod")
-        _winapi.CreateJunction(PROD_REPO_ROOT, link_to_prod)
+        _winapi.RemoveDirectory(path)
+    except Exception:  # noqa: BLE001
+        pass
 
-        with pytest.raises(ProtectedPathViolationError, match="resolves inside protected root"):
-            assert_safe_path(link_to_prod)
 
-        # Also test junction escape outside staging root
+@requires_windows_junctions
+def test_ic_reg_12_windows_junction_escape_rejected(tmp_path):
+    """
+    IC-REG-12: Reject Windows NTFS junction escapes into protected roots and
+    outside the staging root.
+
+    Junctions are created only under ``tmp_path`` and always point at a target
+    that has been verified to exist, so the test carries no machine-specific
+    assumption about a historical production directory being present.
+    """
+    import _winapi
+
+    junction_dir = str(tmp_path / "junctions")
+    os.makedirs(junction_dir, exist_ok=True)
+
+    created: list = []
+    try:
+        # --- Case 1: junction into the live protected source checkout --------
+        assert os.path.isdir(SOURCE_REPO_ROOT), "protected junction target must exist"
+        link_to_source = os.path.join(junction_dir, "link_to_source_checkout")
+        _winapi.CreateJunction(SOURCE_REPO_ROOT, link_to_source)
+        created.append(link_to_source)
+
+        with pytest.raises(
+            ProtectedPathViolationError, match="is inside source repository checkout"
+        ):
+            assert_safe_path(link_to_source)
+
+        # Reaching the Canonical data directory *through* the junction is
+        # refused too -- the junction is resolved before the check.
+        with pytest.raises(ProtectedPathViolationError):
+            assert_safe_path(os.path.join(link_to_source, "data"))
+
+        # --- Case 2: junction into a declared legacy protected root ----------
+        # Only exercised when the historical location actually exists here; the
+        # declaration itself is asserted unconditionally in IC-REG-12c.
+        for index, legacy in enumerate(LEGACY_PROTECTED_ROOTS):
+            if not os.path.isdir(legacy):
+                continue
+            link_legacy = os.path.join(junction_dir, f"link_legacy_{index}")
+            _winapi.CreateJunction(legacy, link_legacy)
+            created.append(link_legacy)
+            with pytest.raises(
+                ProtectedPathViolationError, match="resolves inside protected root"
+            ):
+                assert_safe_path(link_legacy)
+
+        # --- Case 3: junction escaping the staging root ----------------------
         target_outside = str(tmp_path / "outside_dir")
         os.makedirs(target_outside, exist_ok=True)
         staging_dir = str(tmp_path / "staging_box")
         os.makedirs(staging_dir, exist_ok=True)
         link_outside = os.path.join(staging_dir, "junction_escape")
         _winapi.CreateJunction(target_outside, link_outside)
+        created.append(link_outside)
 
         with pytest.raises(ProtectedPathViolationError, match="escapes staging root"):
             assert_safe_path(link_outside, staging_root=staging_dir)
+    finally:
+        for link in created:
+            _remove_junction(link)
+
+    # Temporary resources are gone and the staging box holds no reparse points.
+    for link in created:
+        assert not os.path.exists(link)
+
+
+def test_ic_reg_12b_live_checkout_is_protected_dynamically():
+    """
+    IC-REG-12b: The checkout that is actually executing this code is protected,
+    resolved from __file__ rather than from any hardcoded machine layout.
+    """
+    assert SOURCE_REPO_ROOT, "SOURCE_REPO_ROOT must resolve"
+    assert os.path.isdir(SOURCE_REPO_ROOT)
+    assert os.path.normcase(os.path.realpath(SOURCE_REPO_ROOT)) == os.path.normcase(
+        os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+
+    for target in (
+        SOURCE_REPO_ROOT,
+        SOURCE_DATA_DIR,
+        os.path.join(SOURCE_REPO_ROOT, "data", "daily_matches.json"),
+        os.path.join(SOURCE_REPO_ROOT, "tools", "staging_canonical_repair.py"),
+    ):
+        with pytest.raises(
+            ProtectedPathViolationError, match="is inside source repository checkout"
+        ):
+            assert_safe_path(target)
+
+
+def test_ic_reg_12c_legacy_roots_remain_declared_protections():
+    """
+    IC-REG-12c: Legacy production and evidence-epoch roots stay protected as
+    declarations -- matched by path prefix whether or not they exist here -- and
+    are never silently redefined as the current development checkout.
+    """
+    assert PROTECTED_ROOTS == LEGACY_PROTECTED_ROOTS
+
+    for legacy in LEGACY_PROTECTED_ROOTS:
+        assert legacy in PROTECTED_ROOTS
+        # Never re-pointed at the live checkout.
+        assert canonicalize_path(legacy) != canonicalize_path(SOURCE_REPO_ROOT)
+
+        for target in (legacy, os.path.join(legacy, "data")):
+            with pytest.raises(
+                ProtectedPathViolationError, match="resolves inside protected root"
+            ):
+                assert_safe_path(target)
+
+        # Case variants and separator variants normalize to the same root.
+        for variant in (legacy.lower(), legacy.replace("\\", "/")):
+            with pytest.raises(ProtectedPathViolationError):
+                assert_safe_path(variant)
+
+
+def test_ic_reg_12d_containment_is_tri_state_and_fails_closed(tmp_path, monkeypatch):
+    """
+    IC-REG-12d: An undeterminable containment relation must be refused, never
+    reported as "outside" and thereby silently authorized.
+    """
+    import tools.staging_canonical_repair as mod
+
+    # Undeterminable: an empty canonical form.
+    assert containment_relation("", LEGACY_PROD_REPO_ROOT) is None
+    # Definite.
+    assert containment_relation(SOURCE_REPO_ROOT, SOURCE_REPO_ROOT) is True
+    assert containment_relation(str(tmp_path / "elsewhere"), SOURCE_REPO_ROOT) is False
+
+    # The gate refuses rather than authorizing when resolution is impossible.
+    monkeypatch.setattr(mod, "canonicalize_path", lambda _p: "")
+    with pytest.raises(ProtectedPathViolationError, match="fail closed"):
+        mod.assert_safe_path("/anywhere/at/all")
 
 
 def test_ic_reg_13_immutable_store_mutation_rejected_in_recovery(tmp_path):
