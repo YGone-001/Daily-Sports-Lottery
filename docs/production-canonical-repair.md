@@ -3,7 +3,8 @@
 **Tool Path**: `tools/production_canonical_repair.py`
 **Test Suite**: `tests/test_production_canonical_repair.py`
 **Scope**: `PRODUCTION_CANONICAL_DEDUP`
-**Governance Status**: `PRODUCTION_REPAIR_AUTHORIZATION = GRANTED_VIA_SIGNED_ARTIFACT`
+**Authorization schema**: `2.0.0` (Ed25519 signed owner approval)
+**Governance Status**: `PRODUCTION_REPAIR_AUTHORIZATION = GRANTED_ONLY_BY_SIGNED_OWNER_APPROVAL`
 
 ---
 
@@ -36,14 +37,81 @@ identity -- and refuses everything else.
 
 ---
 
-## 2. Safety model
+## 2. Trust boundary: preparation is not approval
 
-1. **Owner authorization artifact.** No write occurs without a signed authorization
-   whose `data_dir`, `expected_source_sha256`, `target_canonical_id` and
-   `expected_candidate_sha256` all bind to the exact live dataset. Any drift fails
-   closed before a single byte is written.
-2. **Explicit confirmation.** `apply` additionally requires `--confirm-apply`, and the
-   `--operator` must match the operator recorded in the artifact.
+The critical property of this tool is that **preparing** a repair and **approving** a
+repair are different acts performed by different parties.
+
+```
+  operator                     owner (private key, offline)
+     |                                   |
+     | 1. prepare  --> prepared.json      |   (unsigned; authorized: false)
+     |                                   |
+     | 2. approve  <--------------------> |   (Ed25519 sign over canonical payload)
+     |        \--> authorization.json     |   (authorized: true; approval block)
+     |
+     | 3. apply --trusted-public-key <owner public key>
+```
+
+1. `prepare` is read-only and derives the exact expected source hash, source record
+   count and candidate hash for one collision. Its artifact carries
+   `"authorized": false` and `"approval": null`. **It grants nothing.**
+2. `approve` signs the artifact's canonical payload with an Ed25519 key the owner holds
+   **outside the repository**. The signature is detached and covers the whole artifact
+   minus its `approval` block.
+3. `apply` accepts the artifact only if that signature verifies against a *separately
+   provisioned* trusted public key **and** the artifact is explicitly marked
+   `"authorized": true`.
+
+A SHA-256 fingerprint is an integrity check, not an authentication primitive. The
+artifact's `authorization_sha256` exists solely to tie a journal entry to the exact
+artifact it recorded -- it never authorizes anything.
+
+### Signed bindings
+
+The canonical payload is the artifact minus `approval`, serialized with
+`ensure_ascii=False, sort_keys=True, separators=(",", ":")` and UTF-8 encoded. A valid
+signature therefore binds:
+
+| Binding | Field |
+| :--- | :--- |
+| Repair scope | `scope` |
+| Canonical target ID | `target_canonical_id` |
+| Canonical source SHA-256 | `expected_source_sha256` |
+| Expected candidate SHA-256 | `expected_candidate_sha256` |
+| Expected source record count | `expected_source_total` |
+| Canonical data directory | `data_dir` |
+| Migration ID | `migration_id` |
+| Approver identity | `operator` |
+| Authorization purpose | `purpose` |
+| Declaration time / justification | `approved_at`, `reason` |
+
+### Key handling
+
+- `keygen` provisions a fresh Ed25519 keypair. It **refuses any private-key path inside
+  the repository or the application workspace.**
+- The private key is never generated, read from, or persisted inside the repository.
+- Only the public half is distributed; `apply` / `verify` / `recover` require it as
+  `--trusted-public-key`.
+- If the `cryptography` backend is unavailable, signature verification raises. The tool
+  never silently degrades to "trusted".
+
+### Schema migration
+
+Schema `1.0.0` artifacts asserted `"authorized": true` with no signature at all. They are
+**permanently barred**: `load_authorization` rejects them with an explicit message. Any
+authorization must be re-prepared and re-approved under schema `2.0.0`.
+
+---
+
+## 3. Safety model
+
+1. **Signed owner approval.** No write occurs without an Ed25519 approval whose bound
+   fields (table above) all match the exact live dataset. Any drift fails closed before a
+   single byte is written.
+2. **Mandatory operator identity.** `apply` and `recover` require an explicit
+   `--operator`, and it must equal the approver recorded in the signed artifact. A
+   missing or mismatched operator is refused.
 3. **Refusal of preserved evidence.** Evidence-epoch archives
    (`_quiescent_evidence_backup*`) and filesystem/drive roots are rejected.
 4. **Workspace containment.** The journal/archive/output workspace must be neither
@@ -56,14 +124,39 @@ identity -- and refuses everything else.
    discovered at runtime, so the tool keeps working as the live dataset grows.
 7. **Independently derived postconditions.** The expected projected file bytes are
    re-derived from the archived raw source rather than trusted from the active file.
+8. **No bypass switches.** There is deliberately no `--force`, `--skip-verification`,
+   `--ignore-hash`, `--allow-unsigned` or `--allow-production-without-approval`.
+9. **Test-only fault hooks.** The deterministic crash hooks used by the suite are gated
+   behind an in-process flag that the production CLI cannot reach: there is no flag, no
+   environment variable and no argument that arms them.
 
 ---
 
-## 3. Seven-phase transaction state machine
+## 4. Read-only semantics (exact)
+
+| Command | Reads data dir | Writes data dir | Writes elsewhere |
+| :--- | :--- | :--- | :--- |
+| `inspect` | yes | **no** | nothing |
+| `verify-authorization` | no | **no** | nothing |
+| `verify` | yes | **no** | nothing |
+| `dry-run` | yes | **no** | one preview artifact in `<workspace>/output/` |
+| `prepare` | yes | **no** | the artifact at `--out` |
+| `approve` | no | **no** | the signed artifact at `--out` |
+| `keygen` | no | **no** | the keypair at the given paths |
+| `apply` | yes | **yes** (journal, archive, Canonical file) | result artifact in `<workspace>/output/` |
+| `recover` | yes | **yes** (journal; Canonical file only on rollback) | nothing |
+
+`dry-run` is **not** globally zero-write: it writes an external preview artifact and says
+so in its result (`"read_only_data_dir": true`, `"writes_external_artifact": true`).
+The live data directory is never modified by `inspect`, `dry-run` or `verify`.
+
+---
+
+## 5. Seven-phase transaction state machine
 
 ```text
 [1. PREPARED]
-      |  lock acquired; authorization bound; pre-store hashes + N recorded
+      |  lock acquired; signed authorization bound; pre-store hashes + N recorded
       v
 [2. EVIDENCE_VERIFIED]
       |  exactly one collision group == target; exactly 2 records;
@@ -93,12 +186,70 @@ Fault boundaries are resolvable by `recover`:
 - **At `COMMIT_INTENT_DURABLE`, file still baseline** -> `RECOVERED_ROLLED_BACK`
   (restored byte-identically from the forensic archive).
 - **At/after `PROJECTION_COMMITTED`, file already projected** ->
-  `RECOVERED_FORWARD_COMPLETED`.
+  `RECOVERED_FORWARD_COMPLETED`, but only after the full postcondition contract passes.
 - **Any unrecognised file hash** -> fails closed with `RecoveryStateError`; no write.
 
 ---
 
-## 4. Enforced postconditions
+## 6. Recovery integrity
+
+`recover` can rewrite the Canonical file, so it is treated as a mutation:
+
+1. **Immutable-store drift is checked first.** A mutated non-Canonical store voids the
+   whole transaction (`ImmutableStoreMutationError`).
+2. **The transaction must be authenticated.** Recovery requires the same signed
+   authorization and explicit `--operator`; the journal must carry the matching
+   migration ID and the matching `authorization_sha256`. Unrelated or forged journal
+   state is refused.
+3. **Evidence is verified before mutation.** The forensic archive raw bytes must hash to
+   the pre-state fingerprint recorded at `PREPARED`.
+4. **Fingerprints are independently derived.** The expected projected file hash is
+   recomputed from the archived raw source. If the journal's recorded
+   `projected_file_sha256` disagrees, recovery refuses (`forged or stale journal state`).
+5. **Fail-closed UNKNOWN is preserved.** If the active file matches neither the
+   independently derived source nor the independently derived projection, recovery
+   raises and writes nothing.
+6. **No false completion.** The forward path builds the terminal journal entries in
+   memory and runs the full postcondition contract over that planned chain *before* the
+   `COMPLETION_RECORDED` entry is allowed to become durable.
+7. **Evidence is never discarded.** Recovery never deletes the forensic archive.
+
+---
+
+## 7. Verification contract
+
+Two deliberately distinct contracts exist, and a successful basic inspection is **never**
+reported as a successful repair verification.
+
+### A. Dataset integrity inspection (`inspect`, `inspect_dataset`)
+
+Canonical schema validity, match count, duplicate-ID detection, basic record consistency.
+Result is labelled `"verification": "DATASET_INTEGRITY_INSPECTION"` and carries
+`"verified": false, "repair_verified": false`.
+
+### B. Full repair postcondition verification (`verify`)
+
+Requires a signed authorization and the trusted public key, and verifies:
+
+| # | Element |
+| :--- | :--- |
+| 1 | Verified authorization binding (signature, directory, ids, purpose) |
+| 2 | Archived source fingerprint equals the authorized source hash |
+| 3 | Projected-file fingerprint independently derived from the archive |
+| 4 | Candidate record fingerprint re-derived from archived bytes |
+| 5 | `N -> N-1` cardinality against the authorized source count |
+| 6 | Unrelated record preservation (byte-identical, original order) |
+| 7 | Six immutable-store hashes unchanged |
+| 8 | Journal chain valid and terminal at `COMPLETION_RECORDED` |
+| 9 | Forensic manifest, evidence records and migration identity |
+
+Missing or unverifiable evidence raises `IncompleteVerificationError`; the CLI reports
+exit code `107` and the JSON result carries `"complete": false`. Strict verification is
+never silently downgraded.
+
+---
+
+## 8. Enforced postconditions
 
 | # | Invariant |
 | :--- | :--- |
@@ -115,7 +266,7 @@ Fault boundaries are resolvable by `recover`:
 
 ---
 
-## 5. Field synthesis policy ("Owner Decision A", generalized)
+## 9. Field synthesis policy ("Owner Decision A", generalized)
 
 The candidate is synthesized deterministically, then **must** match the authorized hash:
 
@@ -133,59 +284,87 @@ number `4004` and the closing odds from the live-score alias.
 
 ---
 
-## 6. CLI reference
+## 10. CLI reference
 
 ```bash
-# Read-only: what collisions exist?
+# Read-only: what collisions exist?  (dataset integrity inspection)
 python -m tools.production_canonical_repair inspect --data-dir <data_dir>
 
-# Read-only: build the signed authorization artifact (the owner decision)
-python -m tools.production_canonical_repair authorize \
+# Provision an owner Ed25519 keypair OUTSIDE the repository (once per owner)
+python -m tools.production_canonical_repair keygen \
+  --private-key-out ~/keys/canonical-owner.pem \
+  --public-key-out  ~/keys/canonical-owner.pub.pem
+
+# Read-only: build the UNSIGNED preparation artifact (grants nothing)
+python -m tools.production_canonical_repair prepare \
   --data-dir <data_dir> --target-id <canonical_id> \
   --operator <name> --reason "<justification>" \
+  --out <prepared.json>
+
+# Owner approval: sign with the external private key
+python -m tools.production_canonical_repair approve \
+  --prepared <prepared.json> --private-key ~/keys/canonical-owner.pem \
   --out <authorization.json>
+
+# Read-only: confirm the approval verifies against the pinned public key
+python -m tools.production_canonical_repair verify-authorization \
+  --authorization <authorization.json> \
+  --trusted-public-key ~/keys/canonical-owner.pub.pem
 
 # Read-only: preview the projection, diff and projected cardinality
 python -m tools.production_canonical_repair dry-run \
-  --data-dir <data_dir> --authorization <authorization.json> [--workspace <dir>]
+  --data-dir <data_dir> --authorization <authorization.json> \
+  --trusted-public-key ~/keys/canonical-owner.pub.pem [--workspace <dir>]
 
 # Execute the guarded repair
 python -m tools.production_canonical_repair apply \
   --data-dir <data_dir> --authorization <authorization.json> \
-  --workspace <dir> --operator <name> --confirm-apply
+  --workspace <dir> --operator <name> \
+  --trusted-public-key ~/keys/canonical-owner.pub.pem --confirm-apply
 
-# Read-only postcondition audit
+# Read-only FULL repair postcondition audit
 python -m tools.production_canonical_repair verify \
-  --data-dir <data_dir> [--authorization <authorization.json>]
+  --data-dir <data_dir> --authorization <authorization.json> \
+  --trusted-public-key ~/keys/canonical-owner.pub.pem \
+  --operator <name> [--workspace <dir>]
 
-# Resolve an interrupted repair
+# Resolve an interrupted repair (authenticated mutation)
 python -m tools.production_canonical_repair recover \
-  --data-dir <data_dir> --workspace <dir>
+  --data-dir <data_dir> --workspace <dir> \
+  --authorization <authorization.json> \
+  --trusted-public-key ~/keys/canonical-owner.pub.pem --operator <name>
 ```
 
-Exit codes: `0` success, `101` safety violation, `102` precondition failure,
-`103` lock busy, `104` immutable-store mutation, `106` recovery failure,
-`110` authorization failure.
+Exit codes: `0` success, `1` verification failed / unexpected error, `101` safety
+violation, `102` precondition failure, `103` lock busy, `104` immutable-store mutation,
+`106` recovery failure, `107` incomplete verification, `110` authorization failure,
+`112` signature verification failure.
 
 Default workspace: `<parent_of_data_dir>/repair_runs/<migration_id>` (git-ignored).
 
 ---
 
-## 7. Recovery procedure for the recorded incident
+## 11. Recovery procedure for the recorded incident
 
 ```bash
 python -m tools.production_canonical_repair inspect --data-dir data
-python -m tools.production_canonical_repair authorize \
+python -m tools.production_canonical_repair prepare \
   --data-dir data --target-id 500l-2026-10-09-1362422 \
   --operator <name> --reason "legacy canonical duplicate blocking refresh" \
+  --out repair_runs/prepared.json
+# --- hand prepared.json to the owner; they sign it offline ---
+python -m tools.production_canonical_repair approve \
+  --prepared repair_runs/prepared.json --private-key <owner-key.pem> \
   --out repair_runs/authorization.json
 python -m tools.production_canonical_repair dry-run \
-  --data-dir data --authorization repair_runs/authorization.json
+  --data-dir data --authorization repair_runs/authorization.json \
+  --trusted-public-key <owner-public.pem>
 python -m tools.production_canonical_repair apply \
   --data-dir data --authorization repair_runs/authorization.json \
-  --operator <name> --confirm-apply
+  --operator <name> --trusted-public-key <owner-public.pem> --confirm-apply
 python -m tools.production_canonical_repair verify \
-  --data-dir data --authorization repair_runs/authorization.json
+  --data-dir data --authorization repair_runs/authorization.json \
+  --operator <name> --trusted-public-key <owner-public.pem>
 ```
 
 The running application does not need to be restarted: the Canonical file is re-read on
@@ -193,24 +372,30 @@ every refresh.
 
 ---
 
-## 8. Testing
+## 12. Testing
 
 ```bash
-python -m pytest -v tests/test_production_canonical_repair.py
+python -m pytest -q tests/test_production_canonical_repair.py
+python -m pytest -q tests/
 ```
 
 The suite is fully offline and portable: synthetic fixtures are generated in a temporary
-directory, so it never touches `data/`. It covers safety refusals, authorization
-binding, read-only guarantees, the happy path with every postcondition, idempotency,
-lock contention, immutable-store protection, fault injection and all recovery branches.
+directory, so it never touches `data/`. It covers the authorization trust boundary
+(unsigned, forged, tampered, untrusted-key, legacy-schema and missing-key artifacts),
+mandatory operator identity, CLI bypass rejection, read-only guarantees, the happy path
+with every postcondition, idempotency, lock contention, immutable-store protection,
+inspection-vs-verification separation, and all recovery branches.
+
+`cryptography` is required for the signature tests (it is declared in
+`requirements.txt`).
 
 ---
 
-## 9. Relationship to the staging tools
+## 13. Relationship to the staging tools
 
 The staging tools remain the correct instrument for rehearsing a repair against an
 isolated replica. This production tool is the only sanctioned way to apply one to the
-live dataset, and it is the one that carries an explicit owner authorization. All three
+live dataset, and it is the one that carries an explicit signed owner approval. All three
 share one evidence language: `hash_record`, `serialize_record`, `sha256_file` and
 `valid_full_time_score` are imported from `tools/staging_canonical_repair.py`, so a
 record hashes identically everywhere.

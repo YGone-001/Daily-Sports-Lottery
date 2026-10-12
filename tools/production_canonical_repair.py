@@ -24,20 +24,40 @@ and refuses anything else.
 
 SAFETY MODEL
 ------------
-1.  No write happens without an explicit *authorization artifact* whose
-    ``data_dir``, ``expected_source_sha256``, ``target_canonical_id`` and
-    ``expected_candidate_sha256`` all bind to the exact live dataset.  Any drift
+1.  No write happens without a *signed owner approval* whose ``data_dir``,
+    ``expected_source_sha256``, ``expected_source_total``,
+    ``target_canonical_id``, ``expected_candidate_sha256``, ``migration_id``,
+    ``operator`` and ``purpose`` all bind to the exact live dataset.  Any drift
     fails closed before a single byte is written.
-2.  ``apply`` additionally requires ``--confirm-apply`` and an ``--operator``
-    matching the artifact.
-3.  Evidence-epoch archives are refused; the workspace must live outside the
+2.  Preparation and approval are separate steps.  ``prepare`` emits an
+    *unsigned* artifact (``authorized: false``) that grants nothing; only an
+    Ed25519 signature -- produced with an owner key held outside the repository
+    and verified against a separately provisioned trusted public key -- can
+    raise it to ``authorized: true``.  A SHA-256 fingerprint is integrity, not
+    authentication, so it never authorizes anything.
+3.  ``apply`` additionally requires ``--confirm-apply``, an explicit
+    ``--operator`` matching the approver, and the trusted public key.
+4.  Evidence-epoch archives are refused; the workspace must live outside the
     data directory.
-4.  The very same ``.refresh.lock`` byte-range lock used by ``utils.scraper``
+5.  The very same ``.refresh.lock`` byte-range lock used by ``utils.scraper``
     is held for the whole transaction, so a concurrent refresh cannot interleave.
-5.  Seven-phase journal, forensic archive, atomic ``os.replace`` and crash
-    recovery with fail-closed UNKNOWN classification.
-6.  Postconditions are re-derived from the archived raw bytes rather than
+6.  Seven-phase journal, forensic archive, atomic ``os.replace`` and crash
+    recovery with fail-closed UNKNOWN classification.  Recovery is itself a
+    mutation, so it requires the same signed authorization and operator.
+7.  Postconditions are re-derived from the archived raw bytes rather than
     trusted from the active file.
+8.  Deterministic fault hooks exist for tests only and are unreachable from the
+    production command surface.
+
+READ-ONLY SEMANTICS
+-------------------
+``inspect`` reads the data directory and writes nothing at all.
+``dry-run`` reads the data directory and writes one preview artifact to
+``<workspace>/output/`` -- it is *not* globally zero-write and reports so.
+``verify`` / ``verify-authorization`` are strictly read-only.
+``prepare`` / ``approve`` write only to the operator-chosen output path.
+``apply`` / ``recover`` write the journal, the forensic archive and, finally,
+the Canonical file itself.
 
 The cryptographic and serialization primitives (``hash_record``,
 ``serialize_record``, ``sha256_file``, ``valid_full_time_score``) are imported
@@ -47,12 +67,14 @@ language -- the same record must hash the same way everywhere.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter
 import copy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
+import stat
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,17 +116,52 @@ NON_CANONICAL_STORES: List[str] = [
 
 ALL_STORES: List[str] = NON_CANONICAL_STORES + [CANONICAL_FILE]
 
-AUTHORIZATION_SCHEMA_VERSION = "1.0.0"
+#: Schema ``2.0.0`` separates *preparation* (an unsigned, reviewable artifact)
+#: from *approval* (an Ed25519 detached signature produced by an owner-held
+#: private key).  Schema ``1.0.0`` artifacts carried ``authorized: true`` with no
+#: signature at all and are therefore permanently barred from authorizing a
+#: production mutation.
+AUTHORIZATION_SCHEMA_VERSION = "2.0.0"
+LEGACY_AUTHORIZATION_SCHEMA_VERSIONS: List[str] = ["1.0.0"]
 REPAIR_SCOPE = "PRODUCTION_CANONICAL_DEDUP"
 
+#: The authorization purpose is signed, so an approval granted for one class of
+#: action can never be replayed against another.
+AUTHORIZATION_PURPOSE = "PRODUCTION_CANONICAL_DEDUP_APPLY"
+
+#: Established signature mechanism (RFC 8032 Ed25519 via ``cryptography``).
+#: No bespoke cryptography is implemented anywhere in this module.
+APPROVAL_ALGORITHM = "ed25519"
+APPROVAL_FIELD = "approval"
+APPROVAL_PUBLIC_KEY_BYTES = 32
+APPROVAL_SIGNATURE_BYTES = 64
+
 AUTHORIZATION_REQUIRED_FIELDS: List[str] = [
+    "migration_id",
     "data_dir",
     "target_canonical_id",
     "expected_source_sha256",
+    "expected_source_total",
     "expected_candidate_sha256",
     "operator",
     "approved_at",
     "reason",
+    "purpose",
+]
+
+#: Every field an owner approval must bind.  The signed payload covers the whole
+#: artifact minus the ``approval`` block, so this list is documentation of the
+#: required bindings rather than an allow-list of what is covered.
+AUTHORIZATION_BOUND_FIELDS: List[str] = [
+    "scope",
+    "target_canonical_id",
+    "expected_source_sha256",
+    "expected_candidate_sha256",
+    "expected_source_total",
+    "data_dir",
+    "migration_id",
+    "operator",
+    "purpose",
 ]
 
 EVIDENCE_EPOCH_PREFIX = "_quiescent_evidence_backup"
@@ -112,6 +169,12 @@ EVIDENCE_EPOCH_PREFIX = "_quiescent_evidence_backup"
 DEFAULT_WORKSPACE_DIRNAME = "repair_runs"
 
 MISSING = "MISSING"
+
+#: Two deliberately distinct verification contracts.  A successful dataset
+#: integrity inspection must never be reported as a successful repair
+#: verification.
+DATASET_INTEGRITY_INSPECTION = "DATASET_INTEGRITY_INSPECTION"
+FULL_REPAIR_VERIFICATION = "FULL_REPAIR_POSTCONDITION_VERIFICATION"
 
 #: Seven-phase production transaction sequence.  Phase 3 is named for what it
 #: actually authorizes here -- a *production* repair -- rather than reusing the
@@ -126,6 +189,30 @@ JOURNAL_STATES: List[str] = [
     "COMPLETION_RECORDED",
 ]
 
+#: Deterministic failure hooks exist so crash recovery can be exercised without
+#: killing a process.  They are *test-only*: the production command surface
+#: exposes no flag, no environment variable and no argument that can arm them,
+#: and ``apply`` refuses any ``fault_inject`` value while this gate is closed.
+#: Only ``fault_injection_enabled()`` -- a context manager tests import directly
+#: -- can open it.
+_FAULT_INJECTION_GATE: Dict[str, bool] = {"enabled": False}
+
+
+@contextmanager
+def fault_injection_enabled():
+    """Test-only: arm the deterministic fault hooks for the enclosed block."""
+    previous = _FAULT_INJECTION_GATE["enabled"]
+    _FAULT_INJECTION_GATE["enabled"] = True
+    try:
+        yield
+    finally:
+        _FAULT_INJECTION_GATE["enabled"] = previous
+
+
+def fault_injection_armed() -> bool:
+    """Whether the test-only fault hooks are currently armed."""
+    return bool(_FAULT_INJECTION_GATE["enabled"])
+
 
 # =============================================================================
 # Exceptions
@@ -134,6 +221,23 @@ JOURNAL_STATES: List[str] = [
 class AuthorizationError(StagingMigrationError):
     """Raised when the owner authorization artifact is missing, malformed, or
     does not bind to the live dataset."""
+    pass
+
+
+class SignatureVerificationError(AuthorizationError):
+    """Raised when an approval signature is absent, malformed, untrusted or does
+    not verify against the canonical signed payload."""
+    pass
+
+
+class IncompleteVerificationError(StagingMigrationError):
+    """Raised when the evidence required for *full repair postcondition*
+    verification is missing or unverifiable.
+
+    This is deliberately distinct from a plain failure: it signals that the
+    question could not be answered, so callers must never report a successful
+    basic inspection as a successful full repair verification.
+    """
     pass
 
 
@@ -349,15 +453,24 @@ class RepairJournal:
         if writable:
             os.makedirs(os.path.dirname(self.journal_file), exist_ok=True)
 
-    def append_entry(self, state: str, payload: dict) -> None:
+    @staticmethod
+    def build_entry(state: str, payload: dict) -> dict:
+        """Construct a journal entry without writing it.
+
+        Lets recovery validate the complete chain -- including the terminal
+        entry it is about to append -- before that entry becomes durable.
+        """
         if state not in JOURNAL_STATES:
             raise StagingMigrationError(f"Unknown state: {state}")
-        os.makedirs(os.path.dirname(self.journal_file), exist_ok=True)
-        entry = {
+        return {
             "state": state,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "payload": payload,
         }
+
+    def append_entry(self, state: str, payload: dict) -> None:
+        entry = self.build_entry(state, payload)
+        os.makedirs(os.path.dirname(self.journal_file), exist_ok=True)
         with open(self.journal_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
             fh.flush()
@@ -485,7 +598,16 @@ class RepairJournal:
             raise RecoveryStateError("COMPLETION_RECORDED must be the final journal entry")
 
     def get_latest_valid_state(self) -> Optional[str]:
-        for entry in reversed(self.read_entries()):
+        return self.latest_valid_state(self.read_entries())
+
+    @staticmethod
+    def latest_valid_state(entries: List[dict]) -> Optional[str]:
+        """Latest journalled state in a *given* entry list.
+
+        Recovery needs to reason about the chain it is about to write, not the
+        chain that is currently on disk.
+        """
+        for entry in reversed(entries):
             if entry.get("state") in JOURNAL_STATES:
                 return entry.get("state")
         return None
@@ -534,6 +656,9 @@ def inspect_dataset(data_dir: str) -> dict:
         store_hashes[store] = sha256_file(path) if os.path.exists(path) else MISSING
 
     return {
+        "verification": DATASET_INTEGRITY_INSPECTION,
+        "read_only_data_dir": True,
+        "writes_external_artifact": False,
         "data_dir": norm,
         "total_matches": len(matches),
         "unique_ids_count": len(id_counts),
@@ -604,38 +729,442 @@ def default_migration_id(target_canonical_id: str) -> str:
 
 
 # =============================================================================
-# Authorization artifact
+# Authorization: preparation vs. approval (Ed25519 trust boundary)
 # =============================================================================
+#
+# TRUST BOUNDARY
+# --------------
+# ``prepare`` is a read-only convenience.  It derives the exact expected source
+# hash, source record count and candidate hash for one collision and packages
+# them into an artifact whose ``authorized`` flag is ``false`` and whose
+# ``approval`` block is ``null``.  That artifact grants nothing: possession of a
+# preparation artifact is not permission to mutate production.
+#
+# ``approve`` is the owner decision.  It signs the artifact's canonical payload
+# with an Ed25519 key the owner holds outside the repository.  Only a signature
+# that verifies against a *separately provisioned* trusted public key can raise
+# an artifact to ``authorized: true``.
+#
+# A SHA-256 fingerprint is an integrity check, not an authentication primitive.
+# ``authorization_fingerprint`` therefore exists only to tie a journal entry to
+# the exact artifact it recorded -- never as evidence of owner intent.
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _crypto_backend() -> Dict[str, Any]:
+    """
+    Import the established Ed25519 implementation, or fail closed.
+
+    No bespoke cryptography is implemented in this module: Ed25519 comes from
+    ``cryptography`` (PyCA).  If the backend is unavailable, every signature
+    check raises, so an artifact can never be *silently* treated as trusted.
+    """
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+            Ed25519PublicKey,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise SignatureVerificationError(
+            "Ed25519 verification backend ('cryptography') is unavailable; refusing to "
+            "treat any authorization artifact as trusted."
+        ) from exc
+    return {
+        "InvalidSignature": InvalidSignature,
+        "serialization": serialization,
+        "Ed25519PrivateKey": Ed25519PrivateKey,
+        "Ed25519PublicKey": Ed25519PublicKey,
+    }
+
+
+def public_key_id(raw_public_key: bytes) -> str:
+    """Stable identifier for a trusted public key: ``sha256:<hex>``."""
+    return "sha256:" + sha256_bytes(raw_public_key)
+
+
+def authorization_signing_payload(authorization: dict) -> bytes:
+    """
+    Deterministic canonical payload for the owner approval signature.
+
+    The payload is the artifact *minus* its ``approval`` block, serialized with
+    sorted keys, no insignificant whitespace and UTF-8 encoding.  A signature is
+    therefore bound to every declared field -- repair scope, canonical target
+    ID, source SHA-256, candidate SHA-256, expected source record count,
+    canonical data directory, migration ID, approver identity, authorization
+    purpose, approval timestamp and justification.
+    """
+    body = {k: v for k, v in authorization.items() if k != APPROVAL_FIELD}
+    text = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return text.encode("utf-8")
+
 
 def authorization_fingerprint(authorization: dict) -> str:
+    """Integrity fingerprint of the whole artifact (journal binding only)."""
     return sha256_bytes(serialize_record(authorization).encode("utf-8"))
 
 
-def load_authorization(path: str) -> dict:
+# --- owner key provisioning -------------------------------------------------
+
+def _assert_private_key_path_is_external(path: str) -> str:
+    """
+    A production private signing key may never be generated into, or loaded
+    from, the repository or the application workspace.
+    """
+    if not path or not str(path).strip():
+        raise AuthorizationError("A private signing key path is required")
+    norm = canonicalize_path(path)
+    if is_subpath_or_equal(norm, REPO_ROOT):
+        raise AuthorizationError(
+            "Refusing to use a private signing key stored inside the repository "
+            f"({REPO_ROOT}). Provision the owner key outside the repository and the "
+            "application workspace, and share only the public half with this tool."
+        )
+    return norm
+
+
+def generate_signing_keypair(
+    private_key_path: str,
+    public_key_path: str,
+) -> Dict[str, str]:
+    """
+    Provision a fresh Ed25519 owner keypair **outside** the repository.
+
+    Writes the PKCS#8 private key (owner-held, never committed) and the
+    SubjectPublicKeyInfo public key (safe to distribute / pin as trusted).
+    """
+    backend = _crypto_backend()
+    serialization = backend["serialization"]
+
+    private_norm = _assert_private_key_path_is_external(private_key_path)
+    if not public_key_path or not str(public_key_path).strip():
+        raise AuthorizationError("A public key output path is required")
+
+    private_key = backend["Ed25519PrivateKey"].generate()
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    for target, blob in ((private_norm, private_pem), (canonicalize_path(public_key_path), public_pem)):
+        directory = os.path.dirname(target) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_key_", suffix=".pem")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
+            os.replace(tmp_path, target)
+        except BaseException:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    raw_public = _raw_public_key_from_pem(public_pem)
+    return {
+        "private_key_path": private_norm,
+        "public_key_path": canonicalize_path(public_key_path),
+        "key_id": public_key_id(raw_public),
+        "algorithm": APPROVAL_ALGORITHM,
+    }
+
+
+def _raw_public_key_from_pem(public_pem: bytes) -> bytes:
+    backend = _crypto_backend()
+    serialization = backend["serialization"]
+    try:
+        key = serialization.load_pem_public_key(public_pem)
+    except Exception as exc:  # noqa: BLE001
+        raise SignatureVerificationError(f"Cannot parse trusted public key: {exc}") from exc
+    if not isinstance(key, backend["Ed25519PublicKey"]):
+        raise SignatureVerificationError(
+            "Trusted public key is not an Ed25519 public key; refusing to trust it."
+        )
+    return key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def load_trusted_public_key(path: str) -> Dict[str, Any]:
+    """
+    Load the separately provisioned trusted public key.
+
+    Rejects an unavailable, unreadable, malformed or non-Ed25519 key: an
+    unverifiable approval must never be treated as verified.
+    """
+    if not path or not str(path).strip():
+        raise SignatureVerificationError(
+            "A trusted public key is required to verify an owner approval; none was provided."
+        )
+    if not os.path.isfile(path):
+        raise SignatureVerificationError(f"Trusted public key not found: {path}")
+    try:
+        with open(path, "rb") as fh:
+            pem = fh.read()
+    except OSError as exc:
+        raise SignatureVerificationError(f"Cannot read trusted public key '{path}': {exc}") from exc
+
+    raw = _raw_public_key_from_pem(pem)
+    if len(raw) != APPROVAL_PUBLIC_KEY_BYTES:
+        raise SignatureVerificationError(
+            f"Trusted public key has unexpected length {len(raw)}; expected {APPROVAL_PUBLIC_KEY_BYTES}"
+        )
+    return {"path": canonicalize_path(path), "raw": raw, "key_id": public_key_id(raw)}
+
+
+def load_owner_private_key(private_key_path: str):
+    """Load the owner-held Ed25519 private key from outside the repository."""
+    backend = _crypto_backend()
+    norm = _assert_private_key_path_is_external(private_key_path)
+    if not os.path.isfile(norm):
+        raise AuthorizationError(f"Owner private key not found: {private_key_path}")
+    try:
+        with open(norm, "rb") as fh:
+            pem = fh.read()
+    except OSError as exc:
+        raise AuthorizationError(f"Cannot read owner private key: {exc}") from exc
+    try:
+        key = backend["serialization"].load_pem_private_key(pem, password=None)
+    except Exception as exc:  # noqa: BLE001
+        raise SignatureVerificationError(f"Cannot parse owner private key: {exc}") from exc
+    if not isinstance(key, backend["Ed25519PrivateKey"]):
+        raise SignatureVerificationError("Owner private key is not an Ed25519 private key")
+    return key
+
+
+# --- approval ---------------------------------------------------------------
+
+def sign_authorization(
+    prepared: dict,
+    private_key_path: str,
+    *,
+    operator: Optional[str] = None,
+    signed_at: Optional[str] = None,
+) -> dict:
+    """
+    Owner approval: turn an unsigned preparation artifact into a signed one.
+
+    The private key is supplied by the owner from outside the repository; this
+    function never generates or persists a production signing key.
+    """
+    if not isinstance(prepared, dict):
+        raise AuthorizationError("Preparation artifact must be a JSON object")
+    if prepared.get("authorization_schema_version") != AUTHORIZATION_SCHEMA_VERSION:
+        raise AuthorizationError(
+            f"Preparation artifact schema must be '{AUTHORIZATION_SCHEMA_VERSION}', got "
+            f"'{prepared.get('authorization_schema_version')}'"
+        )
+    if prepared.get(APPROVAL_FIELD) is not None:
+        raise AuthorizationError("Preparation artifact is already approved; re-signing is refused")
+
+    artifact = {k: v for k, v in prepared.items() if k != APPROVAL_FIELD}
+    artifact["authorized"] = True
+
+    if operator is not None and artifact.get("operator") != operator:
+        raise AuthorizationError(
+            f"Approving operator '{operator}' does not match the prepared operator "
+            f"'{artifact.get('operator')}'"
+        )
+    for field in AUTHORIZATION_REQUIRED_FIELDS:
+        value = artifact.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise AuthorizationError(f"Preparation artifact missing required field '{field}'")
+
+    backend = _crypto_backend()
+    serialization = backend["serialization"]
+    private_key = load_owner_private_key(private_key_path)
+
+    public_raw = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    payload = authorization_signing_payload(artifact)
+    signature = private_key.sign(payload)
+
+    artifact[APPROVAL_FIELD] = {
+        "algorithm": APPROVAL_ALGORITHM,
+        "key_id": public_key_id(public_raw),
+        "public_key": base64.b64encode(public_raw).decode("ascii"),
+        "payload_sha256": sha256_bytes(payload),
+        "signature": base64.b64encode(signature).decode("ascii"),
+        "signed_at": signed_at or datetime.now(timezone.utc).isoformat(),
+    }
+    return artifact
+
+
+def verify_authorization_signature(
+    authorization: dict,
+    trusted_public_key: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Verify the owner approval against a separately provisioned trusted key.
+
+    Rejects missing, malformed, tampered and unverifiable signatures, and
+    rejects unavailable, unparseable or mismatched verification keys.
+    """
+    if not isinstance(authorization, dict):
+        raise SignatureVerificationError("Authorization artifact must be a JSON object")
+
+    approval = authorization.get(APPROVAL_FIELD)
+    if approval is None:
+        raise SignatureVerificationError(
+            "Authorization artifact carries no owner approval; an unsigned preparation "
+            "artifact can never authorize a production mutation."
+        )
+    if not isinstance(approval, dict):
+        raise SignatureVerificationError("Authorization 'approval' block must be a JSON object")
+    if approval.get("algorithm") != APPROVAL_ALGORITHM:
+        raise SignatureVerificationError(
+            f"Unsupported approval algorithm '{approval.get('algorithm')}'; expected "
+            f"'{APPROVAL_ALGORITHM}'"
+        )
+
+    # Resolve the trusted key *first*: an untrusted key must reject the artifact
+    # before any signature math runs.
+    trusted = load_trusted_public_key(trusted_public_key) if trusted_public_key else None
+    if trusted is None:
+        raise SignatureVerificationError(
+            "A trusted public key is required to verify an owner approval; none was provided."
+        )
+
+    try:
+        embedded_raw = base64.b64decode(str(approval.get("public_key")), validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise SignatureVerificationError(f"Approval 'public_key' is not valid base64: {exc}") from exc
+    if len(embedded_raw) != APPROVAL_PUBLIC_KEY_BYTES:
+        raise SignatureVerificationError(
+            f"Approval public key has unexpected length {len(embedded_raw)}"
+        )
+
+    embedded_key_id = public_key_id(embedded_raw)
+    if approval.get("key_id") != embedded_key_id:
+        raise SignatureVerificationError(
+            "Approval 'key_id' does not match the embedded public key (tampered artifact)"
+        )
+    if trusted["key_id"] != embedded_key_id:
+        raise SignatureVerificationError(
+            f"Approval was signed by untrusted key '{embedded_key_id}'; the configured trusted "
+            f"key is '{trusted['key_id']}'"
+        )
+
+    payload = authorization_signing_payload(authorization)
+    payload_sha = sha256_bytes(payload)
+    if approval.get("payload_sha256") != payload_sha:
+        raise SignatureVerificationError(
+            "Signed payload digest mismatch: the authorization was modified after approval"
+        )
+
+    try:
+        signature = base64.b64decode(str(approval.get("signature")), validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise SignatureVerificationError(f"Approval 'signature' is not valid base64: {exc}") from exc
+    if len(signature) != APPROVAL_SIGNATURE_BYTES:
+        raise SignatureVerificationError(
+            f"Approval signature has unexpected length {len(signature)}"
+        )
+
+    backend = _crypto_backend()
+    serialization = backend["serialization"]
+    try:
+        public_key = backend["Ed25519PublicKey"].from_public_bytes(trusted["raw"])
+        public_key.verify(signature, payload)
+    except backend["InvalidSignature"] as exc:
+        raise SignatureVerificationError(
+            "Owner approval signature does not verify against the canonical payload"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise SignatureVerificationError(f"Owner approval signature is unverifiable: {exc}") from exc
+
+    return {
+        "verified": True,
+        "algorithm": APPROVAL_ALGORITHM,
+        "key_id": trusted["key_id"],
+        "trusted_public_key": trusted["path"],
+        "payload_sha256": payload_sha,
+        "signed_at": approval.get("signed_at"),
+    }
+
+
+# --- loading ----------------------------------------------------------------
+
+def load_authorization(
+    path: str,
+    trusted_public_key: Optional[str] = None,
+    require_signature: bool = True,
+) -> dict:
+    """
+    Load and validate an authorization artifact.
+
+    ``require_signature=True`` (the default) is the mutation path: the artifact
+    must be schema ``2.0.0`` and its approval must verify against the trusted
+    public key.  ``require_signature=False`` is the read-only preview path: an
+    unsigned preparation artifact is accepted for inspection, but an artifact
+    *claiming* ``authorized: true`` is still rejected unless its signature
+    verifies.
+    """
     if not path or not os.path.exists(path):
         raise AuthorizationError(f"Authorization artifact not found: {path}")
     data = read_json_strict(path)
     if not isinstance(data, dict):
         raise AuthorizationError("Authorization artifact must be a JSON object")
 
-    if data.get("authorization_schema_version") != AUTHORIZATION_SCHEMA_VERSION:
+    schema = data.get("authorization_schema_version")
+    if schema in LEGACY_AUTHORIZATION_SCHEMA_VERSIONS:
         raise AuthorizationError(
-            f"Unsupported authorization schema: '{data.get('authorization_schema_version')}'"
+            f"Authorization schema '{schema}' predates signed owner approvals and can never "
+            f"authorize a production mutation; re-prepare and re-approve under schema "
+            f"'{AUTHORIZATION_SCHEMA_VERSION}'."
         )
+    if schema != AUTHORIZATION_SCHEMA_VERSION:
+        raise AuthorizationError(f"Unsupported authorization schema: '{schema}'")
     if data.get("scope") != REPAIR_SCOPE:
         raise AuthorizationError(f"Unexpected authorization scope: '{data.get('scope')}'")
-    if data.get("authorized") is not True:
-        raise AuthorizationError("Authorization artifact must carry 'authorized': true")
+    if data.get("purpose") != AUTHORIZATION_PURPOSE:
+        raise AuthorizationError(f"Unexpected authorization purpose: '{data.get('purpose')}'")
 
     for field in AUTHORIZATION_REQUIRED_FIELDS:
         value = data.get(field)
-        if value is None or not str(value).strip():
+        if value is None or (isinstance(value, str) and not value.strip()):
             raise AuthorizationError(f"Authorization artifact missing required field '{field}'")
+
+    total = data.get("expected_source_total")
+    if not isinstance(total, int) or isinstance(total, bool) or total < 1:
+        raise AuthorizationError(
+            "Authorization artifact 'expected_source_total' must be a positive integer"
+        )
+
+    if require_signature:
+        verify_authorization_signature(data, trusted_public_key)
+        if data.get("authorized") is not True:
+            raise SignatureVerificationError(
+                "Authorization artifact is not marked 'authorized': true; a verified approval "
+                "must set that flag explicitly."
+            )
+    elif data.get("authorized") is True:
+        # An artifact asserting authorization without a verified signature is
+        # precisely the forgery this schema exists to reject.
+        verify_authorization_signature(data, trusted_public_key)
 
     return data
 
 
-def build_authorization(
+def build_preparation(
     data_dir: str,
     target_canonical_id: str,
     operator: str,
@@ -643,13 +1172,17 @@ def build_authorization(
     migration_id: Optional[str] = None,
 ) -> dict:
     """
-    Read-only: derive the exact expected source hash and candidate hash for one
-    collision and package them into a reviewable authorization artifact.
+    Read-only: derive the exact expected source hash, source record count and
+    candidate hash for one collision and package them into an **unsigned**
+    preparation artifact for owner review.
+
+    The result carries ``authorized: false`` and ``approval: null``: it cannot
+    authorize a production mutation on its own.
     """
     if not operator or not str(operator).strip():
-        raise AuthorizationError("--operator is required to build an authorization artifact")
+        raise AuthorizationError("--operator is required to prepare an authorization artifact")
     if not reason or not str(reason).strip():
-        raise AuthorizationError("--reason is required to build an authorization artifact")
+        raise AuthorizationError("--reason is required to prepare an authorization artifact")
 
     report = inspect_dataset(data_dir)
     groups = report["duplicate_groups"]
@@ -676,7 +1209,9 @@ def build_authorization(
     return {
         "authorization_schema_version": AUTHORIZATION_SCHEMA_VERSION,
         "scope": REPAIR_SCOPE,
-        "authorized": True,
+        "purpose": AUTHORIZATION_PURPOSE,
+        "authorized": False,
+        APPROVAL_FIELD: None,
         "migration_id": migration_id or default_migration_id(target_canonical_id),
         "data_dir": norm,
         "target_canonical_id": target_canonical_id,
@@ -703,11 +1238,15 @@ class ProductionCanonicalRepairer:
         workspace: Optional[str] = None,
         migration_id: Optional[str] = None,
         writable: bool = True,
+        trusted_public_key: Optional[str] = None,
     ):
         self.data_dir = assert_production_data_dir(data_dir)
         self._migration_id_explicit = migration_id is not None
         self._workspace_explicit = bool(workspace)
         self._writable = writable
+        #: Path to the separately provisioned trusted public key.  Only
+        #: mutation paths need it; inspection and preview do not.
+        self.trusted_public_key = trusted_public_key
         self.migration_id = migration_id or default_migration_id("pending")
 
         if workspace:
@@ -765,49 +1304,115 @@ class ProductionCanonicalRepairer:
             projected_data["meta"]["total"] = len(projected_matches)
         return projected_matches, projected_data
 
-    def _assert_authorization_binding(self, authorization: dict, operator: Optional[str]) -> None:
+    def _assert_authorization_binding(
+        self,
+        authorization: dict,
+        operator: Optional[str],
+        trusted_public_key: Optional[str] = None,
+        require_signature: bool = True,
+        require_operator: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Enforce the full authorization binding *before* any mutation.
+
+        Order matters: the signature is checked first, because nothing else in
+        the artifact is meaningful until the owner's approval has been proven.
+        """
+        if not isinstance(authorization, dict):
+            raise AuthorizationError("Authorization artifact must be a JSON object")
+
+        signature = {"verified": False}
+        if require_signature:
+            signature = verify_authorization_signature(
+                authorization, trusted_public_key if trusted_public_key else self.trusted_public_key
+            )
+            if authorization.get("authorized") is not True:
+                raise SignatureVerificationError(
+                    "Authorization artifact is not marked 'authorized': true"
+                )
+
+        for field in AUTHORIZATION_REQUIRED_FIELDS:
+            value = authorization.get(field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                raise AuthorizationError(f"Authorization artifact missing required field '{field}'")
+
+        if authorization.get("purpose") != AUTHORIZATION_PURPOSE:
+            raise AuthorizationError(
+                f"Unexpected authorization purpose: '{authorization.get('purpose')}'"
+            )
+
+        # --- operator identity -------------------------------------------
+        if require_operator:
+            if operator is None or not str(operator).strip():
+                raise AuthorizationError(
+                    "An explicit --operator is required for any authorized production mutation"
+                )
+        if operator is not None and str(operator).strip():
+            if authorization["operator"] != operator:
+                raise AuthorizationError(
+                    f"Operator mismatch: authorization was approved by "
+                    f"'{authorization['operator']}', invoked by '{operator}'"
+                )
+
+        # --- canonical data directory ------------------------------------
         if canonicalize_path(authorization["data_dir"]) != self.data_dir:
             raise AuthorizationError(
                 f"Authorization is bound to '{authorization['data_dir']}' but the target is '{self.data_dir}'"
             )
-        if operator is not None and authorization["operator"] != operator:
+
+        # --- expected source record count --------------------------------
+        total = authorization.get("expected_source_total")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 1:
             raise AuthorizationError(
-                f"Operator mismatch: authorization was approved by '{authorization['operator']}', "
-                f"invoked by '{operator}'"
+                "Authorization 'expected_source_total' must be a positive integer"
             )
+
+        # --- migration ID -------------------------------------------------
         bound_migration = authorization.get("migration_id")
-        if bound_migration:
-            if self._migration_id_explicit and self.migration_id != bound_migration:
-                raise AuthorizationError(
-                    f"Migration ID mismatch: authorization '{bound_migration}' vs '{self.migration_id}'"
+        if not bound_migration or not str(bound_migration).strip():
+            raise AuthorizationError("Authorization artifact is missing a non-empty migration_id")
+        if self._migration_id_explicit and self.migration_id != bound_migration:
+            raise AuthorizationError(
+                f"Migration ID mismatch: authorization '{bound_migration}' vs '{self.migration_id}'"
+            )
+        if self.migration_id != bound_migration:
+            self.migration_id = bound_migration
+            if not self._workspace_explicit:
+                self.workspace = assert_workspace_outside_data_dir(
+                    os.path.join(
+                        os.path.dirname(self.data_dir), DEFAULT_WORKSPACE_DIRNAME, self.migration_id
+                    ),
+                    self.data_dir,
                 )
-            if self.migration_id != bound_migration:
-                self.migration_id = bound_migration
-                if not self._workspace_explicit:
-                    self.workspace = assert_workspace_outside_data_dir(
-                        os.path.join(
-                            os.path.dirname(self.data_dir), DEFAULT_WORKSPACE_DIRNAME, self.migration_id
-                        ),
-                        self.data_dir,
-                    )
-                    self._bind_paths()
+                self._bind_paths()
+
+        return signature
 
     # -- read-only preview --------------------------------------------------
 
     def dry_run(self, authorization: Optional[dict] = None) -> dict:
-        """Read-only preview. Never touches the data directory."""
+        """
+        Read-only preview of the projection.
+
+        The live data directory is never touched.  A preview artifact *is*
+        written to ``<workspace>/output/``, so this command is not globally
+        zero-write and says so in its result.
+        """
         report = inspect_dataset(self.data_dir)
         groups = report["duplicate_groups"]
         if not groups:
             return {
                 "status": "DRY_RUN_NO_COLLISION",
                 "read_only_data_dir": True,
+                "writes_external_artifact": False,
                 "total_matches": report["total_matches"],
                 "duplicate_groups": {},
             }
 
         if authorization is not None:
-            self._assert_authorization_binding(authorization, None)
+            self._assert_authorization_binding(
+                authorization, None, require_signature=False, require_operator=False
+            )
             target_id = authorization["target_canonical_id"]
             if set(groups.keys()) != {target_id}:
                 raise PreconditionViolationError(
@@ -838,6 +1443,7 @@ class ProductionCanonicalRepairer:
         preview = {
             "status": "DRY_RUN_COMPLETED",
             "read_only_data_dir": True,
+            "writes_external_artifact": True,
             "data_dir": self.data_dir,
             "target_canonical_id": target_id,
             "before_total": len(matches),
@@ -845,6 +1451,7 @@ class ProductionCanonicalRepairer:
             "candidate_record": candidate,
             "candidate_sha256": hash_record(candidate),
             "field_diff": field_diff,
+            "authorization_signature_verified": False,
             "authorized_candidate_sha256": (
                 authorization.get("expected_candidate_sha256") if authorization else None
             ),
@@ -898,12 +1505,28 @@ class ProductionCanonicalRepairer:
         confirm_apply: bool = False,
         operator: Optional[str] = None,
         fault_inject: Optional[str] = None,
+        trusted_public_key: Optional[str] = None,
     ) -> dict:
-        """Execute the guarded production repair under the seven-phase machine."""
+        """
+        Execute the guarded production repair under the seven-phase machine.
+
+        ``fault_inject`` exists solely so the test suite can exercise crash
+        recovery.  It is inert unless :func:`fault_injection_enabled` is active,
+        and the production CLI exposes no way to reach it.
+        """
         if not confirm_apply:
             raise AuthorizationError("apply requires the explicit --confirm-apply flag")
 
-        self._assert_authorization_binding(authorization, operator)
+        if fault_inject is not None and not fault_injection_armed():
+            raise StagingMigrationError(
+                "Fault injection is a test-only facility and is not available in this process"
+            )
+
+        # Everything that can refuse happens here, before the lock is taken and
+        # long before a single byte of Canonical data is replaced.
+        signature = self._assert_authorization_binding(
+            authorization, operator, trusted_public_key=trusted_public_key
+        )
         target_id = authorization["target_canonical_id"]
         authorization_sha = authorization_fingerprint(authorization)
         operator_name = authorization["operator"]
@@ -930,14 +1553,24 @@ class ProductionCanonicalRepairer:
                     raise PreconditionViolationError(
                         "No duplicates remain but the target record does not match the authorized candidate"
                     )
-                self.verify_completed_dataset(authorization)
+                self.verify_completed_dataset(
+                    authorization, trusted_public_key=trusted_public_key
+                )
                 return {
                     "status": "NO_OP_ALREADY_REPAIRED",
                     "target_canonical_id": target_id,
                     "total_matches": total,
                     "candidate_sha256": authorization["expected_candidate_sha256"],
+                    "authorization_key_id": signature.get("key_id"),
                     "message": "Dataset already satisfies the authorized projection; nothing written.",
                 }
+
+            # --- Mutation path: the source must match the authorized count --
+            if total != authorization["expected_source_total"]:
+                raise PreconditionViolationError(
+                    f"Source record count {total} does not match the authorized "
+                    f"{authorization['expected_source_total']}"
+                )
 
             if set(dup_groups.keys()) != {target_id} or dup_groups.get(target_id) != 2:
                 raise PreconditionViolationError(
@@ -1171,6 +1804,7 @@ class ProductionCanonicalRepairer:
                 "attempt": attempt,
                 "operator": operator_name,
                 "authorization_sha256": authorization_sha,
+                "authorization_key_id": signature.get("key_id"),
                 "target_canonical_id": target_id,
                 "before_total": total,
                 "after_total": projected_total,
@@ -1267,13 +1901,44 @@ class ProductionCanonicalRepairer:
                     f"{pre_hashes[store]} -> {post_hashes[store]}"
                 )
 
-    def verify_completed_dataset(self, authorization: dict) -> dict:
+    def verify_completed_dataset(
+        self,
+        authorization: dict,
+        trusted_public_key: Optional[str] = None,
+        *,
+        journal_entries: Optional[List[dict]] = None,
+        require_journal: bool = True,
+        require_archive: bool = True,
+    ) -> dict:
+        """
+        FULL REPAIR POSTCONDITION VERIFICATION.
+
+        Strictly stronger than ``inspect_dataset``, which only answers "is this
+        dataset structurally sound?".  Every element below must be *evidenced*.
+        When evidence is missing or unverifiable this raises
+        :class:`IncompleteVerificationError` -- it never downgrades to a pass.
+        """
+        evidence: Dict[str, Any] = {}
+        missing: List[str] = []
+
+        # 1. Verified authorization binding (signature + directory + ids).
+        signature = self._assert_authorization_binding(
+            authorization,
+            None,
+            trusted_public_key=trusted_public_key,
+            require_operator=False,
+        )
+        evidence["authorization_binding"] = "VERIFIED"
+        evidence["authorization_key_id"] = signature.get("key_id")
         target_id = authorization["target_canonical_id"]
+
+        # 2. Dataset integrity -- necessary, but far from sufficient.
         report = inspect_dataset(self.data_dir)
         if report["duplicate_ids"]:
             raise RecoveryStateError(f"Duplicate IDs present: {report['duplicate_ids']}")
         if report["unique_ids_count"] != report["total_matches"]:
             raise RecoveryStateError("Unique ID count does not equal total match count")
+        evidence["dataset_integrity"] = "OK"
 
         current = read_json_strict(self._daily_file())
         targets = [m for m in current.get("matches", []) if m.get("id") == target_id]
@@ -1283,70 +1948,300 @@ class ProductionCanonicalRepairer:
             raise RecoveryStateError("Target record does not match the authorized candidate")
         if not valid_full_time_score(targets[0].get("score")):
             raise RecoveryStateError("Target record has an invalid full-time score")
+        evidence["candidate_record"] = "MATCHES_AUTHORIZED_HASH"
 
-        for store in NON_CANONICAL_STORES:
-            path = os.path.join(self.data_dir, store)
-            if os.path.exists(path) and report["store_hashes"][store] == MISSING:
-                raise RecoveryStateError(f"Immutable store disappeared: {store}")
-
-        entries = self.journal.read_entries()
-        if entries:
-            self.journal.validate_chain(entries)
-            if self.journal.get_latest_valid_state() != "COMPLETION_RECORDED":
-                raise RecoveryStateError("Journal latest state is not COMPLETION_RECORDED")
-            completions = [e for e in entries if e.get("state") == "COMPLETION_RECORDED"]
-            if len(completions) != 1:
-                raise RecoveryStateError(f"Expected exactly 1 COMPLETION_RECORDED entry, got {len(completions)}")
-
-        raw_archive = self._raw_archive()
-        if os.path.exists(raw_archive):
-            self.verify_forensic_archive(
-                baseline_source_hash=sha256_file(raw_archive),
-                expected_migration_id=self.migration_id,
+        # 3. N -> N-1 cardinality against the authorized source count.
+        if report["total_matches"] != authorization["expected_source_total"] - 1:
+            raise RecoveryStateError(
+                f"Cardinality {report['total_matches']} != authorized N-1 "
+                f"({authorization['expected_source_total'] - 1})"
             )
-        return report
+        evidence["cardinality"] = f"N-1={report['total_matches']}"
 
-    def verify(self, authorization: Optional[dict] = None) -> dict:
-        """Read-only postcondition audit."""
+        # 4. Archived source fingerprint (independent of the active file).
+        raw_archive = self._raw_archive()
+        if not os.path.exists(raw_archive):
+            missing.append("forensic_archive_raw")
+        else:
+            baseline_hash = sha256_file(raw_archive)
+            if baseline_hash != authorization["expected_source_sha256"]:
+                raise RecoveryStateError(
+                    "Archived source fingerprint does not match the authorized source hash"
+                )
+            evidence["archived_source_sha256"] = baseline_hash
+
+        if not missing:
+            raw_data = read_json_strict(raw_archive)
+            raw_targets = [
+                m for m in raw_data.get("matches", []) if m.get("id") == target_id
+            ]
+            if len(raw_targets) != 2:
+                raise RecoveryStateError(
+                    f"Archived source holds {len(raw_targets)} target records, expected exactly 2"
+                )
+
+            # 5. Candidate record fingerprint, re-derived from archived bytes.
+            candidate, _diff = synthesize_candidate(raw_targets)
+            if hash_record(candidate) != authorization["expected_candidate_sha256"]:
+                raise RecoveryStateError(
+                    "Candidate re-derived from the archive does not match the authorized candidate"
+                )
+            evidence["candidate_recomputed"] = "MATCHES_AUTHORIZED_HASH"
+
+            # 6. Independently derived projected-file fingerprint.
+            _pm, derived = self._derive_projected_from_raw(raw_data, target_id)
+            derived_hash = derive_file_hash(derived)
+            if sha256_file(self._daily_file()) != derived_hash:
+                raise RecoveryStateError(
+                    "Active file hash does not match the projection independently derived "
+                    "from the archived raw source"
+                )
+            evidence["projected_file_sha256"] = derived_hash
+            evidence["projected_hash_independently_derived"] = True
+
+            # 7. Unrelated record preservation.
+            raw_unrelated = [m for m in raw_data.get("matches", []) if m.get("id") != target_id]
+            cur_unrelated = [m for m in current.get("matches", []) if m.get("id") != target_id]
+            if serialize_record(raw_unrelated) != serialize_record(cur_unrelated):
+                raise RecoveryStateError("Unrelated Canonical records altered or reordered")
+            evidence["unrelated_records_preserved"] = len(cur_unrelated)
+
+            # 8. Six immutable-store hashes versus the archived pre-state.
+            entries = journal_entries if journal_entries is not None else self.journal.read_entries()
+            prep = next(
+                (e for e in entries
+                 if e.get("state") == "PREPARED"
+                 and (e.get("payload") or {}).get("action") != "ROLLED_BACK_TO_RAW_ARCHIVE"),
+                None,
+            )
+            pre_hashes = (prep.get("payload") or {}).get("pre_store_hashes") if prep else None
+            if not pre_hashes:
+                missing.append("pre_store_hashes")
+            else:
+                current_stores = self.get_store_hashes()
+                for store in NON_CANONICAL_STORES:
+                    if current_stores.get(store) != pre_hashes.get(store):
+                        raise ImmutableStoreMutationError(
+                            f"CRITICAL: immutable store '{store}' mutated: "
+                            f"{pre_hashes.get(store)} -> {current_stores.get(store)}"
+                        )
+                evidence["immutable_store_hashes"] = "ALL_SIX_UNCHANGED"
+
+            # 9. Forensic manifest, evidence records and migration identity.
+            if require_archive:
+                self.verify_forensic_archive(
+                    baseline_source_hash=evidence["archived_source_sha256"],
+                    expected_migration_id=self.migration_id,
+                )
+                evidence["forensic_manifest"] = "VERIFIED"
+
+        # 10. Journal progression and terminal completion state.
+        if require_journal:
+            entries = journal_entries if journal_entries is not None else self.journal.read_entries()
+            if not entries:
+                missing.append("journal_entries")
+            else:
+                self.journal.validate_chain(entries, expected_migration_id=self.migration_id)
+                latest = RepairJournal.latest_valid_state(entries)
+                if latest != "COMPLETION_RECORDED":
+                    raise RecoveryStateError(
+                        f"Journal latest state is '{latest}', not COMPLETION_RECORDED"
+                    )
+                completions = [e for e in entries if e.get("state") == "COMPLETION_RECORDED"]
+                if len(completions) != 1:
+                    raise RecoveryStateError(
+                        f"Expected exactly 1 COMPLETION_RECORDED entry, got {len(completions)}"
+                    )
+                expected_fingerprint = authorization_fingerprint(authorization)
+                for entry in entries:
+                    recorded = (entry.get("payload") or {}).get("authorization_sha256")
+                    if recorded and recorded != expected_fingerprint:
+                        raise RecoveryStateError(
+                            "Journal records a different authorization fingerprint for this migration"
+                        )
+                evidence["journal_chain"] = "VALID_TERMINAL_COMPLETION"
+
+        if missing:
+            raise IncompleteVerificationError(
+                "Full repair verification is INCOMPLETE; missing evidence: "
+                + ", ".join(sorted(set(missing)))
+            )
+
+        return {
+            "verification": FULL_REPAIR_VERIFICATION,
+            "verified": True,
+            "complete": True,
+            "evidence": evidence,
+            "dataset_report": report,
+        }
+
+    def inspect_only(self) -> dict:
+        """
+        DATASET INTEGRITY INSPECTION -- explicitly *not* repair verification.
+
+        The result is labelled so it can never be mistaken for a completed
+        repair audit, and it carries no claim about a repair at all.
+        """
+        report = inspect_dataset(self.data_dir)
+        return {
+            "verification": DATASET_INTEGRITY_INSPECTION,
+            "verified": False,
+            "complete": False,
+            "repair_verified": False,
+            "note": (
+                "Dataset integrity inspection only. This is NOT full repair "
+                "postcondition verification; run 'verify' with a signed "
+                "authorization to audit a repair."
+            ),
+            "dataset_report": report,
+        }
+
+    def verify(
+        self,
+        authorization: Optional[dict] = None,
+        trusted_public_key: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> dict:
+        """
+        Read-only audit.
+
+        Without an authorization artifact this can only report dataset
+        integrity, and it says so -- a clean dataset is never reported as a
+        successful repair verification.
+        """
         try:
-            report = inspect_dataset(self.data_dir)
-            if report["duplicate_ids"]:
-                return {
-                    "verified": False,
-                    "duplicate_ids": report["duplicate_ids"],
-                    "error": "Duplicate Canonical IDs still present",
-                    "error_type": "PreconditionViolationError",
-                }
-            if authorization is not None:
-                self.verify_completed_dataset(authorization)
+            if authorization is None:
+                return self.inspect_only()
+
+            if operator is not None and authorization.get("operator") != operator:
+                raise AuthorizationError(
+                    f"Operator mismatch: authorization was approved by "
+                    f"'{authorization.get('operator')}', invoked by '{operator}'"
+                )
+
+            return self.verify_completed_dataset(
+                authorization, trusted_public_key=trusted_public_key
+            )
+        except IncompleteVerificationError as exc:
             return {
-                "verified": True,
-                "total_matches": report["total_matches"],
-                "unique_ids_count": report["unique_ids_count"],
-                "duplicate_ids": {},
-                "dataset_report": report,
+                "verification": FULL_REPAIR_VERIFICATION,
+                "verified": False,
+                "complete": False,
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
             }
         except Exception as exc:  # noqa: BLE001
             return {
+                "verification": FULL_REPAIR_VERIFICATION,
                 "verified": False,
+                "complete": False,
                 "error": str(exc),
                 "error_type": exc.__class__.__name__,
             }
 
     # -- crash recovery -----------------------------------------------------
 
-    def recover(self) -> dict:
-        """Classify durable state under one lock and resolve deterministically."""
+    def _assert_recovery_authorized(
+        self,
+        entries: List[dict],
+        authorization: Optional[dict],
+        operator: Optional[str],
+        trusted_public_key: Optional[str],
+    ) -> None:
+        """
+        Tie recovery to the authenticated transaction that produced the journal.
+
+        Recovery can rewrite the Canonical file, so it is a mutation and needs
+        the same owner approval, operator identity and migration identity as the
+        transaction it is finishing.
+        """
+        if authorization is None:
+            raise AuthorizationError(
+                "recover requires the signed authorization artifact that authorized this "
+                "transaction; recovery is a mutation and cannot run unauthenticated"
+            )
+        self._assert_authorization_binding(
+            authorization, operator, trusted_public_key=trusted_public_key
+        )
+
+        recorded_migrations = {
+            (e.get("payload") or {}).get("migration_id") for e in entries
+        }
+        if authorization["migration_id"] not in recorded_migrations:
+            raise RecoveryStateError(
+                f"Journal does not belong to the authorized migration "
+                f"'{authorization['migration_id']}'"
+            )
+
+        expected_fingerprint = authorization_fingerprint(authorization)
+        for entry in entries:
+            recorded = (entry.get("payload") or {}).get("authorization_sha256")
+            if recorded and recorded != expected_fingerprint:
+                raise RecoveryStateError(
+                    "Journal was produced under a different authorization artifact; "
+                    "refusing to recover unrelated or forged journal state"
+                )
+
+    def _derive_recovery_fingerprints(
+        self,
+        baseline_hash: Optional[str],
+        target_id: Optional[str],
+        journal_claimed_projected: Optional[str],
+    ) -> Dict[str, Optional[str]]:
+        """
+        Independently derive the expected pre- and post-repair file fingerprints
+        from the forensic archive instead of trusting the journal's own claims.
+        """
+        raw_archive = self._raw_archive()
+        if not os.path.exists(raw_archive):
+            return {"source": None, "projected": None}
+
+        if not baseline_hash or not target_id:
+            return {"source": None, "projected": None}
+
+        if sha256_file(raw_archive) != baseline_hash:
+            raise RecoveryStateError(
+                "Forensic archive raw bytes do not match the journal's recorded pre-state "
+                "fingerprint; refusing to recover from unverifiable evidence"
+            )
+
+        raw_data = read_json_strict(raw_archive)
+        raw_targets = [m for m in raw_data.get("matches", []) if m.get("id") == target_id]
+        if len(raw_targets) != 2:
+            raise RecoveryStateError(
+                f"Forensic archive holds {len(raw_targets)} target records, expected exactly 2"
+            )
+
+        _pm, derived = self._derive_projected_from_raw(raw_data, target_id)
+        derived_projected = derive_file_hash(derived)
+
+        if journal_claimed_projected and journal_claimed_projected != derived_projected:
+            raise RecoveryStateError(
+                "Journal's projected fingerprint disagrees with the projection independently "
+                "derived from the forensic archive (forged or stale journal state)"
+            )
+
+        return {"source": baseline_hash, "projected": derived_projected}
+
+    def recover(
+        self,
+        authorization: Optional[dict] = None,
+        operator: Optional[str] = None,
+        trusted_public_key: Optional[str] = None,
+    ) -> dict:
+        """
+        Classify durable state under one lock and resolve deterministically.
+
+        Ordering is deliberate: immutable-store drift is detected first, the
+        transaction is authenticated second, and the expected fingerprints are
+        independently re-derived from the forensic archive before any mutation.
+        A completion entry is only ever appended after the full postcondition
+        contract has been proven against the journal state it would create.
+        """
         with acquire_repair_lock(self.data_dir):
             entries = self.journal.read_entries()
             if not entries:
                 return {"status": "NO_JOURNAL_ENTRIES", "action": "NOTHING_TO_RECOVER"}
-
-            self.journal.validate_chain(entries)
-            latest = self.journal.get_latest_valid_state()
-
-            daily_file = self._daily_file()
-            current_hash = sha256_file(daily_file) if os.path.exists(daily_file) else MISSING
 
             prep = next(
                 (e for e in entries
@@ -1354,9 +2249,9 @@ class ProductionCanonicalRepairer:
                  and (e.get("payload") or {}).get("action") != "ROLLED_BACK_TO_RAW_ARCHIVE"),
                 None,
             )
-            baseline_hash = None
+
+            # (1) Immutable-store drift voids every downstream conclusion.
             if prep:
-                baseline_hash = (prep.get("payload") or {}).get("pre_store_hashes", {}).get(CANONICAL_FILE)
                 pre_hashes = (prep.get("payload") or {}).get("pre_store_hashes", {})
                 current_stores = self.get_store_hashes()
                 for store in NON_CANONICAL_STORES:
@@ -1365,23 +2260,46 @@ class ProductionCanonicalRepairer:
                             f"CRITICAL: immutable store '{store}' mutated prior to recovery!"
                         )
 
-            intent = next((e for e in reversed(entries) if e.get("state") == "COMMIT_INTENT_DURABLE"), None)
-            intended_hash = (intent.get("payload") or {}).get("projected_file_sha256") if intent else None
-            migration_id = (
-                (intent.get("payload") or {}).get("migration_id") if intent
-                else ((prep.get("payload") or {}).get("migration_id") if prep else self.migration_id)
+            # (2) Authentication: only the authorized transaction may recover.
+            self._assert_recovery_authorized(entries, authorization, operator, trusted_public_key)
+
+            self.journal.validate_chain(entries, expected_migration_id=self.migration_id)
+            latest = self.journal.get_latest_valid_state()
+
+            daily_file = self._daily_file()
+            current_hash = sha256_file(daily_file) if os.path.exists(daily_file) else MISSING
+
+            baseline_hash = None
+            target_id = None
+            if prep:
+                payload = prep.get("payload") or {}
+                baseline_hash = (payload.get("pre_store_hashes") or {}).get(CANONICAL_FILE)
+                target_id = payload.get("target_canonical_id")
+
+            intent = next(
+                (e for e in reversed(entries) if e.get("state") == "COMMIT_INTENT_DURABLE"), None
+            )
+            journal_claimed_projected = (
+                (intent.get("payload") or {}).get("projected_file_sha256") if intent else None
+            )
+            migration_id = self.migration_id
+
+            # (3) Independently derived fingerprints (never trusted from the journal).
+            derived = self._derive_recovery_fingerprints(
+                baseline_hash, target_id, journal_claimed_projected
             )
 
             if baseline_hash and current_hash == baseline_hash:
                 file_state = "EXPECTED_SOURCE"
-            elif intended_hash and current_hash == intended_hash:
+            elif derived["projected"] and current_hash == derived["projected"]:
                 file_state = "EXPECTED_PROJECTED"
             else:
                 file_state = "UNKNOWN"
 
             if file_state == "UNKNOWN":
                 raise RecoveryStateError(
-                    f"Recovery failed closed: active Canonical hash '{current_hash}' is UNKNOWN. No write permitted."
+                    f"Recovery failed closed: active Canonical hash '{current_hash}' is UNKNOWN. "
+                    "No write permitted."
                 )
 
             if file_state == "EXPECTED_PROJECTED":
@@ -1394,40 +2312,44 @@ class ProductionCanonicalRepairer:
                         "latest_state": latest,
                         "migration_id": migration_id,
                     }
-                if latest == "POSTCONDITIONS_VERIFIED":
-                    self.journal.append_entry("COMPLETION_RECORDED", {
-                        "migration_id": migration_id,
-                        "status": "RECOVERED_COMPLETED_FORWARD",
-                        "action": "RECORDED_COMPLETION",
-                        "after_total": len(read_json_strict(daily_file).get("matches", [])),
-                    })
-                    return {"status": "RECOVERED_FORWARD_COMPLETED", "action": "RECORDED_COMPLETION"}
-                if latest == "PROJECTION_COMMITTED":
-                    self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
-                        "migration_id": migration_id,
-                        "note": "recovery verification",
-                    })
-                    self.journal.append_entry("COMPLETION_RECORDED", {
+
+                if latest in ("COMMIT_INTENT_DURABLE", "PROJECTION_COMMITTED", "POSTCONDITIONS_VERIFIED"):
+                    planned = list(entries)
+                    if latest == "COMMIT_INTENT_DURABLE":
+                        planned.append(RepairJournal.build_entry("PROJECTION_COMMITTED", {
+                            "migration_id": migration_id,
+                            "daily_matches_sha256": current_hash,
+                        }))
+                    if latest in ("COMMIT_INTENT_DURABLE", "PROJECTION_COMMITTED"):
+                        planned.append(RepairJournal.build_entry("POSTCONDITIONS_VERIFIED", {
+                            "migration_id": migration_id,
+                            "note": "recovery verification",
+                        }))
+                    completion = RepairJournal.build_entry("COMPLETION_RECORDED", {
                         "migration_id": migration_id,
                         "status": "RECOVERED_COMPLETED_FORWARD",
                         "action": "VERIFIED_POSTCONDITIONS_AND_RECORDED_COMPLETION",
+                        "after_total": len(read_json_strict(daily_file).get("matches", [])),
+                        "authorization_sha256": authorization_fingerprint(authorization),
                     })
-                    return {"status": "RECOVERED_FORWARD_COMPLETED", "action": "VERIFIED_AND_COMPLETED"}
-                if latest == "COMMIT_INTENT_DURABLE":
-                    self.journal.append_entry("PROJECTION_COMMITTED", {
-                        "migration_id": migration_id,
-                        "daily_matches_sha256": current_hash,
-                    })
-                    self.journal.append_entry("POSTCONDITIONS_VERIFIED", {
-                        "migration_id": migration_id,
-                        "note": "recovery verification",
-                    })
-                    self.journal.append_entry("COMPLETION_RECORDED", {
-                        "migration_id": migration_id,
-                        "status": "RECOVERED_COMPLETED_FORWARD",
-                        "action": "COMMITTED_PROJECTION_AND_RECORDED_COMPLETION",
-                    })
-                    return {"status": "RECOVERED_FORWARD_COMPLETED", "action": "COMMITTED_AND_COMPLETED"}
+                    planned.append(completion)
+
+                    # Prove the full postcondition contract -- including the
+                    # terminal journal state we are about to write -- before it
+                    # is allowed to become durable.
+                    self.verify_completed_dataset(
+                        authorization,
+                        trusted_public_key=trusted_public_key,
+                        journal_entries=planned,
+                    )
+
+                    for entry in planned[len(entries):]:
+                        self.journal.append_entry(entry["state"], entry["payload"])
+                    return {
+                        "status": "RECOVERED_FORWARD_COMPLETED",
+                        "action": "VERIFIED_AND_COMPLETED",
+                        "latest_state": "COMPLETION_RECORDED",
+                    }
 
                 raise RecoveryStateError(f"Unexpected journal state '{latest}' with a projected file")
 
@@ -1466,37 +2388,83 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    p_inspect = sub.add_parser("inspect", help="Read-only dataset inspection")
+    p_inspect = sub.add_parser(
+        "inspect", help="Read-only dataset integrity inspection (not repair verification)"
+    )
     p_inspect.add_argument("--data-dir", required=True)
 
-    p_auth = sub.add_parser("authorize", help="Read-only: build an authorization artifact")
-    p_auth.add_argument("--data-dir", required=True)
-    p_auth.add_argument("--target-id", required=True, help="Canonical ID to de-duplicate")
-    p_auth.add_argument("--operator", required=True, help="Approving operator identity")
-    p_auth.add_argument("--reason", required=True, help="Justification recorded in the journal")
-    p_auth.add_argument("--out", required=True, help="Where to write the authorization artifact")
-    p_auth.add_argument("--migration-id", default=None)
+    p_keygen = sub.add_parser(
+        "keygen",
+        help="Provision an owner Ed25519 signing keypair OUTSIDE the repository",
+    )
+    p_keygen.add_argument("--private-key-out", required=True, help="Owner-held PKCS#8 PEM path")
+    p_keygen.add_argument("--public-key-out", required=True, help="Trusted public key PEM path")
 
-    p_dry = sub.add_parser("dry-run", help="Read-only projection preview")
+    p_prepare = sub.add_parser(
+        "prepare",
+        help="Read-only: build an UNSIGNED preparation artifact for owner review",
+    )
+    p_prepare.add_argument("--data-dir", required=True)
+    p_prepare.add_argument("--target-id", required=True, help="Canonical ID to de-duplicate")
+    p_prepare.add_argument("--operator", required=True, help="Operator identity")
+    p_prepare.add_argument("--reason", required=True, help="Justification recorded in the journal")
+    p_prepare.add_argument("--out", required=True, help="Where to write the preparation artifact")
+    p_prepare.add_argument("--migration-id", default=None)
+
+    p_sign = sub.add_parser(
+        "approve",
+        help="Owner approval: sign a preparation artifact with an external Ed25519 key",
+    )
+    p_sign.add_argument("--prepared", required=True, help="Unsigned preparation artifact")
+    p_sign.add_argument("--private-key", required=True, help="Owner Ed25519 private key (outside repo)")
+    p_sign.add_argument("--out", required=True, help="Where to write the signed authorization artifact")
+    p_sign.add_argument("--operator", default=None, help="Must match the prepared operator, if given")
+
+    p_verify_auth = sub.add_parser(
+        "verify-authorization",
+        help="Read-only: verify an owner approval against the trusted public key",
+    )
+    p_verify_auth.add_argument("--authorization", required=True)
+    p_verify_auth.add_argument("--trusted-public-key", required=True)
+
+    p_dry = sub.add_parser(
+        "dry-run",
+        help="Read-only projection preview (writes only an external preview artifact)",
+    )
     p_dry.add_argument("--data-dir", required=True)
     p_dry.add_argument("--authorization", default=None)
     p_dry.add_argument("--workspace", default=None)
+    p_dry.add_argument(
+        "--trusted-public-key", default=None,
+        help="Required only when the supplied artifact claims 'authorized': true",
+    )
 
     p_apply = sub.add_parser("apply", help="Execute the guarded repair")
     p_apply.add_argument("--data-dir", required=True)
     p_apply.add_argument("--authorization", required=True)
     p_apply.add_argument("--workspace", default=None)
-    p_apply.add_argument("--operator", default=None)
+    p_apply.add_argument("--operator", required=True, help="Operator identity; must match the approval")
+    p_apply.add_argument("--trusted-public-key", required=True, help="Trusted Ed25519 public key PEM")
     p_apply.add_argument("--confirm-apply", action="store_true")
-    p_apply.add_argument("--fault-inject", default=None, help=argparse.SUPPRESS)
 
-    p_verify = sub.add_parser("verify", help="Read-only postcondition audit")
+    p_verify = sub.add_parser(
+        "verify", help="Read-only FULL repair postcondition verification"
+    )
     p_verify.add_argument("--data-dir", required=True)
-    p_verify.add_argument("--authorization", default=None)
+    p_verify.add_argument("--authorization", required=True)
+    p_verify.add_argument("--trusted-public-key", required=True)
+    p_verify.add_argument("--operator", default=None, help="If given, must match the approval")
+    p_verify.add_argument(
+        "--workspace", default=None,
+        help="Journal/archive workspace; defaults to <parent_of_data_dir>/repair_runs/<migration_id>",
+    )
 
     p_recover = sub.add_parser("recover", help="Resolve an interrupted repair")
     p_recover.add_argument("--data-dir", required=True)
     p_recover.add_argument("--workspace", required=True)
+    p_recover.add_argument("--authorization", required=True)
+    p_recover.add_argument("--trusted-public-key", required=True)
+    p_recover.add_argument("--operator", required=True)
 
     return parser
 
@@ -1510,8 +2478,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps(inspect_dataset(args.data_dir), indent=2, ensure_ascii=False))
             return 0
 
-        if args.subcommand == "authorize":
-            artifact = build_authorization(
+        if args.subcommand == "keygen":
+            info = generate_signing_keypair(args.private_key_out, args.public_key_out)
+            print(json.dumps({
+                "status": "OWNER_KEYPAIR_PROVISIONED",
+                "algorithm": info["algorithm"],
+                "key_id": info["key_id"],
+                "private_key_path": info["private_key_path"],
+                "public_key_path": info["public_key_path"],
+                "note": "Keep the private key offline; pin the public key as --trusted-public-key.",
+            }, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.subcommand == "prepare":
+            artifact = build_preparation(
                 data_dir=args.data_dir,
                 target_canonical_id=args.target_id,
                 operator=args.operator,
@@ -1520,18 +2500,61 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             write_json_atomic(args.out, artifact)
             print(json.dumps({
-                "status": "AUTHORIZATION_WRITTEN",
+                "status": "PREPARATION_WRITTEN_UNSIGNED",
                 "out": args.out,
+                "authorized": False,
                 "migration_id": artifact["migration_id"],
                 "target_canonical_id": artifact["target_canonical_id"],
                 "expected_source_sha256": artifact["expected_source_sha256"],
+                "expected_source_total": artifact["expected_source_total"],
                 "expected_candidate_sha256": artifact["expected_candidate_sha256"],
+                "preparation_sha256": authorization_fingerprint(artifact),
+                "note": (
+                    "This artifact grants nothing. Have the owner run 'approve' with the "
+                    "external Ed25519 private key before 'apply'."
+                ),
+            }, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.subcommand == "approve":
+            prepared = read_json_strict(args.prepared)
+            artifact = sign_authorization(
+                prepared, args.private_key, operator=args.operator
+            )
+            write_json_atomic(args.out, artifact)
+            print(json.dumps({
+                "status": "AUTHORIZATION_SIGNED",
+                "out": args.out,
+                "authorized": True,
+                "algorithm": artifact[APPROVAL_FIELD]["algorithm"],
+                "key_id": artifact[APPROVAL_FIELD]["key_id"],
+                "migration_id": artifact["migration_id"],
                 "authorization_sha256": authorization_fingerprint(artifact),
             }, indent=2, ensure_ascii=False))
             return 0
 
+        if args.subcommand == "verify-authorization":
+            authorization = load_authorization(
+                args.authorization, args.trusted_public_key, require_signature=True
+            )
+            print(json.dumps({
+                "status": "AUTHORIZATION_SIGNATURE_VERIFIED",
+                "verification": verify_authorization_signature(
+                    authorization, args.trusted_public_key
+                ),
+                "migration_id": authorization["migration_id"],
+                "target_canonical_id": authorization["target_canonical_id"],
+                "operator": authorization["operator"],
+            }, indent=2, ensure_ascii=False))
+            return 0
+
         if args.subcommand == "dry-run":
-            authorization = load_authorization(args.authorization) if args.authorization else None
+            authorization = (
+                load_authorization(
+                    args.authorization, args.trusted_public_key, require_signature=False
+                )
+                if args.authorization else None
+            )
             repairer = ProductionCanonicalRepairer(
                 data_dir=args.data_dir,
                 workspace=args.workspace,
@@ -1541,35 +2564,67 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         if args.subcommand == "apply":
-            authorization = load_authorization(args.authorization)
+            authorization = load_authorization(
+                args.authorization, args.trusted_public_key, require_signature=True
+            )
             repairer = ProductionCanonicalRepairer(
                 data_dir=args.data_dir,
                 workspace=args.workspace,
                 migration_id=authorization.get("migration_id"),
+                trusted_public_key=args.trusted_public_key,
             )
             result = repairer.apply(
                 authorization=authorization,
                 confirm_apply=args.confirm_apply,
                 operator=args.operator,
-                fault_inject=args.fault_inject,
             )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
 
         if args.subcommand == "verify":
-            authorization = load_authorization(args.authorization) if args.authorization else None
-            repairer = ProductionCanonicalRepairer(data_dir=args.data_dir, writable=False)
-            report = repairer.verify(authorization)
+            authorization = load_authorization(
+                args.authorization, args.trusted_public_key, require_signature=True
+            )
+            repairer = ProductionCanonicalRepairer(
+                data_dir=args.data_dir,
+                workspace=args.workspace,
+                writable=False,
+                migration_id=authorization.get("migration_id"),
+                trusted_public_key=args.trusted_public_key,
+            )
+            report = repairer.verify(
+                authorization,
+                trusted_public_key=args.trusted_public_key,
+                operator=args.operator,
+            )
             print(json.dumps(report, indent=2, ensure_ascii=False))
-            return 0 if report.get("verified") else 1
+            return 0 if report.get("verified") and report.get("complete") else 1
 
         if args.subcommand == "recover":
-            repairer = ProductionCanonicalRepairer(data_dir=args.data_dir, workspace=args.workspace)
-            print(json.dumps(repairer.recover(), indent=2, ensure_ascii=False))
+            authorization = load_authorization(
+                args.authorization, args.trusted_public_key, require_signature=True
+            )
+            repairer = ProductionCanonicalRepairer(
+                data_dir=args.data_dir,
+                workspace=args.workspace,
+                migration_id=authorization.get("migration_id"),
+                trusted_public_key=args.trusted_public_key,
+            )
+            print(json.dumps(
+                repairer.recover(
+                    authorization,
+                    operator=args.operator,
+                    trusted_public_key=args.trusted_public_key,
+                ),
+                indent=2, ensure_ascii=False,
+            ))
             return 0
 
         return 0
 
+    except SignatureVerificationError as exc:
+        print(f"SIGNATURE ERROR: {exc}", file=sys.stderr)
+        return 112
     except AuthorizationError as exc:
         print(f"AUTHORIZATION ERROR: {exc}", file=sys.stderr)
         return 110
@@ -1585,6 +2640,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ImmutableStoreMutationError as exc:
         print(f"MUTATION ERROR: {exc}", file=sys.stderr)
         return 104
+    except IncompleteVerificationError as exc:
+        print(f"INCOMPLETE VERIFICATION: {exc}", file=sys.stderr)
+        return 107
     except RecoveryStateError as exc:
         print(f"RECOVERY ERROR: {exc}", file=sys.stderr)
         return 106

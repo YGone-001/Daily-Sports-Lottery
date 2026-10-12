@@ -1,2 +1,6 @@
 flask==3.1.1
 requests==2.32.3
+# Ed25519 owner-approval verification for tools/production_canonical_repair.py.
+# The production repair tool fails closed without it: an authorization artifact
+# whose approval cannot be verified is never treated as trusted.
+cryptography==50.0.2

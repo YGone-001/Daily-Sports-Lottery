@@ -1,0 +1,63 @@
+name: CI
+
+# Minimal offline CI: no production data, no sports-data scraping, no
+# credentials.  The repair CLI cannot mutate anything here -- every test
+# operates on synthetic fixtures under pytest's temporary directories, and a
+# production mutation additionally requires an Ed25519 owner approval signed
+# with a key that is never present in CI.
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+
+# Least privilege: the workflow only needs to read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-tests:
+    name: Offline pytest suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install runtime and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run the complete offline test suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -q
+
+      - name: Confirm no Canonical production data was modified
+        run: |
+          if [ -n "$(git status --porcelain -- data)" ]; then
+            echo "::error::data/ was modified by the test run"
+            git status --porcelain -- data
+            exit 1
+          fi
+          echo "data/ untouched by the test run"

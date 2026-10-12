@@ -8,14 +8,25 @@ Coverage
 --------
 * Safety boundaries: evidence epochs, drive roots, workspace placement.
 * Read-only guarantees for ``inspect`` / ``dry-run`` / ``verify``.
-* Authorization binding: schema, scope, ``authorized`` flag, data-dir, source
-  hash, operator and migration-ID binding.
+* The Ed25519 authorization trust boundary: preparation is unsigned, approval
+  is signed, and only a signature that verifies against a separately
+  provisioned trusted public key can authorize a mutation.
+* Authorization binding: schema, scope, purpose, ``authorized`` flag, data-dir,
+  source hash, source record count, candidate hash, operator, migration ID.
+* Operator identity is mandatory for every mutation.
+* CLI safety: no destructive fault-injection flag exists on the deployable
+  command surface, and unsupported mutation switches are rejected without
+  touching any persistent store.
 * Happy path: dynamic ``N -> N - 1`` projection with every postcondition
   enforced (uniqueness, unrelated-record preservation and ordering, metadata
   preservation, unknown top-level key preservation, six immutable stores).
+* Separation of dataset integrity inspection from full repair verification.
 * Idempotency, lock contention, and refusal on unexpected collision shapes.
-* Fault injection and deterministic crash recovery (rollback / forward / fail
-  closed on UNKNOWN).
+* Deterministic crash recovery (rollback / forward / fail closed on UNKNOWN),
+  bound to an authenticated authorization.
+
+Every fixture lives in a temporary directory: this suite never touches ``data/``
+and never performs network access.
 """
 from __future__ import annotations
 
@@ -27,29 +38,45 @@ import os
 import pytest
 
 from tools.production_canonical_repair import (
+    APPROVAL_ALGORITHM,
+    APPROVAL_FIELD,
+    AUTHORIZATION_PURPOSE,
+    AUTHORIZATION_SCHEMA_VERSION,
     CANONICAL_FILE,
+    DATASET_INTEGRITY_INSPECTION,
+    FULL_REPAIR_VERIFICATION,
     JOURNAL_STATES,
     NON_CANONICAL_STORES,
+    REPAIR_SCOPE,
     AuthorizationError,
     ImmutableStoreMutationError,
+    IncompleteVerificationError,
     PreconditionViolationError,
     ProductionCanonicalRepairer,
     ProtectedPathViolationError,
     RecoveryStateError,
+    SignatureVerificationError,
     StagingLockError,
     acquire_repair_lock,
-    build_authorization,
+    authorization_fingerprint,
+    build_preparation,
     canonicalize_path,
     default_migration_id,
     derive_file_hash,
+    fault_injection_enabled,
+    generate_signing_keypair,
     inspect_dataset,
     load_authorization,
+    load_trusted_public_key,
+    sign_authorization,
     synthesize_candidate,
+    verify_authorization_signature,
     write_json_atomic,
 )
-from tools.staging_canonical_repair import hash_record
+from tools.staging_canonical_repair import StagingMigrationError, hash_record
 
 TARGET_ID = "500l-2026-10-09-1362422"
+OPERATOR = "ops-oncall"
 
 # Record A: live-score alias (abbreviated club names, closing odds, lottery no.)
 RECORD_A = {
@@ -91,6 +118,35 @@ RECORD_B = {
     "jczq_no": "",
     "market_tracked": True,
 }
+
+
+# ===========================================================================
+# Owner key material (provisioned once, outside the repository)
+# ===========================================================================
+
+_KEYS: dict = {}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def owner_keys(tmp_path_factory):
+    """Provision an owner keypair plus an unrelated keypair, outside the repo."""
+    base = tmp_path_factory.mktemp("owner_keys")
+    private = base / "owner-private.pem"
+    public = base / "owner-public.pem"
+    generate_signing_keypair(str(private), str(public))
+
+    other_private = base / "attacker-private.pem"
+    other_public = base / "attacker-public.pem"
+    generate_signing_keypair(str(other_private), str(other_public))
+
+    _KEYS.update({
+        "dir": str(base),
+        "private": str(private),
+        "public": str(public),
+        "other_private": str(other_private),
+        "other_public": str(other_public),
+    })
+    yield _KEYS
 
 
 def _match(mid, home, away, *, status="upcoming", score=None, date="2026-10-09", time="01:00"):
@@ -194,46 +250,79 @@ def snapshot_dir_hashes(directory: str) -> dict:
     return hashes
 
 
-def make_authorization(data_dir: str, **overrides):
-    artifact = build_authorization(
+# ===========================================================================
+# Authorization helpers
+# ===========================================================================
+
+def make_preparation(data_dir: str, **overrides):
+    """Unsigned preparation artifact, exactly as the ``prepare`` command emits."""
+    artifact = build_preparation(
         data_dir=data_dir,
         target_canonical_id=TARGET_ID,
-        operator="ops-oncall",
+        operator=OPERATOR,
         reason="repair legacy canonical duplicate",
     )
     artifact.update(overrides)
     return artifact
 
 
-def manual_authorization(data_dir: str) -> dict:
-    """Hand-built artifact used to exercise apply-side guards that
-    ``build_authorization`` itself would refuse to produce."""
+def make_authorization(data_dir: str, **overrides):
+    """Signed authorization artifact (prepared, then owner-approved)."""
+    return sign_authorization(make_preparation(data_dir, **overrides), _KEYS["private"])
+
+
+def manual_preparation(data_dir: str, **overrides):
+    """Hand-built preparation artifact used to exercise apply-side guards that
+    ``build_preparation`` itself would refuse to produce."""
     report = inspect_dataset(data_dir)
     payload = json.load(open(os.path.join(data_dir, CANONICAL_FILE), encoding="utf-8"))
     records = [m for m in payload["matches"] if m.get("id") == TARGET_ID]
-    candidate, _diff = synthesize_candidate(records)
-    return {
-        "authorization_schema_version": "1.0.0",
-        "scope": "PRODUCTION_CANONICAL_DEDUP",
-        "authorized": True,
+    candidate, field_diff = synthesize_candidate(records)
+    artifact = {
+        "authorization_schema_version": AUTHORIZATION_SCHEMA_VERSION,
+        "scope": REPAIR_SCOPE,
+        "purpose": AUTHORIZATION_PURPOSE,
+        "authorized": False,
+        APPROVAL_FIELD: None,
         "migration_id": default_migration_id(TARGET_ID),
-        "data_dir": data_dir,
+        "data_dir": canonicalize_path(data_dir),
         "target_canonical_id": TARGET_ID,
         "expected_source_sha256": report["store_hashes"][CANONICAL_FILE],
+        "expected_source_total": report["total_matches"],
         "expected_candidate_sha256": hash_record(candidate),
-        "operator": "ops-oncall",
+        "operator": OPERATOR,
         "approved_at": "2026-10-12T00:00:00+00:00",
         "reason": "manual",
+        "field_diff": field_diff,
     }
+    artifact.update(overrides)
+    return artifact
 
 
-def apply_artifact(tmp_path, data_dir, artifact, **kwargs):
-    repairer = ProductionCanonicalRepairer(
+def manual_authorization(data_dir: str, **overrides):
+    return sign_authorization(manual_preparation(data_dir, **overrides), _KEYS["private"])
+
+
+def tampered(artifact: dict, **changes) -> dict:
+    """Return a copy of a signed artifact with fields changed after signing."""
+    out = copy.deepcopy(artifact)
+    out.update(changes)
+    return out
+
+
+def make_repairer(data_dir: str, workspace: str, artifact: dict | None = None, **kwargs):
+    return ProductionCanonicalRepairer(
         data_dir=data_dir,
-        workspace=str(tmp_path / "ws"),
-        migration_id=artifact.get("migration_id"),
+        workspace=workspace,
+        migration_id=(artifact or {}).get("migration_id"),
+        trusted_public_key=_KEYS["public"],
+        **kwargs,
     )
-    return repairer, repairer.apply(artifact, confirm_apply=True, **kwargs)
+
+
+def apply_artifact(tmp_path, data_dir, artifact, operator=OPERATOR, **kwargs):
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    return repairer, repairer.apply(artifact, confirm_apply=True, operator=operator, **kwargs)
 
 
 # ===========================================================================
@@ -292,18 +381,23 @@ def test_workspace_parent_of_data_dir_is_rejected(tmp_path):
 
 
 # ===========================================================================
-# 2. Authorization artifact
+# 2. Authorization artifact: preparation vs. approval
 # ===========================================================================
 
-def test_build_authorization_binds_source_and_candidate(tmp_path):
+def test_build_preparation_is_unsigned_and_binds_source_and_candidate(tmp_path):
     data_dir = build_dataset(str(tmp_path))
-    artifact = make_authorization(data_dir)
+    artifact = make_preparation(data_dir)
 
-    assert artifact["authorization_schema_version"] == "1.0.0"
-    assert artifact["scope"] == "PRODUCTION_CANONICAL_DEDUP"
-    assert artifact["authorized"] is True
+    assert artifact["authorization_schema_version"] == AUTHORIZATION_SCHEMA_VERSION
+    assert artifact["scope"] == REPAIR_SCOPE
+    assert artifact["purpose"] == AUTHORIZATION_PURPOSE
+    # Preparation grants nothing.
+    assert artifact["authorized"] is False
+    assert artifact[APPROVAL_FIELD] is None
+
     assert artifact["data_dir"] == canonicalize_path(data_dir)
     assert artifact["expected_source_sha256"] == inspect_dataset(data_dir)["store_hashes"][CANONICAL_FILE]
+    assert artifact["expected_source_total"] == inspect_dataset(data_dir)["total_matches"]
 
     candidate, _ = synthesize_candidate([RECORD_A, RECORD_B])
     assert artifact["expected_candidate_sha256"] == hash_record(candidate)
@@ -318,36 +412,64 @@ def test_build_authorization_binds_source_and_candidate(tmp_path):
 def test_build_authorization_refuses_clean_dataset(tmp_path):
     data_dir = build_dataset(str(tmp_path), target_occurrences=1)
     with pytest.raises(PreconditionViolationError):
-        make_authorization(data_dir)
+        make_preparation(data_dir)
 
 
 def test_build_authorization_refuses_unexpected_duplicate_group(tmp_path):
     data_dir = build_dataset(str(tmp_path), extra_dup_group=True)
     with pytest.raises(PreconditionViolationError):
-        make_authorization(data_dir)
+        make_preparation(data_dir)
 
 
 def test_build_authorization_refuses_three_occurrences(tmp_path):
     data_dir = build_dataset(str(tmp_path), target_occurrences=3)
     with pytest.raises(PreconditionViolationError):
-        make_authorization(data_dir)
+        make_preparation(data_dir)
 
 
 def test_build_authorization_requires_operator_and_reason(tmp_path):
     data_dir = build_dataset(str(tmp_path))
     with pytest.raises(AuthorizationError):
-        build_authorization(data_dir, TARGET_ID, "", "reason")
+        build_preparation(data_dir, TARGET_ID, "", "reason")
     with pytest.raises(AuthorizationError):
-        build_authorization(data_dir, TARGET_ID, "ops", "   ")
+        build_preparation(data_dir, TARGET_ID, "ops", "   ")
+
+
+def test_signed_artifact_verifies_and_is_bound_to_every_declared_field(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+
+    assert artifact["authorized"] is True
+    approval = artifact[APPROVAL_FIELD]
+    assert approval["algorithm"] == APPROVAL_ALGORITHM
+    assert approval["key_id"] == load_trusted_public_key(_KEYS["public"])["key_id"]
+
+    info = verify_authorization_signature(artifact, _KEYS["public"])
+    assert info["verified"] is True
+
+    # Every bound field is covered by the signature.
+    for field, value in (
+        ("scope", "SOMETHING_ELSE"),
+        ("target_canonical_id", "other-id"),
+        ("expected_source_sha256", "0" * 64),
+        ("expected_candidate_sha256", "0" * 64),
+        ("expected_source_total", 999),
+        ("migration_id", "MIG-FORGED"),
+        ("operator", "someone-else"),
+        ("purpose", "SOMETHING_ELSE"),
+        ("reason", "rewritten"),
+    ):
+        with pytest.raises(SignatureVerificationError):
+            verify_authorization_signature(tampered(artifact, **{field: value}), _KEYS["public"])
 
 
 def test_load_authorization_rejects_unauthorized_flag(tmp_path):
     data_dir = build_dataset(str(tmp_path))
-    artifact = make_authorization(data_dir, authorized=False)
+    artifact = tampered(make_authorization(data_dir), authorized=False)
     path = str(tmp_path / "auth.json")
     write_json_atomic(path, artifact)
-    with pytest.raises(AuthorizationError):
-        load_authorization(path)
+    with pytest.raises(SignatureVerificationError):
+        load_authorization(path, _KEYS["public"])
 
 
 def test_load_authorization_rejects_bad_scope_and_missing_fields(tmp_path):
@@ -356,18 +478,231 @@ def test_load_authorization_rejects_bad_scope_and_missing_fields(tmp_path):
     path = str(tmp_path / "bad_scope.json")
     write_json_atomic(path, bad_scope)
     with pytest.raises(AuthorizationError):
-        load_authorization(path)
+        load_authorization(path, _KEYS["public"])
 
     missing = make_authorization(data_dir)
     missing.pop("expected_candidate_sha256")
     path2 = str(tmp_path / "missing.json")
     write_json_atomic(path2, missing)
     with pytest.raises(AuthorizationError):
-        load_authorization(path2)
+        load_authorization(path2, _KEYS["public"])
+
+
+def test_load_authorization_rejects_legacy_unsigned_schema(tmp_path):
+    """A schema 1.0.0 artifact asserted `authorized: true` with no signature."""
+    data_dir = build_dataset(str(tmp_path))
+    legacy = make_authorization(data_dir)
+    legacy["authorization_schema_version"] = "1.0.0"
+    legacy.pop(APPROVAL_FIELD)
+    path = str(tmp_path / "legacy.json")
+    write_json_atomic(path, legacy)
+
+    with pytest.raises(AuthorizationError, match="predates signed owner approvals"):
+        load_authorization(path, _KEYS["public"])
+
+
+def test_load_authorization_accepts_unsigned_preparation_only_for_preview(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    prepared = make_preparation(data_dir)
+    path = str(tmp_path / "prepared.json")
+    write_json_atomic(path, prepared)
+
+    # Read-only preview may inspect an unsigned preparation artifact...
+    loaded = load_authorization(path, require_signature=False)
+    assert loaded["authorized"] is False
+
+    # ...but it can never authorize a mutation.
+    with pytest.raises(SignatureVerificationError):
+        load_authorization(path, _KEYS["public"], require_signature=True)
 
 
 # ===========================================================================
-# 3. Dry run
+# 3. Negative: authorization trust boundary
+# ===========================================================================
+
+def test_unsigned_authorization_cannot_authorize_apply(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    prepared = make_preparation(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), prepared)
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(prepared, confirm_apply=True, operator=OPERATOR)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_forged_authorization_signature_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    forged = tampered(artifact)
+    forged[APPROVAL_FIELD] = dict(artifact[APPROVAL_FIELD])
+    forged[APPROVAL_FIELD]["signature"] = "A" * 88  # well-formed base64, wrong bytes
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(forged, confirm_apply=True, operator=OPERATOR)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_authorization_signed_by_untrusted_key_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    prepared = make_preparation(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    # An attacker with their own keypair produces a perfectly valid signature...
+    attacker_signed = sign_authorization(prepared, _KEYS["other_private"])
+    with pytest.raises(SignatureVerificationError, match="untrusted key"):
+        verify_authorization_signature(attacker_signed, _KEYS["public"])
+
+    # ...and the production apply path refuses it.
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), attacker_signed)
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(attacker_signed, confirm_apply=True, operator=OPERATOR)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_missing_trusted_public_key_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    with pytest.raises(SignatureVerificationError):
+        verify_authorization_signature(artifact, None)
+    with pytest.raises(SignatureVerificationError):
+        load_trusted_public_key("")
+    with pytest.raises(SignatureVerificationError):
+        load_trusted_public_key(str(tmp_path / "does-not-exist.pem"))
+
+    repairer = ProductionCanonicalRepairer(
+        data_dir=data_dir, workspace=str(tmp_path / "ws"), migration_id=artifact["migration_id"]
+    )
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_wrong_trusted_public_key_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    with pytest.raises(SignatureVerificationError):
+        verify_authorization_signature(artifact, _KEYS["other_public"])
+
+    repairer = ProductionCanonicalRepairer(
+        data_dir=data_dir,
+        workspace=str(tmp_path / "ws"),
+        migration_id=artifact["migration_id"],
+        trusted_public_key=_KEYS["other_public"],
+    )
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_tampered_source_hash_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(
+            tampered(artifact, expected_source_sha256="f" * 64),
+            confirm_apply=True,
+            operator=OPERATOR,
+        )
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_tampered_candidate_hash_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(
+            tampered(artifact, expected_candidate_sha256="f" * 64),
+            confirm_apply=True,
+            operator=OPERATOR,
+        )
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_tampered_source_record_count_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with pytest.raises(SignatureVerificationError):
+        repairer.apply(
+            tampered(artifact, expected_source_total=42),
+            confirm_apply=True,
+            operator=OPERATOR,
+        )
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_invalid_migration_id_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = ProductionCanonicalRepairer(
+        data_dir=data_dir,
+        workspace=str(tmp_path / "ws"),
+        migration_id="MIG-SOMEONE-ELSES",
+        trusted_public_key=_KEYS["public"],
+    )
+    with pytest.raises(AuthorizationError, match="Migration ID mismatch"):
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_owner_private_key_inside_repository_is_refused(tmp_path):
+    """A production private signing key must never live in the repository."""
+    from tools.production_canonical_repair import REPO_ROOT
+
+    with pytest.raises(AuthorizationError, match="inside the repository"):
+        generate_signing_keypair(
+            os.path.join(REPO_ROOT, "leaked-private.pem"),
+            os.path.join(str(tmp_path), "public.pem"),
+        )
+
+
+# ===========================================================================
+# 4. Operator identity binding
+# ===========================================================================
+
+def test_missing_operator_is_rejected(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    for missing in (None, "", "   "):
+        with pytest.raises(AuthorizationError, match="explicit --operator"):
+            repairer.apply(artifact, confirm_apply=True, operator=missing)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_apply_rejects_operator_mismatch(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with pytest.raises(AuthorizationError, match="Operator mismatch"):
+        repairer.apply(artifact, confirm_apply=True, operator="someone-else")
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+# ===========================================================================
+# 5. Dry run
 # ===========================================================================
 
 def test_dry_run_is_read_only_and_predicts_n_minus_1(tmp_path):
@@ -381,14 +716,30 @@ def test_dry_run_is_read_only_and_predicts_n_minus_1(tmp_path):
     preview = repairer.dry_run(artifact)
 
     assert preview["read_only_data_dir"] is True
+    assert preview["writes_external_artifact"] is True
     assert preview["after_total"] == preview["before_total"] - 1
     assert preview["candidate_sha256"] == artifact["expected_candidate_sha256"]
     assert preview["authorization_matches_candidate"] is True
     assert snapshot_dir_hashes(data_dir) == before
 
 
+def test_dry_run_accepts_an_unsigned_preparation_artifact(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    prepared = make_preparation(data_dir)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = ProductionCanonicalRepairer(
+        data_dir=data_dir, workspace=str(tmp_path / "ws"), writable=False
+    )
+    preview = repairer.dry_run(prepared)
+
+    assert preview["status"] == "DRY_RUN_COMPLETED"
+    assert preview["authorization_signature_verified"] is False
+    assert snapshot_dir_hashes(data_dir) == before
+
+
 # ===========================================================================
-# 4. Apply guards
+# 6. Apply guards
 # ===========================================================================
 
 def test_apply_requires_confirm_flag(tmp_path):
@@ -396,9 +747,9 @@ def test_apply_requires_confirm_flag(tmp_path):
     artifact = make_authorization(data_dir)
     before = snapshot_dir_hashes(data_dir)
 
-    repairer = ProductionCanonicalRepairer(data_dir=data_dir, workspace=str(tmp_path / "ws"))
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
     with pytest.raises(AuthorizationError):
-        repairer.apply(artifact, confirm_apply=False)
+        repairer.apply(artifact, confirm_apply=False, operator=OPERATOR)
     assert snapshot_dir_hashes(data_dir) == before
 
 
@@ -407,18 +758,10 @@ def test_apply_rejects_artifact_bound_to_other_data_dir(tmp_path):
     data_dir_b = build_dataset(str(tmp_path / "b"))
     artifact = make_authorization(data_dir_a)
 
-    repairer = ProductionCanonicalRepairer(data_dir=data_dir_b, workspace=str(tmp_path / "ws"))
+    repairer = make_repairer(data_dir_b, str(tmp_path / "ws"), artifact)
     with pytest.raises(AuthorizationError):
-        repairer.apply(artifact, confirm_apply=True)
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
     assert inspect_dataset(data_dir_b)["duplicate_ids"] == {TARGET_ID: 2}
-
-
-def test_apply_rejects_operator_mismatch(tmp_path):
-    data_dir = build_dataset(str(tmp_path))
-    artifact = make_authorization(data_dir)
-    repairer = ProductionCanonicalRepairer(data_dir=data_dir, workspace=str(tmp_path / "ws"))
-    with pytest.raises(AuthorizationError):
-        repairer.apply(artifact, confirm_apply=True, operator="someone-else")
 
 
 def test_apply_rejects_stale_source_hash(tmp_path):
@@ -432,9 +775,9 @@ def test_apply_rejects_stale_source_hash(tmp_path):
     write_json_atomic(path, payload)
     drifted = snapshot_dir_hashes(data_dir)
 
-    repairer = ProductionCanonicalRepairer(data_dir=data_dir, workspace=str(tmp_path / "ws"))
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
     with pytest.raises(PreconditionViolationError):
-        repairer.apply(artifact, confirm_apply=True)
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
     assert snapshot_dir_hashes(data_dir) == drifted
 
 
@@ -443,9 +786,9 @@ def test_apply_rejects_unexpected_duplicate_groups(tmp_path):
     artifact = manual_authorization(data_dir)
     before = snapshot_dir_hashes(data_dir)
 
-    repairer = ProductionCanonicalRepairer(data_dir=data_dir, workspace=str(tmp_path / "ws"))
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
     with pytest.raises(PreconditionViolationError):
-        repairer.apply(artifact, confirm_apply=True)
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
     assert snapshot_dir_hashes(data_dir) == before
 
 
@@ -454,24 +797,35 @@ def test_apply_rejects_three_occurrences(tmp_path):
     artifact = manual_authorization(data_dir)
     before = snapshot_dir_hashes(data_dir)
 
-    repairer = ProductionCanonicalRepairer(data_dir=data_dir, workspace=str(tmp_path / "ws"))
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
     with pytest.raises(PreconditionViolationError):
-        repairer.apply(artifact, confirm_apply=True)
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_apply_rejects_source_count_drift(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = manual_authorization(data_dir, expected_source_total=99)
+    before = snapshot_dir_hashes(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with pytest.raises(PreconditionViolationError, match="record count"):
+        repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
     assert snapshot_dir_hashes(data_dir) == before
 
 
 def test_apply_lock_contention_fails_closed(tmp_path):
     data_dir = build_dataset(str(tmp_path))
     artifact = make_authorization(data_dir)
-    repairer = ProductionCanonicalRepairer(data_dir=data_dir, workspace=str(tmp_path / "ws"))
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
 
     with acquire_repair_lock(data_dir):
         with pytest.raises(StagingLockError):
-            repairer.apply(artifact, confirm_apply=True)
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
 
 
 # ===========================================================================
-# 5. Happy path
+# 7. Happy path
 # ===========================================================================
 
 def test_apply_happy_path_enforces_every_postcondition(tmp_path):
@@ -483,6 +837,8 @@ def test_apply_happy_path_enforces_every_postcondition(tmp_path):
     repairer, result = apply_artifact(tmp_path, data_dir, artifact)
 
     assert result["status"] == "SUCCESS"
+    assert result["operator"] == OPERATOR
+    assert result["authorization_key_id"] == load_trusted_public_key(_KEYS["public"])["key_id"]
     assert result["before_total"] == original["meta"]["total"]
     assert result["after_total"] == original["meta"]["total"] - 1
     assert result["duplicate_ids_count"] == 0
@@ -519,7 +875,10 @@ def test_apply_happy_path_enforces_every_postcondition(tmp_path):
     assert states == JOURNAL_STATES
 
     assert os.path.exists(result["result_file"])
-    assert repairer.verify(artifact)["verified"] is True
+    audit = repairer.verify(artifact, trusted_public_key=_KEYS["public"])
+    assert audit["verified"] is True
+    assert audit["complete"] is True
+    assert audit["verification"] == FULL_REPAIR_VERIFICATION
 
 
 def test_apply_is_idempotent(tmp_path):
@@ -530,11 +889,16 @@ def test_apply_is_idempotent(tmp_path):
     journal_before = repairer.journal.read_entries()
     hashes_before = snapshot_dir_hashes(data_dir)
 
-    second = repairer.apply(artifact, confirm_apply=True)
+    second = repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
 
     assert second["status"] == "NO_OP_ALREADY_REPAIRED"
     assert snapshot_dir_hashes(data_dir) == hashes_before
     assert repairer.journal.read_entries() == journal_before
+
+    # Repeated verification stays green and writes nothing.
+    for _ in range(2):
+        assert repairer.verify(artifact, trusted_public_key=_KEYS["public"])["verified"] is True
+    assert snapshot_dir_hashes(data_dir) == hashes_before
 
 
 def test_derived_hash_matches_on_disk_bytes(tmp_path):
@@ -545,24 +909,22 @@ def test_derived_hash_matches_on_disk_bytes(tmp_path):
 
 
 # ===========================================================================
-# 6. Immutable store protection
+# 8. Immutable store protection
 # ===========================================================================
 
 def test_immutable_store_mutation_is_detected(tmp_path):
     data_dir = build_dataset(str(tmp_path))
     artifact = make_authorization(data_dir)
-    repairer = ProductionCanonicalRepairer(
-        data_dir=data_dir,
-        workspace=str(tmp_path / "ws"),
-        migration_id=artifact["migration_id"],
-    )
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
 
-    with pytest.raises(ImmutableStoreMutationError):
-        repairer.apply(
-            artifact,
-            confirm_apply=True,
-            fault_inject="corrupt_store_pre_postconditions",
-        )
+    with fault_injection_enabled():
+        with pytest.raises(ImmutableStoreMutationError):
+            repairer.apply(
+                artifact,
+                confirm_apply=True,
+                operator=OPERATOR,
+                fault_inject="corrupt_store_pre_postconditions",
+            )
 
     # The projection was committed but completion was correctly withheld.
     states = [e["state"] for e in repairer.journal.read_entries()]
@@ -571,71 +933,236 @@ def test_immutable_store_mutation_is_detected(tmp_path):
 
     # Recovery must also fail closed rather than paper over the mutation.
     with pytest.raises(ImmutableStoreMutationError):
+        repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
+
+
+# ===========================================================================
+# 9. Verification contract: inspection vs. full repair verification
+# ===========================================================================
+
+def test_basic_inspection_is_never_reported_as_full_repair_verification(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    repairer = ProductionCanonicalRepairer(
+        data_dir=data_dir, workspace=str(tmp_path / "ws"), writable=False
+    )
+
+    report = repairer.verify()
+    assert report["verification"] == DATASET_INTEGRITY_INSPECTION
+    assert report["verified"] is False
+    assert report["complete"] is False
+    assert report["repair_verified"] is False
+
+    # inspect_dataset itself is labelled as the weaker contract.
+    assert inspect_dataset(data_dir)["verification"] == DATASET_INTEGRITY_INSPECTION
+
+
+def test_full_repair_verification_reports_incomplete_when_evidence_is_missing(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    repairer, _result = apply_artifact(tmp_path, data_dir, artifact)
+
+    assert repairer.verify(artifact, trusted_public_key=_KEYS["public"])["verified"] is True
+
+    # Remove the forensic archive: the audit must report INCOMPLETE, not a pass.
+    for name in os.listdir(repairer.archive_dir):
+        os.unlink(os.path.join(repairer.archive_dir, name))
+
+    audit = repairer.verify(artifact, trusted_public_key=_KEYS["public"])
+    assert audit["verified"] is False
+    assert audit["complete"] is False
+    assert audit["verification"] == FULL_REPAIR_VERIFICATION
+    assert "forensic_archive_raw" in audit["error"]
+
+
+def test_full_repair_verification_requires_the_signed_authorization(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    # Prepared while the collision still exists, so it is a genuine artifact.
+    unsigned = make_preparation(data_dir)
+    artifact = sign_authorization(unsigned, _KEYS["private"])
+    repairer, _result = apply_artifact(tmp_path, data_dir, artifact)
+
+    audit = repairer.verify(unsigned, trusted_public_key=_KEYS["public"])
+    assert audit["verified"] is False
+    assert audit["complete"] is False
+    assert audit["verification"] == FULL_REPAIR_VERIFICATION
+
+    # An unsigned artifact is an explicit authorization failure, never a pass.
+    with pytest.raises(SignatureVerificationError):
+        repairer.verify_completed_dataset(unsigned, trusted_public_key=_KEYS["public"])
+
+
+# ===========================================================================
+# 10. Crash recovery
+# ===========================================================================
+
+def test_recover_requires_the_signed_authorization(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_commit_intent")
+
+    with pytest.raises(AuthorizationError, match="signed authorization artifact"):
         repairer.recover()
 
 
-# ===========================================================================
-# 7. Crash recovery
-# ===========================================================================
+def test_recover_rejects_a_foreign_authorization(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    foreign = make_authorization(data_dir, migration_id="MIG-SOMETHING-ELSE")
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_commit_intent")
+
+    with pytest.raises(AuthorizationError):
+        repairer.recover(foreign, operator=OPERATOR, trusted_public_key=_KEYS["public"])
+
+
+def test_recover_rejects_a_forged_journal_fingerprint(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_replace_before_committed")
+
+    # Rewrite the durable commit intent with a fingerprint the archive cannot
+    # possibly produce.
+    entries = repairer.journal.read_entries()
+    for entry in entries:
+        if entry["state"] == "COMMIT_INTENT_DURABLE":
+            entry["payload"]["projected_file_sha256"] = "a" * 64
+    with open(repairer.journal.journal_file, "w", encoding="utf-8") as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
+    with pytest.raises(RecoveryStateError, match="independently derived"):
+        repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
+
+
+def test_recover_rejects_an_invalid_journal_chain(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_commit_intent")
+
+    entries = repairer.journal.read_entries()
+    # Drop the EVIDENCE_VERIFIED entry: the state machine skips a phase.
+    entries = [e for e in entries if e["state"] != "EVIDENCE_VERIFIED"]
+    with open(repairer.journal.journal_file, "w", encoding="utf-8") as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
+    with pytest.raises(RecoveryStateError):
+        repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
+
+
+def test_recover_fails_closed_when_forensic_evidence_is_missing(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    baseline = open(os.path.join(data_dir, CANONICAL_FILE), "rb").read()
+
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_commit_intent")
+
+    import shutil
+    shutil.rmtree(repairer.archive_dir)
+
+    with pytest.raises(RecoveryStateError, match="Missing raw archive"):
+        repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
+    assert open(os.path.join(data_dir, CANONICAL_FILE), "rb").read() == baseline
+
 
 def test_recover_rolls_back_from_commit_intent_then_apply_succeeds(tmp_path):
     data_dir = build_dataset(str(tmp_path))
     artifact = make_authorization(data_dir)
     baseline_bytes = open(os.path.join(data_dir, CANONICAL_FILE), "rb").read()
 
-    repairer = ProductionCanonicalRepairer(
-        data_dir=data_dir,
-        workspace=str(tmp_path / "ws"),
-        migration_id=artifact["migration_id"],
-    )
-    with pytest.raises(Exception):
-        repairer.apply(artifact, confirm_apply=True, fault_inject="after_commit_intent")
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_commit_intent")
 
     assert open(os.path.join(data_dir, CANONICAL_FILE), "rb").read() == baseline_bytes
 
-    recovery = repairer.recover()
+    recovery = repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
     assert recovery["status"] == "RECOVERED_ROLLED_BACK"
     assert open(os.path.join(data_dir, CANONICAL_FILE), "rb").read() == baseline_bytes
 
-    result = repairer.apply(artifact, confirm_apply=True)
+    result = repairer.apply(artifact, confirm_apply=True, operator=OPERATOR)
     assert result["status"] == "SUCCESS"
     assert inspect_dataset(data_dir)["duplicate_ids"] == {}
-    assert repairer.verify(artifact)["verified"] is True
+    assert repairer.verify(artifact, trusted_public_key=_KEYS["public"])["verified"] is True
 
 
 def test_recover_completes_forward_when_projection_already_written(tmp_path):
     data_dir = build_dataset(str(tmp_path))
     artifact = make_authorization(data_dir)
 
-    repairer = ProductionCanonicalRepairer(
-        data_dir=data_dir,
-        workspace=str(tmp_path / "ws"),
-        migration_id=artifact["migration_id"],
-    )
-    with pytest.raises(Exception):
-        repairer.apply(artifact, confirm_apply=True, fault_inject="after_replace_before_committed")
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_replace_before_committed")
 
     states = [e["state"] for e in repairer.journal.read_entries()]
     assert states[-1] == "COMMIT_INTENT_DURABLE"
     assert inspect_dataset(data_dir)["duplicate_ids"] == {}
 
-    recovery = repairer.recover()
+    recovery = repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
     assert recovery["status"] == "RECOVERED_FORWARD_COMPLETED"
     assert [e["state"] for e in repairer.journal.read_entries()][-1] == "COMPLETION_RECORDED"
-    assert repairer.verify(artifact)["verified"] is True
+    assert repairer.verify(artifact, trusted_public_key=_KEYS["public"])["verified"] is True
+
+
+def test_recover_does_not_record_a_false_completion(tmp_path):
+    """A projection that is not the authorized one must never be 'completed'."""
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_replace_before_committed")
+
+    # Tamper with the committed projection so it no longer matches the derived one.
+    payload = json.load(open(os.path.join(data_dir, CANONICAL_FILE), encoding="utf-8"))
+    payload["matches"][0]["home"] = "被篡改的主队"
+    write_json_atomic(os.path.join(data_dir, CANONICAL_FILE), payload)
+
+    with pytest.raises(RecoveryStateError):
+        repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
+
+    states = [e["state"] for e in repairer.journal.read_entries()]
+    assert "COMPLETION_RECORDED" not in states
 
 
 def test_recover_fails_closed_on_unknown_state(tmp_path):
     data_dir = build_dataset(str(tmp_path))
     artifact = make_authorization(data_dir)
 
-    repairer = ProductionCanonicalRepairer(
-        data_dir=data_dir,
-        workspace=str(tmp_path / "ws"),
-        migration_id=artifact["migration_id"],
-    )
-    with pytest.raises(Exception):
-        repairer.apply(artifact, confirm_apply=True, fault_inject="after_commit_intent")
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    with fault_injection_enabled():
+        with pytest.raises(Exception):
+            repairer.apply(artifact, confirm_apply=True, operator=OPERATOR,
+                           fault_inject="after_commit_intent")
 
     # Corrupt the active file into a state matching neither baseline nor projection.
     payload = json.load(open(os.path.join(data_dir, CANONICAL_FILE), encoding="utf-8"))
@@ -643,7 +1170,7 @@ def test_recover_fails_closed_on_unknown_state(tmp_path):
     write_json_atomic(os.path.join(data_dir, CANONICAL_FILE), payload)
 
     with pytest.raises(RecoveryStateError):
-        repairer.recover()
+        repairer.recover(artifact, operator=OPERATOR, trusted_public_key=_KEYS["public"])
 
 
 def test_recover_without_journal_is_a_no_op(tmp_path):
@@ -653,39 +1180,201 @@ def test_recover_without_journal_is_a_no_op(tmp_path):
 
 
 # ===========================================================================
-# 8. CLI surface
+# 11. CLI surface
 # ===========================================================================
 
-def test_cli_authorize_apply_verify_roundtrip(tmp_path, capsys):
+def test_cli_prepare_approve_apply_verify_roundtrip(tmp_path, capsys):
     from tools.production_canonical_repair import main
 
     data_dir = build_dataset(str(tmp_path))
+    prepared_path = str(tmp_path / "prepared.json")
     auth_path = str(tmp_path / "authorization.json")
     workspace = str(tmp_path / "ws")
+    public = _KEYS["public"]
 
     assert main(["inspect", "--data-dir", data_dir]) == 0
     capsys.readouterr()
 
     assert main([
-        "authorize", "--data-dir", data_dir, "--target-id", TARGET_ID,
-        "--operator", "ops-oncall", "--reason", "cli roundtrip", "--out", auth_path,
+        "prepare", "--data-dir", data_dir, "--target-id", TARGET_ID,
+        "--operator", OPERATOR, "--reason", "cli roundtrip", "--out", prepared_path,
     ]) == 0
     capsys.readouterr()
-    assert os.path.exists(auth_path)
+    assert os.path.exists(prepared_path)
+    assert json.load(open(prepared_path, encoding="utf-8"))["authorized"] is False
 
-    assert main(["dry-run", "--data-dir", data_dir, "--authorization", auth_path, "--workspace", workspace]) == 0
+    # An unsigned preparation artifact cannot be applied.
+    assert main([
+        "apply", "--data-dir", data_dir, "--authorization", prepared_path,
+        "--workspace", workspace, "--operator", OPERATOR,
+        "--trusted-public-key", public, "--confirm-apply",
+    ]) == 112
+    capsys.readouterr()
+
+    assert main([
+        "approve", "--prepared", prepared_path, "--private-key", _KEYS["private"],
+        "--out", auth_path,
+    ]) == 0
+    capsys.readouterr()
+    assert json.load(open(auth_path, encoding="utf-8"))["authorized"] is True
+
+    assert main([
+        "verify-authorization", "--authorization", auth_path,
+        "--trusted-public-key", public,
+    ]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "dry-run", "--data-dir", data_dir, "--authorization", auth_path,
+        "--workspace", workspace, "--trusted-public-key", public,
+    ]) == 0
     capsys.readouterr()
 
     assert main([
         "apply", "--data-dir", data_dir, "--authorization", auth_path,
-        "--workspace", workspace, "--operator", "ops-oncall", "--confirm-apply",
+        "--workspace", workspace, "--operator", OPERATOR,
+        "--trusted-public-key", public, "--confirm-apply",
     ]) == 0
     capsys.readouterr()
 
-    assert main(["verify", "--data-dir", data_dir, "--authorization", auth_path]) == 0
+    assert main([
+        "verify", "--data-dir", data_dir, "--authorization", auth_path,
+        "--trusted-public-key", public, "--operator", OPERATOR, "--workspace", workspace,
+    ]) == 0
     capsys.readouterr()
 
     # Applying without --confirm-apply is refused with the authorization exit code.
     assert main([
         "apply", "--data-dir", data_dir, "--authorization", auth_path, "--workspace", workspace,
+        "--operator", OPERATOR, "--trusted-public-key", public,
     ]) == 110
+
+
+def test_cli_has_no_fault_injection_option(tmp_path, capsys):
+    from tools.production_canonical_repair import main
+
+    data_dir = build_dataset(str(tmp_path))
+    prepared_path = str(tmp_path / "prepared.json")
+    auth_path = str(tmp_path / "authorization.json")
+    main([
+        "prepare", "--data-dir", data_dir, "--target-id", TARGET_ID,
+        "--operator", OPERATOR, "--reason", "fault hook", "--out", prepared_path,
+    ])
+    main(["approve", "--prepared", prepared_path, "--private-key", _KEYS["private"],
+          "--out", auth_path])
+    capsys.readouterr()
+
+    before = snapshot_dir_hashes(data_dir)
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "apply", "--data-dir", data_dir, "--authorization", auth_path,
+            "--workspace", str(tmp_path / "ws"), "--operator", OPERATOR,
+            "--trusted-public-key", _KEYS["public"], "--confirm-apply",
+            "--fault-inject", "corrupt_store_pre_postconditions",
+        ])
+    assert exc.value.code == 2
+    capsys.readouterr()
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--force",
+        "--skip-verification",
+        "--ignore-hash",
+        "--allow-unsigned",
+        "--allow-production-without-approval",
+        "--fault-inject",
+    ],
+)
+def test_cli_rejects_unsupported_mutation_switches(tmp_path, capsys, flag):
+    from tools.production_canonical_repair import main
+
+    data_dir = build_dataset(str(tmp_path))
+    prepared_path = str(tmp_path / "prepared.json")
+    auth_path = str(tmp_path / "authorization.json")
+    main([
+        "prepare", "--data-dir", data_dir, "--target-id", TARGET_ID,
+        "--operator", OPERATOR, "--reason", "bypass probe", "--out", prepared_path,
+    ])
+    main(["approve", "--prepared", prepared_path, "--private-key", _KEYS["private"],
+          "--out", auth_path])
+    capsys.readouterr()
+
+    before = snapshot_dir_hashes(data_dir)
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "apply", "--data-dir", data_dir, "--authorization", auth_path,
+            "--workspace", str(tmp_path / "ws"), "--operator", OPERATOR,
+            "--trusted-public-key", _KEYS["public"], "--confirm-apply", flag,
+        ])
+    assert exc.value.code == 2
+    capsys.readouterr()
+    assert snapshot_dir_hashes(data_dir) == before
+    assert inspect_dataset(data_dir)["duplicate_ids"] == {TARGET_ID: 2}
+
+
+def test_fault_injection_gate_blocks_direct_api_use(tmp_path):
+    """Even a Python caller cannot arm the destructive hooks by accident."""
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    repairer = make_repairer(data_dir, str(tmp_path / "ws"), artifact)
+    before = snapshot_dir_hashes(data_dir)
+
+    with pytest.raises(StagingMigrationError, match="test-only facility"):
+        repairer.apply(
+            artifact, confirm_apply=True, operator=OPERATOR,
+            fault_inject="corrupt_store_pre_postconditions",
+        )
+    assert snapshot_dir_hashes(data_dir) == before
+
+
+def test_cli_verify_requires_a_signed_authorization(tmp_path, capsys):
+    from tools.production_canonical_repair import main
+
+    data_dir = build_dataset(str(tmp_path))
+    prepared_path = str(tmp_path / "prepared.json")
+    main([
+        "prepare", "--data-dir", data_dir, "--target-id", TARGET_ID,
+        "--operator", OPERATOR, "--reason", "verify probe", "--out", prepared_path,
+    ])
+    capsys.readouterr()
+
+    # Signature failure is reported on the signature exit code.
+    assert main([
+        "verify", "--data-dir", data_dir, "--authorization", prepared_path,
+        "--trusted-public-key", _KEYS["public"], "--operator", OPERATOR,
+    ]) == 112
+    capsys.readouterr()
+
+
+# ===========================================================================
+# 12. Production isolation
+# ===========================================================================
+
+def test_repo_canonical_data_is_never_touched(tmp_path):
+    """The suite operates on synthetic fixtures only."""
+    repo_data = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    live = os.path.join(repo_data, CANONICAL_FILE)
+    if os.path.exists(live):
+        before = hashlib.sha256(open(live, "rb").read()).hexdigest()
+    else:
+        before = None
+
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    apply_artifact(tmp_path, data_dir, artifact)
+
+    if before is None:
+        assert not os.path.exists(live)
+    else:
+        assert hashlib.sha256(open(live, "rb").read()).hexdigest() == before
+
+
+def test_authorization_fingerprint_covers_the_approval_block(tmp_path):
+    data_dir = build_dataset(str(tmp_path))
+    artifact = make_authorization(data_dir)
+    assert authorization_fingerprint(artifact) != authorization_fingerprint(
+        tampered(artifact, expected_candidate_sha256="0" * 64)
+    )
