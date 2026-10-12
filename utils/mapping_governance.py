@@ -43,7 +43,12 @@ from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
 from utils.source_identity import (
+    IDENTITY_KEY_SCHEMA_VERSION,
+    LEGACY_IDENTITY_KEY_SCHEMA_VERSION,
     PROVENANCE_SCHEMA_VERSION,
+    SUFFICIENT_IDENTITY_KEY_KINDS,
+    IdentityKeyKind,
+    ScopedSourceIdentityKey,
     SourceObservation,
     canonical_json,
     fingerprint,
@@ -108,6 +113,78 @@ class SignatureVerificationError(GovernanceError):
 
 class StaleBaselineError(GovernanceError):
     """基线指纹在提案之后发生变化；批准不可复用于新基线。"""
+
+
+class LegacyBindingKeyError(GovernanceError):
+    """
+    遇到旧契约的绑定键（仅由作用域元数据构成、无判别性身份证据）。
+
+    旧键**不得**被静默重新解释为新的身份键含义，也不得据以授权活动绑定。
+    """
+
+
+class MissingApprovalEvidenceError(GovernanceError):
+    """
+    APPROVED 记录缺少可独立复核的批准证据（签名工件或不可变提案证据）。
+
+    fail closed：缺少证据时绝不声称已完成密码学批准核验。
+    """
+
+
+class ActorBindingError(GovernanceError):
+    """账本主体身份与已签名批准件中的主体身份不一致。"""
+
+
+# =============================================================================
+# 绑定键契约兼容性
+# =============================================================================
+
+#: 绑定键契约分类。
+BINDING_KEY_CURRENT = "CURRENT"
+BINDING_KEY_LEGACY_SCOPE_ONLY = "LEGACY_SCOPE_ONLY"
+BINDING_KEY_LEGACY_VERSION = "LEGACY_VERSION"
+BINDING_KEY_UNKNOWN = "UNKNOWN"
+
+#: 旧契约（仅作用域元数据）的字段集合。
+_LEGACY_SCOPE_FIELDS = frozenset(
+    {"adapter", "sport", "event_date", "provider_namespace", "raw_identifier_type"}
+)
+
+
+def classify_binding_key(key: object) -> str:
+    """
+    判定一条已记录绑定键所属的契约。
+
+    - ``CURRENT``：带 ``identity_key_schema_version`` 且版本等于当前契约。
+    - ``LEGACY_VERSION``：带版本标记但版本不是当前契约。
+    - ``LEGACY_SCOPE_ONLY``：旧契约 —— 只有作用域元数据，没有判别性身份证据。
+    - ``UNKNOWN``：无法解析。
+
+    **绝不**把旧键静默重新解释为当前身份键。
+    """
+    if not isinstance(key, str) or not key.strip():
+        return BINDING_KEY_UNKNOWN
+    try:
+        payload = json.loads(key)
+    except (ValueError, TypeError):
+        return BINDING_KEY_UNKNOWN
+    if not isinstance(payload, dict):
+        return BINDING_KEY_UNKNOWN
+
+    version = payload.get("identity_key_schema_version")
+    if version is not None:
+        return (
+            BINDING_KEY_CURRENT
+            if version == IDENTITY_KEY_SCHEMA_VERSION
+            else BINDING_KEY_LEGACY_VERSION
+        )
+    if _LEGACY_SCOPE_FIELDS.issubset(set(payload)):
+        return BINDING_KEY_LEGACY_SCOPE_ONLY
+    return BINDING_KEY_UNKNOWN
+
+
+def binding_key_is_current(key: object) -> bool:
+    return classify_binding_key(key) == BINDING_KEY_CURRENT
 
 
 # =============================================================================
@@ -219,7 +296,7 @@ FORBIDDEN_ACTION_TOKENS: tuple[str, ...] = (
     "MERGE_CANONICAL",
 )
 
-PROPOSAL_SCHEMA_VERSION = "1.0.0"
+PROPOSAL_SCHEMA_VERSION = "2.0.0"
 
 #: 提案必填字段（schema 契约）。
 PROPOSAL_REQUIRED_FIELDS: tuple[str, ...] = (
@@ -227,6 +304,7 @@ PROPOSAL_REQUIRED_FIELDS: tuple[str, ...] = (
     "proposal_id",
     "source_observation_ref",
     "source_identity_scope",
+    "scoped_source_identity_key",
     "candidate_canonical_id",
     "existing_canonical_owner",
     "identity_evidence_type",
@@ -247,12 +325,16 @@ class MappingProposal:
 
     ``status`` 默认 ``PROPOSED``；``OBSERVED`` 只表示「已观测」，绝不等于已提案，
     更不等于已批准。
+
+    绑定身份由 ``scoped_source_identity_key`` 承载 —— 宽泛的 ``source_identity_scope``
+    只描述**域**，绝不单独构成绑定键。
     """
 
     proposal_schema_version: str
     proposal_id: str
     source_observation_ref: str
     source_identity_scope: tuple[tuple[str, str], ...]
+    scoped_source_identity_key: tuple[tuple[str, str], ...]
     candidate_canonical_id: str | None
     existing_canonical_owner: str | None
     identity_evidence_type: str
@@ -272,9 +354,34 @@ class MappingProposal:
         return dict(self.source_identity_scope)
 
     @property
+    def identity_key_dict(self) -> dict[str, str]:
+        return dict(self.scoped_source_identity_key)
+
+    @property
+    def identity_key_kind(self) -> str:
+        return self.identity_key_dict.get("identity_kind", "")
+
+    @property
+    def identity_key_value(self) -> str:
+        return self.identity_key_dict.get("identity_value", "")
+
+    @property
+    def identity_key_sufficient(self) -> bool:
+        """绑定键是否承载足以授权活动绑定的判别性身份证据。"""
+        return self.identity_key_kind in SUFFICIENT_IDENTITY_KEY_KINDS
+
+    @property
+    def identity_key_fingerprint(self) -> str:
+        return fingerprint(self.identity_key_dict)
+
+    @property
     def source_key(self) -> str:
-        """源身份作用域键（用于活动绑定冲突检测）。"""
-        return canonical_json(self.scope_dict)
+        """
+        **绑定身份键**：由判别性身份证据构成，用于活动绑定冲突检测。
+
+        绝不是「仅作用域元数据」。
+        """
+        return canonical_json(self.identity_key_dict)
 
     @property
     def is_binding_action(self) -> bool:
@@ -292,6 +399,7 @@ class MappingProposal:
             "proposal_id": self.proposal_id,
             "source_observation_ref": self.source_observation_ref,
             "source_identity_scope": self.scope_dict,
+            "scoped_source_identity_key": self.identity_key_dict,
             "candidate_canonical_id": self.candidate_canonical_id,
             "existing_canonical_owner": self.existing_canonical_owner,
             "identity_evidence_type": self.identity_evidence_type,
@@ -320,6 +428,16 @@ class MappingProposal:
         payload.pop("status", None)
         return fingerprint(payload)
 
+    def evidence_payload(self) -> dict:
+        """
+        不可变提案证据（供历史批准独立复核）。
+
+        只包含重建与复核该提案所需的字段；不含任何私钥或瞬时状态。
+        """
+        payload = self.as_dict()
+        payload.pop("status", None)
+        return payload
+
 
 def build_proposal(
     *,
@@ -333,22 +451,39 @@ def build_proposal(
     reason: str,
     expected_baseline_fingerprint: str,
     requested_action: str,
+    identity_key: ScopedSourceIdentityKey | None = None,
+    scoped_source_identity_key: Mapping[str, Any] | None = None,
     conflict_category: str | None = None,
     status: str = MappingState.PROPOSED.value,
     operator: str = "",
 ) -> MappingProposal:
     """
     构造一条提案。``proposal_id`` 由**内容**确定性派生（与输入顺序无关）。
+
+    ``identity_key`` 是**绑定身份**的权威来源；只给出 ``scoped_source_identity_key``
+    字典（例如从账本证据重建时）同样接受。绑定动作必须携带**充分**的身份键。
     """
-    scope_pairs = tuple(
-        sorted((str(k), str(v)) for k, v in dict(source_identity_scope).items())
-    )
+    if identity_key is not None:
+        key_dict = identity_key.as_dict()
+        scope_dict = identity_key.scope.as_dict()
+    elif scoped_source_identity_key is not None:
+        key_dict = {str(k): str(v) for k, v in dict(scoped_source_identity_key).items()}
+        scope_dict = {str(k): str(v) for k, v in dict(source_identity_scope).items()}
+    else:
+        raise ProposalValidationError(
+            "A scoped source identity key is required; broad scope metadata alone "
+            "never constitutes a binding identity"
+        )
+
+    scope_pairs = tuple(sorted((str(k), str(v)) for k, v in scope_dict.items()))
+    key_pairs = tuple(sorted(key_dict.items()))
     proposal_id = fingerprint(
         {
             "governance_schema_version": GOVERNANCE_SCHEMA_VERSION,
             "proposal_schema_version": PROPOSAL_SCHEMA_VERSION,
             "source_observation_ref": source_observation_ref,
             "source_identity_scope": dict(scope_pairs),
+            "scoped_source_identity_key": dict(key_pairs),
             "candidate_canonical_id": candidate_canonical_id,
             "existing_canonical_owner": existing_canonical_owner,
             "identity_evidence_type": identity_evidence_type,
@@ -365,6 +500,7 @@ def build_proposal(
         proposal_id=proposal_id,
         source_observation_ref=source_observation_ref,
         source_identity_scope=scope_pairs,
+        scoped_source_identity_key=key_pairs,
         candidate_canonical_id=candidate_canonical_id,
         existing_canonical_owner=existing_canonical_owner,
         identity_evidence_type=identity_evidence_type,
@@ -418,6 +554,15 @@ def validate_proposal(proposal: MappingProposal) -> None:
             raise ProposalValidationError(
                 "BIND_SOURCE_TO_EXISTING_CANONICAL requires an existing_canonical_owner"
             )
+        # 绑定身份必须由**判别性**身份证据支撑：行位置派生、含义不可确认或缺号
+        # 的观测只能被观测 / 复核，绝不能授权活动绑定。
+        if not proposal.identity_key_sufficient:
+            raise ProposalValidationError(
+                "A binding action requires sufficient scoped source identity evidence; "
+                f"identity_kind='{proposal.identity_key_kind}' is not sufficient "
+                "(ambiguous, unstable or position-derived evidence cannot authorize an "
+                "active binding)"
+            )
 
     if not proposal.source_observation_ref:
         raise ProposalValidationError("source_observation_ref is required")
@@ -429,6 +574,12 @@ def validate_proposal(proposal: MappingProposal) -> None:
         raise ProposalValidationError("expected_baseline_fingerprint is required")
     if not proposal.source_identity_scope:
         raise ProposalValidationError("source_identity_scope is required")
+    if not proposal.scoped_source_identity_key:
+        raise ProposalValidationError("scoped_source_identity_key is required")
+    if not proposal.identity_key_kind or not proposal.identity_key_value:
+        raise ProposalValidationError(
+            "scoped_source_identity_key must carry an identity_kind and identity_value"
+        )
     if not proposal.reason:
         raise ProposalValidationError("reason is required")
 
@@ -451,6 +602,7 @@ def proposal_from_observations(
     expected_baseline_fingerprint: str,
     reason: str,
     identity_evidence_type: str,
+    identity_key: ScopedSourceIdentityKey | None = None,
     conflict_category: str | None = None,
     operator: str = "",
     status: str = MappingState.PROPOSED.value,
@@ -458,19 +610,27 @@ def proposal_from_observations(
     """
     由一组源观测构造提案（只读；不修改观测）。
 
-    作用域取自**首条**观测（同一提案的观测必须共享同一作用域，否则请分别提案）。
+    ``identity_key`` 未显式给出时，由**首条**观测推导。同一提案的观测必须共享同一
+    身份键（否则请分别提案）—— 这正是「不同赛事不得共用同一绑定身份」的保障。
     """
     if not observations:
         raise ProposalValidationError("at least one observation is required")
-    scope = observations[0].stability_scope.as_dict()
-    scopes = {tuple(sorted(o.stability_scope.as_dict().items())) for o in observations}
-    if len(scopes) > 1:
+
+    keys = [
+        (identity_key if identity_key is not None else ScopedSourceIdentityKey.for_observation(o))
+        for o in observations
+    ]
+    key_signatures = {k.source_key() for k in keys}
+    if len(key_signatures) > 1:
         raise ProposalValidationError(
-            "observations in one proposal must share a single source identity scope"
+            "observations in one proposal must resolve to a single scoped source "
+            "identity key; distinct events must be proposed separately"
         )
+    resolved_key = keys[0]
+
     return build_proposal(
         source_observation_ref=observations[0].observation_id,
-        source_identity_scope=scope,
+        source_identity_scope=resolved_key.scope.as_dict(),
         candidate_canonical_id=candidate_canonical_id,
         existing_canonical_owner=existing_canonical_owner,
         identity_evidence_type=identity_evidence_type,
@@ -481,6 +641,7 @@ def proposal_from_observations(
         reason=reason,
         expected_baseline_fingerprint=expected_baseline_fingerprint,
         requested_action=requested_action,
+        identity_key=resolved_key,
         conflict_category=conflict_category,
         status=status,
         operator=operator,
@@ -491,7 +652,7 @@ def proposal_from_observations(
 # 所有者批准信任边界（Ed25519）
 # =============================================================================
 
-MAPPING_APPROVAL_SCHEMA_VERSION = "1.0.0"
+MAPPING_APPROVAL_SCHEMA_VERSION = "2.0.0"
 
 #: 域分离用途串。刻意与生产修复授权（``PRODUCTION_CANONICAL_DEDUP_APPLY``）
 #: 完全不同，因此生产修复的授权件**永远无法**被当作映射批准件使用。
@@ -504,11 +665,16 @@ APPROVAL_PUBLIC_KEY_BYTES = 32
 APPROVAL_SIGNATURE_BYTES = 64
 
 #: 批准件必须绑定的字段。
+#:
+#: ``scoped_source_identity_key`` 是本次修正新增的绑定项：批准件必须绑定**判别性
+#: 身份证据**，而不只是宽泛的作用域元数据。因此批准契约版本提升为 ``2.0.0``，
+#: 旧版本批准件一律按不兼容契约拒绝（绝不静默重新解释、绝不静默迁移）。
 APPROVAL_BOUND_FIELDS: tuple[str, ...] = (
     "proposal_id",
     "proposal_content_fingerprint",
     "source_observation_fingerprint",
     "source_identity_scope",
+    "scoped_source_identity_key",
     "candidate_canonical_id",
     "requested_action",
     "dataset_identity",
@@ -728,6 +894,7 @@ def build_approval_body(
         "proposal_content_fingerprint": proposal.content_fingerprint(),
         "source_observation_fingerprint": source_observation_fingerprint,
         "source_identity_scope": proposal.scope_dict,
+        "scoped_source_identity_key": proposal.identity_key_dict,
         "candidate_canonical_id": proposal.candidate_canonical_id,
         "requested_action": proposal.requested_action,
         "dataset_identity": dataset_identity,
@@ -747,6 +914,8 @@ def verify_mapping_approval(
     dataset_identity: str,
     current_baseline_fingerprint: str,
     trusted_public_key_path: str,
+    expected_actor: str | None = None,
+    expected_operator: str | None = None,
 ) -> None:
     """
     独立验证一份所有者批准件。
@@ -754,10 +923,17 @@ def verify_mapping_approval(
     拒绝（fail closed）：
     - 缺失 / 未签名 / 空签名的批准尝试；
     - 非映射用途的批准件（例如生产修复授权件）；
+    - 旧契约版本的批准件（不兼容，绝不静默迁移）；
     - 任何被篡改的字段（签名校验失败）；
     - 不可信或非 Ed25519 的公钥；
-    - 绑定不匹配（提案、内容指纹、观测指纹、作用域、目标 Canonical ID、动作、数据集）；
+    - 绑定不匹配（提案、内容指纹、观测指纹、作用域、**判别性身份键**、目标
+      Canonical ID、动作、数据集）；
+    - **主体归属不匹配**：``expected_actor`` 必须等于已签名的 ``approver``；
+      ``expected_operator`` 必须等于已签名的 ``operator``；
     - 基线指纹已变化（陈旧批准，必须重新验证）。
+
+    ``expected_actor`` / ``expected_operator`` 由调用方给出（账本主体、提案操作者），
+    使「账本记录的主体」与「被签名的身份」无法被拆开。
     """
     if not approval:
         raise SignatureVerificationError(
@@ -769,7 +945,8 @@ def verify_mapping_approval(
     if approval.get("approval_schema_version") != MAPPING_APPROVAL_SCHEMA_VERSION:
         raise SignatureVerificationError(
             "Approval artifact schema is not the mapping governance schema "
-            f"'{MAPPING_APPROVAL_SCHEMA_VERSION}'"
+            f"'{MAPPING_APPROVAL_SCHEMA_VERSION}'; legacy approval contracts are "
+            "incompatible and are never silently migrated"
         )
 
     purpose = approval.get("purpose")
@@ -805,6 +982,10 @@ def verify_mapping_approval(
         raise SignatureVerificationError(
             "Approval does not bind the source identity scope"
         )
+    if dict(approval.get("scoped_source_identity_key") or {}) != proposal.identity_key_dict:
+        raise SignatureVerificationError(
+            "Approval does not bind the scoped source identity key"
+        )
     if approval.get("candidate_canonical_id") != proposal.candidate_canonical_id:
         raise SignatureVerificationError(
             "Approval does not bind the candidate Canonical ID"
@@ -818,6 +999,28 @@ def verify_mapping_approval(
     if approval.get("approver") == approval.get("operator"):
         raise SignatureVerificationError(
             "Approval approver and operator must be distinct identities"
+        )
+    if not str(approval.get("approver") or "").strip():
+        raise SignatureVerificationError(
+            "Approval approver identity is blank; a signed decision must be attributable"
+        )
+    if not str(approval.get("operator") or "").strip():
+        raise SignatureVerificationError(
+            "Approval operator identity is blank; a signed decision must be attributable"
+        )
+
+    # --- 主体归属（账本主体 / 提案操作者 必须与被签名的身份一致） ----------
+    if expected_actor is not None and approval.get("approver") != expected_actor:
+        raise ActorBindingError(
+            "The recorded decision actor does not match the signed approver "
+            f"(actor={expected_actor!r}, signed approver={approval.get('approver')!r}); "
+            "a signed decision can never be attributed to a different identity"
+        )
+    if expected_operator is not None and approval.get("operator") != expected_operator:
+        raise ActorBindingError(
+            "The signed operator does not match the proposal operator "
+            f"(proposal operator={expected_operator!r}, "
+            f"signed operator={approval.get('operator')!r})"
         )
 
     expected_baseline = approval.get("expected_baseline_fingerprint")
@@ -891,7 +1094,14 @@ def _utc_now() -> str:
 
 @dataclass(frozen=True)
 class LedgerEntry:
-    """账本中的一条 append-only 条目。"""
+    """
+    账本中的一条 append-only 条目。
+
+    ``approval_artifact`` 与 ``proposal_evidence`` 使**独立的历史批准复核**成为可能：
+    审计者仅凭账本 + 明确可信的公钥即可重算 Ed25519 签名并核对全部绑定，无需任何
+    外部数据库。它们位于被哈希覆盖的条目内容之内，因此篡改会破坏哈希链。
+    绝不包含任何私钥。
+    """
 
     sequence: int
     transition_id: str
@@ -913,6 +1123,9 @@ class LedgerEntry:
     entry_hash: str
     binding_source_key: str = ""
     binding_canonical_id: str | None = None
+    binding_source_key_contract: str = ""
+    approval_artifact: dict | None = None
+    proposal_evidence: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -934,6 +1147,9 @@ class LedgerEntry:
             "approval_fingerprint": self.approval_fingerprint,
             "binding_source_key": self.binding_source_key,
             "binding_canonical_id": self.binding_canonical_id,
+            "binding_source_key_contract": self.binding_source_key_contract,
+            "approval_artifact": self.approval_artifact,
+            "proposal_evidence": self.proposal_evidence,
             "previous_entry_hash": self.previous_entry_hash,
             "entry_hash": self.entry_hash,
         }
@@ -1116,14 +1332,14 @@ class GovernanceLedger:
 
         return {
             "governance_schema_version": GOVERNANCE_SCHEMA_VERSION,
+            "verification_category": VERIFICATION_STRUCTURAL_LEDGER_INTEGRITY,
             "ledger_path": self.path,
             "entry_count": len(entries),
             "chain_tip": previous,
             "integrity": "OK",
-            "trust_anchor": (
-                "NONE — the hash chain proves internal consistency only; it is not an "
-                "independently trusted signature or checkpoint"
-            ),
+            "binding_key_contracts": self.binding_key_contracts(),
+            "incomplete_approved_entries": list(self.incomplete_approved_entries()),
+            "trust_anchor": LEDGER_TRUST_ANCHOR_STATEMENT,
         }
 
     # -- 状态视图（只读） --------------------------------------------------
@@ -1142,11 +1358,16 @@ class GovernanceLedger:
         """某提案的完整迁移历史（只读；证据永不被静默抹除）。"""
         return tuple(e for e in self.entries() if e.proposal_id == proposal_id)
 
-    def active_bindings(self) -> dict[str, dict[str, str]]:
+    def active_bindings(self, *, require_current_keys: bool = True) -> dict[str, dict[str, str]]:
         """
-        活动绑定视图（只读）：源身份作用域键 -> {canonical_id, proposal_id}。
+        活动绑定视图（只读）：**绑定身份键** -> {canonical_id, proposal_id}。
 
         仅 ``APPROVED`` 且动作是绑定动作的提案计入。
+
+        ``require_current_keys=True``（默认）时，一旦发现由**旧契约**绑定键支撑的
+        活动绑定即抛 ``LegacyBindingKeyError`` —— 旧键不得被静默重新解释为新的身份键
+        含义，也不得据以主张活动授权。设为 ``False`` 时只返回当前契约的绑定，
+        旧键另行通过 ``legacy_active_bindings()`` 只读检视（历史可审计）。
         """
         states = self.proposal_states()
         bindings: dict[str, dict[str, str]] = {}
@@ -1156,20 +1377,78 @@ class GovernanceLedger:
             record = self._binding_record_for(proposal_id)
             if record is None:
                 continue
-            key, canonical_id = record
+            key, canonical_id, contract = record
+            if contract != BINDING_KEY_CURRENT:
+                if require_current_keys:
+                    raise LegacyBindingKeyError(
+                        "An active binding is backed by a legacy binding key contract "
+                        f"({contract}); it cannot be reinterpreted as the corrected "
+                        "scoped source identity key. Re-approval under the current "
+                        "contract is required."
+                    )
+                continue
             bindings[key] = {"canonical_id": canonical_id, "proposal_id": proposal_id}
         return bindings
 
-    def _binding_record_for(self, proposal_id: str) -> tuple[str, str] | None:
-        """从账本中恢复某提案的绑定记录（源身份键 + 目标 Canonical ID）。"""
+    def legacy_active_bindings(self) -> tuple[dict[str, str], ...]:
+        """
+        只读检视：由**旧契约**绑定键支撑的活动绑定（历史审计，不构成授权）。
+        """
+        states = self.proposal_states()
+        legacy: list[dict[str, str]] = []
+        for proposal_id, state in sorted(states.items()):
+            if state not in ACTIVE_STATES:
+                continue
+            record = self._binding_record_for(proposal_id)
+            if record is None:
+                continue
+            key, canonical_id, contract = record
+            if contract == BINDING_KEY_CURRENT:
+                continue
+            legacy.append(
+                {
+                    "proposal_id": proposal_id,
+                    "binding_source_key": key,
+                    "binding_key_contract": contract,
+                    "canonical_id": canonical_id,
+                }
+            )
+        return tuple(legacy)
+
+    def binding_key_contracts(self) -> dict[str, int]:
+        """只读：账本中出现的绑定键契约分布。"""
+        counts: dict[str, int] = {}
+        for entry in self.entries():
+            key = entry.binding_source_key
+            if not key:
+                continue
+            contract = entry.binding_source_key_contract or classify_binding_key(key)
+            counts[contract] = counts.get(contract, 0) + 1
+        return counts
+
+    def incomplete_approved_entries(self) -> tuple[int, ...]:
+        """
+        只读：缺少可独立复核批准证据的 APPROVED 条目序号。
+
+        新增记录永不缺证据；该视图用于检出旧记录并驱动 fail-closed 审计。
+        """
+        return tuple(
+            entry.sequence
+            for entry in self.entries()
+            if entry.to_state in ACTIVE_STATES
+            and (not entry.approval_artifact or not entry.proposal_evidence)
+        )
+
+    def _binding_record_for(self, proposal_id: str) -> tuple[str, str, str] | None:
+        """从账本中恢复某提案的绑定记录（身份键 + 目标 Canonical ID + 契约分类）。"""
         for entry in self.entries():
             if entry.proposal_id != proposal_id:
                 continue
-            payload = entry.as_dict()
-            key = payload.get("binding_source_key")
-            canonical = payload.get("binding_canonical_id")
+            key = entry.binding_source_key
+            canonical = entry.binding_canonical_id
             if key and canonical:
-                return str(key), str(canonical)
+                contract = entry.binding_source_key_contract or classify_binding_key(key)
+                return str(key), str(canonical), contract
         return None
 
     # -- 写入 --------------------------------------------------------------
@@ -1194,7 +1473,8 @@ class GovernanceLedger:
         追加一次状态迁移。返回 ``(entry, appended)``；``appended=False`` 表示幂等
         no-op（完全相同的提交）。
 
-        失败一律 fail closed：非法迁移、冲突活动绑定、重放、断链、缺批准。
+        失败一律 fail closed：非法迁移、冲突活动绑定、重放、断链、缺批准、
+        主体归属不匹配、旧契约绑定键。
         """
         validate_proposal(proposal)
 
@@ -1216,6 +1496,19 @@ class GovernanceLedger:
                         f"its declared status '{proposal.status}', got '{to_state}'"
                     )
 
+            if not str(actor or "").strip():
+                raise ActorBindingError(
+                    "A decision actor identity is required; every transition must be "
+                    "attributable"
+                )
+
+            key_contract = classify_binding_key(proposal.source_key)
+            if key_contract != BINDING_KEY_CURRENT:
+                raise LegacyBindingKeyError(
+                    "The proposal carries a binding key that is not on the current "
+                    f"contract ({key_contract}); it is never silently reinterpreted"
+                )
+
             payload: dict[str, Any] = {
                 "sequence": len(entries),
                 "proposal_id": proposal.proposal_id,
@@ -1235,6 +1528,11 @@ class GovernanceLedger:
                 ),
                 "binding_source_key": proposal.source_key,
                 "binding_canonical_id": proposal.candidate_canonical_id,
+                "binding_source_key_contract": key_contract,
+                "approval_artifact": dict(approval) if approval else None,
+                "proposal_evidence": (
+                    proposal.evidence_payload() if to_state in ACTIVE_STATES else None
+                ),
             }
 
             # --- 重复提交处理（先于状态迁移校验） --------------------------
@@ -1279,6 +1577,10 @@ class GovernanceLedger:
                     dataset_identity=self.dataset_identity,
                     current_baseline_fingerprint=baseline_fingerprint,
                     trusted_public_key_path=trusted_public_key_path,
+                    # 主体归属：账本主体必须是被签名的批准人，且被签名的操作者必须
+                    # 是提案的操作者。仅靠 actor_role="owner" 不足以证明身份。
+                    expected_actor=actor,
+                    expected_operator=proposal.operator,
                 )
 
             if expected_previous_hash is not None and expected_previous_hash != previous:
@@ -1288,6 +1590,12 @@ class GovernanceLedger:
                 )
 
             if to_state in ACTIVE_STATES and proposal.is_binding_action:
+                if not proposal.identity_key_sufficient:
+                    raise ProposalValidationError(
+                        "An active binding requires sufficient scoped source identity "
+                        f"evidence; identity_kind='{proposal.identity_key_kind}' is not "
+                        "sufficient"
+                    )
                 existing = self.active_bindings().get(proposal.source_key)
                 if existing and existing["canonical_id"] != proposal.candidate_canonical_id:
                     raise ConflictingBindingError(
@@ -1429,6 +1737,249 @@ class _ledger_lock:
 
 
 # =============================================================================
+# 历史批准审计（与结构性账本校验严格分离）
+# =============================================================================
+
+#: 结构性账本校验：序号 / 前驱哈希 / 条目哈希 / 重放 / 结构一致性。
+VERIFICATION_STRUCTURAL_LEDGER_INTEGRITY = "STRUCTURAL_LEDGER_INTEGRITY"
+
+#: 密码学批准审计：可信公钥 + 可恢复签名证据 + 主体归属 + 绑定核验。
+VERIFICATION_AUTHENTICATED_MAPPING_APPROVAL_AUDIT = (
+    "AUTHENTICATED_MAPPING_APPROVAL_AUDIT"
+)
+
+#: 当前映射资格：历史批准对**当前**基线是否仍然有效。
+VERIFICATION_CURRENT_MAPPING_ELIGIBILITY = "CURRENT_MAPPING_ELIGIBILITY"
+
+#: 账本自身的信任锚说明。哈希链不是外部信任锚。
+LEDGER_TRUST_ANCHOR_STATEMENT = (
+    "NONE — the hash chain proves internal consistency only; it is not an "
+    "independently trusted signature or checkpoint, and it does not by itself detect "
+    "tail truncation or a full-chain rewrite"
+)
+
+
+def reconstruct_proposal_from_evidence(evidence: Mapping[str, Any]) -> MappingProposal:
+    """
+    由账本保留的**不可变提案证据**重建提案（只读）。
+
+    重建出的 ``proposal_id`` / 内容指纹必须与账本记录一致，否则证据不可信。
+    """
+    if not isinstance(evidence, Mapping):
+        raise MissingApprovalEvidenceError("Proposal evidence is missing or malformed")
+    required = (
+        "proposal_schema_version",
+        "source_identity_scope",
+        "scoped_source_identity_key",
+        "candidate_canonical_id",
+        "identity_evidence_type",
+        "observation_fingerprints",
+        "ingestion_plan_reference",
+        "reason",
+        "expected_baseline_fingerprint",
+        "requested_action",
+        "operator",
+    )
+    missing = [field for field in required if field not in evidence]
+    if missing:
+        raise MissingApprovalEvidenceError(
+            f"Proposal evidence is incomplete; missing {sorted(missing)}"
+        )
+    return build_proposal(
+        source_observation_ref=str(evidence.get("source_observation_ref") or ""),
+        source_identity_scope=dict(evidence["source_identity_scope"]),
+        scoped_source_identity_key=dict(evidence["scoped_source_identity_key"]),
+        candidate_canonical_id=evidence.get("candidate_canonical_id"),
+        existing_canonical_owner=evidence.get("existing_canonical_owner"),
+        identity_evidence_type=str(evidence["identity_evidence_type"]),
+        observation_fingerprints=list(evidence["observation_fingerprints"]),
+        ingestion_plan_reference=str(evidence["ingestion_plan_reference"]),
+        reason=str(evidence["reason"]),
+        expected_baseline_fingerprint=str(evidence["expected_baseline_fingerprint"]),
+        requested_action=str(evidence["requested_action"]),
+        conflict_category=evidence.get("conflict_category"),
+        operator=str(evidence.get("operator") or ""),
+    )
+
+
+def audit_historical_approvals(
+    ledger: GovernanceLedger,
+    *,
+    trusted_public_key_path: str | None,
+    dataset_identity: str | None = None,
+) -> dict:
+    """
+    **独立的历史批准审计**：仅凭账本 + 明确可信的公钥重算并核验每一份所有者批准。
+
+    与结构性校验严格分离（``ledger.verify()`` 只做结构性判定）。本函数：
+
+    1. 先做结构性校验（哈希链 / 重放 / 结构）；
+    2. 对每一条 ``APPROVED`` 记录要求保留的批准工件与不可变提案证据齐备
+       —— 缺失即 fail closed（``MissingApprovalEvidenceError``）；
+    3. 用**记录中的原始基线**重新验证 Ed25519 签名与全部绑定（历史真实性）；
+    4. 校验主体归属：账本主体 == 被签名的批准人；被签名的操作者 == 提案操作者。
+
+    ``trusted_public_key_path`` **必须**由调用方提供。缺失时**绝不**退化为信任
+    批准件内嵌的公钥 —— 那会把信任锚交到被审计对象自己手里。
+
+    历史真实性与「当前是否可执行」是两件事：本函数只回答前者。
+    """
+    if not trusted_public_key_path:
+        raise SignatureVerificationError(
+            "An explicitly trusted public key is required for an authenticated approval "
+            "audit; an embedded public key is never accepted as the trust anchor"
+        )
+
+    structural = ledger.verify()
+    entries = ledger.entries()
+    verified: list[dict] = []
+    failures: list[dict] = []
+
+    for entry in entries:
+        if entry.to_state not in ACTIVE_STATES:
+            continue
+        if not entry.approval_artifact or not entry.proposal_evidence:
+            raise MissingApprovalEvidenceError(
+                f"Ledger entry {entry.sequence} is an APPROVED decision without "
+                "retained approval evidence; authenticated verification is impossible"
+            )
+
+        try:
+            proposal = reconstruct_proposal_from_evidence(entry.proposal_evidence)
+            if proposal.proposal_id != entry.proposal_id:
+                raise SignatureVerificationError(
+                    f"Ledger entry {entry.sequence} proposal evidence does not "
+                    "reproduce the recorded proposal identity"
+                )
+            if proposal.content_fingerprint() != entry.proposal_content_fingerprint:
+                raise SignatureVerificationError(
+                    f"Ledger entry {entry.sequence} proposal evidence does not "
+                    "reproduce the recorded content fingerprint"
+                )
+            if approval_fingerprint(entry.approval_artifact) != entry.approval_fingerprint:
+                raise SignatureVerificationError(
+                    f"Ledger entry {entry.sequence} retained approval artifact does not "
+                    "match the recorded approval fingerprint"
+                )
+            if not binding_key_is_current(entry.binding_source_key):
+                raise LegacyBindingKeyError(
+                    f"Ledger entry {entry.sequence} is bound under a legacy binding key "
+                    "contract and cannot be reinterpreted under the corrected identity key"
+                )
+            observation_fingerprint = (
+                proposal.observation_fingerprints[0]
+                if proposal.observation_fingerprints
+                else ""
+            )
+            verify_mapping_approval(
+                entry.approval_artifact,
+                proposal=proposal,
+                source_observation_fingerprint=observation_fingerprint,
+                dataset_identity=(
+                    dataset_identity
+                    if dataset_identity is not None
+                    else ledger.dataset_identity
+                ),
+                # 历史真实性：以**记录中的原始基线**为准，而非当前基线。
+                current_baseline_fingerprint=entry.baseline_fingerprint,
+                trusted_public_key_path=trusted_public_key_path,
+                expected_actor=entry.actor,
+                expected_operator=proposal.operator,
+            )
+        except GovernanceError as exc:
+            # fail closed：保留原始异常类型并附上条目定位，绝不把失败降级为聚合报告。
+            raise type(exc)(
+                f"Ledger entry {entry.sequence} (proposal {entry.proposal_id[:12]}...): "
+                f"{exc}"
+            ) from exc
+
+        verified.append(
+            {
+                "sequence": entry.sequence,
+                "proposal_id": entry.proposal_id,
+                "actor": entry.actor,
+                "approver": entry.approval_artifact.get("approver"),
+                "operator": entry.approval_artifact.get("operator"),
+                "candidate_canonical_id": entry.binding_canonical_id,
+                "scoped_source_identity_key": entry.binding_source_key,
+                "recorded_baseline_fingerprint": entry.baseline_fingerprint,
+                "approval_fingerprint": entry.approval_fingerprint,
+                "public_key_id": entry.approval_artifact.get("public_key_id"),
+            }
+        )
+
+    if failures:
+        raise MissingApprovalEvidenceError(
+            "Authenticated approval audit failed for "
+            f"{len(failures)} decision(s): {failures}"
+        )
+
+    trusted = load_trusted_public_key(trusted_public_key_path)
+    return {
+        "verification_category": VERIFICATION_AUTHENTICATED_MAPPING_APPROVAL_AUDIT,
+        "governance_schema_version": GOVERNANCE_SCHEMA_VERSION,
+        "identity_key_schema_version": IDENTITY_KEY_SCHEMA_VERSION,
+        "ledger_path": ledger.path,
+        "structural_integrity": structural["integrity"],
+        "trust_anchor": f"trusted public key {trusted['public_key_id']}",
+        "approved_decisions": len(verified),
+        "verified": verified,
+        "failures": [],
+    }
+
+
+def mapping_eligibility(
+    ledger: GovernanceLedger,
+    *,
+    current_baseline_fingerprint: str,
+) -> dict:
+    """
+    **当前映射资格**（只读）：历史批准对**当前**基线是否仍然有效。
+
+    一份历史批准可以依然「真实」（签名有效、绑定完整），却因为 Canonical 基线
+    已经变化而**不再可执行**。二者必须分开报告：一份有效的旧签名**绝不**自动
+    授权对新基线采取行动。
+    """
+    states = ledger.proposal_states()
+    eligible: list[dict] = []
+    stale: list[dict] = []
+
+    for entry in ledger.entries():
+        if entry.to_state not in ACTIVE_STATES:
+            continue
+        if states.get(entry.proposal_id) not in ACTIVE_STATES:
+            continue
+        record = {
+            "sequence": entry.sequence,
+            "proposal_id": entry.proposal_id,
+            "candidate_canonical_id": entry.binding_canonical_id,
+            "recorded_baseline_fingerprint": entry.baseline_fingerprint,
+        }
+        if entry.baseline_fingerprint == current_baseline_fingerprint:
+            eligible.append(record)
+        else:
+            stale.append(
+                {
+                    **record,
+                    "current_baseline_fingerprint": current_baseline_fingerprint,
+                    "detail": (
+                        "historical approval authenticity may still hold, but it does "
+                        "not authorize action against the new baseline"
+                    ),
+                }
+            )
+
+    return {
+        "verification_category": VERIFICATION_CURRENT_MAPPING_ELIGIBILITY,
+        "current_baseline_fingerprint": current_baseline_fingerprint,
+        "eligible_count": len(eligible),
+        "stale_count": len(stale),
+        "eligible": eligible,
+        "stale": stale,
+    }
+
+
+# =============================================================================
 # 冲突与重放治理（只读判定）
 # =============================================================================
 
@@ -1547,6 +2098,12 @@ def proposal_for_conflict(
         reason=rule["detail"],
         expected_baseline_fingerprint=expected_baseline_fingerprint,
         requested_action=rule["requested_action"],
+        # 歧义身份键**永远不充分**，因此这类提案只能复核 / 拒绝，不能活动绑定。
+        identity_key=ScopedSourceIdentityKey.for_ambiguous_source(
+            shared_source_id=str(getattr(conflict, "subject", "")),
+            member_scopes=[o.stability_scope.as_dict() for o in members],
+            conflict_category=category,
+        ),
         conflict_category=category,
         # 声明的初始状态是 PROPOSED：``OBSERVED`` 不等于已提案（§9.1），
         # 冲突必须先被显式提案，再由治理流程推进到 REVIEW_REQUIRED / REJECTED。
@@ -1594,10 +2151,16 @@ def governance_status() -> dict:
         "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
         "proposal_schema_version": PROPOSAL_SCHEMA_VERSION,
         "approval_schema_version": MAPPING_APPROVAL_SCHEMA_VERSION,
+        "identity_key_schema_version": IDENTITY_KEY_SCHEMA_VERSION,
+        "legacy_identity_key_schema_version": LEGACY_IDENTITY_KEY_SCHEMA_VERSION,
         "production_mapping_write_authorization": PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
         "runtime_ledger_enforcement": RUNTIME_LEDGER_ENFORCEMENT,
         "approval_purpose": MAPPING_APPROVAL_PURPOSE,
         "production_repair_purpose": "PRODUCTION_CANONICAL_DEDUP_APPLY",
         "ledger_is_production_authority": False,
         "runtime_identity_authority": "utils.ingestion_identity.validate_ingestion_identity",
+        "structural_verification_category": VERIFICATION_STRUCTURAL_LEDGER_INTEGRITY,
+        "authenticated_audit_category": VERIFICATION_AUTHENTICATED_MAPPING_APPROVAL_AUDIT,
+        "eligibility_category": VERIFICATION_CURRENT_MAPPING_ELIGIBILITY,
+        "ledger_trust_anchor": LEDGER_TRUST_ANCHOR_STATEMENT,
     }

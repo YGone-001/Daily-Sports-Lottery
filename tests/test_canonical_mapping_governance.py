@@ -14,6 +14,7 @@ Canonical 映射治理测试套件（PG-09 .. PG-30）
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 
 from tools.mapping_governance_shadow import (
     SHADOW_LEDGER_NAME,
@@ -32,31 +34,42 @@ from tools.mapping_governance_shadow import (
 from utils import fetcher_500, scraper
 from utils.daily_loader import load_json, save_json
 from utils.evaluation_rows import build_evaluation_row, get_all_evaluation_rows
-from utils.ingestion_identity import CanonicalIdentityCollisionError
+from utils.ingestion_identity import (
+    CanonicalIdentityCollisionError,
+    plan_ingestion_identity,
+)
 from utils.mapping_governance import (
     ACTIVE_STATES,
     ALLOWED_TRANSITIONS,
     APPROVAL_ALGORITHM,
     GENESIS_PREVIOUS_HASH,
     GOVERNANCE_SCHEMA_VERSION,
+    IDENTITY_KEY_SCHEMA_VERSION,
     MAPPING_APPROVAL_PURPOSE,
     PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
+    PROPOSAL_SCHEMA_VERSION,
     RUNTIME_LEDGER_ENFORCEMENT,
+    ActorBindingError,
     ConflictingBindingError,
     GovernanceLedger,
     InvalidTransitionError,
     LedgerIntegrityError,
     LedgerPathError,
     LedgerReplayError,
+    LegacyBindingKeyError,
     MappingState,
+    MissingApprovalEvidenceError,
     ProposalAction,
     ProposalValidationError,
     SignatureVerificationError,
     StaleBaselineError,
+    audit_historical_approvals,
     build_approval_body,
+    classify_binding_key,
     generate_mapping_owner_keypair,
     governance_rule_for,
     governance_status,
+    mapping_eligibility,
     proposal_for_conflict,
     proposal_from_observations,
     reachable_states,
@@ -69,6 +82,7 @@ from utils.odds_snapshots import build_snapshot as build_odds_snapshot
 from utils.prediction_snapshots import build_snapshot as build_pred_snapshot
 from utils.settlements import build_settlement, extract_final_score
 from utils.source_identity import (
+    canonical_json,
     detect_all_conflicts,
     observe_source_row,
 )
@@ -1055,31 +1069,34 @@ print("CHILD_OK", appended, entry.sequence)
 '''
 
 
-def test_pg_29_cross_process_ledger_updates_are_safe(tmp_path):
-    """PG-29: 跨进程并发追加是串行化的，哈希链保持完整。"""
+def _run_concurrent_children(tmp_path, count: int = 2):
+    """在独立子进程中并发追加同一账本（跨进程锁语义的真实检验）。"""
     workspace = tmp_path / "concurrent"
     workspace.mkdir(parents=True, exist_ok=True)
     ledger_path = str(workspace / SHADOW_LEDGER_NAME)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    script = _CHILD_SCRIPT.format(root=root, ledger=ledger_path, dataset=DATASET, num="001")
-    script_b = _CHILD_SCRIPT.format(root=root, ledger=ledger_path, dataset=DATASET, num="002")
-    script_path = workspace / "child.py"
-    script_b_path = workspace / "child_b.py"
-    script_path.write_text(script, encoding="utf-8")
-    script_b_path.write_text(script_b, encoding="utf-8")
+    paths = []
+    for index in range(count):
+        path = workspace / f"child_{index}.py"
+        path.write_text(
+            _CHILD_SCRIPT.format(root=root, ledger=ledger_path, dataset=DATASET,
+                                 num=f"{index + 1:03d}"),
+            encoding="utf-8",
+        )
+        paths.append(path)
 
     env = os.environ.copy()
     env["PYTHONPATH"] = root
     processes = [
         subprocess.Popen([sys.executable, str(path)], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        for path in (script_path, script_b_path)
+        for path in paths
     ]
     outputs = []
     try:
         for process in processes:
-            out, err = process.communicate(timeout=120)
+            out, err = process.communicate(timeout=180)
             outputs.append((process.returncode, out, err))
     finally:
         for process in processes:
@@ -1090,13 +1107,22 @@ def test_pg_29_cross_process_ledger_updates_are_safe(tmp_path):
     for returncode, out, err in outputs:
         assert returncode == 0, f"child failed: stdout={out!r} stderr={err!r}"
         assert "CHILD_OK True" in out, f"stdout={out!r} stderr={err!r}"
+    return ledger_path, outputs
+
+
+def test_pg_29_cross_process_ledger_updates_are_safe(tmp_path):
+    """PG-29: 跨进程并发追加是串行化的，哈希链保持完整。"""
+    ledger_path, _outputs = _run_concurrent_children(tmp_path, count=2)
 
     ledger = GovernanceLedger(ledger_path, dataset_identity=DATASET)
     entries = ledger.entries()
     assert len(entries) == 2
     assert [e.sequence for e in entries] == [0, 1]
     assert entries[1].previous_entry_hash == entries[0].entry_hash
-    assert ledger.verify()["integrity"] == "OK"
+    report = ledger.verify()
+    assert report["integrity"] == "OK"
+    assert report["verification_category"] == "STRUCTURAL_LEDGER_INTEGRITY"
+    assert set(report["binding_key_contracts"].values()) == {2}
 
 
 # ---------------------------------------------------------------------------
@@ -1182,5 +1208,687 @@ def test_proposal_contract_rejects_canonical_rewrite_actions():
     # 合法提案通过校验。
     proposal = _binding_proposal(observation, "canon-keep", "baseline-A")
     validate_proposal(proposal)
-    assert proposal.proposal_schema_version == "1.0.0"
+    assert proposal.proposal_schema_version == PROPOSAL_SCHEMA_VERSION
     assert proposal.status == MappingState.PROPOSED.value
+    # 绑定键契约已升级：键必须携带判别性身份证据，而非仅作用域元数据。
+    assert proposal.identity_key_dict["identity_key_schema_version"] == (
+        IDENTITY_KEY_SCHEMA_VERSION
+    )
+    assert proposal.identity_key_kind == "COMPETITION_NUMBER"
+    assert proposal.identity_key_sufficient is True
+
+
+# ---------------------------------------------------------------------------
+# MC-02 .. MC-27 — 作用域/身份键修正、批准主体归属与历史批准审计
+# ---------------------------------------------------------------------------
+
+def _rewrite_ledger(ledger_path, transform):
+    """
+    以**内部一致**的方式重写账本（保留哈希链完整）。
+
+    仅用于测试：它让我们能在不破坏哈希链的前提下，构造「旧契约绑定键」、
+    「缺失批准证据」或「被篡改的保留批准件」等记录，从而逐项验证审计边界，
+    而不是被哈希不匹配掩盖。
+    """
+    from utils.mapping_governance import (
+        _decision_fingerprint,
+        _entry_hash,
+        _replay_key_of,
+        _transition_identity,
+    )
+
+    with open(ledger_path, encoding="utf-8") as handle:
+        payloads = [json.loads(line) for line in handle.read().splitlines() if line.strip()]
+
+    payloads = [transform(payload, index) for index, payload in enumerate(payloads)]
+
+    previous = GENESIS_PREVIOUS_HASH
+    out = []
+    for index, payload in enumerate(payloads):
+        payload["sequence"] = index
+        payload["decision_fingerprint"] = _decision_fingerprint(payload)
+        payload["replay_key"] = _replay_key_of(payload)
+        payload["transition_id"] = _transition_identity(payload)
+        payload["previous_entry_hash"] = previous
+        payload["entry_hash"] = _entry_hash(payload)
+        previous = payload["entry_hash"]
+        out.append(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":")))
+
+    with open(ledger_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(out) + "\n")
+
+
+def test_mc_02_two_independent_bindings_can_both_be_approved(tmp_path, owner_keys):
+    """MC-02: 两个真正独立的事件都能独立获得批准，不产生虚假冲突。"""
+    baseline = "baseline-A"
+    ledger = _ledger(tmp_path)
+
+    first_obs = _observation()
+    second_obs = _observation(match_id="500l-2030-05-01-021", number="021",
+                              home="甲", away="乙")
+
+    first = _binding_proposal(first_obs, "canon-keep", baseline)
+    second = _binding_proposal(second_obs, "canon-other", baseline)
+
+    assert first.source_key != second.source_key
+    assert first.identity_key_value == "football|2030-05-01|jczq|7"
+    assert second.identity_key_value == "football|2030-05-01|jczq|21"
+
+    for proposal, observation in ((first, first_obs), (second, second_obs)):
+        ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                      actor="operator-1", actor_role="operator", reason="proposed",
+                      baseline_fingerprint=baseline)
+        _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+
+    bindings = ledger.active_bindings()
+    assert len(bindings) == 2
+    assert bindings[first.source_key]["canonical_id"] == "canon-keep"
+    assert bindings[second.source_key]["canonical_id"] == "canon-other"
+    assert ledger.verify()["integrity"] == "OK"
+
+
+def test_mc_03_one_source_identity_cannot_bind_two_canonical_owners(tmp_path, owner_keys):
+    """MC-03: 同一源身份不得绑定两个不同的 Canonical 所有者。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    ledger = _ledger(tmp_path)
+
+    first = _binding_proposal(observation, "canon-A", baseline)
+    second = _binding_proposal(observation, "canon-B", baseline)
+
+    # 同一源身份（同一天、同一竞彩编号）解析到**同一个**绑定键。
+    assert first.source_key == second.source_key
+
+    ledger.append(proposal=first, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, first, observation, owner_keys, baseline=baseline)
+
+    ledger.append(proposal=second, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    with pytest.raises(ConflictingBindingError):
+        _approve(ledger, second, observation, owner_keys, baseline=baseline)
+
+    assert ledger.active_bindings()[first.source_key]["canonical_id"] == "canon-A"
+
+
+def test_mc_07_row_position_identity_cannot_authorize_an_active_binding(tmp_path):
+    """MC-07: 行位置派生身份在证据不足时不得授权活动绑定。"""
+    finished_rows = fetcher_500._parse_wanchang(
+        '<table><tr id="w0"><td>英超</td><td>第1轮</td><td>05-01 15:30</td><td>完</td>'
+        '<td><span class="mainName">甲队</span></td><td>2 - 1</td>'
+        '<td><span class="mainName">乙队</span></td><td>1 - 0</td><td>析</td></tr></table>'
+    )
+    observation = observe_source_row(finished_rows[0], adapter="finished_feed",
+                                     canonical_match_id="canon-x")
+
+    with pytest.raises(ProposalValidationError) as exc:
+        proposal_from_observations(
+            [observation],
+            requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+            candidate_canonical_id="canon-x",
+            existing_canonical_owner="canon-x",
+            ingestion_plan_reference="planner:ACCEPTED",
+            expected_baseline_fingerprint="baseline-A",
+            reason="row position alone must not authorize a binding",
+            identity_evidence_type="row_position",
+        )
+    assert "not sufficient" in str(exc.value)
+
+    # 但仍可作为观测 / 复核对象提案（非绑定动作）。
+    review = proposal_from_observations(
+        [observation],
+        requested_action=ProposalAction.FLAG_AMBIGUOUS_IDENTITY.value,
+        candidate_canonical_id=None,
+        existing_canonical_owner=None,
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint="baseline-A",
+        reason="row position identity requires review",
+        identity_evidence_type="row_position",
+    )
+    assert review.identity_key_sufficient is False
+    assert review.identity_key_kind == "INSUFFICIENT"
+
+    # 既有摄取预检同样拒绝据此覆盖无关 Canonical 记录。
+    with pytest.raises(CanonicalIdentityCollisionError):
+        plan_ingestion_identity([dict(finished_rows[0], market_tracked=True)],
+                                [dict(finished_rows[0], home="丙队", away="丁队")])
+
+
+def test_mc_09_legacy_scope_only_binding_key_is_never_reinterpreted(tmp_path, owner_keys):
+    """MC-09: 旧契约（仅作用域元数据）绑定键不得被静默当作新身份键。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+    assert ledger.active_bindings()
+
+    legacy_key = canonical_json(proposal.scope_dict)
+    assert classify_binding_key(legacy_key) == "LEGACY_SCOPE_ONLY"
+    assert classify_binding_key(proposal.source_key) == "CURRENT"
+    assert classify_binding_key("{}") == "UNKNOWN"
+
+    def _downgrade(payload, index):
+        if index != 0:
+            return payload
+        payload["binding_source_key"] = legacy_key
+        payload["binding_source_key_contract"] = "LEGACY_SCOPE_ONLY"
+        return payload
+
+    _rewrite_ledger(ledger.path, _downgrade)
+    assert ledger.verify()["integrity"] == "OK"
+
+    # 请求活动授权时 fail closed。
+    with pytest.raises(LegacyBindingKeyError):
+        ledger.active_bindings()
+    # 只读历史检视仍然保留（不删除证据，也不静默重新解释）。
+    legacy = ledger.legacy_active_bindings()
+    assert len(legacy) == 1
+    assert legacy[0]["binding_key_contract"] == "LEGACY_SCOPE_ONLY"
+    assert legacy[0]["canonical_id"] == "canon-keep"
+    assert ledger.active_bindings(require_current_keys=False) == {}
+
+    # 在该账本上请求新的活动绑定 -> 同样 fail closed。
+    other = _binding_proposal(
+        _observation(match_id="500l-2030-05-01-021", number="021", home="甲", away="乙"),
+        "canon-other", baseline,
+    )
+    ledger.append(proposal=other, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    with pytest.raises(LegacyBindingKeyError):
+        _approve(ledger, other,
+                 _observation(match_id="500l-2030-05-01-021", number="021",
+                              home="甲", away="乙"),
+                 owner_keys, baseline=baseline)
+
+    # 旧键与键的新含义之间没有任何迁移。
+    assert ledger.binding_key_contracts().get("LEGACY_SCOPE_ONLY") == 1
+
+
+def test_mc_10_signed_approval_with_mismatched_ledger_actor_is_rejected(tmp_path, owner_keys):
+    """MC-10: 账本主体与被签名的批准人不一致 -> 拒绝。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    ledger.append(proposal=proposal, to_state=MappingState.REVIEW_REQUIRED.value,
+                  actor="operator-1", actor_role="operator", reason="review",
+                  baseline_fingerprint=baseline)
+    assert ledger.state_of(proposal.proposal_id) == MappingState.REVIEW_REQUIRED.value
+
+    # 账本主体 (owner-B) 与被签名的批准人 (owner-A) 不一致 -> 拒绝。
+    with pytest.raises(ActorBindingError) as exc:
+        ledger.append(
+            proposal=proposal, to_state=MappingState.APPROVED.value,
+            actor="owner-B", actor_role="owner", reason="approve",
+            baseline_fingerprint=baseline,
+            approval=sign_mapping_approval(
+                owner_keys["private"],
+                build_approval_body(
+                    proposal=proposal,
+                    source_observation_fingerprint=observation.semantic_fingerprint(),
+                    dataset_identity=DATASET, operator="operator-1", approver="owner-A",
+                    approved_at="2030-01-01T00:00:00+00:00", reason="owner approves",
+                ),
+            ),
+            trusted_public_key_path=owner_keys["public"],
+            source_observation_fingerprint=observation.semantic_fingerprint(),
+        )
+    assert "owner-B" in str(exc.value) and "owner-A" in str(exc.value)
+    assert ledger.state_of(proposal.proposal_id) == MappingState.REVIEW_REQUIRED.value
+
+
+def test_mc_11_signed_operator_differing_from_proposal_operator_is_rejected(
+    tmp_path, owner_keys
+):
+    """MC-11: 被签名的操作者与提案操作者不一致 -> 拒绝。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline, operator="operator-1")
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+
+    approval = sign_mapping_approval(
+        owner_keys["private"],
+        build_approval_body(
+            proposal=proposal,
+            source_observation_fingerprint=observation.semantic_fingerprint(),
+            dataset_identity=DATASET, operator="operator-IMPOSTOR", approver="owner-1",
+            approved_at="2030-01-01T00:00:00+00:00", reason="owner approves",
+        ),
+    )
+    with pytest.raises(ActorBindingError) as exc:
+        ledger.append(
+            proposal=proposal, to_state=MappingState.APPROVED.value,
+            actor="owner-1", actor_role="owner", reason="approve",
+            baseline_fingerprint=baseline, approval=approval,
+            trusted_public_key_path=owner_keys["public"],
+            source_observation_fingerprint=observation.semantic_fingerprint(),
+        )
+    assert "operator-IMPOSTOR" in str(exc.value)
+    assert ledger.state_of(proposal.proposal_id) == MappingState.PROPOSED.value
+
+
+def test_mc_12_correct_owner_and_operator_identities_succeed(tmp_path, owner_keys):
+    """MC-12: 正确的批准人与操作者身份 -> 成功记录，且主体归属可审计。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline, operator="operator-1")
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+
+    entry, appended = _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+
+    assert appended is True
+    assert entry.actor == "owner-1"
+    assert entry.approval_artifact["approver"] == "owner-1"
+    assert entry.approval_artifact["operator"] == "operator-1"
+    assert ledger.state_of(proposal.proposal_id) == MappingState.APPROVED.value
+    # 保留的证据使主体归属可被独立复核。
+    audit = audit_historical_approvals(ledger, trusted_public_key_path=owner_keys["public"])
+    assert audit["verified"][0]["actor"] == "owner-1"
+    assert audit["verified"][0]["approver"] == "owner-1"
+    assert audit["verified"][0]["operator"] == "operator-1"
+
+
+def test_mc_13_historical_signed_approval_is_independently_verifiable(tmp_path, owner_keys):
+    """MC-13: 一个全新的审计者可以独立复核历史批准（仅凭账本 + 可信公钥）。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline, operator="operator-1")
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+
+    # 全新审计者：全新实例、只读、无任何内存状态。
+    fresh_ledger = GovernanceLedger(ledger.path, dataset_identity=DATASET)
+    audit = audit_historical_approvals(
+        fresh_ledger, trusted_public_key_path=owner_keys["public"]
+    )
+
+    assert audit["verification_category"] == "AUTHENTICATED_MAPPING_APPROVAL_AUDIT"
+    assert audit["approved_decisions"] == 1
+    assert audit["failures"] == []
+    verified = audit["verified"][0]
+    assert verified["candidate_canonical_id"] == "canon-keep"
+    assert verified["scoped_source_identity_key"] == proposal.source_key
+    assert verified["recorded_baseline_fingerprint"] == baseline
+    assert verified["public_key_id"] == owner_keys["public_key_id"]
+    # Ed25519 签名确实被保留并可独立验证（不是只存了一个 SHA-256）。
+    retained = fresh_ledger.entries()[-1].approval_artifact
+    assert retained["approval"]["signature"]
+    assert len(base64.b64decode(retained["approval"]["signature"])) == 64
+
+
+def test_mc_14_removing_retained_approval_evidence_breaks_authenticated_verification(
+    tmp_path, owner_keys
+):
+    """MC-14: 移除保留的批准证据 -> 认证核验 fail closed。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+    assert audit_historical_approvals(
+        ledger, trusted_public_key_path=owner_keys["public"]
+    )["approved_decisions"] == 1
+
+    def _strip(payload, index):
+        payload["approval_artifact"] = None
+        payload["proposal_evidence"] = None
+        return payload
+
+    _rewrite_ledger(ledger.path, _strip)
+
+    # 结构性校验只看结构；APPROVED 记录不完整的证据由审计专门发现。
+    assert ledger.verify()["integrity"] == "OK"
+    assert ledger.incomplete_approved_entries() == (1,)
+
+    with pytest.raises(MissingApprovalEvidenceError):
+        audit_historical_approvals(ledger, trusted_public_key_path=owner_keys["public"])
+
+    # 缺少可信公钥时，绝不声称已完成认证核验。
+    with pytest.raises(SignatureVerificationError):
+        audit_historical_approvals(ledger, trusted_public_key_path=None)
+
+
+def test_mc_15_tampering_with_retained_approval_evidence_fails(tmp_path, owner_keys):
+    """MC-15: 篡改保留的批准件 -> 认证核验失败。"""
+    from utils.mapping_governance import approval_fingerprint as _fp
+
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+
+    def _tamper(payload, index):
+        if not payload.get("approval_artifact"):
+            return payload
+        artifact = payload["approval_artifact"]
+        signature = artifact["approval"]["signature"]
+        artifact["approval"]["signature"] = (
+            "AAAA" + signature[4:] if not signature.startswith("AAAA") else signature[4:]
+        )
+        # 同步更新指纹，确保失败发生在**密码学签名校验**这一层。
+        payload["approval_fingerprint"] = _fp(artifact)
+        return payload
+
+    _rewrite_ledger(ledger.path, _tamper)
+    assert ledger.verify()["integrity"] == "OK"
+
+    with pytest.raises(SignatureVerificationError):
+        audit_historical_approvals(ledger, trusted_public_key_path=owner_keys["public"])
+
+
+def test_mc_16_wrong_trusted_public_key_is_rejected(tmp_path, owner_keys, other_keys):
+    """MC-16: 错误的可信公钥 -> 历史批准审计拒绝。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+
+    with pytest.raises(SignatureVerificationError):
+        audit_historical_approvals(ledger, trusted_public_key_path=other_keys["public"])
+    assert audit_historical_approvals(
+        ledger, trusted_public_key_path=owner_keys["public"]
+    )["approved_decisions"] == 1
+
+
+def test_mc_17_historical_authenticity_is_separate_from_current_eligibility(
+    tmp_path, owner_keys
+):
+    """MC-17: 旧批准的历史真实性可被验证，但不会自动授权对已变化基线采取行动。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+
+    # 历史真实性：以**记录中的原始基线**验证 -> 通过。
+    audit = audit_historical_approvals(ledger, trusted_public_key_path=owner_keys["public"])
+    assert audit["approved_decisions"] == 1
+    assert audit["verified"][0]["recorded_baseline_fingerprint"] == baseline
+
+    # 当前资格：基线已变化 -> 不再可执行，且绝不自动授权。
+    eligibility = mapping_eligibility(
+        ledger, current_baseline_fingerprint="baseline-CHANGED"
+    )
+    assert eligibility["verification_category"] == "CURRENT_MAPPING_ELIGIBILITY"
+    assert eligibility["eligible_count"] == 0
+    assert eligibility["stale_count"] == 1
+    assert "does not authorize action against the new baseline" in (
+        eligibility["stale"][0]["detail"]
+    )
+    # 基线未变时仍然具备资格。
+    still = mapping_eligibility(ledger, current_baseline_fingerprint=baseline)
+    assert still["eligible_count"] == 1 and still["stale_count"] == 0
+
+
+def test_mc_18_revoked_and_superseded_history_remains_auditable(tmp_path, owner_keys):
+    """MC-18: 撤销与取代后的历史仍可审计，且不构成活动绑定。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+    ledger.append(proposal=proposal, to_state=MappingState.REVOKED.value,
+                  actor="owner-1", actor_role="owner", reason="revoked",
+                  baseline_fingerprint=baseline)
+    ledger.append(proposal=proposal, to_state=MappingState.SUPERSEDED.value,
+                  actor="owner-1", actor_role="owner", reason="superseded",
+                  baseline_fingerprint=baseline)
+
+    assert ledger.active_bindings() == {}
+    # 完整历史保留（含被撤销与被取代的证据），哈希链完整。
+    assert [e.to_state for e in ledger.history_of(proposal.proposal_id)] == [
+        "PROPOSED", "APPROVED", "REVOKED", "SUPERSEDED",
+    ]
+    assert ledger.verify()["integrity"] == "OK"
+    # 历史 APPROVED 决定的真实性仍然可独立复核（这是审计，不是授权）。
+    audit = audit_historical_approvals(ledger, trusted_public_key_path=owner_keys["public"])
+    assert audit["approved_decisions"] == 1
+    eligibility = mapping_eligibility(ledger, current_baseline_fingerprint=baseline)
+    assert eligibility["eligible_count"] == 0
+
+
+def test_mc_19_broken_ledger_hash_chains_are_rejected(tmp_path, owner_keys):
+    """MC-19: 哈希链断裂 / 内容篡改 / JSON 损坏一律拒绝。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, proposal, observation, owner_keys, baseline=baseline)
+    original = open(ledger.path, encoding="utf-8").read()
+    lines = original.splitlines()
+
+    record = json.loads(lines[1])
+    record["binding_canonical_id"] = "canon-attacker"
+    tampered = [*lines[:1],
+                json.dumps(record, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")),
+                *lines[2:]]
+    open(ledger.path, "w", encoding="utf-8", newline="\n").write("\n".join(tampered) + "\n")
+    with pytest.raises(LedgerIntegrityError):
+        ledger.verify()
+
+    open(ledger.path, "w", encoding="utf-8", newline="\n").write("}{\n")
+    with pytest.raises(LedgerIntegrityError):
+        ledger.verify()
+
+    open(ledger.path, "w", encoding="utf-8", newline="\n").write(original)
+    assert ledger.verify()["integrity"] == "OK"
+
+
+def test_mc_20_conflicting_active_bindings_remain_rejected(tmp_path, owner_keys):
+    """MC-20: 冲突活动绑定仍被拒绝（同一身份键映射到不同 Canonical ID）。"""
+    baseline = "baseline-A"
+    observation = _observation()
+    ledger = _ledger(tmp_path)
+    first = _binding_proposal(observation, "canon-A", baseline)
+    second = _binding_proposal(observation, "canon-B", baseline)
+    for proposal in (first, second):
+        ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                      actor="operator-1", actor_role="operator", reason="proposed",
+                      baseline_fingerprint=baseline)
+    _approve(ledger, first, observation, owner_keys, baseline=baseline)
+    with pytest.raises(ConflictingBindingError):
+        _approve(ledger, second, observation, owner_keys, baseline=baseline)
+    assert len(ledger.active_bindings()) == 1
+
+    # 不同的源身份仍可独立绑定（修正后的契约不会误伤）。
+    other_obs = _observation(match_id="500l-2030-05-01-021", number="021",
+                             home="甲", away="乙")
+    other = _binding_proposal(other_obs, "canon-C", baseline)
+    ledger.append(proposal=other, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    _approve(ledger, other, other_obs, owner_keys, baseline=baseline)
+    assert len(ledger.active_bindings()) == 2
+
+
+def test_mc_21_exact_duplicate_transitions_remain_idempotent(tmp_path):
+    """MC-21: 完全相同的迁移提交保持幂等。"""
+    baseline = "baseline-A"
+    proposal = _binding_proposal(_observation(), "canon-keep", baseline)
+    ledger = _ledger(tmp_path)
+    kwargs = dict(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                  actor="operator-1", actor_role="operator", reason="proposed",
+                  baseline_fingerprint=baseline)
+    first, first_appended = ledger.append(**kwargs)
+    second, second_appended = ledger.append(**kwargs)
+    assert first_appended is True and second_appended is False
+    assert first == second
+    assert len(ledger.entries()) == 1
+    with pytest.raises(LedgerReplayError):
+        ledger.append(proposal=proposal, to_state=MappingState.PROPOSED.value,
+                      actor="operator-1", actor_role="operator",
+                      reason="different justification", baseline_fingerprint=baseline)
+
+
+def test_mc_22_concurrent_isolated_ledger_updates_remain_safe(tmp_path):
+    """MC-22: 并发隔离账本更新仍然安全（跨进程锁 + 哈希链）。
+
+    允许对**整个场景**重试一次：Windows 上新建临时文件可能受到安全软件扫描等
+    与被测逻辑无关的瞬态干扰。断言本身不会因重试而放松。
+    """
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        workspace = tmp_path / f"concurrent_attempt_{attempt}"
+        try:
+            ledger_path, _outputs = _run_concurrent_children(workspace, count=3)
+            ledger = GovernanceLedger(ledger_path, dataset_identity=DATASET)
+            entries = ledger.entries()
+            assert len(entries) == 3
+            assert [e.sequence for e in entries] == [0, 1, 2]
+            assert all(
+                entries[i].previous_entry_hash == entries[i - 1].entry_hash
+                for i in range(1, len(entries))
+            )
+            assert ledger.verify()["integrity"] == "OK"
+            assert len({e.binding_source_key for e in entries}) == 3
+            last_error = None
+            break
+        except AssertionError as exc:
+            last_error = exc
+    assert last_error is None, f"concurrent ledger updates failed twice: {last_error}"
+
+
+def test_mc_23_shadow_validation_remains_outside_production(tmp_path):
+    """MC-23: 影子校验仍在生产之外，且默认不产生活动映射。"""
+    observations, rows, fixture = demo_observations()
+    report = shadow_validate(
+        workspace=str(tmp_path / "shadow_ws"), observations=observations,
+        incoming_rows=rows, canonical_fixture=fixture, dataset_identity=DATASET,
+    )
+    assert report["is_production_authority"] is False
+    assert report["production_mapping_write_authorization"] == "NOT_GRANTED"
+    assert report["runtime_ledger_enforcement"] == "NOT_ENABLED"
+    assert report["active_bindings"] == {}
+    assert set(report["proposal_states"].values()) <= {
+        MappingState.PROPOSED.value, MappingState.REVIEW_REQUIRED.value,
+        MappingState.REJECTED.value,
+    }
+    from utils.mapping_governance import REPO_ROOT
+    assert not report["ledger_path"].startswith(REPO_ROOT)
+    # 提供可信公钥时也不改变隔离性：审计只是报告，不授权。
+    audited = shadow_validate(
+        workspace=str(tmp_path / "shadow_ws2"), observations=observations,
+        incoming_rows=rows, canonical_fixture=fixture, dataset_identity=DATASET,
+        owner_private_key_path=None, trusted_public_key_path=None,
+    )
+    assert audited["authenticated_approval_audit"]["status"] == "NOT_PERFORMED"
+
+
+def test_mc_24_all_seven_persistent_stores_remain_unchanged(
+    isolated_data_dir, tmp_path
+):
+    """MC-24: 影子校验后七个持久化 JSON 库逐字节不变。"""
+    _seed_seven_stores(isolated_data_dir)
+    before = _hash_all(isolated_data_dir)
+    observations, rows, fixture = demo_observations()
+    shadow_validate(
+        workspace=str(tmp_path / "shadow_ws"), observations=observations,
+        incoming_rows=rows, canonical_fixture=fixture, dataset_identity=DATASET,
+    )
+    assert _hash_all(isolated_data_dir) == before
+
+
+def test_mc_25_existing_ingestion_identity_graph_remains_unchanged():
+    """MC-25: 既有摄取身份图行为不变（非传递三角仍 fail closed）。"""
+    x = _row("live-x", number=None, home="A", away="B")
+    y = _row("market-y", number="001", home="A", away="B")
+    z = _row("market-z", number="002", home="A", away="B")
+    import itertools
+
+    for order in itertools.permutations((x, y, z)):
+        with pytest.raises(CanonicalIdentityCollisionError) as exc:
+            plan_ingestion_identity([], list(order))
+        assert exc.value.category == "AMBIGUOUS_CANONICAL_OWNERSHIP"
+
+
+def test_mc_26_normal_refresh_never_consults_the_governance_ledger(
+    isolated_data_dir, tmp_path
+):
+    """MC-26: 正常刷新绝不读写治理账本。"""
+    _seed_seven_stores(isolated_data_dir)
+    before = _hash_all(isolated_data_dir)
+    with MonkeyPatch().context() as patch:
+        _fake_sources(patch, live_football=[_row("m-1", number="021", odds=FOOTBALL_1X2)])
+        scraper.refresh(verbose=False)
+    assert not any("ledger" in n for n in os.listdir(str(isolated_data_dir)))
+    after = _hash_all(isolated_data_dir)
+    assert after["daily_matches.json"] != before["daily_matches.json"]
+    for name in SEVEN_STORES:
+        if name != "daily_matches.json":
+            assert after[name] == before[name]
+
+
+def test_mc_27_production_repair_authorization_remains_domain_separated(
+    tmp_path, owner_keys
+):
+    """MC-27: 生产修复授权与映射批准保持独立域分离。"""
+    from tools import production_canonical_repair as repair
+
+    assert repair.AUTHORIZATION_PURPOSE == "PRODUCTION_CANONICAL_DEDUP_APPLY"
+    assert repair.AUTHORIZATION_PURPOSE != MAPPING_APPROVAL_PURPOSE
+    assert repair.AUTHORIZATION_SCHEMA_VERSION == "2.0.0"
+
+    observation = _observation()
+    proposal = _binding_proposal(observation, "canon-keep", "baseline-A")
+    approval = sign_mapping_approval(
+        owner_keys["private"],
+        build_approval_body(
+            proposal=proposal,
+            source_observation_fingerprint=observation.semantic_fingerprint(),
+            dataset_identity=DATASET, operator="operator-1", approver="owner-1",
+            approved_at="2030-01-01T00:00:00+00:00", reason="approve",
+        ),
+    )
+    with pytest.raises(repair.SignatureVerificationError):
+        repair.verify_authorization_signature(approval, owner_keys["public"])
+    with pytest.raises(SignatureVerificationError):
+        verify_mapping_approval(
+            {"approval_schema_version": repair.AUTHORIZATION_SCHEMA_VERSION,
+             "purpose": repair.AUTHORIZATION_PURPOSE},
+            proposal=proposal,
+            source_observation_fingerprint=observation.semantic_fingerprint(),
+            dataset_identity=DATASET,
+            current_baseline_fingerprint="baseline-A",
+            trusted_public_key_path=owner_keys["public"],
+        )

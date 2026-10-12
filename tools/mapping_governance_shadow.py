@@ -43,9 +43,11 @@ from utils.mapping_governance import (
     MappingProposal,
     MappingState,
     ProposalAction,
+    audit_historical_approvals,
     build_approval_body,
     governance_rule_for,
     governance_status,
+    mapping_eligibility,
     proposal_for_conflict,
     proposal_from_observations,
     sign_mapping_approval,
@@ -306,6 +308,10 @@ def shadow_validate(
                     dataset_identity=dataset_identity,
                     current_baseline_fingerprint=baseline,
                     trusted_public_key_path=trusted_public_key_path,
+                    # 主体归属：账本主体必须等于被签名的批准人；被签名的操作者必须
+                    # 等于提案的操作者。
+                    expected_actor=approver,
+                    expected_operator=proposal.operator,
                 )
                 entry, appended = ledger.append(
                     proposal=proposal,
@@ -329,6 +335,31 @@ def shadow_validate(
 
     ledger_state = ledger.proposal_states() if write_ledger else {}
     active = ledger.active_bindings() if write_ledger else {}
+    legacy_active = ledger.legacy_active_bindings() if write_ledger else ()
+
+    # 4) 独立的历史批准审计（仅在提供可信公钥时；缺失时绝不退化为信任内嵌公钥）
+    audit: dict | None = None
+    eligibility: dict | None = None
+    if write_ledger and ledger.exists():
+        if trusted_public_key_path:
+            audit = audit_historical_approvals(
+                ledger,
+                trusted_public_key_path=trusted_public_key_path,
+                dataset_identity=dataset_identity,
+            )
+        else:
+            audit = {
+                "verification_category": "AUTHENTICATED_MAPPING_APPROVAL_AUDIT",
+                "status": "NOT_PERFORMED",
+                "detail": (
+                    "no explicitly trusted public key was supplied; an embedded public "
+                    "key is never accepted as the trust anchor, so no authenticated "
+                    "approval verification is claimed"
+                ),
+            }
+        eligibility = mapping_eligibility(
+            ledger, current_baseline_fingerprint=baseline
+        )
 
     return {
         "shadow_report_schema_version": SHADOW_REPORT_SCHEMA_VERSION,
@@ -347,6 +378,9 @@ def shadow_validate(
         "approvals": approvals,
         "proposal_states": ledger_state,
         "active_bindings": active,
+        "legacy_active_bindings": list(legacy_active),
+        "authenticated_approval_audit": audit,
+        "current_mapping_eligibility": eligibility,
         "ledger_verification": ledger.verify() if ledger.exists() else None,
         "governance_status": governance_status(),
         "production_mapping_write_authorization": PRODUCTION_MAPPING_WRITE_AUTHORIZATION,

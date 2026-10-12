@@ -546,3 +546,136 @@ def test_provenance_report_is_deterministic_and_versioned():
     assert first["batch_semantic_fingerprint"] == second["batch_semantic_fingerprint"]
     assert first["observations"] == second["observations"]
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# MC-01 / MC-04 / MC-05 / MC-06 / MC-08 — 作用域与身份键的正确区分
+# ---------------------------------------------------------------------------
+
+def test_mc_01_distinct_competition_numbers_produce_distinct_identity_keys():
+    """MC-01: 同日不同竞彩编号 -> 不同作用域身份键（不再是同一绑定键）。"""
+    from utils.source_identity import ScopedSourceIdentityKey
+
+    observation_a = observe_source_row(_market_row(number="001"), adapter="market_xml")
+    observation_b = observe_source_row(_market_row(number="002", home="甲", away="乙"),
+                                       adapter="market_xml")
+
+    key_a = ScopedSourceIdentityKey.for_observation(observation_a)
+    key_b = ScopedSourceIdentityKey.for_observation(observation_b)
+
+    assert observation_a.stability_scope.as_dict() == observation_b.stability_scope.as_dict()
+    assert key_a.identity_kind == key_b.identity_kind == "COMPETITION_NUMBER"
+    assert key_a.identity_value == "football|2030-05-01|jczq|1"
+    assert key_b.identity_value == "football|2030-05-01|jczq|2"
+    assert key_a.source_key() != key_b.source_key()
+
+    # 治理层的绑定键同样区分二者。
+    from utils.mapping_governance import ProposalAction, proposal_from_observations
+
+    proposal_a = proposal_from_observations(
+        [observation_a],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id="canon-A",
+        existing_canonical_owner="canon-A",
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint="baseline-A",
+        reason="bind first event",
+        identity_evidence_type="strong_competition_number",
+    )
+    proposal_b = proposal_from_observations(
+        [observation_b],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id="canon-B",
+        existing_canonical_owner="canon-B",
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint="baseline-A",
+        reason="bind second event",
+        identity_evidence_type="strong_competition_number",
+    )
+    assert proposal_a.source_key != proposal_b.source_key
+    assert proposal_a.identity_key_sufficient and proposal_b.identity_key_sufficient
+
+
+def test_mc_04_same_number_football_and_basketball_remain_distinct():
+    """MC-04: 同编号足球/篮球身份保持区分且作用域正确。"""
+    from utils.source_identity import ScopedSourceIdentityKey
+
+    football = observe_source_row(_market_row(sport="football"), adapter="market_xml")
+    basketball = observe_source_row(
+        _market_row(sport="basketball", home="湖人", away="勇士"), adapter="market_xml"
+    )
+
+    key_football = ScopedSourceIdentityKey.for_observation(football)
+    key_basketball = ScopedSourceIdentityKey.for_observation(basketball)
+
+    assert key_football.identity_value == "football|2030-05-01|jczq|1"
+    assert key_basketball.identity_value == "basketball|2030-05-01|jczq|1"
+    assert key_football.source_key() != key_basketball.source_key()
+    # 键本身已包含 sport 作用域，不依赖裸数字编号。
+    assert "football" in key_football.identity_value
+    assert "basketball" in key_basketball.identity_value
+
+
+def test_mc_05_same_number_different_dates_remain_distinct():
+    """MC-05: 同编号不同日期的身份保持区分。"""
+    from utils.source_identity import ScopedSourceIdentityKey
+
+    day_one = observe_source_row(_market_row(number="001"), adapter="market_xml")
+    day_two = observe_source_row(
+        _market_row(number="001", date="2030-05-02"), adapter="market_xml"
+    )
+
+    key_one = ScopedSourceIdentityKey.for_observation(day_one)
+    key_two = ScopedSourceIdentityKey.for_observation(day_two)
+
+    assert key_one.identity_value == "football|2030-05-01|jczq|1"
+    assert key_two.identity_value == "football|2030-05-02|jczq|1"
+    assert key_one.source_key() != key_two.source_key()
+
+
+def test_mc_06_repeated_observations_resolve_to_one_identity_key():
+    """MC-06: 同一源身份的重复观测解析到同一身份键（与观测顺序无关）。"""
+    from utils.source_identity import ScopedSourceIdentityKey, batch_semantic_fingerprint
+
+    rows = [
+        (_market_row(number="001"), "market_xml"),
+        (_market_row(number="002", home="甲", away="乙"), "market_xml"),
+        (_market_row(number="003", home="丙", away="丁"), "market_xml"),
+    ]
+
+    first_pass = [observe_source_row(r, adapter=a) for r, a in rows]
+    second_pass = [observe_source_row(dict(r), adapter=a) for r, a in reversed(rows)]
+
+    keys_first = [ScopedSourceIdentityKey.for_observation(o) for o in first_pass]
+    keys_second = [ScopedSourceIdentityKey.for_observation(o) for o in second_pass]
+
+    assert {k.source_key() for k in keys_first} == {k.source_key() for k in keys_second}
+    assert len({k.source_key() for k in keys_first}) == 3
+
+    # 批次证据指纹同样与顺序无关。
+    assert batch_semantic_fingerprint(first_pass) == batch_semantic_fingerprint(second_pass)
+
+
+def test_mc_08_missing_provider_evidence_is_never_fabricated_into_an_identity_key():
+    """MC-08: 缺失的 provider 证据不得被合成进身份键。"""
+    from utils.source_identity import IdentityKeyKind, ScopedSourceIdentityKey
+
+    finished = fetcher_500._parse_wanchang(
+        _finished_html([("15:30", "甲队", "乙队", "2 - 1")])
+    )[0]
+    observation = observe_source_row(finished, adapter="finished_feed")
+
+    key = ScopedSourceIdentityKey.for_observation(observation)
+
+    # 行位置派生 -> 证据不足，不得用于活动绑定。
+    assert key.identity_kind == IdentityKeyKind.INSUFFICIENT.value
+    assert key.is_sufficient is False
+    # 身份键取值是**已观测**的推导标识符，绝不是凭空合成的 provider 标识符。
+    assert key.identity_value == finished["id"]
+    assert key.audit_payload()["detail"]["identifier_stability"] == (
+        IdentifierStability.ROW_POSITION_UNSTABLE.value
+    )
+    assert observation.raw_provider_id is None
+
+    # 原始 provider 证据仍然缺失（不会因为要构造身份键而出现）。
+    assert "raw_provider_id" in observation.missing_evidence()

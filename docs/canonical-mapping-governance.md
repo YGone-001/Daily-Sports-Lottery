@@ -2,8 +2,11 @@
 
 **Module**: `utils/mapping_governance.py`
 **Shadow entry point**: `tools/mapping_governance_shadow.py`
-**Tests**: `tests/test_canonical_mapping_governance.py` (PG-09 … PG-30)
-**Schema version**: `GOVERNANCE_SCHEMA_VERSION = "1.0.0"`
+**Tests**: `tests/test_canonical_mapping_governance.py` (PG-09 … PG-30, MC-01 … MC-27)
+**Governance schema version**: `GOVERNANCE_SCHEMA_VERSION = "1.0.0"`
+**Proposal schema version**: `PROPOSAL_SCHEMA_VERSION = "2.0.0"`
+**Approval schema version**: `MAPPING_APPROVAL_SCHEMA_VERSION = "2.0.0"`
+**Identity-key schema version**: `IDENTITY_KEY_SCHEMA_VERSION = "2.0.0"` (legacy `1.0.0` = scope-only)
 **Production mapping write authorization**: `NOT_GRANTED`
 **Runtime ledger enforcement**: `NOT_ENABLED`
 
@@ -28,6 +31,9 @@ Hard invariants:
 > - A source observation is **not** an authorization to bind or modify a Canonical identity.
 > - A proposal is **not** an approved mapping.
 > - An approved mapping is **not** permission to rewrite historical Canonical data.
+> - A recorded decision is attributed to the identity that **signed** it, never to whoever
+>   happens to submit the transition.
+> - A hash chain is **not** a signature, and a signature is **not** a SHA-256.
 
 This phase builds and validates governance with **synthetic, isolated data only**.
 
@@ -37,8 +43,10 @@ This phase builds and validates governance with **synthetic, isolated data only*
 | :--- | :--- |
 | Provenance model, stability classification, conflict classification | **implemented** |
 | Proposal contract + explicit state machine | **implemented** |
-| Ed25519 owner approval with domain separation and full binding | **implemented** |
-| Isolated append-only hash-chained ledger + read-only verification | **implemented** |
+| Scoped source identity key (distinct from scope metadata) | **implemented** |
+| Ed25519 owner approval, bound to the identity key, with actor/operator attribution | **implemented** |
+| Retained approval evidence + independent historical approval audit | **implemented** |
+| Isolated append-only hash-chained ledger + structural verification | **implemented** |
 | Read-only shadow validation entry point | **implemented** |
 | Runtime mapping enforcement / production mapping writes | **NOT implemented (not authorized)** |
 | Historical Canonical migration | **NOT implemented (not authorized)** |
@@ -47,26 +55,7 @@ This phase builds and validates governance with **synthetic, isolated data only*
 
 ## 2. MappingProposal schema
 
-| Field | Notes |
-| :--- | :--- |
-| `proposal_schema_version` | `"1.0.0"` |
-| `proposal_id` | Deterministic, derived from **content** (order independent) |
-| `source_observation_ref` | Observation ID |
-| `source_identity_scope` | Scope dict; for conflicts this is an explicit `AMBIGUOUS_SHARED_SOURCE_ID` scope listing member scopes |
-| `candidate_canonical_id` | Target Canonical ID (required for binding actions) |
-| `existing_canonical_owner` | Existing owner, if present |
-| `identity_evidence_type` | `strong_competition_number`, `exact_team_pair`, `source_alias`, `none` |
-| `observation_fingerprints` | Semantic fingerprints of the evidence |
-| `ingestion_plan_reference` | Read-only reference to the planner's conclusion |
-| `reason` | Justification |
-| `conflict_category` | Conflict class, if any |
-| `expected_baseline_fingerprint` | Canonical baseline the proposal was built against |
-| `requested_action` | See below |
-| `status` | Declared initial status (`APPROVED` is rejected at construction) |
-| `operator` | Preparing identity |
-
-Allowed actions: `BIND_SOURCE_TO_EXISTING_CANONICAL`, `REGISTER_NEW_SOURCE_IDENTITY`,
-`REJECT_IDENTITY_CLAIM`, `FLAG_AMBIGUOUS_IDENTITY`, `NO_ACTION`.
+`PROPOSAL_SCHEMA_VERSION = "2.0.0"`. Required: proposal ID (content-derived), schema version, observation reference, source identity scope, **scoped source identity key**, candidate Canonical ID, existing owner, identity evidence type, observation fingerprints, ingestion-plan reference, reason, conflict category, expected baseline fingerprint, requested action, status, operator. Actions: `BIND_SOURCE_TO_EXISTING_CANONICAL`, `REGISTER_NEW_SOURCE_IDENTITY`, `REJECT_IDENTITY_CLAIM`, `FLAG_AMBIGUOUS_IDENTITY`, `NO_ACTION`.
 
 > A proposal never executes its action. There is **no** action that rewrites an existing
 > Canonical ID; `validate_proposal` rejects any action containing `REWRITE`, `RENAME`,
@@ -75,6 +64,36 @@ Allowed actions: `BIND_SOURCE_TO_EXISTING_CANONICAL`, `REGISTER_NEW_SOURCE_IDENT
 One source identity claim cannot silently acquire multiple Canonical owners; one approved
 source key cannot map to different owners without a separately governed supersession
 decision.
+
+### 2.1 Scoped source identity key (scope is not identity)
+
+`SourceIdentityScope` (`adapter`, `sport`, `event_date`, `provider_namespace`,
+`raw_identifier_type`) describes a **domain**. It does **not** identify one event. Two
+genuinely distinct events — e.g. jczq `001` and `002` on the same sport/day — share an
+identical scope tuple, so a binding key built only from scope metadata would collide and
+falsely reject one of them.
+
+`ScopedSourceIdentityKey` therefore adds **discriminating identity evidence**, versioned by
+`IDENTITY_KEY_SCHEMA_VERSION = "2.0.0"`:
+
+| Kind | `identity_value` | Sufficient for an active binding |
+| :--- | :--- | :--- |
+| `COMPETITION_NUMBER` | `sport\|date\|jczq\|normalized_number` | **yes** — the bare number is never used without sport and date scoping |
+| `RAW_PROVIDER_ID` | `adapter\|namespace\|raw_identifier_type\|raw_provider_id` | **yes** — only when the provider actually supplied it (never invented) |
+| `AMBIGUOUS_SHARED_SOURCE_ID` | the disputed shared source string + member scopes | **no** — review only |
+| `INSUFFICIENT` | the derived source ID as observed | **no** — row-position-derived, meaning-unconfirmable or synthetic evidence |
+
+Fail-closed rules:
+
+- A **binding** action requires `identity_key.is_sufficient`; otherwise
+  `ProposalValidationError` (ambiguous / unstable / position-derived observations can
+  still be *observed* and sent to `REVIEW_REQUIRED`, but never actively bound).
+- A provider identifier that was never supplied is never inferred into the key.
+- Row-position identifiers are never treated as durable mapping authority.
+- Two distinct events → two distinct keys; repeated observations of one identity → one key.
+- Football and basketball remain separate identity scopes; the same number on different
+  dates stays distinct; different numbers on the same sport/date stay distinct.
+- The key never depends on observation order.
 
 ---
 
@@ -129,21 +148,42 @@ The signed payload is the artifact minus its `approval` block, canonically seria
 signature binds **every** declared field:
 
 `proposal_id`, `proposal_content_fingerprint`, `source_observation_fingerprint`,
-`source_identity_scope`, `candidate_canonical_id`, `requested_action`, `dataset_identity`,
-`expected_baseline_fingerprint`, `operator`, `approver`, `approved_at`, `reason`, `purpose`.
+`source_identity_scope`, **`scoped_source_identity_key`**, `candidate_canonical_id`,
+`requested_action`, `dataset_identity`, `expected_baseline_fingerprint`, `operator`,
+`approver`, `approved_at`, `reason`, `purpose`.
 
-Refused (fail closed):
+### 4.1 Actor attribution
+
+A signed decision is attributed to the identity that signed it. For every `APPROVED`
+transition the ledger enforces:
+
+```text
+ledger.actor              == signed_approval.approver
+signed_approval.operator  == proposal.operator
+signed_approval.approver  != signed_approval.operator
+```
+
+Verified cryptographically against the complete approved payload, **before** any ledger
+append. Refused (fail closed):
 
 - missing / unsigned / empty-signature approval attempts;
 - an approval whose `purpose` is not the mapping purpose;
+- an approval under a **legacy approval contract** (schema other than `2.0.0` — never
+  silently migrated or reinterpreted);
 - any tampered field (signature verification fails);
 - unavailable, malformed or non-Ed25519 trusted public keys;
 - an approval produced by an untrusted signing key;
 - binding mismatches (proposal, content fingerprint, observation fingerprint, scope,
-  candidate Canonical ID, action, dataset identity);
-- `approver == operator` (the owner decision must be distinguishable from the operator);
+  **scoped source identity key**, candidate Canonical ID, action, dataset identity);
+- `approver == operator`, blank approver or blank operator;
+- **wrong ledger actor** (`ActorBindingError`: `owner-B` cannot record a decision signed
+  by `owner-A`);
+- **wrong signed operator** (`ActorBindingError`: the approval cannot be attributed to an
+  operator other than the proposal's operator);
 - a **stale baseline**: if the Canonical baseline fingerprint changed after proposal
   creation, the approval cannot be reused without revalidation (`StaleBaselineError`).
+
+> `actor_role="owner"` alone proves nothing about *which* owner decided.
 
 > Mapping approval **never** invokes production repair and never rewrites Canonical files.
 
@@ -167,6 +207,8 @@ Refused (fail closed):
 | Reject conflicting active bindings | one source key cannot be actively bound to two different Canonical IDs |
 | Detect broken hash chains | `verify()` recomputes every hash, sequence and identity |
 | Detect replayed transition identities | `replay_key` uniqueness + stale-tip binding |
+| Retained approval evidence | every `APPROVED` entry carries the full signed artifact **and** the immutable proposal evidence inside the hashed entry |
+| Legacy binding-key compatibility | `classify_binding_key` distinguishes `CURRENT` / `LEGACY_SCOPE_ONLY` / `LEGACY_VERSION` / `UNKNOWN`; legacy keys are never reinterpreted and never authorize an active binding (`LegacyBindingKeyError`) |
 | Preserve rejected / superseded evidence | append-only |
 | Read-only verification | `verify()` never writes |
 
@@ -182,7 +224,54 @@ Identity model (three derived hashes per entry, all recomputed by `verify()`):
 > or detectable tampering. It is **not** an external trust anchor and must not be described
 > as tamper-proof. Truncating the tail yields a shorter but self-consistent chain; that is
 > precisely why an independently trusted signature or checkpoint would be required. This is
-> asserted explicitly in PG-14 and reported by `verify()["trust_anchor"]`.
+> asserted explicitly in PG-14 / MC-14 and reported by `verify()["trust_anchor"]`.
+
+### 5.1 Structural verification vs. authenticated approval audit
+
+Two deliberately separate contracts (never conflated):
+
+| Category | What it establishes | Requires |
+| :--- | :--- | :--- |
+| `STRUCTURAL_LEDGER_INTEGRITY` (`ledger.verify()`) | sequence integrity, previous-entry hashes, entry hashes, replay checks, ledger structure, binding-key contract histogram | nothing |
+| `AUTHENTICATED_MAPPING_APPROVAL_AUDIT` (`audit_historical_approvals`) | the actual Ed25519 signature verifies; the signed payload binds the proposal, the scoped source identity key, the observation evidence, the Canonical target, the mapping purpose, the operator and approver identities, the recorded transition and the original approved baseline; the recorded actor matches the signed approver | an **explicitly trusted public key** + retained evidence |
+| `CURRENT_MAPPING_ELIGIBILITY` (`mapping_eligibility`) | which historical approvals are still executable against the **current** baseline | a current baseline fingerprint |
+
+Fail-closed rules for the authenticated audit:
+
+- Missing trusted public key → `SignatureVerificationError`; an embedded public key is
+  **never** accepted as the trust anchor.
+- An `APPROVED` entry without retained `approval_artifact` **or** `proposal_evidence` →
+  `MissingApprovalEvidenceError` (new records can never be incomplete; `verify()` also
+  exposes `incomplete_approved_entries()` structurally).
+- The retained artifact must reproduce the recorded `approval_fingerprint`, and the
+  retained proposal evidence must reproduce the recorded proposal identity and content
+  fingerprint; otherwise fail closed.
+- Failures preserve their **original** exception type with the entry sequence attached.
+
+### 5.2 Historical authenticity vs. current eligibility
+
+`audit_historical_approvals` verifies each decision against the **recorded** baseline, so a
+historical approval remains valid *evidence of its original decision* even after the current
+Canonical baseline changes. `mapping_eligibility` separately reports which of those are
+still executable now. A valid old signature **never** automatically authorizes action
+against a new baseline.
+
+### 5.3 Schema compatibility boundary
+
+The binding-key contract moved from scope-only metadata (`IDENTITY_KEY_SCHEMA_VERSION`
+absent = legacy `1.0.0`) to discriminating identity evidence (`2.0.0`), and the approval
+contract gained `scoped_source_identity_key` (`MAPPING_APPROVAL_SCHEMA_VERSION` `1.0.0` →
+`2.0.0`). Consequences:
+
+- Legacy artifacts are **not** silently migrated, reinterpreted, or reused for a new
+  identity-key meaning.
+- Legacy keys are preserved for read-only inspection (`legacy_active_bindings()`,
+  `binding_key_contracts()`), and are refused whenever active authority is requested
+  (`LegacyBindingKeyError`).
+- Legacy approvals are refused by schema version.
+- No migration code exists; any migration would be an isolated fixture test, never a
+  production operation. The ledger is not production authority and is not adopted by
+  `refresh()`.
 
 ---
 

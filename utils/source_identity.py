@@ -282,6 +282,216 @@ def competition_identity_key(
 
 
 # ---------------------------------------------------------------------------
+# 作用域身份键（ScopedSourceIdentityKey）
+# ---------------------------------------------------------------------------
+
+#: 绑定键契约版本。任何影响绑定键**含义**的变化都必须提升该版本。
+IDENTITY_KEY_SCHEMA_VERSION = "2.0.0"
+
+#: 旧契约的版本标记：缺失 ``identity_key_schema_version`` 即为旧契约（仅作用域元数据）。
+LEGACY_IDENTITY_KEY_SCHEMA_VERSION = "1.0.0"
+
+
+class IdentityKeyKind(str, Enum):
+    """
+    绑定键中承载的判别性身份证据种类。
+
+    ``COMPETITION_NUMBER`` / ``RAW_PROVIDER_ID`` 是**充分**证据；
+    ``AMBIGUOUS_SHARED_SOURCE_ID`` / ``INSUFFICIENT`` **不足以**授权活动绑定。
+    """
+
+    COMPETITION_NUMBER = "COMPETITION_NUMBER"
+    RAW_PROVIDER_ID = "RAW_PROVIDER_ID"
+    AMBIGUOUS_SHARED_SOURCE_ID = "AMBIGUOUS_SHARED_SOURCE_ID"
+    INSUFFICIENT = "INSUFFICIENT"
+
+
+#: 足以支撑一个活动绑定的身份证据种类。
+SUFFICIENT_IDENTITY_KEY_KINDS: frozenset[str] = frozenset(
+    {IdentityKeyKind.COMPETITION_NUMBER.value, IdentityKeyKind.RAW_PROVIDER_ID.value}
+)
+
+
+@dataclass(frozen=True)
+class ScopedSourceIdentityKey:
+    """
+    **一个具体源身份声明**的判别性身份键。
+
+    ``SourceIdentityScope`` 描述的是**域**（adapter / sport / date / namespace /
+    raw_identifier_type 等宽泛元数据），本身并不识别某一场具体赛事。本类型在其之上
+    给出**判别性身份证据**：
+
+    - ``COMPETITION_NUMBER``：带 sport + date 作用域的规范化竞彩编号
+      （``sport|date|jczq|number``）；绝不使用裸数字编号。
+    - ``RAW_PROVIDER_ID``：**数据源确实提供**的 provider 标识符
+      （含 adapter / namespace / 类型；绝不凭空合成）。
+    - ``AMBIGUOUS_SHARED_SOURCE_ID``：一条被判定为歧义的共享源字符串
+      （仅用于复核类提案，**不得**用于活动绑定）。
+    - ``INSUFFICIENT``：缺乏受支持的稳定证据（行位置派生、含义不可确认等）
+      -> fail closed，只能观测 / 复核，**不得**授权活动绑定。
+    """
+
+    scope: SourceIdentityScope
+    identity_kind: str
+    identity_value: str
+    supporting_evidence_fingerprint: str
+    identity_key_schema_version: str = IDENTITY_KEY_SCHEMA_VERSION
+    detail: tuple[tuple[str, str], ...] = ()
+
+    # -- 充分性 -----------------------------------------------------------
+
+    @property
+    def is_sufficient(self) -> bool:
+        """是否承载足以授权活动绑定的判别性身份证据。"""
+        return self.identity_kind in SUFFICIENT_IDENTITY_KEY_KINDS
+
+    @property
+    def requires_review(self) -> bool:
+        return not self.is_sufficient
+
+    # -- 序列化 -----------------------------------------------------------
+
+    def as_dict(self) -> dict[str, str]:
+        """
+        绑定键载荷。
+
+        刻意**只**包含版本、证据种类与判别性取值 —— 宽泛的命名空间元数据
+        不构成身份键。
+        """
+        return {
+            "identity_key_schema_version": self.identity_key_schema_version,
+            "identity_kind": self.identity_kind,
+            "identity_value": self.identity_value,
+        }
+
+    def source_key(self) -> str:
+        """稳定的绑定键字符串（人类可读的规范 JSON）。"""
+        return canonical_json(self.as_dict())
+
+    def audit_payload(self) -> dict:
+        """供审计报告使用的完整视图（含作用域与支撑证据）。"""
+        payload = self.as_dict()
+        payload.update(
+            {
+                "scope": self.scope.as_dict(),
+                "supporting_evidence_fingerprint": self.supporting_evidence_fingerprint,
+                "detail": dict(self.detail),
+                "is_sufficient": self.is_sufficient,
+            }
+        )
+        return payload
+
+    def fingerprint(self) -> str:
+        return fingerprint(self.as_dict())
+
+    # -- 构造 -------------------------------------------------------------
+
+    @classmethod
+    def for_observation(cls, observation: SourceObservation) -> ScopedSourceIdentityKey:
+        """
+        由一次源观测推导其判别性身份键（纯函数，只读）。
+
+        优先级：带作用域的竞彩编号 > 数据源确实提供的 provider 标识符 > 证据不足。
+        """
+        scope = observation.stability_scope
+
+        if (
+            observation.competition_number_normalized is not None
+            and observation.sport
+            and observation.event_date
+        ):
+            value = competition_identity_key(
+                observation.sport,
+                observation.event_date,
+                observation.competition_number_normalized,
+            )
+            if value is not None:
+                return cls(
+                    scope=scope,
+                    identity_kind=IdentityKeyKind.COMPETITION_NUMBER.value,
+                    identity_value=value,
+                    supporting_evidence_fingerprint=observation.semantic_fingerprint(),
+                    detail=(
+                        ("sport", observation.sport),
+                        ("event_date", observation.event_date),
+                        (
+                            "normalized_competition_number",
+                            observation.competition_number_normalized,
+                        ),
+                    ),
+                )
+
+        if observation.raw_provider_id is not None:
+            value = "|".join(
+                (
+                    scope.adapter,
+                    scope.provider_namespace,
+                    scope.raw_identifier_type,
+                    observation.raw_provider_id,
+                )
+            )
+            return cls(
+                scope=scope,
+                identity_kind=IdentityKeyKind.RAW_PROVIDER_ID.value,
+                identity_value=value,
+                supporting_evidence_fingerprint=observation.semantic_fingerprint(),
+                detail=(("raw_provider_id", observation.raw_provider_id),),
+            )
+
+        # 缺乏受支持的稳定证据 -> fail closed（不得授权活动绑定）。
+        return cls(
+            scope=scope,
+            identity_kind=IdentityKeyKind.INSUFFICIENT.value,
+            identity_value=observation.derived_source_id or MISSING,
+            supporting_evidence_fingerprint=observation.semantic_fingerprint(),
+            detail=(
+                ("derived_source_id", observation.derived_source_id or MISSING),
+                ("identifier_stability", observation.identifier_stability),
+            ),
+        )
+
+    @classmethod
+    def for_ambiguous_source(
+        cls,
+        *,
+        shared_source_id: str,
+        member_scopes: Sequence[Mapping[str, Any]],
+        conflict_category: str,
+    ) -> ScopedSourceIdentityKey:
+        """
+        为一条被判定为**歧义**的共享源字符串构造身份键。
+
+        这类键**永远不充分**，只用于复核类提案。
+        """
+        scopes = sorted({canonical_json(dict(scope)) for scope in member_scopes})
+        first = dict(member_scopes[0]) if len(member_scopes) else {}
+        scope = SourceIdentityScope(
+            adapter=str(first.get("adapter", MISSING)),
+            sport=str(first.get("sport", MISSING)),
+            event_date=(str(first["event_date"]) if first.get("event_date") else None),
+            provider_namespace=str(first.get("provider_namespace", MISSING)),
+            raw_identifier_type=str(first.get("raw_identifier_type", MISSING)),
+        )
+        return cls(
+            scope=scope,
+            identity_kind=IdentityKeyKind.AMBIGUOUS_SHARED_SOURCE_ID.value,
+            identity_value=shared_source_id or MISSING,
+            supporting_evidence_fingerprint=fingerprint(
+                {"shared_source_id": shared_source_id, "member_scopes": scopes}
+            ),
+            detail=(
+                ("conflict_category", conflict_category),
+                ("member_scopes", canonical_json(scopes)),
+            ),
+        )
+
+
+def identity_key_for_observation(observation: SourceObservation) -> ScopedSourceIdentityKey:
+    """便捷入口：由观测推导身份键（只读）。"""
+    return ScopedSourceIdentityKey.for_observation(observation)
+
+
+# ---------------------------------------------------------------------------
 # 源观测（SourceObservation）
 # ---------------------------------------------------------------------------
 
