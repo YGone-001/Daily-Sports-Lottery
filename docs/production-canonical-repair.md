@@ -150,6 +150,11 @@ authorization must be re-prepared and re-approved under schema `2.0.0`.
 so in its result (`"read_only_data_dir": true`, `"writes_external_artifact": true`).
 The live data directory is never modified by `inspect`, `dry-run` or `verify`.
 
+The preview reports the audit fields needed to review a projection without running
+`apply`: `canonical_source_sha256`, `candidate_sha256`, `projected_file_sha256`
+(independently derived from the source payload) and `immutable_store_hashes`
+(the six non-Canonical stores).
+
 ---
 
 ## 5. Seven-phase transaction state machine
@@ -376,8 +381,18 @@ every refresh.
 
 ```bash
 python -m pytest -q tests/test_production_canonical_repair.py
+python -m pytest -q tests/test_canonical_repair_end_to_end.py
 python -m pytest -q tests/
 ```
+
+`tests/test_canonical_repair_end_to_end.py` is the isolated staging validation suite. It
+generates its own deterministic collision fixture under a private temporary directory
+(outside the repository) and walks the complete lifecycle -- `prepare` -> `approve` ->
+Ed25519 verification -> authorization binding -> `dry-run` -> controlled `apply` ->
+journal state machine -> crash interruption matrix -> rollback and forward recovery ->
+full postcondition verification -- then destroys the fixture. It also asserts that no
+production path (`data/`, `repair_runs/`, `_quiescent_evidence_backup*`) is touched.
+CI runs it as a dedicated job on Ubuntu and Windows.
 
 The suite is fully offline and portable: synthetic fixtures are generated in a temporary
 directory, so it never touches `data/`. It covers the authorization trust boundary

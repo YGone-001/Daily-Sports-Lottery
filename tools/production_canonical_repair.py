@@ -1407,6 +1407,10 @@ class ProductionCanonicalRepairer:
                 "writes_external_artifact": False,
                 "total_matches": report["total_matches"],
                 "duplicate_groups": {},
+                "canonical_source_sha256": report["store_hashes"][CANONICAL_FILE],
+                "immutable_store_hashes": {
+                    k: v for k, v in report["store_hashes"].items() if k != CANONICAL_FILE
+                },
             }
 
         if authorization is not None:
@@ -1440,6 +1444,16 @@ class ProductionCanonicalRepairer:
                 continue
             projected_matches.append(match)
 
+        # Independently derived projected file fingerprint and the immutable-store
+        # baseline, so a reviewer can audit the projection without running apply.
+        try:
+            _pm, projected_data = self._derive_projected_from_raw(daily_data, target_id)
+            projected_file_sha256 = derive_file_hash(projected_data)
+        except RecoveryStateError:
+            # Malformed collision shapes are refused by the apply guards; the
+            # preview simply cannot offer a projected fingerprint for them.
+            projected_file_sha256 = None
+
         preview = {
             "status": "DRY_RUN_COMPLETED",
             "read_only_data_dir": True,
@@ -1451,6 +1465,11 @@ class ProductionCanonicalRepairer:
             "candidate_record": candidate,
             "candidate_sha256": hash_record(candidate),
             "field_diff": field_diff,
+            "canonical_source_sha256": report["store_hashes"][CANONICAL_FILE],
+            "projected_file_sha256": projected_file_sha256,
+            "immutable_store_hashes": {
+                k: v for k, v in report["store_hashes"].items() if k != CANONICAL_FILE
+            },
             "authorization_signature_verified": False,
             "authorized_candidate_sha256": (
                 authorization.get("expected_candidate_sha256") if authorization else None
