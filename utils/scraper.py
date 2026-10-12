@@ -28,6 +28,7 @@ from utils.daily_loader import (
 from utils.evaluation_rows import EvaluationIntegrityError, capture_evaluation_row
 from utils.ingestion_identity import (
     CanonicalIdentityCollisionError,
+    plan_ingestion_identity,
     validate_canonical_uniqueness,
     validate_ingestion_identity,
 )
@@ -212,11 +213,14 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
     使用 same_event 做去重，严格保持旧 canonical id，通过 resolve_match_update 实施状态机。
     返回 (merged, added, updated)。
 
-    入口先执行**摄取身份预检**（``utils.ingestion_identity.validate_ingestion_identity``）：
+    入口先执行**摄取身份预检**（``utils.ingestion_identity.plan_ingestion_identity``）：
     批次内任何无法唯一确定 Canonical 归属的情况都整体拒绝，且该预检在**任何持久化写入之前**，
     因此直接调用本函数的调用方同样受到 fail-closed 保护。
+
+    新事件的 Canonical ID 一律取自预检给出的**确定性选择结果**，而不是本批次的行序：
+    同一组 unambiguous 的 incoming 记录，无论排列如何，都会得到同一个首个 Canonical ID。
     """
-    validate_ingestion_identity(existing, incoming)
+    plan = plan_ingestion_identity(existing, incoming)
 
     result: list[dict] = [copy.deepcopy(m) for m in existing]
 
@@ -289,10 +293,12 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
                 updated += 1
         else:
             m = dict(inc)
-            mid = m.get("id")
+            # Canonical ID 由预检确定性给出（源命名空间优先级 + 字典序，
+            # 或对无源 ID 记录的确定性合成序号），与本批次行序无关。
+            mid = plan.canonical_id_by_index[inc_idx] or m.get("id")
             if not mid:
                 mid = f"{m.get('sport','f')}-{m.get('date')}-{len(result) + added}"
-                m["id"] = mid
+            m["id"] = mid
 
             if mid in seen_ids:
                 raise CanonicalIdentityCollisionError(mid, "INCOMING_SHARED_ID", "New event shares existing ID")

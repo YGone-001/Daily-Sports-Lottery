@@ -30,7 +30,6 @@ from tools.staging_canonical_repair import (
     RecoveryStateError,
     StagingMigrationError,
     assert_safe_path,
-    canonicalize_path,
     is_subpath_or_equal,
     build_candidate_projection,
     hash_record,
@@ -947,6 +946,33 @@ def _remove_junction(path: str) -> None:
         pass
 
 
+#: The two legitimate refusal reasons for a path that lies inside a protected
+#: location.  On a host whose checkout sits at a declared legacy production root
+#: the two protections overlap, and the guard reports the declared-root reason
+#: first.  Both are refusals of the *same* security decision, so individual
+#: expectations must not depend on which branch happens to be reached first.
+PROTECTED_REJECTION_PATTERNS = (
+    "resolves inside protected root",
+    "is inside source repository checkout",
+)
+
+
+def assert_refused_as_protected(target: str, **kwargs) -> str:
+    """
+    Assert ``target`` is refused by the path guard for a protected-location
+    reason, and return the refusal message.
+
+    Deliberately reason-agnostic: the refusal itself is the security decision,
+    and which of the two protected-location branches reports it first depends on
+    the host layout rather than on the strength of the guard.
+    """
+    with pytest.raises(ProtectedPathViolationError) as exc_info:
+        assert_safe_path(target, **kwargs)
+    message = str(exc_info.value)
+    assert any(pattern in message for pattern in PROTECTED_REJECTION_PATTERNS), message
+    return message
+
+
 @requires_windows_junctions
 def test_ic_reg_12_windows_junction_escape_rejected(tmp_path):
     """
@@ -970,10 +996,10 @@ def test_ic_reg_12_windows_junction_escape_rejected(tmp_path):
         _winapi.CreateJunction(SOURCE_REPO_ROOT, link_to_source)
         created.append(link_to_source)
 
-        with pytest.raises(
-            ProtectedPathViolationError, match="is inside source repository checkout"
-        ):
-            assert_safe_path(link_to_source)
+        # Refused as a protected location.  Which branch reports it first is a
+        # host-layout detail (a checkout may itself sit at a declared legacy
+        # root); the refusal is the contract.
+        assert_refused_as_protected(link_to_source)
 
         # Reaching the Canonical data directory *through* the junction is
         # refused too -- the junction is resolved before the check.
@@ -1014,23 +1040,40 @@ def test_ic_reg_12_windows_junction_escape_rejected(tmp_path):
         assert not os.path.exists(link)
 
 
-def test_ic_reg_12b_live_checkout_is_protected_dynamically():
+def test_ic_reg_12b_live_checkout_is_protected_dynamically(monkeypatch):
     """
     IC-REG-12b: The checkout that is actually executing this code is protected,
-    resolved from __file__ rather than from any hardcoded machine layout.
+    resolved from ``__file__`` rather than from any hardcoded machine layout.
+
+    The refusal is asserted reason-agnostically, and the *dynamic* checkout
+    protection is then isolated from the declared legacy roots so the assertion
+    holds on any host -- including one whose checkout happens to sit exactly at a
+    declared legacy production root.  The isolation is test-scoped: the shipped
+    guard and its protected-root declarations are untouched.
     """
+    import tools.staging_canonical_repair as mod
+
     assert SOURCE_REPO_ROOT, "SOURCE_REPO_ROOT must resolve"
     assert os.path.isdir(SOURCE_REPO_ROOT)
     assert os.path.normcase(os.path.realpath(SOURCE_REPO_ROOT)) == os.path.normcase(
         os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
 
-    for target in (
+    targets = (
         SOURCE_REPO_ROOT,
         SOURCE_DATA_DIR,
         os.path.join(SOURCE_REPO_ROOT, "data", "daily_matches.json"),
         os.path.join(SOURCE_REPO_ROOT, "tools", "staging_canonical_repair.py"),
-    ):
+    )
+
+    for target in targets:
+        assert_refused_as_protected(target)
+
+    # Isolate the dynamic source-checkout branch: with no declared legacy root in
+    # play, the live checkout must still be refused -- and specifically because it
+    # is the source repository checkout.
+    monkeypatch.setattr(mod, "LEGACY_PROTECTED_ROOTS", [])
+    for target in targets:
         with pytest.raises(
             ProtectedPathViolationError, match="is inside source repository checkout"
         ):
@@ -1043,12 +1086,41 @@ def test_ic_reg_12c_legacy_roots_remain_declared_protections():
     declarations -- matched by path prefix whether or not they exist here -- and
     are never silently redefined as the current development checkout.
     """
+    import ast
+    import pathlib
+    import tools.staging_canonical_repair as mod
+
     assert PROTECTED_ROOTS == LEGACY_PROTECTED_ROOTS
+    # The same declaration object, never re-derived per call.
+    assert mod.PROTECTED_ROOTS is mod.LEGACY_PROTECTED_ROOTS
+
+    # The legacy roots are static string literals in the module source, so they
+    # are never silently re-pointed at the dynamically resolved development
+    # checkout.  Comparing canonicalized values against SOURCE_REPO_ROOT would be
+    # machine dependent: a checkout may legitimately sit at a declared legacy
+    # root, in which case the two protections coincide and the guard reports the
+    # declared-root reason first -- still a refusal.
+    literal_names = (
+        "LEGACY_PROD_REPO_ROOT",
+        "LEGACY_EPOCH_0_ROOT",
+        "LEGACY_EPOCH_1_ROOT",
+    )
+    declared: dict[str, str] = {}
+    tree = ast.parse(pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for assign_target in node.targets:
+            if isinstance(assign_target, ast.Name) and assign_target.id in literal_names:
+                assert isinstance(node.value, ast.Constant) and isinstance(
+                    node.value.value, str
+                ), f"{assign_target.id} must remain a literal string declaration"
+                declared[assign_target.id] = node.value.value
+    assert set(declared) == set(literal_names)
+    assert sorted(declared.values()) == sorted(LEGACY_PROTECTED_ROOTS)
 
     for legacy in LEGACY_PROTECTED_ROOTS:
         assert legacy in PROTECTED_ROOTS
-        # Never re-pointed at the live checkout.
-        assert canonicalize_path(legacy) != canonicalize_path(SOURCE_REPO_ROOT)
 
         for target in (legacy, os.path.join(legacy, "data")):
             with pytest.raises(
@@ -1079,6 +1151,112 @@ def test_ic_reg_12d_containment_is_tri_state_and_fails_closed(tmp_path, monkeypa
     monkeypatch.setattr(mod, "canonicalize_path", lambda _p: "")
     with pytest.raises(ProtectedPathViolationError, match="fail closed"):
         mod.assert_safe_path("/anywhere/at/all")
+
+
+def test_ic_reg_17_overlapping_source_and_legacy_protected_root_rejects_safely(
+    tmp_path, monkeypatch
+):
+    """
+    IC-REG-17: A declared legacy protected root and the live source checkout may
+    resolve to the *same* directory on some hosts.  Both protections must stay
+    effective in that overlap, and each must be independently sufficient.
+
+    Uses a controlled temporary fixture root, so the expectation carries no
+    machine-location assumption.  The isolation is test-scoped: the shipped guard
+    and its protected-root declarations are unchanged.
+    """
+    import tools.staging_canonical_repair as mod
+
+    overlap_root = tmp_path / "overlap_root"
+    overlap_data = overlap_root / "data"
+    os.makedirs(overlap_data, exist_ok=True)
+    root = str(overlap_root)
+    targets = (root, str(overlap_data))
+
+    # (a) Overlap: one directory is simultaneously the declared legacy root and
+    #     the source checkout.  Every target is refused.
+    monkeypatch.setattr(mod, "LEGACY_PROTECTED_ROOTS", [root])
+    monkeypatch.setattr(mod, "SOURCE_REPO_ROOT", root)
+    monkeypatch.setattr(mod, "SOURCE_DATA_DIR", str(overlap_data))
+    for target in targets:
+        assert_refused_as_protected(target)
+
+    # (b) Declared legacy root alone (checkout moved elsewhere) -> declared-root reason.
+    monkeypatch.setattr(mod, "SOURCE_REPO_ROOT", str(tmp_path / "elsewhere"))
+    monkeypatch.setattr(mod, "SOURCE_DATA_DIR", str(tmp_path / "elsewhere" / "data"))
+    for target in targets:
+        with pytest.raises(
+            ProtectedPathViolationError, match="resolves inside protected root"
+        ):
+            assert_safe_path(target)
+
+    # (c) Dynamic checkout protection alone (no declared legacy root covers it).
+    monkeypatch.setattr(mod, "LEGACY_PROTECTED_ROOTS", [])
+    monkeypatch.setattr(mod, "SOURCE_REPO_ROOT", root)
+    monkeypatch.setattr(mod, "SOURCE_DATA_DIR", str(overlap_data))
+    for target in targets:
+        with pytest.raises(
+            ProtectedPathViolationError, match="is inside source repository checkout"
+        ):
+            assert_safe_path(target)
+
+    # (d) The overlap must not become an authorisation: a staging workspace placed
+    #     at the overlapping root is refused as well.
+    monkeypatch.setattr(mod, "LEGACY_PROTECTED_ROOTS", [root])
+    with pytest.raises(ProtectedPathViolationError):
+        assert_safe_path(os.path.join(root, "staging"), staging_root=root)
+
+
+@requires_windows_junctions
+def test_ic_reg_18_ntfs_junction_escapes_remain_rejected(tmp_path, monkeypatch):
+    """
+    IC-REG-18: Real NTFS junction behaviour stays covered -- a junction resolving
+    into a protected root is refused, and a junction escaping the staging root is
+    refused.  Both use controlled temporary fixture roots, so no machine-specific
+    historical directory needs to exist, and nothing outside ``tmp_path`` is
+    touched.
+    """
+    import _winapi
+    import tools.staging_canonical_repair as mod
+
+    protected_target = tmp_path / "protected_target"
+    protected_target.mkdir()
+    outside_target = tmp_path / "outside_target"
+    outside_target.mkdir()
+    staging_root = tmp_path / "staging_box"
+    staging_root.mkdir()
+    links_dir = tmp_path / "links"
+    links_dir.mkdir()
+
+    created: list[str] = []
+    try:
+        # (a) Junction resolving into a protected root -> refused.
+        link_protected = os.path.join(str(links_dir), "junction_into_protected")
+        _winapi.CreateJunction(str(protected_target), link_protected)
+        created.append(link_protected)
+
+        monkeypatch.setattr(
+            mod,
+            "LEGACY_PROTECTED_ROOTS",
+            list(mod.LEGACY_PROTECTED_ROOTS) + [str(protected_target)],
+        )
+        with pytest.raises(
+            ProtectedPathViolationError, match="resolves inside protected root"
+        ):
+            assert_safe_path(link_protected)
+
+        # (b) Junction escaping the staging root -> refused.
+        link_escape = os.path.join(str(staging_root), "junction_escape")
+        _winapi.CreateJunction(str(outside_target), link_escape)
+        created.append(link_escape)
+        with pytest.raises(ProtectedPathViolationError, match="escapes staging root"):
+            assert_safe_path(link_escape, staging_root=str(staging_root))
+    finally:
+        for link in created:
+            _remove_junction(link)
+
+    for link in created:
+        assert not os.path.exists(link)
 
 
 def test_ic_reg_13_immutable_store_mutation_rejected_in_recovery(tmp_path):

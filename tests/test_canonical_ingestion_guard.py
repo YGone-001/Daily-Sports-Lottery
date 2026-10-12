@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +29,7 @@ from utils.daily_loader import load_json, save_json
 from utils.evaluation_rows import build_evaluation_row, get_all_evaluation_rows
 from utils.ingestion_identity import (
     CanonicalIdentityCollisionError,
+    plan_ingestion_identity,
     validate_canonical_uniqueness,
     validate_ingestion_identity,
 )
@@ -899,3 +901,325 @@ def test_cross_source_combinations_are_covered():
             _match("row-2", home="C", away="D"),
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# IC-01 .. IC-15 — incoming-only 非传递歧义 与 first-seen 确定性归属
+# ---------------------------------------------------------------------------
+
+def _triangle():
+    """
+    复现器 A 的 incoming-only 三角：
+
+    - ``X`` 缺强编号（队名回退可命中 Y / Z）
+    - ``Y`` 强编号 001、``Z`` 强编号 002，二者强编号互斥
+    """
+    x = _match("live-x", home="A", away="B", jczq_no=None)
+    y = _match("market-y", home="A", away="B", jczq_no="001")
+    z = _match("market-z", home="A", away="B", jczq_no="002")
+    return x, y, z
+
+
+def _pipeline_triangle():
+    """
+    能真正穿过 ``refresh()`` 候选构造的三角：
+
+    - live 行：强编号 001，无盘口
+    - market 行：强编号 002，带完整盘口（不会被 live 行消费，因为强编号不同）
+    - finished 行：无强编号，与二者队名一致（桥接）
+    """
+    live = _match("500l-2030-05-01-001", jczq_no="001", home="A", away="B", time="20:00")
+    market = _match(
+        "500j-2030-05-01-002", jczq_no="002", home="A", away="B",
+        time="00:00", kickoff_time_known=False, odds=FOOTBALL_1X2,
+    )
+    finished = _match(
+        "500w-2030-05-01-0", home="A", away="B",
+        status="finished", score={"ft": [1, 0]},
+    )
+    return live, market, finished
+
+
+def test_ic_01_incoming_only_non_transitive_triangle_is_rejected():
+    """IC-01: 无既有 Canonical 所有者时，incoming-only 非传递三角必须被拒绝。"""
+    x, y, z = _triangle()
+
+    assert same_event(x, y) is True
+    assert same_event(x, z) is True
+    assert same_event(y, z) is False
+
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        scraper._merge([], [x, y, z])
+
+    assert exc.value.category == "AMBIGUOUS_CANONICAL_OWNERSHIP"
+    assert exc.value.evidence_type == "non_transitive_identity"
+    assert exc.value.reason == "non_clique_component"
+
+
+def test_ic_02_all_permutations_reject_the_triangle_with_the_same_category():
+    """IC-02: 三角的 6 种排列必须全部被拒绝，且冲突类别一致。"""
+    x, y, z = _triangle()
+
+    categories = set()
+    for order in itertools.permutations((x, y, z)):
+        with pytest.raises(CanonicalIdentityCollisionError) as exc:
+            scraper._merge([], copy.deepcopy(list(order)))
+        categories.add(exc.value.category)
+
+    assert categories == {"AMBIGUOUS_CANONICAL_OWNERSHIP"}
+
+
+def test_ic_03_triangle_rejected_with_no_existing_canonical_records():
+    """IC-03: 既有集合为空时同样拒绝（空所有者集合不是「无歧义」的证明）。"""
+    x, y, z = _triangle()
+
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        validate_ingestion_identity([], [x, y, z])
+    assert exc.value.category == "AMBIGUOUS_CANONICAL_OWNERSHIP"
+
+    plan_inputs = list(itertools.permutations((x, y, z)))
+    for order in plan_inputs:
+        with pytest.raises(CanonicalIdentityCollisionError):
+            plan_ingestion_identity([], copy.deepcopy(list(order)))
+
+
+def test_ic_04_triangle_rejected_when_an_unrelated_canonical_owner_exists():
+    """IC-04: 存在无关 Canonical 所有者时，三角依然被拒绝。"""
+    unrelated = [_match("canon-unrelated", home="P", away="Q", jczq_no="099")]
+    x, y, z = _triangle()
+
+    for order in itertools.permutations((x, y, z)):
+        with pytest.raises(CanonicalIdentityCollisionError) as exc:
+            scraper._merge(copy.deepcopy(unrelated), copy.deepcopy(list(order)))
+        assert exc.value.category == "AMBIGUOUS_CANONICAL_OWNERSHIP"
+
+
+def test_ic_05_compatible_incoming_only_events_reconcile_safely():
+    """IC-05: 兼容的 incoming-only 事件（同一强编号）安全合并为一个新事件。"""
+    live = _match("500l-2030-05-01-007", jczq_no="007",
+                  home="皇家马德里", away="巴塞罗那", time="20:00")
+    market = _match("500j-2030-05-01-007", jczq_no="7",
+                    home="皇马", away="巴萨", time="00:00",
+                    kickoff_time_known=False, odds=FOOTBALL_1X2)
+    finished = _match("500w-2030-05-01-0", jczq_no="007",
+                      home="皇马", away="巴萨", status="finished", score={"ft": [2, 1]})
+
+    merged, added, _updated = scraper._merge([], [live, market, finished])
+
+    assert len(merged) == 1
+    assert added == 1
+    # live 命名空间优先级最高 -> 首个 Canonical ID 取 live 行
+    assert merged[0]["id"] == "500l-2030-05-01-007"
+    assert merged[0]["status"] == "finished"
+    assert merged[0]["score"] == {"ft": [2, 1]}
+    assert merged[0]["odds"] == FOOTBALL_1X2
+
+
+def _first_seen_pair():
+    """复现器 B：同一事件、两个不同源 ID、无既有所有者。"""
+    return (
+        _match("500l-2030-05-01-001", jczq_no="001", home="A", away="B"),
+        _match("500j-2030-05-01-001", jczq_no="001", home="A", away="B",
+               time="00:00", kickoff_time_known=False),
+    )
+
+
+def test_ic_06_first_seen_same_event_rows_yield_deterministic_canonical_id():
+    """IC-06: 首次出现的同一事件、多个源 ID -> 确定性 Canonical ID。"""
+    a, b = _first_seen_pair()
+    assert same_event(a, b) is True
+
+    merged, added, _updated = scraper._merge([], [a, b])
+
+    assert len(merged) == 1
+    assert added == 1
+    assert merged[0]["id"] == "500l-2030-05-01-001"
+
+
+def test_ic_07_reversing_source_rows_produces_identical_canonical_ownership():
+    """IC-07: 反转行序得到完全相同的 Canonical 归属。"""
+    a, b = _first_seen_pair()
+
+    forward = scraper._merge([], [copy.deepcopy(a), copy.deepcopy(b)])
+    backward = scraper._merge([], [copy.deepcopy(b), copy.deepcopy(a)])
+
+    assert forward[0][0]["id"] == backward[0][0]["id"] == "500l-2030-05-01-001"
+    assert forward[1] == backward[1] == 1
+    assert len(forward[0]) == len(backward[0]) == 1
+
+
+def test_ic_08_existing_canonical_ids_are_never_changed_by_the_selection_policy():
+    """IC-08: 新选择策略绝不改写既有 Canonical ID，即使存在更优命名空间。"""
+    existing = [
+        _match("500j-2030-05-01-007", jczq_no="007", home="A", away="B",
+               time="00:00", kickoff_time_known=False, odds=FOOTBALL_1X2,
+               market_tracked=True),
+    ]
+    incoming = [_match("500l-2030-05-01-007", jczq_no="007", home="A", away="B",
+                       time="20:00")]
+
+    merged, added, _updated = scraper._merge(existing, incoming)
+
+    assert len(merged) == 1
+    assert added == 0
+    assert merged[0]["id"] == "500j-2030-05-01-007"
+    assert merged[0]["time"] == "20:00"
+
+
+def test_ic_09_unrelated_incoming_events_remain_independent():
+    """IC-09: 互不相关的 incoming 事件保持彼此独立，不被误并。"""
+    rows = [
+        _match("500l-2030-05-01-001", jczq_no="001", home="A", away="B"),
+        _match("500l-2030-05-01-002", jczq_no="002", home="C", away="D"),
+        _match("500l-2030-05-01-003", home="E", away="F"),
+    ]
+
+    merged, added, _updated = scraper._merge([], rows)
+
+    assert added == 3
+    assert len(merged) == 3
+    assert len({m["id"] for m in merged}) == 3
+
+
+def test_ic_10_distinct_strong_number_events_with_same_team_names_are_not_merged():
+    """IC-10: 队名相同但强编号不同的两个事件绝不合并。"""
+    a = _match("500l-2030-05-01-001", jczq_no="001", home="A", away="B")
+    b = _match("500l-2030-05-01-002", jczq_no="002", home="A", away="B")
+
+    assert same_event(a, b) is False
+
+    merged, added, _updated = scraper._merge([], [a, b])
+
+    assert added == 2
+    assert len(merged) == 2
+    assert {m["id"] for m in merged} == {"500l-2030-05-01-001", "500l-2030-05-01-002"}
+
+
+def test_ic_11_missing_number_bridge_cannot_silently_join_incompatible_events():
+    """IC-11: 缺号桥接记录不得静默把两个互斥强编号事件连成一个。"""
+    bridge = _match("500l-2030-05-01-999", home="A", away="B", jczq_no=None)
+    one = _match("500j-2030-05-01-001", jczq_no="001", home="A", away="B")
+    two = _match("500j-2030-05-01-002", jczq_no="002", home="A", away="B")
+
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        validate_ingestion_identity([], [bridge, one, two])
+
+    assert exc.value.category == "AMBIGUOUS_CANONICAL_OWNERSHIP"
+    assert exc.value.reason == "non_clique_component"
+    assert exc.value.evidence_type == "non_transitive_identity"
+
+
+def test_ic_12_rejected_incoming_only_ambiguity_changes_zero_persistent_stores(
+    isolated_data_dir, monkeypatch
+):
+    """IC-12: 被拒绝的 incoming-only 歧义对七个持久化库零写入。"""
+    _seed_seven_stores(isolated_data_dir)
+    before = _hash_all(isolated_data_dir)
+
+    live, market, finished = _pipeline_triangle()
+    _fake_sources(monkeypatch, live_football=[live], market=[market], finished=[finished])
+
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        scraper.refresh(verbose=False)
+
+    assert exc.value.category == "AMBIGUOUS_CANONICAL_OWNERSHIP"
+    assert _hash_all(isolated_data_dir) == before, "七个库必须逐字节不变"
+
+
+def test_ic_13_and_ic_14_lock_released_and_subsequent_valid_refresh_succeeds(
+    isolated_data_dir, monkeypatch
+):
+    """IC-13/IC-14: 拒绝后刷新锁已释放，随后一次合法刷新可以正常完成。"""
+    live, market, finished = _pipeline_triangle()
+    _fake_sources(monkeypatch, live_football=[live], market=[market], finished=[finished])
+
+    with pytest.raises(CanonicalIdentityCollisionError):
+        scraper.refresh(verbose=False)
+
+    # 锁已释放：再次 refresh 不会抛 RefreshBusyError
+    _fake_sources(
+        monkeypatch,
+        live_football=[
+            _match("500l-2030-06-01-001", jczq_no="001", home="C", away="D",
+                   odds=FOOTBALL_1X2, date="2030-06-01")
+        ],
+    )
+    result = scraper.refresh(verbose=False)
+
+    assert result["added"] == 1
+    assert result["total"] == 1
+    assert [m["id"] for m in load_json("daily_matches.json")["matches"]] == [
+        "500l-2030-06-01-001"
+    ]
+
+
+def test_ic_15_valid_initial_market_admission_remains_functional(
+    isolated_data_dir, monkeypatch
+):
+    """IC-15: 首次市场准入（带完整盘口的新事件）保持可用。"""
+    market = _match(
+        "500j-2030-05-01-007", jczq_no="007", time="00:00",
+        kickoff_time_known=False, odds=FOOTBALL_1X2,
+    )
+    _fake_sources(monkeypatch, market=[market])
+
+    result = scraper.refresh(verbose=False)
+
+    assert result["added"] == 1
+    stored = load_json("daily_matches.json")["matches"]
+    assert [m["id"] for m in stored] == ["500j-2030-05-01-007"]
+    assert stored[0]["market_tracked"] is True
+
+
+# ---------------------------------------------------------------------------
+# IC 补充：排列不变性矩阵（计划层与合并层）
+# ---------------------------------------------------------------------------
+
+def test_permutation_matrix_is_invariant_for_a_clean_batch():
+    """任意排列下，Canonical ID 集合与新增计数完全一致。"""
+    rows = [
+        _match("500l-2030-05-01-007", jczq_no="007",
+               home="皇家马德里", away="巴塞罗那", time="20:00"),
+        _match("500j-2030-05-01-007", jczq_no="7", home="皇马", away="巴萨",
+               time="00:00", kickoff_time_known=False, odds=FOOTBALL_1X2),
+        _match("500w-2030-05-01-0", jczq_no="007", home="皇马", away="巴萨",
+               status="finished", score={"ft": [2, 1]}),
+        _match("500l-2030-05-01-021", jczq_no="021", home="E", away="F"),
+    ]
+
+    outcomes = set()
+    plan_ids = set()
+    for order in itertools.permutations(rows):
+        merged, added, _updated = scraper._merge([], copy.deepcopy(list(order)))
+        outcomes.add((tuple(sorted(m["id"] for m in merged)), added))
+        plan_ids.add(
+            tuple(
+                sorted(
+                    plan_ingestion_identity([], copy.deepcopy(list(order))).new_canonical_ids
+                )
+            )
+        )
+
+    assert len(outcomes) == 1, outcomes
+    assert len(plan_ids) == 1, plan_ids
+    assert outcomes == {(("500l-2030-05-01-007", "500l-2030-05-01-021"), 2)}
+
+
+def test_plan_exposes_deterministic_owner_resolution():
+    """计划层同时给出既有所有者解析与确定性新 ID。"""
+    existing = [_match("canon-keep", jczq_no="007", home="A", away="B",
+                       market_tracked=True)]
+    incoming = [
+        _match("500l-2030-05-01-007", jczq_no="007", home="A", away="B"),
+        _match("500j-2030-05-01-021", jczq_no="021", home="C", away="D",
+               odds=FOOTBALL_1X2),
+    ]
+
+    plan = plan_ingestion_identity(existing, incoming)
+
+    assert plan.canonical_id_for(0) == "canon-keep"
+    assert plan.owner_index_for(0) == 0
+    assert plan.canonical_id_for(1) == "500j-2030-05-01-021"
+    assert plan.owner_index_for(1) is None
+    assert plan.new_canonical_ids == ("500j-2030-05-01-021",)
+
