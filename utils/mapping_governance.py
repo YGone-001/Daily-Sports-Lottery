@@ -47,7 +47,6 @@ from utils.source_identity import (
     SourceObservation,
     canonical_json,
     fingerprint,
-    sha256_text,
 )
 
 #: 治理 schema 版本。
@@ -1330,6 +1329,15 @@ class GovernanceLedger:
             raise
 
 
+#: 账本锁的最长等待时间（秒）。跨进程竞争时以非阻塞尝试 + 截止时间重试实现，
+#: 而不是依赖 ``msvcrt.LK_LOCK`` 固定长度的重试窗口（该窗口在慢速文件系统或
+#: 安全软件扫描下可能不足，从而让一次合法写入假性失败）。
+LEDGER_LOCK_TIMEOUT_SECONDS = 120.0
+
+#: 两次非阻塞加锁尝试之间的间隔（秒）。
+LEDGER_LOCK_POLL_SECONDS = 0.05
+
+
 class _ledger_lock:
     """
     账本专用的跨进程 + 跨线程互斥锁。
@@ -1366,21 +1374,35 @@ class _ledger_lock:
         if st.st_size == 0:
             os.write(self._fd, b"0")
         os.lseek(self._fd, 0, os.SEEK_SET)
+
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(self._fd, msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self._fd, fcntl.LOCK_EX)
-        except OSError:
+            self._acquire_os_lock()
+        except BaseException:
             os.close(self._fd)
             self._fd = None
             self._guard.release()
             raise
         return self
+
+    def _acquire_os_lock(self) -> None:
+        """获取 OS 级排他锁；以截止时间为界重试，超时才放弃。"""
+        if os.name == "nt":
+            import msvcrt
+
+            deadline = time.monotonic() + LEDGER_LOCK_TIMEOUT_SECONDS
+            while True:
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(LEDGER_LOCK_POLL_SECONDS)
+        else:
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
 
     def __exit__(self, exc_type, exc, tb):
         try:

@@ -162,7 +162,7 @@ Refused (fail closed):
 | Deterministic serialization | `canonical_json` per line |
 | Previous-entry hash binding | `previous_entry_hash` / `entry_hash`; genesis = 64 zeros |
 | Atomic writes | same-directory temp file + `fsync` + `os.replace` |
-| Concurrency safety | dedicated cross-process + cross-thread lock (independent of the refresh lock) |
+| Concurrency safety | dedicated cross-process + cross-thread lock (independent of the refresh lock); acquisition retries against an explicit deadline (`LEDGER_LOCK_TIMEOUT_SECONDS`) rather than relying on the platform primitive's fixed retry window |
 | Reject malformed transitions | `validate_transition` + first-transition/declared-status consistency |
 | Reject conflicting active bindings | one source key cannot be actively bound to two different Canonical IDs |
 | Detect broken hash chains | `verify()` recomputes every hash, sequence and identity |

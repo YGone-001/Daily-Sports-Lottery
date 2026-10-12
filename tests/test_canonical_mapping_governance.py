@@ -23,7 +23,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import config
 from tools.mapping_governance_shadow import (
     SHADOW_LEDGER_NAME,
     canonical_baseline_fingerprint,
@@ -1089,8 +1088,8 @@ def test_pg_29_cross_process_ledger_updates_are_safe(tmp_path):
                 process.wait(timeout=10)
 
     for returncode, out, err in outputs:
-        assert returncode == 0, err
-        assert "CHILD_OK True" in out, out
+        assert returncode == 0, f"child failed: stdout={out!r} stderr={err!r}"
+        assert "CHILD_OK True" in out, f"stdout={out!r} stderr={err!r}"
 
     ledger = GovernanceLedger(ledger_path, dataset_identity=DATASET)
     entries = ledger.entries()
