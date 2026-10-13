@@ -12,6 +12,7 @@ Canonical 映射治理的**只读影子校验**入口
 - 与隔离的 Canonical 夹具对比；
 - **只读**地调用既有摄取规划器校验归属；
 - **只读**地生成迁移影响清单（`utils.source_id_migration`）；
+- **只读**地模拟未来的运行期资格闸门（`utils.runtime_mapping_eligibility`）；
 - 校验治理账本；
 - 产出确定性冲突报告。
 
@@ -23,9 +24,10 @@ Canonical 映射治理的**只读影子校验**入口
 - 让账本决策阻断实时刷新；
 - 自动批准提案；
 - 自动迁移历史映射；
-- **执行任何迁移**（清单只是分析工件）。
+- **执行任何迁移**（清单只是分析工件）；
+- **激活任何运行期映射**（就绪清单只是分析工件）。
 
-默认行为：无活动绑定、无生产权威、无迁移执行。
+默认行为：无活动绑定、无生产权威、无迁移执行、无运行期映射激活。
 运行期身份权威仍然是 ``utils.ingestion_identity.validate_ingestion_identity``；
 本工具**不是**额外的生产写入路径，``utils/scraper.py`` 也从不引用它。
 """
@@ -35,6 +37,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
 from utils.ingestion_identity import CanonicalIdentityCollisionError, plan_ingestion_identity
@@ -42,6 +45,7 @@ from utils.mapping_governance import (
     ACTIVE_STATES,
     GOVERNANCE_SCHEMA_VERSION,
     PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
+    PROPOSAL_SCHEMA_VERSION,
     RUNTIME_LEDGER_ENFORCEMENT,
     GovernanceLedger,
     MappingProposal,
@@ -49,6 +53,7 @@ from utils.mapping_governance import (
     ProposalAction,
     audit_historical_approvals,
     build_approval_body,
+    build_proposal,
     governance_rule_for,
     governance_status,
     mapping_eligibility,
@@ -62,6 +67,18 @@ from utils.provider_evidence import (
     PROVIDER_EVIDENCE_SCHEMA_VERSION,
     extract_source_evidence,
 )
+from utils.runtime_mapping_eligibility import (
+    RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
+    RUNTIME_READINESS_MANIFEST_KIND,
+    RuntimeMappingContext,
+    build_runtime_readiness_manifest,
+    evaluate_runtime_mapping_eligibility,
+    runtime_eligibility_status,
+)
+from utils.runtime_mapping_policy import (
+    RUNTIME_MAPPING_ACTIVATION,
+    RUNTIME_MAPPING_POLICY_VERSION,
+)
 from utils.source_id_migration import (
     MARKET_SOURCE_ID_CONTRACT_VERSION,
     MIGRATION_EXECUTION_AVAILABLE,
@@ -71,7 +88,9 @@ from utils.source_id_migration import (
     manifest_fingerprint,
 )
 from utils.source_identity import (
+    IDENTITY_KEY_SCHEMA_VERSION,
     PROVENANCE_SCHEMA_VERSION,
+    ScopedSourceIdentityKey,
     SourceObservation,
     build_provenance_report,
     conflict_report,
@@ -546,6 +565,383 @@ def proposed_mapping_from_payload(payload: Mapping[str, Any]) -> ProposedSourceM
 
 
 # ---------------------------------------------------------------------------
+# 影子入口：运行期资格模拟（只读、无激活、无账本写入）
+# ---------------------------------------------------------------------------
+
+#: 运行期资格模拟的必需场景：``(场景名, 期望结果, 说明)``。
+RUNTIME_SCENARIO_MATRIX: tuple[tuple[str, str, str], ...] = (
+    (
+        "VALID_APPROVED_MAPPING",
+        "ELIGIBLE",
+        "已批准的作用域身份、无历史影响 -> 应判为 ELIGIBLE（且不做任何变更）。",
+    ),
+    ("MISSING_APPROVAL", "NOT_ELIGIBLE", "缺少所有者批准件。"),
+    ("LEGACY_IDENTITY_KEY", "NOT_ELIGIBLE", "旧契约身份键（2.0.0）不得被消费。"),
+    ("UNVERIFIED_PROVIDER_ID", "NOT_ELIGIBLE", "未验证的 provider 标识符一律阻断。"),
+    ("REVOKED_APPROVAL", "NOT_ELIGIBLE", "已撤销的映射不得被消费。"),
+    ("STALE_BASELINE", "NOT_ELIGIBLE", "批准绑定的基线已过期。"),
+    ("HISTORICAL_SNAPSHOT_IMPACT", "NOT_ELIGIBLE", "任何历史（快照）影响一律阻断。"),
+    ("CANONICAL_OWNER_CONFLICT", "NOT_ELIGIBLE", "Canonical 所有者冲突一律阻断。"),
+)
+
+
+def shadow_runtime_eligibility_check(
+    *,
+    workspace: str,
+    proposal: MappingProposal | None,
+    approval: Mapping[str, Any] | None,
+    source_observation: SourceObservation | None,
+    runtime_context: RuntimeMappingContext,
+    evaluated_at: str | None = None,
+    scenario: str = "",
+) -> dict:
+    """
+    **只读**运行期资格模拟。
+
+    绝不写账本、绝不写文件、绝不创建绑定、绝不修改 Canonical 记录、绝不激活映射。
+    返回决策工件 + 显式隔离标记。
+    """
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        source_observation,
+        runtime_context,
+        evaluated_at=evaluated_at,
+    )
+    return {
+        "shadow_report_schema_version": SHADOW_REPORT_SCHEMA_VERSION,
+        "analysis_kind": "SHADOW_RUNTIME_ELIGIBILITY_CHECK",
+        "scenario": scenario,
+        "workspace": os.path.realpath(os.path.abspath(workspace)),
+        "runtime_mapping_policy_version": RUNTIME_MAPPING_POLICY_VERSION,
+        "runtime_eligibility_evaluator_version": RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
+        "decision": decision.as_dict(),
+        "eligibility_result": decision.eligibility_result,
+        "rejection_codes": list(decision.rejection_codes),
+        "runtime_mapping_activation": RUNTIME_MAPPING_ACTIVATION,
+        "production_mapping_write_authorization": PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
+        "runtime_ledger_enforcement": RUNTIME_LEDGER_ENFORCEMENT,
+        "ledger_written": False,
+        "files_written": 0,
+        "bindings_created": 0,
+        "canonical_records_modified": 0,
+        "is_production_authority": False,
+    }
+
+
+def _synthetic_runtime_proposal(
+    *,
+    key_dict: Mapping[str, str],
+    scope_dict: Mapping[str, str],
+    canonical_id: str,
+    operator: str,
+    action: str = ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+) -> MappingProposal:
+    """
+    构造一条**仅用于影子模拟**的提案（刻意绕过 ``validate_proposal``）。
+
+    用途：演示「若有人提交了旧契约 / 未验证身份键，运行期闸门会如何判定」。
+    这类对象**绝不**进入账本，也**绝不**进入任何生产路径。
+    """
+    key_pairs = tuple(sorted((str(k), str(v)) for k, v in key_dict.items()))
+    scope_pairs = tuple(sorted((str(k), str(v)) for k, v in scope_dict.items()))
+    return MappingProposal(
+        proposal_schema_version=PROPOSAL_SCHEMA_VERSION,
+        proposal_id=fingerprint(
+            {
+                "kind": "SHADOW_SYNTHETIC_RUNTIME_PROPOSAL",
+                "scoped_source_identity_key": dict(key_pairs),
+                "candidate_canonical_id": canonical_id,
+                "operator": operator,
+            }
+        ),
+        source_observation_ref="shadow-synthetic-observation",
+        source_identity_scope=scope_pairs,
+        scoped_source_identity_key=key_pairs,
+        candidate_canonical_id=canonical_id,
+        existing_canonical_owner=canonical_id,
+        identity_evidence_type="shadow_synthetic",
+        observation_fingerprints=("0" * 64,),
+        ingestion_plan_reference="planner:SHADOW",
+        reason="shadow runtime eligibility scenario",
+        conflict_category=None,
+        expected_baseline_fingerprint="baseline-A",
+        requested_action=action,
+        status=MappingState.PROPOSED.value,
+        operator=operator,
+    )
+
+
+def shadow_runtime_scenario_matrix(
+    *,
+    workspace: str,
+    canonical_id: str,
+    source_observation: SourceObservation,
+    owner_private_key_path: str | None,
+    trusted_public_key_path: str | None,
+    dataset_identity: str = "synthetic-runtime-fixture",
+    baseline_fingerprint: str = "baseline-A",
+    evaluated_at: str = "2030-01-01T00:00:00+00:00",
+    operator: str = "shadow-operator",
+    approver: str = "shadow-owner",
+) -> dict:
+    """
+    运行 §9 要求的运行期资格场景矩阵（只读、无激活）。
+
+    需要显式提供所有者私钥与可信公钥才能构造「有效批准」场景；缺失时该场景标记为
+    ``SKIPPED``，绝不退化为信任内嵌公钥。
+    """
+    scope = dict(source_observation.stability_scope.as_dict())
+    base_key = ScopedSourceIdentityKey.for_observation(source_observation)
+    base_key_dict = base_key.as_dict()
+
+    base_proposal = build_proposal(
+        source_observation_ref=source_observation.observation_id,
+        source_identity_scope=scope,
+        identity_key=base_key,
+        candidate_canonical_id=canonical_id,
+        existing_canonical_owner=canonical_id,
+        identity_evidence_type="strong_competition_number",
+        observation_fingerprints=[source_observation.semantic_fingerprint()],
+        ingestion_plan_reference="planner:ACCEPTED",
+        reason="shadow runtime eligibility scenario",
+        expected_baseline_fingerprint=baseline_fingerprint,
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        operator=operator,
+    )
+
+    valid_approval: dict | None = None
+    approval_skip_reason = ""
+    if not owner_private_key_path or not trusted_public_key_path:
+        approval_skip_reason = (
+            "owner private key / trusted public key not supplied; the valid-approval "
+            "scenario is SKIPPED rather than trusting an embedded public key"
+        )
+    else:
+        body = build_approval_body(
+            proposal=base_proposal,
+            source_observation_fingerprint=source_observation.semantic_fingerprint(),
+            dataset_identity=dataset_identity,
+            operator=operator,
+            approver=approver,
+            approved_at=evaluated_at,
+            reason="shadow owner approves the proposed binding",
+        )
+        valid_approval = sign_mapping_approval(owner_private_key_path, body)
+
+    base_context = RuntimeMappingContext(
+        dataset_identity=dataset_identity,
+        current_baseline_fingerprint=baseline_fingerprint,
+        canonical_ids=(canonical_id,),
+        trusted_public_key_path=trusted_public_key_path,
+        expected_approver=approver,
+        expected_operator=operator,
+        recorded_proposal_state=MappingState.APPROVED.value,
+    )
+
+    legacy_proposal = _synthetic_runtime_proposal(
+        key_dict={
+            "identity_key_schema_version": "2.0.0",
+            "identity_kind": "RAW_PROVIDER_ID",
+            "identity_value": "market_xml|500j|PROVIDER_MATCH_ID|12345",
+        },
+        scope_dict=scope,
+        canonical_id=canonical_id,
+        operator=operator,
+    )
+    unverified_proposal = _synthetic_runtime_proposal(
+        key_dict={
+            "identity_key_schema_version": IDENTITY_KEY_SCHEMA_VERSION,
+            "identity_kind": "UNVERIFIED_PROVIDER_ID",
+            "identity_value": "market_xml|500j|football|2030-05-01|PROVIDER_MATCH_ID|UNKNOWN|12345",
+            "provider_id_uniqueness_scope": "UNKNOWN",
+        },
+        scope_dict=scope,
+        canonical_id=canonical_id,
+        operator=operator,
+    )
+
+    scenarios: list[dict] = []
+
+    def _run(name: str, expected: str, proposal, approval, context) -> None:
+        if name == "VALID_APPROVED_MAPPING" and valid_approval is None:
+            scenarios.append(
+                {
+                    "scenario": name,
+                    "expected": expected,
+                    "status": "SKIPPED",
+                    "detail": approval_skip_reason,
+                }
+            )
+            return
+
+        report = shadow_runtime_eligibility_check(
+            workspace=workspace,
+            proposal=proposal,
+            approval=approval,
+            source_observation=source_observation,
+            runtime_context=context,
+            evaluated_at=evaluated_at,
+            scenario=name,
+        )
+        scenarios.append(
+            {
+                "scenario": name,
+                "expected": expected,
+                "status": "EVALUATED",
+                "eligibility_result": report["eligibility_result"],
+                "rejection_codes": report["rejection_codes"],
+                "matches_expected": report["eligibility_result"] == expected,
+                "ledger_written": report["ledger_written"],
+                "files_written": report["files_written"],
+                "bindings_created": report["bindings_created"],
+            }
+        )
+
+    for name, expected, _detail in RUNTIME_SCENARIO_MATRIX:
+        if name == "VALID_APPROVED_MAPPING":
+            _run(name, expected, base_proposal, valid_approval, base_context)
+        elif name == "MISSING_APPROVAL":
+            _run(name, expected, base_proposal, None, base_context)
+        elif name == "LEGACY_IDENTITY_KEY":
+            _run(name, expected, legacy_proposal, None, base_context)
+        elif name == "UNVERIFIED_PROVIDER_ID":
+            _run(name, expected, unverified_proposal, None, base_context)
+        elif name == "REVOKED_APPROVAL":
+            _run(
+                name,
+                expected,
+                base_proposal,
+                valid_approval,
+                replace(base_context, recorded_proposal_state=MappingState.REVOKED.value),
+            )
+        elif name == "STALE_BASELINE":
+            _run(
+                name,
+                expected,
+                base_proposal,
+                valid_approval,
+                replace(base_context, current_baseline_fingerprint="baseline-B"),
+            )
+        elif name == "HISTORICAL_SNAPSHOT_IMPACT":
+            _run(
+                name,
+                expected,
+                base_proposal,
+                valid_approval,
+                replace(
+                    base_context,
+                    required_rewrite_targets=("prediction_snapshots.json",),
+                ),
+            )
+        elif name == "CANONICAL_OWNER_CONFLICT":
+            _run(
+                name,
+                expected,
+                base_proposal,
+                valid_approval,
+                replace(
+                    base_context,
+                    known_source_bindings=((base_key.source_key(), "canon-OTHER"),),
+                ),
+            )
+
+    return {
+        "shadow_report_schema_version": SHADOW_REPORT_SCHEMA_VERSION,
+        "analysis_kind": "SHADOW_RUNTIME_SCENARIO_MATRIX",
+        "workspace": os.path.realpath(os.path.abspath(workspace)),
+        "dataset_identity": dataset_identity,
+        "canonical_id": canonical_id,
+        "base_source_identity_key": base_key.source_key(),
+        "runtime_mapping_activation": RUNTIME_MAPPING_ACTIVATION,
+        "runtime_mapping_policy_version": RUNTIME_MAPPING_POLICY_VERSION,
+        "runtime_eligibility_evaluator_version": RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
+        "scenarios": scenarios,
+        "evaluated_count": sum(1 for s in scenarios if s["status"] == "EVALUATED"),
+        "skipped_count": sum(1 for s in scenarios if s["status"] == "SKIPPED"),
+        "all_scenarios_evaluated": all(
+            s["status"] == "EVALUATED" for s in scenarios
+        ),
+        "all_matched": all(
+            s["matches_expected"]
+            for s in scenarios
+            if s["status"] == "EVALUATED"
+        )
+        and all(s["status"] == "EVALUATED" for s in scenarios),
+        "ledger_written": False,
+        "files_written": 0,
+        "bindings_created": 0,
+        "is_production_authority": False,
+    }
+
+
+def shadow_runtime_readiness_report(
+    *,
+    workspace: str,
+    proposals: Sequence[MappingProposal],
+    observations: Sequence[SourceObservation],
+    canonical_fixture: Sequence[Mapping[str, Any]],
+    approvals: Sequence[Mapping[str, Any] | None] | None = None,
+    dataset_identity: str = "synthetic-runtime-fixture",
+    baseline_fingerprint: str = "",
+    trusted_public_key_path: str | None = None,
+    evaluated_at: str | None = None,
+) -> dict:
+    """
+    汇总运行期就绪清单（只读）。默认**不提供任何批准件**，因此结论必然是
+    NOT_ELIGIBLE —— 这正是本阶段的预期状态：闸门存在，但没有任何映射被激活。
+    """
+    canonical_ids = tuple(
+        str(m.get("id") or "") for m in canonical_fixture if m.get("id")
+    )
+    approval_list = list(approvals) if approvals is not None else [None] * len(proposals)
+    context = RuntimeMappingContext(
+        dataset_identity=dataset_identity,
+        current_baseline_fingerprint=baseline_fingerprint,
+        canonical_ids=canonical_ids,
+        trusted_public_key_path=trusted_public_key_path,
+        recorded_proposal_state=None,
+    )
+    decisions = [
+        evaluate_runtime_mapping_eligibility(
+            proposal,
+            approval_list[index] if index < len(approval_list) else None,
+            observations[index] if index < len(observations) else None,
+            context,
+            evaluated_at=evaluated_at,
+        )
+        for index, proposal in enumerate(proposals)
+    ]
+    manifest = build_runtime_readiness_manifest(
+        fixture_identity="shadow-runtime-readiness",
+        decisions=decisions,
+        dataset_identity=dataset_identity,
+        current_baseline_fingerprint=baseline_fingerprint,
+        approval_versions=sorted(
+            {
+                str(a.get("approval_schema_version"))
+                for a in approval_list
+                if isinstance(a, Mapping) and a.get("approval_schema_version")
+            }
+        ),
+    )
+    return {
+        "shadow_report_schema_version": SHADOW_REPORT_SCHEMA_VERSION,
+        "analysis_kind": "SHADOW_RUNTIME_READINESS",
+        "workspace": os.path.realpath(os.path.abspath(workspace)),
+        "manifest_kind": RUNTIME_READINESS_MANIFEST_KIND,
+        "runtime_readiness_manifest": manifest,
+        "runtime_eligibility_status": runtime_eligibility_status(),
+        "ledger_written": False,
+        "files_written": 0,
+        "bindings_created": 0,
+        "canonical_records_modified": 0,
+        "runtime_mapping_activation": RUNTIME_MAPPING_ACTIVATION,
+        "is_production_authority": False,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 合成演示夹具（仅用于演示与测试）
 # ---------------------------------------------------------------------------
 
@@ -676,6 +1072,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--dependent-stores",
         help="JSON file with synthetic dependent evidence stores (7-store fixture)",
     )
+    parser.add_argument(
+        "--runtime-eligibility",
+        action="store_true",
+        help="also build the read-only runtime readiness manifest (never activates)",
+    )
+    parser.add_argument(
+        "--runtime-scenarios",
+        action="store_true",
+        help="also run the runtime eligibility scenario matrix (read-only)",
+    )
     args = parser.parse_args(argv)
 
     evidence_report: dict | None = None
@@ -763,6 +1169,61 @@ def main(argv: Sequence[str] | None = None) -> int:
             dependent_stores=dependent_stores,
             dataset_identity=args.dataset_identity,
         )
+
+    if args.runtime_eligibility or args.runtime_scenarios:
+        baseline = report.get("canonical_baseline_fingerprint", "")
+        target_canonical_id = (
+            str(canonical_fixture[0].get("id") or "") if canonical_fixture else ""
+        )
+        runtime_proposals: list[MappingProposal] = []
+        skipped: list[dict] = []
+        for observation in observations:
+            if not ScopedSourceIdentityKey.for_observation(observation).is_sufficient:
+                skipped.append(
+                    {
+                        "observation_id": observation.observation_id,
+                        "detail": "insufficient identity evidence; not a binding candidate",
+                    }
+                )
+                continue
+            runtime_proposals.append(
+                proposal_from_observations(
+                    [observation],
+                    requested_action=(
+                        ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value
+                    ),
+                    candidate_canonical_id=target_canonical_id or None,
+                    existing_canonical_owner=target_canonical_id or None,
+                    ingestion_plan_reference=(
+                        f"planner:{report['planner_validation']['outcome']}"
+                    ),
+                    expected_baseline_fingerprint=baseline,
+                    reason="shadow runtime readiness candidate",
+                    identity_evidence_type="strong_competition_number",
+                )
+            )
+        readiness = shadow_runtime_readiness_report(
+            workspace=args.workspace,
+            proposals=runtime_proposals,
+            observations=observations,
+            canonical_fixture=canonical_fixture,
+            dataset_identity=args.dataset_identity,
+            baseline_fingerprint=baseline,
+            trusted_public_key_path=args.trusted_public_key,
+        )
+        readiness["skipped_observations"] = skipped
+        report["runtime_readiness"] = readiness
+
+        if args.runtime_scenarios and target_canonical_id and observations:
+            report["runtime_scenario_matrix"] = shadow_runtime_scenario_matrix(
+                workspace=args.workspace,
+                canonical_id=target_canonical_id,
+                source_observation=observations[0],
+                owner_private_key_path=args.owner_private_key,
+                trusted_public_key_path=args.trusted_public_key,
+                dataset_identity=args.dataset_identity,
+                baseline_fingerprint=baseline,
+            )
 
     text = json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2)
     if args.json_out:
