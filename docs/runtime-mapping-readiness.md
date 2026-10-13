@@ -290,6 +290,11 @@ Every failure mode is fail-closed: the decision is `NOT_ELIGIBLE` and no state c
 - **No production mapping database, no admin UI, no `main` modification, no Git history
   rewrite.**
 
+> The **future** activation layer (authorization, runtime reader, audit, rollback and
+> emergency disable) is designed in `docs/runtime-activation-architecture.md` and is
+> **not implemented**. Eligibility and activation remain separate layers; an `ELIGIBLE`
+> decision is never an activation authorization.
+
 ### CLI (read-only)
 
 ```bash
