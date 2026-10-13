@@ -6,8 +6,10 @@
   (`shadow_runtime_eligibility_check`, `shadow_runtime_scenario_matrix`,
   `shadow_runtime_readiness_report`)
 **Tests**: `tests/test_runtime_mapping_readiness.py` (RR-01 … RR-28)
-**Policy version**: `RUNTIME_MAPPING_POLICY_VERSION = "1.0.0"`
-**Evaluator version**: `RUNTIME_ELIGIBILITY_EVALUATOR_VERSION = "1.0.0"`
+**Policy version**: `RUNTIME_MAPPING_POLICY_VERSION = "1.1.0"`
+**Evaluator version**: `RUNTIME_ELIGIBILITY_EVALUATOR_VERSION = "1.1.0"`
+**Decision schema version**: `RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION = "1.1.0"`
+**Rules / rejection codes**: 45 / 45
 
 | Flag | Value |
 | :--- | :--- |
@@ -87,7 +89,12 @@ contains no ad-hoc branches.
 | Rule | Requirement |
 | :--- | :--- |
 | `PROPOSAL_PRESENT` | A structurally valid proposal exists. |
-| `PROPOSAL_FINGERPRINT_MATCHES` | The recorded proposal fingerprint matches. |
+| `GOVERNANCE_EVIDENCE_PROVENANCE_SUPPORTED` | The context declares a **supported** evidence source (caller-asserted / isolated snapshot); a claim of independently verified ledger evidence is rejected. |
+| `PROPOSAL_FINGERPRINT_PRESENT` | A **recorded** proposal fingerprint exists and is non-blank. A missing record is never "validation optional". |
+| `PROPOSAL_FINGERPRINT_MATCHES` | The recorded fingerprint equals the current proposal fingerprint (a malformed value counts as a mismatch). |
+| `RECORDED_STATE_PRESENT` | A **recorded** governance state exists. There is no fallback to `proposal.status`. |
+| `RECORDED_STATE_KNOWN` | The recorded state is a known state. |
+| `RECORDED_STATE_PROPOSAL_MATCHES` | The recorded state corresponds to the **exact evaluated proposal ID**. |
 | `PROPOSAL_STATE_ACTIVE` | The recorded state is `APPROVED`. |
 | `MAPPING_NOT_REVOKED` / `MAPPING_NOT_SUPERSEDED` | Not revoked, not superseded. |
 | `APPROVAL_PRESENT` | An owner approval artifact exists. |
@@ -99,6 +106,20 @@ contains no ad-hoc branches.
 | `BASELINE_MATCHES` | The approved baseline equals the current baseline. |
 | `DATASET_IDENTITY_MATCHES` | The approved dataset identity matches. |
 | `APPROVAL_NOT_REPLAYED` | The approval fingerprint has not been used for a different source identity. |
+
+### 2.2a Evidence binding conditions (`EVIDENCE_BINDING`)
+
+A valid signature alone never makes inconsistent evidence acceptable.
+
+| Rule | Requirement |
+| :--- | :--- |
+| `SOURCE_OBSERVATION_IN_PROPOSAL` | The current observation is genuinely covered by the proposal's evidence: its semantic fingerprint is a member of the proposal's observation fingerprints, the proposal's observation reference is non-blank, and — for a single-observation proposal — that reference equals the current observation ID. A proposal may legitimately carry **several** fingerprints; the current observation is never required to be the first. |
+| `SOURCE_IDENTITY_KEY_MATCHES` | The scoped identity key **independently derived from the `SourceObservation`** equals the proposal's identity key. |
+| `SOURCE_SCOPE_MATCHES` | The observation's source scope equals the proposal's claimed scope, dimension by dimension. |
+
+> `APPROVAL_SIGNATURE_INVALID` is never reused for an observation/proposal inconsistency
+> that can be diagnosed directly. The cryptographic signature check remains mandatory and
+> independent.
 
 ### 2.3 Runtime safety conditions
 
@@ -124,6 +145,44 @@ and exposes **no** mutation or execution method. It answers *"would this mapping
 — never *"this mapping has been applied"*. `evaluated_at` is metadata and is deliberately
 excluded from `decision_id`, so the same inputs yield the same decision identity regardless
 of the clock (re-evaluation is idempotent).
+
+Schema `1.1.0` adds one field, `evidence_provenance`, so a **conditional** decision can never
+be confused with independently verified evidence. Two derived (non-field) properties make the
+distinction explicit:
+
+| Property | Value | Meaning |
+| :--- | :--- | :--- |
+| `is_conditional` | `True` unless the provenance is independently verified ledger evidence | The governance facts were not independently verified. |
+| `is_production_authorization` | **always `False`** | No production mapping authority exists in this phase. |
+
+> **A previously produced ELIGIBLE decision is not permanent authorization.** Re-evaluation is
+> required after any material governance change or Canonical baseline change; a changed
+> baseline yields a different `decision_id` and a `BASELINE_STALE` rejection.
+
+### 2.5 Context evidence provenance
+
+`GovernanceEvidenceProvenance` is a mandatory part of `RuntimeMappingContext`. It answers:
+where did the recorded proposal fingerprint / state come from, which dataset and baseline do
+they refer to, and whether structural ledger validation and authenticated approval audit were
+**actually** performed.
+
+| Source | Meaning | Decision nature |
+| :--- | :--- | :--- |
+| `CALLER_ASSERTED_CONTEXT` | The caller supplied the governance facts. | conditional shadow-readiness |
+| `ISOLATED_SNAPSHOT_CONTEXT` | Facts read from an isolated synthetic governance fixture (structural validation and, if a trusted key was supplied, the authenticated approval audit). | conditional shadow-readiness |
+| `VERIFIED_GOVERNANCE_EVIDENCE` | Claims independently verified ledger evidence. | **blocked** in this phase |
+
+> Self-declared booleans (`structural_ledger_validation_performed`,
+> `authenticated_approval_audit_performed`) are **never** treated as proof that verification
+> occurred. No code path in this phase can establish the verified-ledger source, so any
+> context claiming it is rejected (`EVIDENCE_PROVENANCE_UNSUPPORTED`). Source-of-truth
+> integration remains deferred.
+
+`tools.mapping_governance_shadow.build_isolated_governance_snapshot()` reads an isolated
+synthetic ledger **read-only** (`ledger.verify()` plus, when a trusted key is supplied,
+`audit_historical_approvals`), never appends an entry, never activates a mapping, never
+creates an owner approval, and preserves the ledger's own trust-anchor warning verbatim
+(the hash chain proves internal consistency only).
 
 ---
 
@@ -188,6 +247,15 @@ Runtime mapping and historical migration are **independent** and must stay so:
 
 | Failure mode | Detected by | Rejection code(s) |
 | :--- | :--- | :--- |
+| Missing / blank recorded proposal fingerprint | `PROPOSAL_FINGERPRINT_PRESENT` | `PROPOSAL_FINGERPRINT_MISSING` |
+| Mismatched / malformed recorded fingerprint | `PROPOSAL_FINGERPRINT_MATCHES` | `PROPOSAL_FINGERPRINT_MISMATCH` |
+| Observation not covered by the proposal's evidence | `SOURCE_OBSERVATION_IN_PROPOSAL` | `SOURCE_OBSERVATION_NOT_IN_PROPOSAL` |
+| Observation identity key differs from the proposal's | `SOURCE_IDENTITY_KEY_MATCHES` | `SOURCE_IDENTITY_KEY_MISMATCH` |
+| Observation scope differs from the proposal's | `SOURCE_SCOPE_MATCHES` | `SOURCE_SCOPE_MISMATCH` |
+| Missing recorded governance state | `RECORDED_STATE_PRESENT` | `RECORDED_STATE_MISSING` |
+| Unknown recorded state | `RECORDED_STATE_KNOWN` | `RECORDED_STATE_UNKNOWN` |
+| Recorded state belongs to a different proposal | `RECORDED_STATE_PROPOSAL_MATCHES` | `RECORDED_STATE_PROPOSAL_MISMATCH` |
+| Unsupported / over-claimed evidence provenance | `GOVERNANCE_EVIDENCE_PROVENANCE_SUPPORTED` | `EVIDENCE_PROVENANCE_UNSUPPORTED` |
 | Stale approval (baseline moved) | `BASELINE_MATCHES` + cryptographic verification | `BASELINE_STALE` |
 | Ambiguous identity | `IDENTITY_NOT_AMBIGUOUS`, `NO_PENDING_AMBIGUITY`, `BLOCKED_IDENTITY_TYPE_REJECTED` | `IDENTITY_AMBIGUOUS`, `PENDING_AMBIGUITY`, `IDENTITY_TYPE_BLOCKED` |
 | Provider collision (same number, other day/sport) | `PROVIDER_ID_SCOPE_VERIFIED`, `IDENTITY_KEY_VERSION_CURRENT` | `PROVIDER_ID_SCOPE_NOT_VERIFIED`, `IDENTITY_KEY_VERSION_NOT_CURRENT` |
@@ -227,7 +295,18 @@ Every failure mode is fail-closed: the decision is `NOT_ELIGIBLE` and no state c
 ```bash
 python -m tools.mapping_governance_shadow --demo --workspace /tmp/gov_shadow \
     --no-ledger --runtime-eligibility --runtime-scenarios
+
+# read recorded governance facts from the isolated workspace ledger (read-only)
+python -m tools.mapping_governance_shadow --demo --workspace /tmp/gov_shadow \
+    --runtime-eligibility --runtime-snapshot --trusted-public-key <pub.pem>
 ```
 
 Without owner keys the valid-approval scenario is reported as `SKIPPED` rather than trusting
 an embedded public key; every other scenario still evaluates and must be `NOT_ELIGIBLE`.
+
+### Mandatory evidence
+
+Every evaluation must now supply: an explicit `evidence_provenance`, a recorded proposal ID,
+a recorded proposal fingerprint and a recorded proposal state. Omitting any of them is a
+rejection, never a silent pass — a structurally valid proposal that was never shown to match
+a recorded governance fingerprint can never return `ELIGIBLE`.

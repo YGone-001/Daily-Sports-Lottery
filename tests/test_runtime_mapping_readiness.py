@@ -25,6 +25,8 @@ import pytest
 
 from tools.mapping_governance_shadow import (
     RUNTIME_SCENARIO_MATRIX,
+    IsolatedGovernanceSnapshot,
+    build_isolated_governance_snapshot,
     shadow_runtime_eligibility_check,
     shadow_runtime_readiness_report,
     shadow_runtime_scenario_matrix,
@@ -39,9 +41,11 @@ from utils.mapping_governance import (
     MAPPING_APPROVAL_SCHEMA_VERSION,
     PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
     RUNTIME_LEDGER_ENFORCEMENT,
+    GovernanceLedger,
     MappingProposal,
     ProposalAction,
     approval_fingerprint,
+    audit_historical_approvals,
     build_approval_body,
     generate_mapping_owner_keypair,
     governance_status,
@@ -53,25 +57,35 @@ from utils.runtime_mapping_eligibility import (
     RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION,
     RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
     RUNTIME_READINESS_MANIFEST_KIND,
+    GovernanceEvidenceProvenance,
     RuntimeEligibilityPolicyError,
     RuntimeEligibilityResult,
     RuntimeMappingContext,
     RuntimeMappingEligibilityDecision,
     assert_runtime_manifest_not_executable,
     build_runtime_readiness_manifest,
+    caller_asserted_provenance,
     evaluate_runtime_mapping_eligibility,
+    isolated_snapshot_provenance,
     runtime_eligibility_status,
     runtime_manifest_fingerprint,
 )
 from utils.runtime_mapping_policy import (
     ALLOWED_ACTIONS,
     ALLOWED_APPROVAL_VERSIONS,
+    ALLOWED_CONTEXT_EVIDENCE_PROVENANCE,
     ALLOWED_IDENTITY_KEY_VERSIONS,
+    ALLOWED_PROPOSAL_STATES,
     ALLOWED_RUNTIME_IDENTITY_KEYS,
     ALLOWED_SOURCE_SCOPES,
     BLOCKED_ACTIONS,
+    BLOCKED_CONTEXT_EVIDENCE_PROVENANCE,
     BLOCKED_IDENTITY_TYPES,
     BLOCKED_PROVIDER_ID_UNIQUENESS_SCOPES,
+    CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+    CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT,
+    CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER,
+    KNOWN_PROPOSAL_STATES,
     REJECTION_CODES,
     RUNTIME_ELIGIBILITY_RULES,
     RUNTIME_MAPPING_ACTIVATION,
@@ -88,6 +102,7 @@ from utils.source_identity import (
 )
 
 CANONICAL_ID = "500j-2030-05-01-007"
+CANONICAL_ID_ALT = "500j-2030-05-01-008"
 DATASET = "synthetic-runtime-readiness-fixture"
 BASELINE = "baseline-A"
 OPERATOR = "operator-1"
@@ -126,6 +141,7 @@ def _market_row(
     match_id: str = CANONICAL_ID,
     sport: str = "football",
     date: str = "2030-05-01",
+    time: str = "20:00",
     number: str = "007",
     home: str = "皇马",
     away: str = "巴萨",
@@ -138,7 +154,7 @@ def _market_row(
         "sport": sport,
         "league": "西甲" if sport == "football" else "NBA",
         "date": date,
-        "time": "20:00",
+        "time": time,
         "kickoff_time_known": True,
         "status": status,
         "home": home,
@@ -183,14 +199,30 @@ def _approval(proposal, observation, keys, *, approver: str = APPROVER,
     return sign_mapping_approval(keys["private"], body)
 
 
-def _context(keys, **overrides) -> RuntimeMappingContext:
+def _context(keys, proposal=None, **overrides) -> RuntimeMappingContext:
+    """
+    合成运行期上下文。
+
+    ``evidence_provenance`` / ``recorded_proposal_id`` / ``recorded_proposal_fingerprint``
+    是修正后**必填**的治理证据；省略任何一项都会被评估器判为不合格，而不是静默通过。
+    """
     kwargs = dict(
         dataset_identity=DATASET,
         current_baseline_fingerprint=BASELINE,
-        canonical_ids=(CANONICAL_ID,),
+        evidence_provenance=caller_asserted_provenance(
+            dataset_identity=DATASET,
+            baseline_fingerprint=BASELINE,
+        ),
+        canonical_ids=(CANONICAL_ID, CANONICAL_ID_ALT),
         trusted_public_key_path=keys["public"],
         expected_approver=APPROVER,
         expected_operator=OPERATOR,
+        recorded_proposal_id=(
+            proposal.proposal_id if isinstance(proposal, MappingProposal) else None
+        ),
+        recorded_proposal_fingerprint=(
+            proposal.fingerprint() if isinstance(proposal, MappingProposal) else None
+        ),
         recorded_proposal_state="APPROVED",
     )
     kwargs.update(overrides)
@@ -201,7 +233,7 @@ def _valid_setup(keys):
     observation = _observation()
     proposal = _proposal(observation)
     approval = _approval(proposal, observation, keys)
-    return observation, proposal, approval, _context(keys)
+    return observation, proposal, approval, _context(keys, proposal)
 
 
 def _synthetic_proposal(
@@ -241,6 +273,52 @@ def _synthetic_proposal(
         requested_action=action,
         status="PROPOSED",
         operator=operator,
+    )
+
+
+def _recompose_proposal(
+    proposal: MappingProposal,
+    *,
+    scope_overrides: dict | None = None,
+    key_dict: dict | None = None,
+    observation_fingerprints=None,
+    source_observation_ref: str | None = None,
+    status: str | None = None,
+) -> MappingProposal:
+    """
+    仅用于测试：在保持身份键与观测指纹不变的前提下改写提案的**声明作用域**，
+    以便单独触发 ``SOURCE_SCOPE_MISMATCH``。
+    """
+    scope = dict(proposal.scope_dict)
+    if scope_overrides:
+        scope.update(scope_overrides)
+    return MappingProposal(
+        proposal_schema_version=proposal.proposal_schema_version,
+        proposal_id=proposal.proposal_id,
+        source_observation_ref=(
+            source_observation_ref
+            if source_observation_ref is not None
+            else proposal.source_observation_ref
+        ),
+        source_identity_scope=tuple(sorted((str(k), str(v)) for k, v in scope.items())),
+        scoped_source_identity_key=tuple(
+            sorted((str(k), str(v)) for k, v in (key_dict or proposal.identity_key_dict).items())
+        ),
+        candidate_canonical_id=proposal.candidate_canonical_id,
+        existing_canonical_owner=proposal.existing_canonical_owner,
+        identity_evidence_type=proposal.identity_evidence_type,
+        observation_fingerprints=(
+            tuple(observation_fingerprints)
+            if observation_fingerprints is not None
+            else proposal.observation_fingerprints
+        ),
+        ingestion_plan_reference=proposal.ingestion_plan_reference,
+        reason=proposal.reason,
+        conflict_category=proposal.conflict_category,
+        expected_baseline_fingerprint=proposal.expected_baseline_fingerprint,
+        requested_action=proposal.requested_action,
+        status=status or proposal.status,
+        operator=proposal.operator,
     )
 
 
@@ -354,7 +432,7 @@ def test_rr_02_decision_object_is_deterministic_and_immutable(owner_keys):
     with pytest.raises(dataclasses.FrozenInstanceError):
         first.eligibility_result = RuntimeEligibilityResult.NOT_ELIGIBLE.value  # type: ignore[misc]
 
-    # 字段集合与 §7 要求完全一致（不多不少）。
+    # 字段集合与 §7 要求完全一致（修正后新增 evidence_provenance）。
     assert {f.name for f in dataclasses.fields(RuntimeMappingEligibilityDecision)} == {
         "schema_version",
         "decision_id",
@@ -368,7 +446,14 @@ def test_rr_02_decision_object_is_deterministic_and_immutable(owner_keys):
         "evidence_fingerprint",
         "approval_fingerprint",
         "baseline_fingerprint",
+        "evidence_provenance",
     }
+    # 条件式判定绝不冒充生产授权。
+    assert first.is_conditional is True
+    assert first.is_production_authorization is False
+    assert first.as_dict()["is_conditional"] is True
+    assert first.as_dict()["is_production_authorization"] is False
+    assert first.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
 
     # 无任何执行 / 变更方法。
     for forbidden in ("apply", "execute", "activate", "bind", "write", "mutate", "commit"):
@@ -428,14 +513,12 @@ def test_rr_04_no_canonical_data_changed(tmp_path, owner_keys):
     """RR-04: 判定绝不修改 Canonical 记录。"""
     canonical = [_market_row()]
     canonical_before = copy.deepcopy(canonical)
-    observation = _observation()
+    observation, proposal, approval, context = _valid_setup(owner_keys)
     observation_before = observation.as_dict()
-    proposal = _proposal(observation)
-    approval = _approval(proposal, observation, owner_keys)
     proposal_before = proposal.as_dict()
 
     decision = evaluate_runtime_mapping_eligibility(
-        proposal, approval, observation, _context(owner_keys), evaluated_at=EVALUATED_AT
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
     )
     assert decision.is_eligible
 
@@ -1213,170 +1296,225 @@ def test_every_rejection_code_is_reachable(owner_keys):
     )
 
     scenarios = {
-        "IDENTITY_KEY_VERSION_NOT_CURRENT": (legacy_proposal, None, observation, base),
-        "IDENTITY_KIND_NOT_ALLOWED": (unverified_proposal, None, observation, base),
-        "IDENTITY_EVIDENCE_INSUFFICIENT": (unverified_proposal, None, observation, base),
-        "UNVERIFIED_PROVIDER_ID": (unverified_proposal, None, observation, base),
-        "IDENTITY_TYPE_BLOCKED": (ambiguous_proposal, None, observation, base),
-        "PROVIDER_ID_SCOPE_NOT_VERIFIED": (legacy_proposal, None, observation, base),
+        # -- 证据绑定 ---------------------------------------------------------
+        "SOURCE_OBSERVATION_NOT_IN_PROPOSAL": (
+            proposal, approval, _observation(match_id=CANONICAL_ID_ALT, number="008"),
+            _context(owner_keys, proposal),
+        ),
+        "SOURCE_IDENTITY_KEY_MISMATCH": (
+            proposal, approval, _observation(match_id=CANONICAL_ID_ALT, number="008"),
+            _context(owner_keys, proposal),
+        ),
+        "SOURCE_SCOPE_MISMATCH": (
+            _recompose_proposal(proposal, scope_overrides={"event_date": "2030-05-02"}),
+            approval,
+            observation,
+            _context(owner_keys, proposal),
+        ),
+        # -- 身份 -------------------------------------------------------------
+        "IDENTITY_KEY_VERSION_NOT_CURRENT": (
+            legacy_proposal, None, observation, _context(owner_keys, legacy_proposal),
+        ),
+        "IDENTITY_KIND_NOT_ALLOWED": (
+            unverified_proposal, None, observation,
+            _context(owner_keys, unverified_proposal),
+        ),
+        "IDENTITY_EVIDENCE_INSUFFICIENT": (
+            unverified_proposal, None, observation,
+            _context(owner_keys, unverified_proposal),
+        ),
+        "UNVERIFIED_PROVIDER_ID": (
+            unverified_proposal, None, observation,
+            _context(owner_keys, unverified_proposal),
+        ),
+        "IDENTITY_TYPE_BLOCKED": (
+            ambiguous_proposal, None, observation,
+            _context(owner_keys, ambiguous_proposal),
+        ),
+        "PROVIDER_ID_SCOPE_NOT_VERIFIED": (
+            legacy_proposal, None, observation, _context(owner_keys, legacy_proposal),
+        ),
         "ROW_POSITION_UNSTABLE": (
-            row_position_proposal, None, row_position_observation, base,
+            row_position_proposal, None, row_position_observation,
+            _context(owner_keys, row_position_proposal),
         ),
         "RAW_IDENTIFIER_TYPE_NOT_DURABLE": (
-            row_position_proposal, None, row_position_observation, base,
+            row_position_proposal, None, row_position_observation,
+            _context(owner_keys, row_position_proposal),
         ),
-        "SOURCE_FINGERPRINT_MISSING": (proposal, approval, None, base),
+        "SOURCE_FINGERPRINT_MISSING": (
+            proposal, approval, None, _context(owner_keys, proposal),
+        ),
         "IDENTITY_AMBIGUOUS": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, pending_ambiguities=(base_key_dict["identity_value"],)),
-        ),
-        "CANONICAL_OWNER_CONFLICT": (
-            proposal,
-            approval,
-            observation,
+            proposal, approval, observation,
             _context(
                 owner_keys,
+                proposal,
+                pending_ambiguities=(base_key_dict["identity_value"],),
+            ),
+        ),
+        "CANONICAL_OWNER_CONFLICT": (
+            proposal, approval, observation,
+            _context(
+                owner_keys,
+                proposal,
                 known_source_bindings=(
                     (proposal.source_key, "canon-A"),
                     (proposal.source_key, "canon-B"),
                 ),
             ),
         ),
-        "PROPOSAL_MISSING": (None, approval, observation, base),
-        "PROPOSAL_FINGERPRINT_MISMATCH": (
+        # -- 治理 -------------------------------------------------------------
+        "PROPOSAL_MISSING": (None, approval, observation, _context(owner_keys, proposal)),
+        "EVIDENCE_PROVENANCE_UNSUPPORTED": (
             proposal,
             approval,
             observation,
-            _context(owner_keys, recorded_proposal_fingerprint="other-fingerprint"),
+            _context(
+                owner_keys,
+                proposal,
+                evidence_provenance=GovernanceEvidenceProvenance(
+                    source=CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER,
+                    structural_ledger_validation_performed=True,
+                    authenticated_approval_audit_performed=True,
+                ),
+            ),
+        ),
+        "PROPOSAL_FINGERPRINT_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        ),
+        "PROPOSAL_FINGERPRINT_MISMATCH": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint="0" * 64),
+        ),
+        "RECORDED_STATE_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state=None),
+        ),
+        "RECORDED_STATE_UNKNOWN": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state="NOT_A_KNOWN_STATE"),
+        ),
+        "RECORDED_STATE_PROPOSAL_MISMATCH": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_id="some-other-proposal"),
         ),
         "MAPPING_STATE_NOT_ACTIVE": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, recorded_proposal_state="PROPOSED"),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state="PROPOSED"),
         ),
         "MAPPING_REVOKED": (
             proposal, approval, observation,
-            _context(owner_keys, recorded_proposal_state="REVOKED"),
+            _context(owner_keys, proposal, recorded_proposal_state="REVOKED"),
         ),
         "MAPPING_SUPERSEDED": (
             proposal, approval, observation,
-            _context(owner_keys, recorded_proposal_state="SUPERSEDED"),
+            _context(owner_keys, proposal, recorded_proposal_state="SUPERSEDED"),
         ),
-        "APPROVAL_MISSING": (proposal, None, observation, base),
+        "APPROVAL_MISSING": (proposal, None, observation, _context(owner_keys, proposal)),
         "TRUST_ANCHOR_MISSING": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, trusted_public_key_path=None),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, trusted_public_key_path=None),
         ),
         "APPROVAL_LEGACY_VERSION": (
             proposal,
             dict(approval, approval_schema_version="1.0.0"),
             observation,
-            base,
+            _context(owner_keys, proposal),
         ),
         "APPROVAL_PURPOSE_MISMATCH": (
             proposal,
             dict(approval, purpose="PRODUCTION_CANONICAL_DEDUP_APPLY"),
             observation,
-            base,
+            _context(owner_keys, proposal),
         ),
         "APPROVAL_WRONG_APPROVER": (
             proposal, approval, observation,
-            _context(owner_keys, expected_approver="owner-OTHER"),
+            _context(owner_keys, proposal, expected_approver="owner-OTHER"),
         ),
         "APPROVAL_WRONG_OPERATOR": (
             proposal, approval, observation,
-            _context(owner_keys, expected_operator="operator-OTHER"),
+            _context(owner_keys, proposal, expected_operator="operator-OTHER"),
         ),
-        "APPROVAL_SIGNATURE_INVALID": (proposal, tampered, observation, base),
+        "APPROVAL_SIGNATURE_INVALID": (
+            proposal, tampered, observation, _context(owner_keys, proposal),
+        ),
         "BASELINE_STALE": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, current_baseline_fingerprint="baseline-B"),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, current_baseline_fingerprint="baseline-B"),
         ),
         "DATASET_IDENTITY_MISMATCH": (
             proposal,
             _approval(proposal, observation, owner_keys, dataset="other-dataset"),
             observation,
-            base,
+            _context(owner_keys, proposal),
         ),
         "APPROVAL_REPLAYED": (
-            proposal,
-            approval,
-            observation,
+            proposal, approval, observation,
             _context(
                 owner_keys,
+                proposal,
                 prior_approval_bindings=(
                     (approval_fingerprint(approval), "other-identity-key"),
                 ),
             ),
         ),
-        "ACTION_NOT_ALLOWED": (no_action_proposal, None, observation, base),
-        "SOURCE_SCOPE_NOT_ALLOWED": (foreign_scope_proposal, None, observation, base),
+        # -- 运行期安全 -------------------------------------------------------
+        "ACTION_NOT_ALLOWED": (
+            no_action_proposal, None, observation, _context(owner_keys, no_action_proposal),
+        ),
+        "SOURCE_SCOPE_NOT_ALLOWED": (
+            foreign_scope_proposal, None, observation,
+            _context(owner_keys, foreign_scope_proposal),
+        ),
         "CANONICAL_OWNER_MISSING": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, canonical_ids=(), allow_new_event=False),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, canonical_ids=(), allow_new_event=False),
         ),
         "CANONICAL_OWNERSHIP_CONFLICT": (
-            proposal,
-            approval,
-            observation,
+            proposal, approval, observation,
             _context(
                 owner_keys,
+                proposal,
                 known_source_bindings=((proposal.source_key, "canon-OTHER"),),
             ),
         ),
         "CANONICAL_ID_CHANGE_REQUIRED": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, canonical_rename_required=True),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, canonical_rename_required=True),
         ),
         "HISTORICAL_REFERENCE_CONFLICT": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, required_rewrite_targets=("calibrated.json",)),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, required_rewrite_targets=("calibrated.json",)),
         ),
         "SNAPSHOT_IMPACT": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, required_rewrite_targets=("odds_snapshots.json",)),
+            proposal, approval, observation,
+            _context(
+                owner_keys, proposal,
+                required_rewrite_targets=("odds_snapshots.json",),
+            ),
         ),
         "SETTLEMENT_IMPACT": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, required_rewrite_targets=("settlements.json",)),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, required_rewrite_targets=("settlements.json",)),
         ),
         "EVALUATION_IMPACT": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, required_rewrite_targets=("evaluation_rows.json",)),
+            proposal, approval, observation,
+            _context(
+                owner_keys, proposal,
+                required_rewrite_targets=("evaluation_rows.json",),
+            ),
         ),
         "MIGRATION_REQUIRED": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, migration_required=True),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, migration_required=True),
         ),
         "PENDING_AMBIGUITY": (
-            proposal,
-            approval,
-            observation,
-            _context(owner_keys, pending_ambiguities=("some-other-identity",)),
+            proposal, approval, observation,
+            _context(owner_keys, proposal, pending_ambiguities=("some-other-identity",)),
         ),
     }
-
     # 场景表必须覆盖**全部**声明的拒绝码（不多不少）。
     assert set(scenarios) == set(REJECTION_CODES)
 
@@ -1396,3 +1534,2720 @@ def test_every_rejection_code_is_reachable(owner_keys):
     # 允许列表内没有改写动作。
     for token in BLOCKED_ACTIONS:
         assert all(token not in action for action in ALLOWED_ACTIONS)
+
+
+# ===========================================================================
+# EC-01 .. EC-28 — 证据绑定与 fail-closed 修正回归矩阵
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# EC-01 .. EC-04 — 已记录提案指纹完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_01_missing_recorded_proposal_fingerprint_returns_not_eligible(owner_keys):
+    """EC-01: 缺失已记录提案指纹 -> NOT_ELIGIBLE(PROPOSAL_FINGERPRINT_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "PROPOSAL_FINGERPRINT_MISSING" in decision.rejection_codes
+    # 缺失指纹绝不意味着「指纹校验可选」。
+    assert "PROPOSAL_FINGERPRINT_MISMATCH" not in decision.rejection_codes
+
+
+def test_ec_02_blank_recorded_proposal_fingerprint_returns_not_eligible(owner_keys):
+    """EC-02: 空白已记录指纹 -> NOT_ELIGIBLE(PROPOSAL_FINGERPRINT_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    for blank in ("", "   ", "\t"):
+        decision = evaluate_runtime_mapping_eligibility(
+            proposal,
+            approval,
+            observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=blank),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+        assert "PROPOSAL_FINGERPRINT_MISSING" in decision.rejection_codes, blank
+
+
+def test_ec_03_mismatched_recorded_fingerprint_returns_not_eligible(owner_keys):
+    """EC-03: 不匹配 / 格式不合法的已记录指纹 -> NOT_ELIGIBLE。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    for bad in ("0" * 64, "NOT-A-SHA256", proposal.fingerprint()[:-1] + "0"):
+        decision = evaluate_runtime_mapping_eligibility(
+            proposal,
+            approval,
+            observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=bad),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+        assert "PROPOSAL_FINGERPRINT_MISMATCH" in decision.rejection_codes, bad
+
+
+def test_ec_04_correct_recorded_fingerprint_passes_the_rule(owner_keys):
+    """EC-04: 正确的已记录指纹通过指纹规则（但**不**证明账本可信）。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(
+            owner_keys, proposal,
+            recorded_proposal_fingerprint=proposal.fingerprint(),
+        ),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert "PROPOSAL_FINGERPRINT_MISSING" not in decision.rejection_codes
+    assert "PROPOSAL_FINGERPRINT_MISMATCH" not in decision.rejection_codes
+    # 指纹匹配只是一致性；来源仍然是条件式的，不是独立验证过的证据。
+    assert decision.is_conditional is True
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
+
+
+# ---------------------------------------------------------------------------
+# EC-05 / EC-06 — 已记录治理状态完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_05_missing_recorded_proposal_state_returns_not_eligible(owner_keys):
+    """EC-05: 缺失已记录治理状态 -> NOT_ELIGIBLE(RECORDED_STATE_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_state=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "RECORDED_STATE_MISSING" in decision.rejection_codes
+
+    # 未知状态同样 fail closed。
+    unknown = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_state="BANANA"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "RECORDED_STATE_UNKNOWN" in unknown.rejection_codes
+
+    # 已记录状态必须对应被评估的提案 ID。
+    other = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_id="another-proposal"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "RECORDED_STATE_PROPOSAL_MISMATCH" in other.rejection_codes
+
+
+def test_ec_06_asserted_proposal_status_does_not_replace_the_recorded_state(owner_keys):
+    """EC-06: 提案自述的 APPROVED 状态绝不替代已记录的治理状态。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    self_asserted = _recompose_proposal(proposal, status="APPROVED")
+    assert self_asserted.status == "APPROVED"
+
+    # 没有任何已记录状态 -> 仍然拒绝（绝不回退到提案自述状态）。
+    missing = evaluate_runtime_mapping_eligibility(
+        self_asserted,
+        approval,
+        observation,
+        _context(owner_keys, self_asserted, recorded_proposal_state=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert missing.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "RECORDED_STATE_MISSING" in missing.rejection_codes
+
+    # 已记录状态为 PROPOSED -> 同样拒绝，即便提案自述 APPROVED。
+    proposed = evaluate_runtime_mapping_eligibility(
+        self_asserted,
+        approval,
+        observation,
+        _context(owner_keys, self_asserted, recorded_proposal_state="PROPOSED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "MAPPING_STATE_NOT_ACTIVE" in proposed.rejection_codes
+
+    # 已记录状态为 REVIEW_REQUIRED / REJECTED -> 拒绝（不授权任何变更）。
+    for state in ("REVIEW_REQUIRED", "REJECTED", "REVOKED", "SUPERSEDED", "OBSERVED"):
+        decision = evaluate_runtime_mapping_eligibility(
+            self_asserted,
+            approval,
+            observation,
+            _context(owner_keys, self_asserted, recorded_proposal_state=state),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, state
+        assert "MAPPING_STATE_NOT_ACTIVE" in decision.rejection_codes, state
+
+    # 只有 APPROVED 才是活动终态。
+    assert ALLOWED_PROPOSAL_STATES == {"APPROVED"}
+    assert ALLOWED_PROPOSAL_STATES <= KNOWN_PROPOSAL_STATES
+
+
+# ---------------------------------------------------------------------------
+# EC-07 .. EC-11 — 观测 / 提案证据绑定
+# ---------------------------------------------------------------------------
+
+def _unrelated_observation():
+    return _observation(match_id=CANONICAL_ID_ALT, number="008", home="甲", away="乙")
+
+
+def test_ec_07_observation_with_unrelated_competition_identity_is_rejected(owner_keys):
+    """EC-07: 与提案无关的竞彩身份观测被拒绝。"""
+    _observation_valid, proposal, approval, _ = _valid_setup(owner_keys)
+    other = _unrelated_observation()
+    assert ScopedSourceIdentityKey.for_observation(other).source_key() != proposal.source_key
+
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, other, _context(owner_keys, proposal), evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+
+
+def test_ec_08_observation_fingerprint_absent_from_proposal_is_rejected(owner_keys):
+    """EC-08: 观测指纹不在提案证据集合中 -> NOT_ELIGIBLE。"""
+    observation, proposal, _approval_artifact, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+    assert unrelated.semantic_fingerprint() not in proposal.observation_fingerprints
+
+    # 用**无关观测的指纹**签名一份有效批准，再把它用在原提案上。
+    signed_over_unrelated = _approval(proposal, unrelated, owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        signed_over_unrelated,
+        unrelated,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+
+    # 观测引用为空白同样拒绝。
+    blank_reference = _recompose_proposal(proposal, source_observation_ref="")
+    decision_blank = evaluate_runtime_mapping_eligibility(
+        blank_reference, _approval(blank_reference, observation, owner_keys),
+        observation, _context(owner_keys, proposal), evaluated_at=EVALUATED_AT,
+    )
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision_blank.rejection_codes
+
+
+def test_ec_09_observation_identity_key_differing_is_rejected(owner_keys):
+    """EC-09: 由观测独立推导的身份键与提案身份键不一致 -> NOT_ELIGIBLE。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    tampered_key = dict(proposal.identity_key_dict)
+    tampered_key["identity_value"] = "football|2030-05-01|jczq|99"
+    tampered = _recompose_proposal(proposal, key_dict=tampered_key)
+
+    decision = evaluate_runtime_mapping_eligibility(
+        tampered, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+
+    # 身份键契约非当前 -> 直接拒绝（不因别名而被绕过）。
+    legacy_key = dict(proposal.identity_key_dict)
+    legacy_key["identity_key_schema_version"] = "2.0.0"
+    legacy = _recompose_proposal(proposal, key_dict=legacy_key)
+    decision_legacy = evaluate_runtime_mapping_eligibility(
+        legacy, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "IDENTITY_KEY_VERSION_NOT_CURRENT" in decision_legacy.rejection_codes
+
+
+def test_ec_10_observation_scope_differing_is_rejected(owner_keys):
+    """EC-10: 观测作用域与提案声明作用域不一致 -> NOT_ELIGIBLE(SOURCE_SCOPE_MISMATCH)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+
+    for override in (
+        {"event_date": "2030-05-02"},
+        {"sport": "basketball"},
+        {"provider_namespace": "500l"},
+        {"adapter": "live_football"},
+    ):
+        mismatched = _recompose_proposal(proposal, scope_overrides=override)
+        decision = evaluate_runtime_mapping_eligibility(
+            mismatched, approval, observation, _context(owner_keys, proposal),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, override
+        assert "SOURCE_SCOPE_MISMATCH" in decision.rejection_codes, override
+
+
+def test_ec_11_valid_multi_observation_proposal_remains_supported(owner_keys):
+    """EC-11: 合法的多观测提案仍然受支持（当前观测不必是第一条）。"""
+    first = _observation(time="20:00")
+    second = _observation(time="21:00")
+    assert first.semantic_fingerprint() != second.semantic_fingerprint()
+    assert (
+        ScopedSourceIdentityKey.for_observation(first).source_key()
+        == ScopedSourceIdentityKey.for_observation(second).source_key()
+    )
+
+    proposal = proposal_from_observations(
+        [first, second],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id=CANONICAL_ID,
+        existing_canonical_owner=CANONICAL_ID,
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint=BASELINE,
+        reason="multi-observation proposal",
+        identity_evidence_type="strong_competition_number",
+        operator=OPERATOR,
+    )
+    assert len(proposal.observation_fingerprints) == 2
+    assert second.semantic_fingerprint() in proposal.observation_fingerprints
+
+    # 批准件绑定**第二条**观测；用第二条观测评估 -> 仍然是条件式 ELIGIBLE。
+    approval = _approval(proposal, second, owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, second, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.rejection_codes == ()
+
+    # 第一条观测同样满足成员关系（不要求是「当前」那一条）。
+    first_decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        _approval(proposal, first, owner_keys),
+        first,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert first_decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+
+
+# ---------------------------------------------------------------------------
+# EC-12 / EC-13 — 条件式合格 vs 一致证据
+# ---------------------------------------------------------------------------
+
+def test_ec_12_correct_evidence_produces_a_conditional_eligible_decision(owner_keys):
+    """EC-12: 正确的观测 + 提案 + 签名批准 -> 条件式 ELIGIBLE（非生产授权）。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.rejection_codes == ()
+    assert decision.is_conditional is True
+    assert decision.is_production_authorization is False
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
+
+    # 换成隔离快照来源 -> 仍是条件式（只是来源不同）。
+    snapshot_context = _context(
+        owner_keys,
+        proposal,
+        evidence_provenance=isolated_snapshot_provenance(
+            dataset_identity=DATASET, baseline_fingerprint=BASELINE,
+            structural_ledger_validation_performed=True,
+        ),
+    )
+    snapshot_decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, snapshot_context, evaluated_at=EVALUATED_AT
+    )
+    assert snapshot_decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert snapshot_decision.evidence_provenance == (
+        CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    )
+    assert snapshot_decision.is_conditional is True
+
+    # 声称独立验证过的账本证据 -> 一律阻断（自述布尔值不是证据）。
+    claimed = _context(
+        owner_keys,
+        proposal,
+        evidence_provenance=GovernanceEvidenceProvenance(
+            source=CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER,
+            structural_ledger_validation_performed=True,
+            authenticated_approval_audit_performed=True,
+        ),
+    )
+    claimed_decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, claimed, evaluated_at=EVALUATED_AT
+    )
+    assert claimed_decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "EVIDENCE_PROVENANCE_UNSUPPORTED" in claimed_decision.rejection_codes
+    assert CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER in BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+    assert ALLOWED_CONTEXT_EVIDENCE_PROVENANCE == {
+        CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+        CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT,
+    }
+
+
+def test_ec_13_valid_signature_over_inconsistent_evidence_remains_not_eligible(owner_keys):
+    """EC-13: 有效签名覆盖不一致证据时仍然 NOT_ELIGIBLE（签名不使证据变合格）。"""
+    observation, proposal, _approval_artifact, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+
+    # 用无关观测的指纹签署**原提案**：签名本身有效，但证据不一致。
+    signed_over_unrelated = _approval(proposal, unrelated, owner_keys)
+    assert signed_over_unrelated["source_observation_fingerprint"] == (
+        unrelated.semantic_fingerprint()
+    )
+
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        signed_over_unrelated,
+        unrelated,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    # 直接可诊断的不一致**不**复用 APPROVAL_SIGNATURE_INVALID。
+    assert "APPROVAL_SIGNATURE_INVALID" not in decision.rejection_codes
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+
+
+# ---------------------------------------------------------------------------
+# EC-14 .. EC-19 — 既有拒绝面在修正后保持有效
+# ---------------------------------------------------------------------------
+
+def test_ec_14_revoked_mapping_remains_rejected(owner_keys):
+    """EC-14: 已撤销映射仍然被拒绝。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, recorded_proposal_state="REVOKED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "MAPPING_REVOKED" in decision.rejection_codes
+
+
+def test_ec_15_superseded_mapping_remains_rejected(owner_keys):
+    """EC-15: 已取代映射仍然被拒绝。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, recorded_proposal_state="SUPERSEDED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "MAPPING_SUPERSEDED" in decision.rejection_codes
+
+
+def test_ec_16_stale_baseline_remains_rejected(owner_keys):
+    """EC-16: 陈旧基线仍然被拒绝，且旧 ELIGIBLE 判定不构成永久授权。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    before = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert before.is_eligible
+
+    after = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, current_baseline_fingerprint="baseline-B"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert after.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "BASELINE_STALE" in after.rejection_codes
+    # 基线变化 -> 判定身份随之改变（必须重新评估）。
+    assert after.decision_id != before.decision_id
+    assert after.baseline_fingerprint != before.baseline_fingerprint
+
+
+def test_ec_17_unverified_provider_identity_remains_rejected(owner_keys):
+    """EC-17: 未验证的 provider 身份仍然被拒绝。"""
+    provider_key = ScopedSourceIdentityKey.for_observation(
+        observe_source_row(
+            _market_row(number=None),
+            adapter="market_xml",
+            raw_provider_id="12345",
+            raw_provider_id_type="PROVIDER_MATCH_ID",
+        )
+    )
+    assert provider_key.identity_kind == IdentityKeyKind.UNVERIFIED_PROVIDER_ID.value
+    proposal = _synthetic_proposal(key_dict=provider_key.as_dict())
+    observation = observe_source_row(
+        _market_row(number=None),
+        adapter="market_xml",
+        raw_provider_id="12345",
+        raw_provider_id_type="PROVIDER_MATCH_ID",
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "UNVERIFIED_PROVIDER_ID" in decision.rejection_codes
+
+
+def test_ec_18_row_position_identity_remains_rejected(owner_keys):
+    """EC-18: 行位置派生身份仍然被拒绝。"""
+    finished = {
+        "id": "500w-2030-05-01-0", "sport": "football", "league": "英超",
+        "date": "2030-05-01", "time": "15:30", "kickoff_time_known": True,
+        "status": "finished", "home": "甲队", "away": "乙队",
+        "score": {"ft": [2, 1]}, "odds": None,
+    }
+    observation = observe_source_row(finished, adapter="finished_feed")
+    proposal = _synthetic_proposal(
+        key_dict=ScopedSourceIdentityKey.for_observation(observation).as_dict()
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "ROW_POSITION_UNSTABLE" in decision.rejection_codes
+    assert "RAW_IDENTIFIER_TYPE_NOT_DURABLE" in decision.rejection_codes
+
+
+def test_ec_19_cross_sport_shared_aliases_remain_ineligible(owner_keys):
+    """EC-19: 跨运动共用源别名的身份证明不足时仍然不合格。"""
+    football = observe_source_row(
+        _market_row(match_id="500j-2030-05-01-001", number="001"), adapter="market_xml"
+    )
+    basketball = observe_source_row(
+        _market_row(
+            match_id="500j-2030-05-01-001", number="001", sport="basketball",
+            home="湖人", away="勇士",
+        ),
+        adapter="market_xml",
+    )
+    assert football.derived_source_id == basketball.derived_source_id
+    key_football = ScopedSourceIdentityKey.for_observation(football)
+    key_basketball = ScopedSourceIdentityKey.for_observation(basketball)
+    assert key_football.source_key() != key_basketball.source_key()
+
+    proposal = proposal_from_observations(
+        [football],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id="500j-2030-05-01-001",
+        existing_canonical_owner="500j-2030-05-01-001",
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint=BASELINE,
+        reason="cross-sport alias",
+        identity_evidence_type="strong_competition_number",
+        operator=OPERATOR,
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, basketball, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+    assert "SOURCE_SCOPE_MISMATCH" in decision.rejection_codes
+
+    # 既有摄取预检继续对该批次 fail closed。
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        plan_ingestion_identity([], [dict(_market_row(match_id="500j-2030-05-01-001", number="001")),
+                                     dict(_market_row(match_id="500j-2030-05-01-001", number="001",
+                                                      sport="basketball", home="湖人", away="勇士"))])
+    assert exc.value.category == "SAME_SOURCE_ALIAS_DIFFERENT_EVENT"
+
+
+# ---------------------------------------------------------------------------
+# EC-20 / EC-21 — 注册表完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_20_policy_registry_and_dispatch_remain_complete():
+    """EC-20: 声明式策略注册表与规则分派表保持完整、自洽。"""
+    from utils.runtime_mapping_eligibility import _RULE_CHECKS
+
+    declared = {rule.code for rule in RUNTIME_ELIGIBILITY_RULES}
+    assert declared == set(_RULE_CHECKS)
+    assert len(declared) == len(RUNTIME_ELIGIBILITY_RULES) == 45
+    assert len(REJECTION_CODES) == 45
+    assert {rule.rejection_code for rule in RUNTIME_ELIGIBILITY_RULES} == REJECTION_CODES
+    assert len(rule_codes()) == len(set(rule_codes()))
+
+    # 新增类别与来源声明齐备。
+    categories = runtime_policy_status()["rules_by_category"]
+    assert categories["EVIDENCE_BINDING"] == [
+        "SOURCE_OBSERVATION_IN_PROPOSAL",
+        "SOURCE_IDENTITY_KEY_MATCHES",
+        "SOURCE_SCOPE_MATCHES",
+    ]
+    assert len(categories["GOVERNANCE"]) == 20
+    assert runtime_policy_status()["known_proposal_states"] == sorted(
+        KNOWN_PROPOSAL_STATES
+    )
+    assert set(ALLOWED_CONTEXT_EVIDENCE_PROVENANCE).isdisjoint(
+        BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+    )
+
+    # 版本号已按语义变化提升。
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
+
+
+def test_ec_21_every_new_rejection_code_has_an_executable_reproducer(owner_keys):
+    """EC-21: 每条**新增**拒绝码都有可执行复现。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+
+    reproducers = {
+        "PROPOSAL_FINGERPRINT_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        ),
+        "SOURCE_OBSERVATION_NOT_IN_PROPOSAL": (
+            proposal, approval, unrelated, _context(owner_keys, proposal),
+        ),
+        "SOURCE_IDENTITY_KEY_MISMATCH": (
+            proposal, approval, unrelated, _context(owner_keys, proposal),
+        ),
+        "SOURCE_SCOPE_MISMATCH": (
+            _recompose_proposal(proposal, scope_overrides={"event_date": "2030-05-02"}),
+            approval, observation, _context(owner_keys, proposal),
+        ),
+        "RECORDED_STATE_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state=None),
+        ),
+        "RECORDED_STATE_UNKNOWN": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state="NOPE"),
+        ),
+        "RECORDED_STATE_PROPOSAL_MISMATCH": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_id="nope"),
+        ),
+        "EVIDENCE_PROVENANCE_UNSUPPORTED": (
+            proposal, approval, observation,
+            _context(
+                owner_keys, proposal,
+                evidence_provenance=GovernanceEvidenceProvenance(
+                    source=CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER
+                ),
+            ),
+        ),
+    }
+    new_codes = {
+        "PROPOSAL_FINGERPRINT_MISSING",
+        "SOURCE_OBSERVATION_NOT_IN_PROPOSAL",
+        "SOURCE_IDENTITY_KEY_MISMATCH",
+        "SOURCE_SCOPE_MISMATCH",
+        "RECORDED_STATE_MISSING",
+        "RECORDED_STATE_UNKNOWN",
+        "RECORDED_STATE_PROPOSAL_MISMATCH",
+        "EVIDENCE_PROVENANCE_UNSUPPORTED",
+    }
+    assert set(reproducers) == new_codes
+    assert new_codes <= REJECTION_CODES
+
+    for code, (candidate_proposal, candidate_approval, candidate_observation, ctx) in (
+        reproducers.items()
+    ):
+        decision = evaluate_runtime_mapping_eligibility(
+            candidate_proposal, candidate_approval, candidate_observation, ctx,
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, code
+        assert code in decision.rejection_codes, (code, decision.rejection_codes)
+
+
+# ---------------------------------------------------------------------------
+# EC-22 / EC-23 — 确定性与不可执行
+# ---------------------------------------------------------------------------
+
+def test_ec_22_repeated_identical_evaluations_remain_deterministic(owner_keys):
+    """EC-22: 重复的相同评估保持确定（判定身份与时钟无关）。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    decisions = [
+        evaluate_runtime_mapping_eligibility(
+            proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+        )
+        for _ in range(5)
+    ]
+    assert len({d.decision_id for d in decisions}) == 1
+    assert len(set(decisions)) == 1
+    assert all(d.is_eligible and d.is_conditional for d in decisions)
+
+    clock_shifted = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context,
+        evaluated_at="2099-12-31T23:59:59+00:00",
+    )
+    assert clock_shifted.decision_id == decisions[0].decision_id
+    assert clock_shifted.evaluated_at != decisions[0].evaluated_at
+
+
+def test_ec_23_readiness_manifests_remain_non_executable(owner_keys):
+    """EC-23: 就绪清单仍然不可执行，并显式标注条件式判定。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    eligible = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    rejected = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, context, evaluated_at=EVALUATED_AT
+    )
+    manifest = build_runtime_readiness_manifest(
+        fixture_identity="ec23",
+        decisions=[eligible, rejected],
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    assert manifest["executable"] is False
+    assert manifest["activation_api"] is None
+    assert manifest["production_authorization_granted"] is False
+    assert manifest["conditional_decision_count"] == 2
+    assert manifest["verified_evidence_decision_count"] == 0
+    assert manifest["conditional_decisions_are_production_authorization"] is False
+    assert manifest["evidence_provenance_histogram"] == {
+        CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED: 2
+    }
+    assert manifest["eligible_count"] == 1
+    assert manifest["rejected_count"] == 1
+    assert_runtime_manifest_not_executable(manifest)
+    with pytest.raises(RuntimeEligibilityPolicyError):
+        assert_runtime_manifest_not_executable(dict(manifest, executable=True))
+    with pytest.raises(RuntimeEligibilityPolicyError):
+        assert_runtime_manifest_not_executable(dict(manifest, activate=True))
+
+
+# ---------------------------------------------------------------------------
+# EC-24 / EC-25 — 隔离与七存储
+# ---------------------------------------------------------------------------
+
+def test_ec_24_shadow_evaluation_creates_no_binding_ledger_or_write(
+    tmp_path, owner_keys
+):
+    """EC-24: 影子评估不创建绑定、不写账本、不写生产数据。"""
+    workspace = tmp_path / "ec24"
+    workspace.mkdir()
+    (workspace / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    before_listing = sorted(os.listdir(workspace))
+    before_bytes = (workspace / "sentinel.txt").read_bytes()
+
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    report = shadow_runtime_eligibility_check(
+        workspace=str(workspace),
+        proposal=proposal,
+        approval=approval,
+        source_observation=observation,
+        runtime_context=context,
+        evaluated_at=EVALUATED_AT,
+        scenario="EC-24",
+    )
+    assert report["eligibility_result"] == RuntimeEligibilityResult.ELIGIBLE.value
+    assert report["ledger_written"] is False
+    assert report["files_written"] == 0
+    assert report["bindings_created"] == 0
+    assert report["canonical_records_modified"] == 0
+    assert report["is_production_authority"] is False
+    assert report["runtime_mapping_activation"] == RUNTIME_MAPPING_ACTIVATION
+    assert report["decision"]["is_production_authorization"] is False
+
+    assert sorted(os.listdir(workspace)) == before_listing
+    assert (workspace / "sentinel.txt").read_bytes() == before_bytes
+    assert not (workspace / "mapping_governance_ledger.jsonl").exists()
+
+
+def test_ec_25_all_seven_stores_remain_byte_identical(
+    isolated_data_dir, monkeypatch, owner_keys
+):
+    """EC-25: 修正后的判定与拒绝路径都不改动七个持久化存储。"""
+    _seed_seven_stores(isolated_data_dir)
+    _fake_sources(
+        monkeypatch,
+        live_football=[
+            _market_row(
+                match_id="m-live",
+                odds={"home_win": 1.9, "draw": 3.4, "away_win": 3.8},
+            )
+        ],
+    )
+    scraper.refresh(verbose=False)
+    before = _hash_seven_stores(isolated_data_dir)
+    assert len(before) == 7 and all(len(v) == 64 for v in before.values())
+
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    workspace = str(isolated_data_dir.parent / "ec25_shadow")
+
+    # 合格路径、拒绝路径、清单与影子入口全部执行一遍。
+    evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    for broken_context in (
+        _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        _context(owner_keys, proposal, recorded_proposal_state=None),
+        _context(owner_keys, proposal, current_baseline_fingerprint="baseline-B"),
+        _context(owner_keys, proposal, required_rewrite_targets=("settlements.json",)),
+    ):
+        evaluate_runtime_mapping_eligibility(
+            proposal, approval, observation, broken_context, evaluated_at=EVALUATED_AT
+        )
+    build_runtime_readiness_manifest(
+        fixture_identity="ec25",
+        decisions=[evaluate_runtime_mapping_eligibility(
+            proposal, approval, observation, context, evaluated_at=EVALUATED_AT)],
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    shadow_runtime_readiness_report(
+        workspace=workspace,
+        proposals=[proposal],
+        observations=[observation],
+        canonical_fixture=[_market_row()],
+        dataset_identity=DATASET,
+        baseline_fingerprint=BASELINE,
+        trusted_public_key_path=owner_keys["public"],
+    )
+
+    assert _hash_seven_stores(isolated_data_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# EC-26 / EC-27 / EC-28 — 既有行为与审计不变
+# ---------------------------------------------------------------------------
+
+def test_ec_26_existing_ingestion_identity_behavior_remains_unchanged():
+    """EC-26: 既有摄取身份行为不变（规划器语义与权威归属均未改）。"""
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        plan_ingestion_identity(
+            [],
+            [
+                _market_row(match_id="500j-2030-05-01-001", number="001"),
+                _market_row(
+                    match_id="500j-2030-05-01-001", number="001",
+                    sport="basketball", home="湖人", away="勇士",
+                ),
+            ],
+        )
+    assert exc.value.category == "SAME_SOURCE_ALIAS_DIFFERENT_EVENT"
+
+    with pytest.raises(CanonicalIdentityCollisionError) as dup:
+        plan_ingestion_identity(
+            [_market_row(match_id="dup-1"), _market_row(match_id="dup-1")], []
+        )
+    assert dup.value.category == "PREEXISTING_DUPLICATE"
+
+    for name in ("ingestion_identity.py", "match_identity.py", "scraper.py"):
+        source = open(os.path.join(REPO_ROOT, "utils", name), encoding="utf-8").read()
+        assert "runtime_mapping" not in source, name
+    assert governance_status()["runtime_identity_authority"] == (
+        "utils.ingestion_identity.validate_ingestion_identity"
+    )
+
+
+def test_ec_27_historical_ed25519_approval_audit_continues_to_work(
+    tmp_path, owner_keys
+):
+    """EC-27: 历史 Ed25519 批准审计继续工作；隔离快照只读且保留信任锚警告。"""
+    observation = _observation()
+    proposal = _proposal(observation)
+    workspace = tmp_path / "ec27_gov"
+    workspace.mkdir()
+    ledger = GovernanceLedger(
+        str(workspace / "mapping_governance_ledger.jsonl"), dataset_identity=DATASET
+    )
+    ledger.append(
+        proposal=proposal,
+        to_state="PROPOSED",
+        actor=OPERATOR,
+        actor_role="operator",
+        reason="propose",
+        baseline_fingerprint=BASELINE,
+    )
+    approval = _approval(proposal, observation, owner_keys)
+    ledger.append(
+        proposal=proposal,
+        to_state="APPROVED",
+        actor=APPROVER,
+        actor_role="owner",
+        reason="approve",
+        baseline_fingerprint=BASELINE,
+        approval=approval,
+        trusted_public_key_path=owner_keys["public"],
+        source_observation_fingerprint=observation.semantic_fingerprint(),
+    )
+
+    audit = audit_historical_approvals(
+        ledger, trusted_public_key_path=owner_keys["public"], dataset_identity=DATASET
+    )
+    assert audit["approved_decisions"] == 1
+    assert audit["failures"] == []
+
+    ledger_bytes = open(ledger.path, "rb").read()
+    snapshot = build_isolated_governance_snapshot(
+        ledger,
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+        trusted_public_key_path=owner_keys["public"],
+    )
+    # 只读：账本逐字节不变。
+    assert open(ledger.path, "rb").read() == ledger_bytes
+
+    assert isinstance(snapshot, IsolatedGovernanceSnapshot)
+    assert snapshot.structural_integrity == "OK"
+    assert snapshot.authenticated_approval_audit == (
+        "AUTHENTICATED_MAPPING_APPROVAL_AUDIT"
+    )
+    assert snapshot.state_of(proposal.proposal_id) == "APPROVED"
+    assert snapshot.fingerprint_of(proposal.proposal_id) == proposal.fingerprint()
+    assert snapshot.provenance.source == CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    # 账本信任锚警告被原样保留（哈希链不是外部信任锚）。
+    assert "NONE" in snapshot.provenance.ledger_trust_anchor
+    assert snapshot.as_dict()["is_production_authority"] is False
+
+    context = RuntimeMappingContext(
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+        evidence_provenance=snapshot.provenance,
+        canonical_ids=(CANONICAL_ID,),
+        trusted_public_key_path=owner_keys["public"],
+        expected_approver=APPROVER,
+        expected_operator=OPERATOR,
+        recorded_proposal_id=proposal.proposal_id,
+        recorded_proposal_fingerprint=snapshot.fingerprint_of(proposal.proposal_id),
+        recorded_proposal_state=snapshot.state_of(proposal.proposal_id),
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    assert decision.is_conditional is True
+    assert decision.is_production_authorization is False
+
+    # 缺少可信公钥时审计**不**执行，并如实记录限制（绝不信任内嵌公钥）。
+    without_key = build_isolated_governance_snapshot(
+        ledger,
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    assert without_key.authenticated_approval_audit == "NOT_PERFORMED"
+    assert any(
+        "trusted public key" in limitation
+        for limitation in without_key.provenance.verification_limitations
+    )
+
+
+def test_ec_28_ci_declares_ubuntu_and_windows_regressions():
+    """EC-28: CI 声明的四个必需 job 与双平台矩阵保持存在。"""
+    workflow = _ci_workflow()
+    for job in (
+        "Offline pytest suite",
+        "Isolated Canonical repair lifecycle",
+    ):
+        assert job in workflow, job
+    assert "ubuntu-latest" in workflow
+    assert "windows-latest" in workflow
+    assert re.search(r"os:/s*/[ubuntu-latest,/s*windows-latest/]", workflow)
+    assert re.search(r'python-version:/s*/["3/.12"/]', workflow)
+
+
+# ===========================================================================
+# EC-01 .. EC-28 — 证据绑定与 fail-closed 修正回归矩阵
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# EC-01 .. EC-04 — 已记录提案指纹完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_01_missing_recorded_proposal_fingerprint_returns_not_eligible(owner_keys):
+    """EC-01: 缺失已记录提案指纹 -> NOT_ELIGIBLE(PROPOSAL_FINGERPRINT_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "PROPOSAL_FINGERPRINT_MISSING" in decision.rejection_codes
+    # 缺失指纹绝不意味着「指纹校验可选」。
+    assert "PROPOSAL_FINGERPRINT_MISMATCH" not in decision.rejection_codes
+
+
+def test_ec_02_blank_recorded_proposal_fingerprint_returns_not_eligible(owner_keys):
+    """EC-02: 空白已记录指纹 -> NOT_ELIGIBLE(PROPOSAL_FINGERPRINT_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    for blank in ("", "   ", "\t"):
+        decision = evaluate_runtime_mapping_eligibility(
+            proposal,
+            approval,
+            observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=blank),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+        assert "PROPOSAL_FINGERPRINT_MISSING" in decision.rejection_codes, blank
+
+
+def test_ec_03_mismatched_recorded_fingerprint_returns_not_eligible(owner_keys):
+    """EC-03: 不匹配 / 格式不合法的已记录指纹 -> NOT_ELIGIBLE。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    for bad in ("0" * 64, "NOT-A-SHA256", proposal.fingerprint()[:-1] + "0"):
+        decision = evaluate_runtime_mapping_eligibility(
+            proposal,
+            approval,
+            observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=bad),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+        assert "PROPOSAL_FINGERPRINT_MISMATCH" in decision.rejection_codes, bad
+
+
+def test_ec_04_correct_recorded_fingerprint_passes_the_rule(owner_keys):
+    """EC-04: 正确的已记录指纹通过指纹规则（但**不**证明账本可信）。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(
+            owner_keys, proposal,
+            recorded_proposal_fingerprint=proposal.fingerprint(),
+        ),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert "PROPOSAL_FINGERPRINT_MISSING" not in decision.rejection_codes
+    assert "PROPOSAL_FINGERPRINT_MISMATCH" not in decision.rejection_codes
+    # 指纹匹配只是一致性；来源仍然是条件式的，不是独立验证过的证据。
+    assert decision.is_conditional is True
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
+
+
+# ---------------------------------------------------------------------------
+# EC-05 / EC-06 — 已记录治理状态完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_05_missing_recorded_proposal_state_returns_not_eligible(owner_keys):
+    """EC-05: 缺失已记录治理状态 -> NOT_ELIGIBLE(RECORDED_STATE_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_state=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "RECORDED_STATE_MISSING" in decision.rejection_codes
+
+    # 未知状态同样 fail closed。
+    unknown = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_state="BANANA"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "RECORDED_STATE_UNKNOWN" in unknown.rejection_codes
+
+    # 已记录状态必须对应被评估的提案 ID。
+    other = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_id="another-proposal"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "RECORDED_STATE_PROPOSAL_MISMATCH" in other.rejection_codes
+
+
+def test_ec_06_asserted_proposal_status_does_not_replace_the_recorded_state(owner_keys):
+    """EC-06: 提案自述的 APPROVED 状态绝不替代已记录的治理状态。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    self_asserted = _recompose_proposal(proposal, status="APPROVED")
+    assert self_asserted.status == "APPROVED"
+
+    # 没有任何已记录状态 -> 仍然拒绝（绝不回退到提案自述状态）。
+    missing = evaluate_runtime_mapping_eligibility(
+        self_asserted,
+        approval,
+        observation,
+        _context(owner_keys, self_asserted, recorded_proposal_state=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert missing.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "RECORDED_STATE_MISSING" in missing.rejection_codes
+
+    # 已记录状态为 PROPOSED -> 同样拒绝，即便提案自述 APPROVED。
+    proposed = evaluate_runtime_mapping_eligibility(
+        self_asserted,
+        approval,
+        observation,
+        _context(owner_keys, self_asserted, recorded_proposal_state="PROPOSED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "MAPPING_STATE_NOT_ACTIVE" in proposed.rejection_codes
+
+    # 其余非活动状态一律拒绝（不授权任何变更）。
+    for state in ("REVIEW_REQUIRED", "REJECTED", "REVOKED", "SUPERSEDED", "OBSERVED"):
+        decision = evaluate_runtime_mapping_eligibility(
+            self_asserted,
+            approval,
+            observation,
+            _context(owner_keys, self_asserted, recorded_proposal_state=state),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, state
+        assert "MAPPING_STATE_NOT_ACTIVE" in decision.rejection_codes, state
+
+    # 只有 APPROVED 才是活动终态。
+    assert ALLOWED_PROPOSAL_STATES == {"APPROVED"}
+    assert ALLOWED_PROPOSAL_STATES <= KNOWN_PROPOSAL_STATES
+
+
+# ---------------------------------------------------------------------------
+# EC-07 .. EC-11 — 观测 / 提案证据绑定
+# ---------------------------------------------------------------------------
+
+def _unrelated_observation():
+    return _observation(match_id=CANONICAL_ID_ALT, number="008", home="甲", away="乙")
+
+
+def test_ec_07_observation_with_unrelated_competition_identity_is_rejected(owner_keys):
+    """EC-07: 与提案无关的竞彩身份观测被拒绝。"""
+    _observation_valid, proposal, approval, _ = _valid_setup(owner_keys)
+    other = _unrelated_observation()
+    assert ScopedSourceIdentityKey.for_observation(other).source_key() != proposal.source_key
+
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, other, _context(owner_keys, proposal), evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+
+
+def test_ec_08_observation_fingerprint_absent_from_proposal_is_rejected(owner_keys):
+    """EC-08: 观测指纹不在提案证据集合中 -> NOT_ELIGIBLE。"""
+    observation, proposal, _approval_artifact, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+    assert unrelated.semantic_fingerprint() not in proposal.observation_fingerprints
+
+    # 用**无关观测的指纹**签名一份有效批准，再把它用在原提案上。
+    signed_over_unrelated = _approval(proposal, unrelated, owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        signed_over_unrelated,
+        unrelated,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+
+    # 观测引用为空白同样拒绝。
+    blank_reference = _recompose_proposal(proposal, source_observation_ref="")
+    decision_blank = evaluate_runtime_mapping_eligibility(
+        blank_reference, _approval(blank_reference, observation, owner_keys),
+        observation, _context(owner_keys, proposal), evaluated_at=EVALUATED_AT,
+    )
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision_blank.rejection_codes
+
+
+def test_ec_09_observation_identity_key_differing_is_rejected(owner_keys):
+    """EC-09: 由观测独立推导的身份键与提案身份键不一致 -> NOT_ELIGIBLE。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    tampered_key = dict(proposal.identity_key_dict)
+    tampered_key["identity_value"] = "football|2030-05-01|jczq|99"
+    tampered = _recompose_proposal(proposal, key_dict=tampered_key)
+
+    decision = evaluate_runtime_mapping_eligibility(
+        tampered, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+
+    # 身份键契约非当前 -> 直接拒绝（不因别名而被绕过）。
+    legacy_key = dict(proposal.identity_key_dict)
+    legacy_key["identity_key_schema_version"] = "2.0.0"
+    legacy = _recompose_proposal(proposal, key_dict=legacy_key)
+    decision_legacy = evaluate_runtime_mapping_eligibility(
+        legacy, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "IDENTITY_KEY_VERSION_NOT_CURRENT" in decision_legacy.rejection_codes
+
+
+def test_ec_10_observation_scope_differing_is_rejected(owner_keys):
+    """EC-10: 观测作用域与提案声明作用域不一致 -> NOT_ELIGIBLE(SOURCE_SCOPE_MISMATCH)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+
+    for override in (
+        {"event_date": "2030-05-02"},
+        {"sport": "basketball"},
+        {"provider_namespace": "500l"},
+        {"adapter": "live_football"},
+    ):
+        mismatched = _recompose_proposal(proposal, scope_overrides=override)
+        decision = evaluate_runtime_mapping_eligibility(
+            mismatched, approval, observation, _context(owner_keys, proposal),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, override
+        assert "SOURCE_SCOPE_MISMATCH" in decision.rejection_codes, override
+
+
+def test_ec_11_valid_multi_observation_proposal_remains_supported(owner_keys):
+    """EC-11: 合法的多观测提案仍然受支持（当前观测不必是第一条）。"""
+    first = _observation(time="20:00")
+    second = _observation(time="21:00")
+    assert first.semantic_fingerprint() != second.semantic_fingerprint()
+    assert (
+        ScopedSourceIdentityKey.for_observation(first).source_key()
+        == ScopedSourceIdentityKey.for_observation(second).source_key()
+    )
+
+    proposal = proposal_from_observations(
+        [first, second],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id=CANONICAL_ID,
+        existing_canonical_owner=CANONICAL_ID,
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint=BASELINE,
+        reason="multi-observation proposal",
+        identity_evidence_type="strong_competition_number",
+        operator=OPERATOR,
+    )
+    assert len(proposal.observation_fingerprints) == 2
+    assert second.semantic_fingerprint() in proposal.observation_fingerprints
+
+    # 批准件绑定**第二条**观测；用第二条观测评估 -> 仍然是条件式 ELIGIBLE。
+    approval = _approval(proposal, second, owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, second, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.rejection_codes == ()
+
+    # 第一条观测同样满足成员关系（不要求是「当前」那一条）。
+    first_decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        _approval(proposal, first, owner_keys),
+        first,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert first_decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+
+
+# ---------------------------------------------------------------------------
+# EC-12 / EC-13 — 条件式合格 vs 一致证据
+# ---------------------------------------------------------------------------
+
+def test_ec_12_correct_evidence_produces_a_conditional_eligible_decision(owner_keys):
+    """EC-12: 正确的观测 + 提案 + 签名批准 -> 条件式 ELIGIBLE（非生产授权）。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.rejection_codes == ()
+    assert decision.is_conditional is True
+    assert decision.is_production_authorization is False
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
+
+    # 换成隔离快照来源 -> 仍是条件式（只是来源不同）。
+    snapshot_context = _context(
+        owner_keys,
+        proposal,
+        evidence_provenance=isolated_snapshot_provenance(
+            dataset_identity=DATASET, baseline_fingerprint=BASELINE,
+            structural_ledger_validation_performed=True,
+        ),
+    )
+    snapshot_decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, snapshot_context, evaluated_at=EVALUATED_AT
+    )
+    assert snapshot_decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert snapshot_decision.evidence_provenance == (
+        CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    )
+    assert snapshot_decision.is_conditional is True
+
+    # 声称独立验证过的账本证据 -> 一律阻断（自述布尔值不是证据）。
+    claimed = _context(
+        owner_keys,
+        proposal,
+        evidence_provenance=GovernanceEvidenceProvenance(
+            source=CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER,
+            structural_ledger_validation_performed=True,
+            authenticated_approval_audit_performed=True,
+        ),
+    )
+    claimed_decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, claimed, evaluated_at=EVALUATED_AT
+    )
+    assert claimed_decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "EVIDENCE_PROVENANCE_UNSUPPORTED" in claimed_decision.rejection_codes
+    assert CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER in BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+    assert ALLOWED_CONTEXT_EVIDENCE_PROVENANCE == {
+        CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+        CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT,
+    }
+
+
+def test_ec_13_valid_signature_over_inconsistent_evidence_remains_not_eligible(owner_keys):
+    """EC-13: 有效签名覆盖不一致证据时仍然 NOT_ELIGIBLE（签名不使证据变合格）。"""
+    observation, proposal, _approval_artifact, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+
+    # 用无关观测的指纹签署**原提案**：签名本身有效，但证据不一致。
+    signed_over_unrelated = _approval(proposal, unrelated, owner_keys)
+    assert signed_over_unrelated["source_observation_fingerprint"] == (
+        unrelated.semantic_fingerprint()
+    )
+
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        signed_over_unrelated,
+        unrelated,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    # 直接可诊断的不一致**不**复用 APPROVAL_SIGNATURE_INVALID。
+    assert "APPROVAL_SIGNATURE_INVALID" not in decision.rejection_codes
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+
+
+# ---------------------------------------------------------------------------
+# EC-14 .. EC-19 — 既有拒绝面在修正后保持有效
+# ---------------------------------------------------------------------------
+
+def test_ec_14_revoked_mapping_remains_rejected(owner_keys):
+    """EC-14: 已撤销映射仍然被拒绝。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, recorded_proposal_state="REVOKED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "MAPPING_REVOKED" in decision.rejection_codes
+
+
+def test_ec_15_superseded_mapping_remains_rejected(owner_keys):
+    """EC-15: 已取代映射仍然被拒绝。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, recorded_proposal_state="SUPERSEDED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "MAPPING_SUPERSEDED" in decision.rejection_codes
+
+
+def test_ec_16_stale_baseline_remains_rejected(owner_keys):
+    """EC-16: 陈旧基线仍然被拒绝，且旧 ELIGIBLE 判定不构成永久授权。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    before = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert before.is_eligible
+
+    after = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, current_baseline_fingerprint="baseline-B"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert after.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "BASELINE_STALE" in after.rejection_codes
+    # 基线变化 -> 判定身份随之改变（必须重新评估）。
+    assert after.decision_id != before.decision_id
+    assert after.baseline_fingerprint != before.baseline_fingerprint
+
+
+def test_ec_17_unverified_provider_identity_remains_rejected(owner_keys):
+    """EC-17: 未验证的 provider 身份仍然被拒绝。"""
+    provider_row = _market_row(number=None)
+    provider_key = ScopedSourceIdentityKey.for_observation(
+        observe_source_row(
+            provider_row,
+            adapter="market_xml",
+            raw_provider_id="12345",
+            raw_provider_id_type="PROVIDER_MATCH_ID",
+        )
+    )
+    assert provider_key.identity_kind == IdentityKeyKind.UNVERIFIED_PROVIDER_ID.value
+    proposal = _synthetic_proposal(key_dict=provider_key.as_dict())
+    observation = observe_source_row(
+        provider_row,
+        adapter="market_xml",
+        raw_provider_id="12345",
+        raw_provider_id_type="PROVIDER_MATCH_ID",
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "UNVERIFIED_PROVIDER_ID" in decision.rejection_codes
+
+
+def test_ec_18_row_position_identity_remains_rejected(owner_keys):
+    """EC-18: 行位置派生身份仍然被拒绝。"""
+    finished = {
+        "id": "500w-2030-05-01-0", "sport": "football", "league": "英超",
+        "date": "2030-05-01", "time": "15:30", "kickoff_time_known": True,
+        "status": "finished", "home": "甲队", "away": "乙队",
+        "score": {"ft": [2, 1]}, "odds": None,
+    }
+    observation = observe_source_row(finished, adapter="finished_feed")
+    proposal = _synthetic_proposal(
+        key_dict=ScopedSourceIdentityKey.for_observation(observation).as_dict()
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "ROW_POSITION_UNSTABLE" in decision.rejection_codes
+    assert "RAW_IDENTIFIER_TYPE_NOT_DURABLE" in decision.rejection_codes
+
+
+def test_ec_19_cross_sport_shared_aliases_remain_ineligible(owner_keys):
+    """EC-19: 跨运动共用源别名的身份证明不足时仍然不合格。"""
+    football_row = _market_row(match_id="500j-2030-05-01-001", number="001")
+    basketball_row = _market_row(
+        match_id="500j-2030-05-01-001", number="001", sport="basketball",
+        home="湖人", away="勇士",
+    )
+    football = observe_source_row(football_row, adapter="market_xml")
+    basketball = observe_source_row(basketball_row, adapter="market_xml")
+    assert football.derived_source_id == basketball.derived_source_id
+    key_football = ScopedSourceIdentityKey.for_observation(football)
+    key_basketball = ScopedSourceIdentityKey.for_observation(basketball)
+    assert key_football.source_key() != key_basketball.source_key()
+
+    proposal = proposal_from_observations(
+        [football],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id="500j-2030-05-01-001",
+        existing_canonical_owner="500j-2030-05-01-001",
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint=BASELINE,
+        reason="cross-sport alias",
+        identity_evidence_type="strong_competition_number",
+        operator=OPERATOR,
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, basketball, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+    assert "SOURCE_SCOPE_MISMATCH" in decision.rejection_codes
+
+    # 既有摄取预检继续对该批次 fail closed。
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        plan_ingestion_identity([], [dict(football_row), dict(basketball_row)])
+    assert exc.value.category == "SAME_SOURCE_ALIAS_DIFFERENT_EVENT"
+
+
+# ---------------------------------------------------------------------------
+# EC-20 / EC-21 — 注册表完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_20_policy_registry_and_dispatch_remain_complete():
+    """EC-20: 声明式策略注册表与规则分派表保持完整、自洽。"""
+    from utils.runtime_mapping_eligibility import _RULE_CHECKS
+
+    declared = {rule.code for rule in RUNTIME_ELIGIBILITY_RULES}
+    assert declared == set(_RULE_CHECKS)
+    assert len(declared) == len(RUNTIME_ELIGIBILITY_RULES) == 45
+    assert len(REJECTION_CODES) == 45
+    assert {rule.rejection_code for rule in RUNTIME_ELIGIBILITY_RULES} == REJECTION_CODES
+    assert len(rule_codes()) == len(set(rule_codes()))
+
+    # 新增类别与来源声明齐备。
+    categories = runtime_policy_status()["rules_by_category"]
+    assert categories["EVIDENCE_BINDING"] == [
+        "SOURCE_OBSERVATION_IN_PROPOSAL",
+        "SOURCE_IDENTITY_KEY_MATCHES",
+        "SOURCE_SCOPE_MATCHES",
+    ]
+    assert len(categories["GOVERNANCE"]) == 20
+    assert runtime_policy_status()["known_proposal_states"] == sorted(
+        KNOWN_PROPOSAL_STATES
+    )
+    assert set(ALLOWED_CONTEXT_EVIDENCE_PROVENANCE).isdisjoint(
+        BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+    )
+
+    # 版本号已按语义变化提升。
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
+
+
+def test_ec_21_every_new_rejection_code_has_an_executable_reproducer(owner_keys):
+    """EC-21: 每条**新增**拒绝码都有可执行复现。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+
+    reproducers = {
+        "PROPOSAL_FINGERPRINT_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        ),
+        "SOURCE_OBSERVATION_NOT_IN_PROPOSAL": (
+            proposal, approval, unrelated, _context(owner_keys, proposal),
+        ),
+        "SOURCE_IDENTITY_KEY_MISMATCH": (
+            proposal, approval, unrelated, _context(owner_keys, proposal),
+        ),
+        "SOURCE_SCOPE_MISMATCH": (
+            _recompose_proposal(proposal, scope_overrides={"event_date": "2030-05-02"}),
+            approval, observation, _context(owner_keys, proposal),
+        ),
+        "RECORDED_STATE_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state=None),
+        ),
+        "RECORDED_STATE_UNKNOWN": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state="NOPE"),
+        ),
+        "RECORDED_STATE_PROPOSAL_MISMATCH": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_id="nope"),
+        ),
+        "EVIDENCE_PROVENANCE_UNSUPPORTED": (
+            proposal, approval, observation,
+            _context(
+                owner_keys, proposal,
+                evidence_provenance=GovernanceEvidenceProvenance(
+                    source=CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER
+                ),
+            ),
+        ),
+    }
+    new_codes = {
+        "PROPOSAL_FINGERPRINT_MISSING",
+        "SOURCE_OBSERVATION_NOT_IN_PROPOSAL",
+        "SOURCE_IDENTITY_KEY_MISMATCH",
+        "SOURCE_SCOPE_MISMATCH",
+        "RECORDED_STATE_MISSING",
+        "RECORDED_STATE_UNKNOWN",
+        "RECORDED_STATE_PROPOSAL_MISMATCH",
+        "EVIDENCE_PROVENANCE_UNSUPPORTED",
+    }
+    assert set(reproducers) == new_codes
+    assert new_codes <= REJECTION_CODES
+
+    for code, (candidate_proposal, candidate_approval, candidate_observation, ctx) in (
+        reproducers.items()
+    ):
+        decision = evaluate_runtime_mapping_eligibility(
+            candidate_proposal, candidate_approval, candidate_observation, ctx,
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, code
+        assert code in decision.rejection_codes, (code, decision.rejection_codes)
+
+
+# ---------------------------------------------------------------------------
+# EC-22 / EC-23 — 确定性与不可执行
+# ---------------------------------------------------------------------------
+
+def test_ec_22_repeated_identical_evaluations_remain_deterministic(owner_keys):
+    """EC-22: 重复的相同评估保持确定（判定身份与时钟无关）。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    decisions = [
+        evaluate_runtime_mapping_eligibility(
+            proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+        )
+        for _ in range(5)
+    ]
+    assert len({d.decision_id for d in decisions}) == 1
+    assert len(set(decisions)) == 1
+    assert all(d.is_eligible and d.is_conditional for d in decisions)
+
+    clock_shifted = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context,
+        evaluated_at="2099-12-31T23:59:59+00:00",
+    )
+    assert clock_shifted.decision_id == decisions[0].decision_id
+    assert clock_shifted.evaluated_at != decisions[0].evaluated_at
+
+
+def test_ec_23_readiness_manifests_remain_non_executable(owner_keys):
+    """EC-23: 就绪清单仍然不可执行，并显式标注条件式判定。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    eligible = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    rejected = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, context, evaluated_at=EVALUATED_AT
+    )
+    manifest = build_runtime_readiness_manifest(
+        fixture_identity="ec23",
+        decisions=[eligible, rejected],
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    assert manifest["executable"] is False
+    assert manifest["activation_api"] is None
+    assert manifest["production_authorization_granted"] is False
+    assert manifest["conditional_decision_count"] == 2
+    assert manifest["verified_evidence_decision_count"] == 0
+    assert manifest["conditional_decisions_are_production_authorization"] is False
+    assert manifest["evidence_provenance_histogram"] == {
+        CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED: 2
+    }
+    assert manifest["eligible_count"] == 1
+    assert manifest["rejected_count"] == 1
+    assert_runtime_manifest_not_executable(manifest)
+    with pytest.raises(RuntimeEligibilityPolicyError):
+        assert_runtime_manifest_not_executable(dict(manifest, executable=True))
+    with pytest.raises(RuntimeEligibilityPolicyError):
+        assert_runtime_manifest_not_executable(dict(manifest, activate=True))
+
+
+# ---------------------------------------------------------------------------
+# EC-24 / EC-25 — 隔离与七存储
+# ---------------------------------------------------------------------------
+
+def test_ec_24_shadow_evaluation_creates_no_binding_ledger_or_write(
+    tmp_path, owner_keys
+):
+    """EC-24: 影子评估不创建绑定、不写账本、不写生产数据。"""
+    workspace = tmp_path / "ec24"
+    workspace.mkdir()
+    (workspace / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    before_listing = sorted(os.listdir(workspace))
+    before_bytes = (workspace / "sentinel.txt").read_bytes()
+
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    report = shadow_runtime_eligibility_check(
+        workspace=str(workspace),
+        proposal=proposal,
+        approval=approval,
+        source_observation=observation,
+        runtime_context=context,
+        evaluated_at=EVALUATED_AT,
+        scenario="EC-24",
+    )
+    assert report["eligibility_result"] == RuntimeEligibilityResult.ELIGIBLE.value
+    assert report["ledger_written"] is False
+    assert report["files_written"] == 0
+    assert report["bindings_created"] == 0
+    assert report["canonical_records_modified"] == 0
+    assert report["is_production_authority"] is False
+    assert report["runtime_mapping_activation"] == RUNTIME_MAPPING_ACTIVATION
+    assert report["decision"]["is_production_authorization"] is False
+
+    assert sorted(os.listdir(workspace)) == before_listing
+    assert (workspace / "sentinel.txt").read_bytes() == before_bytes
+    assert not (workspace / "mapping_governance_ledger.jsonl").exists()
+
+
+def test_ec_25_all_seven_stores_remain_byte_identical(
+    isolated_data_dir, monkeypatch, owner_keys
+):
+    """EC-25: 修正后的判定与拒绝路径都不改动七个持久化存储。"""
+    _seed_seven_stores(isolated_data_dir)
+    _fake_sources(
+        monkeypatch,
+        live_football=[
+            _market_row(
+                match_id="m-live",
+                odds={"home_win": 1.9, "draw": 3.4, "away_win": 3.8},
+            )
+        ],
+    )
+    scraper.refresh(verbose=False)
+    before = _hash_seven_stores(isolated_data_dir)
+    assert len(before) == 7 and all(len(v) == 64 for v in before.values())
+
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    workspace = str(isolated_data_dir.parent / "ec25_shadow")
+
+    # 合格路径、拒绝路径、清单与影子入口全部执行一遍。
+    evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    for broken_context in (
+        _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        _context(owner_keys, proposal, recorded_proposal_state=None),
+        _context(owner_keys, proposal, current_baseline_fingerprint="baseline-B"),
+        _context(owner_keys, proposal, required_rewrite_targets=("settlements.json",)),
+    ):
+        evaluate_runtime_mapping_eligibility(
+            proposal, approval, observation, broken_context, evaluated_at=EVALUATED_AT
+        )
+    build_runtime_readiness_manifest(
+        fixture_identity="ec25",
+        decisions=[
+            evaluate_runtime_mapping_eligibility(
+                proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+            )
+        ],
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    shadow_runtime_readiness_report(
+        workspace=workspace,
+        proposals=[proposal],
+        observations=[observation],
+        canonical_fixture=[_market_row()],
+        dataset_identity=DATASET,
+        baseline_fingerprint=BASELINE,
+        trusted_public_key_path=owner_keys["public"],
+    )
+
+    assert _hash_seven_stores(isolated_data_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# EC-26 / EC-27 / EC-28 — 既有行为与审计不变
+# ---------------------------------------------------------------------------
+
+def test_ec_26_existing_ingestion_identity_behavior_remains_unchanged():
+    """EC-26: 既有摄取身份行为不变（规划器语义与权威归属均未改）。"""
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        plan_ingestion_identity(
+            [],
+            [
+                _market_row(match_id="500j-2030-05-01-001", number="001"),
+                _market_row(
+                    match_id="500j-2030-05-01-001", number="001",
+                    sport="basketball", home="湖人", away="勇士",
+                ),
+            ],
+        )
+    assert exc.value.category == "SAME_SOURCE_ALIAS_DIFFERENT_EVENT"
+
+    with pytest.raises(CanonicalIdentityCollisionError) as dup:
+        plan_ingestion_identity(
+            [_market_row(match_id="dup-1"), _market_row(match_id="dup-1")], []
+        )
+    assert dup.value.category == "PREEXISTING_DUPLICATE"
+
+    for name in ("ingestion_identity.py", "match_identity.py", "scraper.py"):
+        source = open(os.path.join(REPO_ROOT, "utils", name), encoding="utf-8").read()
+        assert "runtime_mapping" not in source, name
+    assert governance_status()["runtime_identity_authority"] == (
+        "utils.ingestion_identity.validate_ingestion_identity"
+    )
+
+
+def test_ec_27_historical_ed25519_approval_audit_continues_to_work(
+    tmp_path, owner_keys
+):
+    """EC-27: 历史 Ed25519 批准审计继续工作；隔离快照只读且保留信任锚警告。"""
+    observation = _observation()
+    proposal = _proposal(observation)
+    workspace = tmp_path / "ec27_gov"
+    workspace.mkdir()
+    ledger = GovernanceLedger(
+        str(workspace / "mapping_governance_ledger.jsonl"), dataset_identity=DATASET
+    )
+    ledger.append(
+        proposal=proposal,
+        to_state="PROPOSED",
+        actor=OPERATOR,
+        actor_role="operator",
+        reason="propose",
+        baseline_fingerprint=BASELINE,
+    )
+    approval = _approval(proposal, observation, owner_keys)
+    ledger.append(
+        proposal=proposal,
+        to_state="APPROVED",
+        actor=APPROVER,
+        actor_role="owner",
+        reason="approve",
+        baseline_fingerprint=BASELINE,
+        approval=approval,
+        trusted_public_key_path=owner_keys["public"],
+        source_observation_fingerprint=observation.semantic_fingerprint(),
+    )
+
+    audit = audit_historical_approvals(
+        ledger, trusted_public_key_path=owner_keys["public"], dataset_identity=DATASET
+    )
+    assert audit["approved_decisions"] == 1
+    assert audit["failures"] == []
+
+    with open(ledger.path, "rb") as handle:
+        ledger_bytes = handle.read()
+    snapshot = build_isolated_governance_snapshot(
+        ledger,
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+        trusted_public_key_path=owner_keys["public"],
+    )
+    # 只读：账本逐字节不变。
+    with open(ledger.path, "rb") as handle:
+        assert handle.read() == ledger_bytes
+
+    assert isinstance(snapshot, IsolatedGovernanceSnapshot)
+    assert snapshot.structural_integrity == "OK"
+    assert snapshot.authenticated_approval_audit == (
+        "AUTHENTICATED_MAPPING_APPROVAL_AUDIT"
+    )
+    assert snapshot.state_of(proposal.proposal_id) == "APPROVED"
+    assert snapshot.fingerprint_of(proposal.proposal_id) == proposal.fingerprint()
+    assert snapshot.provenance.source == CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    # 账本信任锚警告被原样保留（哈希链不是外部信任锚）。
+    assert "NONE" in snapshot.provenance.ledger_trust_anchor
+    assert snapshot.as_dict()["is_production_authority"] is False
+
+    context = RuntimeMappingContext(
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+        evidence_provenance=snapshot.provenance,
+        canonical_ids=(CANONICAL_ID,),
+        trusted_public_key_path=owner_keys["public"],
+        expected_approver=APPROVER,
+        expected_operator=OPERATOR,
+        recorded_proposal_id=proposal.proposal_id,
+        recorded_proposal_fingerprint=snapshot.fingerprint_of(proposal.proposal_id),
+        recorded_proposal_state=snapshot.state_of(proposal.proposal_id),
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    assert decision.is_conditional is True
+    assert decision.is_production_authorization is False
+
+    # 缺少可信公钥时审计**不**执行，并如实记录限制（绝不信任内嵌公钥）。
+    without_key = build_isolated_governance_snapshot(
+        ledger,
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    assert without_key.authenticated_approval_audit == "NOT_PERFORMED"
+    assert any(
+        "trusted public key" in limitation
+        for limitation in without_key.provenance.verification_limitations
+    )
+
+
+def test_ec_28_ci_declares_ubuntu_and_windows_regressions():
+    """EC-28: CI 声明的四个必需 job 与双平台矩阵保持存在。"""
+    workflow = _ci_workflow()
+    for job in (
+        "Offline pytest suite",
+        "Isolated Canonical repair lifecycle",
+    ):
+        assert job in workflow, job
+    assert "ubuntu-latest" in workflow
+    assert "windows-latest" in workflow
+    assert re.search(r"os:\s*\[ubuntu-latest,\s*windows-latest\]", workflow)
+    assert re.search(r'python-version:\s*\["3\.12"\]', workflow)
+
+
+# ===========================================================================
+# EC-01 .. EC-28 — 证据绑定与 fail-closed 修正回归矩阵
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# EC-01 .. EC-04 — 已记录提案指纹完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_01_missing_recorded_proposal_fingerprint_returns_not_eligible(owner_keys):
+    """EC-01: 缺失已记录提案指纹 -> NOT_ELIGIBLE(PROPOSAL_FINGERPRINT_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "PROPOSAL_FINGERPRINT_MISSING" in decision.rejection_codes
+    # 缺失指纹绝不意味着「指纹校验可选」。
+    assert "PROPOSAL_FINGERPRINT_MISMATCH" not in decision.rejection_codes
+
+
+def test_ec_02_blank_recorded_proposal_fingerprint_returns_not_eligible(owner_keys):
+    """EC-02: 空白已记录指纹 -> NOT_ELIGIBLE(PROPOSAL_FINGERPRINT_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    for blank in ("", "   ", "\t"):
+        decision = evaluate_runtime_mapping_eligibility(
+            proposal,
+            approval,
+            observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=blank),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+        assert "PROPOSAL_FINGERPRINT_MISSING" in decision.rejection_codes, blank
+
+
+def test_ec_03_mismatched_recorded_fingerprint_returns_not_eligible(owner_keys):
+    """EC-03: 不匹配 / 格式不合法的已记录指纹 -> NOT_ELIGIBLE。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    for bad in ("0" * 64, "NOT-A-SHA256", proposal.fingerprint()[:-1] + "0"):
+        decision = evaluate_runtime_mapping_eligibility(
+            proposal,
+            approval,
+            observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=bad),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+        assert "PROPOSAL_FINGERPRINT_MISMATCH" in decision.rejection_codes, bad
+
+
+def test_ec_04_correct_recorded_fingerprint_passes_the_rule(owner_keys):
+    """EC-04: 正确的已记录指纹通过指纹规则（但**不**证明账本可信）。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(
+            owner_keys, proposal,
+            recorded_proposal_fingerprint=proposal.fingerprint(),
+        ),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert "PROPOSAL_FINGERPRINT_MISSING" not in decision.rejection_codes
+    assert "PROPOSAL_FINGERPRINT_MISMATCH" not in decision.rejection_codes
+    # 指纹匹配只是一致性；来源仍然是条件式的，不是独立验证过的证据。
+    assert decision.is_conditional is True
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
+
+
+# ---------------------------------------------------------------------------
+# EC-05 / EC-06 — 已记录治理状态完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_05_missing_recorded_proposal_state_returns_not_eligible(owner_keys):
+    """EC-05: 缺失已记录治理状态 -> NOT_ELIGIBLE(RECORDED_STATE_MISSING)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_state=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "RECORDED_STATE_MISSING" in decision.rejection_codes
+
+    # 未知状态同样 fail closed。
+    unknown = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_state="BANANA"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "RECORDED_STATE_UNKNOWN" in unknown.rejection_codes
+
+    # 已记录状态必须对应被评估的提案 ID。
+    other = evaluate_runtime_mapping_eligibility(
+        proposal,
+        approval,
+        observation,
+        _context(owner_keys, proposal, recorded_proposal_id="another-proposal"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "RECORDED_STATE_PROPOSAL_MISMATCH" in other.rejection_codes
+
+
+def test_ec_06_asserted_proposal_status_does_not_replace_the_recorded_state(owner_keys):
+    """EC-06: 提案自述的 APPROVED 状态绝不替代已记录的治理状态。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    self_asserted = _recompose_proposal(proposal, status="APPROVED")
+    assert self_asserted.status == "APPROVED"
+
+    # 没有任何已记录状态 -> 仍然拒绝（绝不回退到提案自述状态）。
+    missing = evaluate_runtime_mapping_eligibility(
+        self_asserted,
+        approval,
+        observation,
+        _context(owner_keys, self_asserted, recorded_proposal_state=None),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert missing.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "RECORDED_STATE_MISSING" in missing.rejection_codes
+
+    # 已记录状态为 PROPOSED -> 同样拒绝，即便提案自述 APPROVED。
+    proposed = evaluate_runtime_mapping_eligibility(
+        self_asserted,
+        approval,
+        observation,
+        _context(owner_keys, self_asserted, recorded_proposal_state="PROPOSED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "MAPPING_STATE_NOT_ACTIVE" in proposed.rejection_codes
+
+    # 其余非活动状态一律拒绝（不授权任何变更）。
+    for state in ("REVIEW_REQUIRED", "REJECTED", "REVOKED", "SUPERSEDED", "OBSERVED"):
+        decision = evaluate_runtime_mapping_eligibility(
+            self_asserted,
+            approval,
+            observation,
+            _context(owner_keys, self_asserted, recorded_proposal_state=state),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, state
+        assert "MAPPING_STATE_NOT_ACTIVE" in decision.rejection_codes, state
+
+    # 只有 APPROVED 才是活动终态。
+    assert ALLOWED_PROPOSAL_STATES == {"APPROVED"}
+    assert ALLOWED_PROPOSAL_STATES <= KNOWN_PROPOSAL_STATES
+
+
+# ---------------------------------------------------------------------------
+# EC-07 .. EC-11 — 观测 / 提案证据绑定
+# ---------------------------------------------------------------------------
+
+def _unrelated_observation():
+    return _observation(match_id=CANONICAL_ID_ALT, number="008", home="甲", away="乙")
+
+
+def test_ec_07_observation_with_unrelated_competition_identity_is_rejected(owner_keys):
+    """EC-07: 与提案无关的竞彩身份观测被拒绝。"""
+    _observation_valid, proposal, approval, _ = _valid_setup(owner_keys)
+    other = _unrelated_observation()
+    assert ScopedSourceIdentityKey.for_observation(other).source_key() != proposal.source_key
+
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, other, _context(owner_keys, proposal), evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+
+
+def test_ec_08_observation_fingerprint_absent_from_proposal_is_rejected(owner_keys):
+    """EC-08: 观测指纹不在提案证据集合中 -> NOT_ELIGIBLE。"""
+    observation, proposal, _approval_artifact, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+    assert unrelated.semantic_fingerprint() not in proposal.observation_fingerprints
+
+    # 用**无关观测的指纹**签名一份有效批准，再把它用在原提案上。
+    signed_over_unrelated = _approval(proposal, unrelated, owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        signed_over_unrelated,
+        unrelated,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+
+    # 观测引用为空白同样拒绝。
+    blank_reference = _recompose_proposal(proposal, source_observation_ref="")
+    decision_blank = evaluate_runtime_mapping_eligibility(
+        blank_reference, _approval(blank_reference, observation, owner_keys),
+        observation, _context(owner_keys, proposal), evaluated_at=EVALUATED_AT,
+    )
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision_blank.rejection_codes
+
+
+def test_ec_09_observation_identity_key_differing_is_rejected(owner_keys):
+    """EC-09: 由观测独立推导的身份键与提案身份键不一致 -> NOT_ELIGIBLE。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    tampered_key = dict(proposal.identity_key_dict)
+    tampered_key["identity_value"] = "football|2030-05-01|jczq|99"
+    tampered = _recompose_proposal(proposal, key_dict=tampered_key)
+
+    decision = evaluate_runtime_mapping_eligibility(
+        tampered, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+
+    # 身份键契约非当前 -> 直接拒绝（不因别名而被绕过）。
+    legacy_key = dict(proposal.identity_key_dict)
+    legacy_key["identity_key_schema_version"] = "2.0.0"
+    legacy = _recompose_proposal(proposal, key_dict=legacy_key)
+    decision_legacy = evaluate_runtime_mapping_eligibility(
+        legacy, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "IDENTITY_KEY_VERSION_NOT_CURRENT" in decision_legacy.rejection_codes
+
+
+def test_ec_10_observation_scope_differing_is_rejected(owner_keys):
+    """EC-10: 观测作用域与提案声明作用域不一致 -> NOT_ELIGIBLE(SOURCE_SCOPE_MISMATCH)。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+
+    for override in (
+        {"event_date": "2030-05-02"},
+        {"sport": "basketball"},
+        {"provider_namespace": "500l"},
+        {"adapter": "live_football"},
+    ):
+        mismatched = _recompose_proposal(proposal, scope_overrides=override)
+        decision = evaluate_runtime_mapping_eligibility(
+            mismatched, approval, observation, _context(owner_keys, proposal),
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, override
+        assert "SOURCE_SCOPE_MISMATCH" in decision.rejection_codes, override
+
+
+def test_ec_11_valid_multi_observation_proposal_remains_supported(owner_keys):
+    """EC-11: 合法的多观测提案仍然受支持（当前观测不必是第一条）。"""
+    first = _observation(time="20:00")
+    second = _observation(time="21:00")
+    assert first.semantic_fingerprint() != second.semantic_fingerprint()
+    assert (
+        ScopedSourceIdentityKey.for_observation(first).source_key()
+        == ScopedSourceIdentityKey.for_observation(second).source_key()
+    )
+
+    proposal = proposal_from_observations(
+        [first, second],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id=CANONICAL_ID,
+        existing_canonical_owner=CANONICAL_ID,
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint=BASELINE,
+        reason="multi-observation proposal",
+        identity_evidence_type="strong_competition_number",
+        operator=OPERATOR,
+    )
+    assert len(proposal.observation_fingerprints) == 2
+    assert second.semantic_fingerprint() in proposal.observation_fingerprints
+
+    # 批准件绑定**第二条**观测；用第二条观测评估 -> 仍然是条件式 ELIGIBLE。
+    approval = _approval(proposal, second, owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, second, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.rejection_codes == ()
+
+    # 第一条观测同样满足成员关系（不要求是「当前」那一条）。
+    first_decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        _approval(proposal, first, owner_keys),
+        first,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert first_decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+
+
+# ---------------------------------------------------------------------------
+# EC-12 / EC-13 — 条件式合格 vs 一致证据
+# ---------------------------------------------------------------------------
+
+def test_ec_12_correct_evidence_produces_a_conditional_eligible_decision(owner_keys):
+    """EC-12: 正确的观测 + 提案 + 签名批准 -> 条件式 ELIGIBLE（非生产授权）。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.rejection_codes == ()
+    assert decision.is_conditional is True
+    assert decision.is_production_authorization is False
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
+
+    # 换成隔离快照来源 -> 仍是条件式（只是来源不同）。
+    snapshot_context = _context(
+        owner_keys,
+        proposal,
+        evidence_provenance=isolated_snapshot_provenance(
+            dataset_identity=DATASET, baseline_fingerprint=BASELINE,
+            structural_ledger_validation_performed=True,
+        ),
+    )
+    snapshot_decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, snapshot_context, evaluated_at=EVALUATED_AT
+    )
+    assert snapshot_decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert snapshot_decision.evidence_provenance == (
+        CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    )
+    assert snapshot_decision.is_conditional is True
+
+    # 声称独立验证过的账本证据 -> 一律阻断（自述布尔值不是证据）。
+    claimed = _context(
+        owner_keys,
+        proposal,
+        evidence_provenance=GovernanceEvidenceProvenance(
+            source=CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER,
+            structural_ledger_validation_performed=True,
+            authenticated_approval_audit_performed=True,
+        ),
+    )
+    claimed_decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, claimed, evaluated_at=EVALUATED_AT
+    )
+    assert claimed_decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "EVIDENCE_PROVENANCE_UNSUPPORTED" in claimed_decision.rejection_codes
+    assert CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER in BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+    assert ALLOWED_CONTEXT_EVIDENCE_PROVENANCE == {
+        CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+        CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT,
+    }
+
+
+def test_ec_13_valid_signature_over_inconsistent_evidence_remains_not_eligible(owner_keys):
+    """EC-13: 有效签名覆盖不一致证据时仍然 NOT_ELIGIBLE（签名不使证据变合格）。"""
+    observation, proposal, _approval_artifact, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+
+    # 用无关观测的指纹签署**原提案**：签名本身有效，但证据不一致。
+    signed_over_unrelated = _approval(proposal, unrelated, owner_keys)
+    assert signed_over_unrelated["source_observation_fingerprint"] == (
+        unrelated.semantic_fingerprint()
+    )
+
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal,
+        signed_over_unrelated,
+        unrelated,
+        _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    # 直接可诊断的不一致**不**复用 APPROVAL_SIGNATURE_INVALID。
+    assert "APPROVAL_SIGNATURE_INVALID" not in decision.rejection_codes
+    assert "SOURCE_OBSERVATION_NOT_IN_PROPOSAL" in decision.rejection_codes
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+
+
+# ---------------------------------------------------------------------------
+# EC-14 .. EC-19 — 既有拒绝面在修正后保持有效
+# ---------------------------------------------------------------------------
+
+def test_ec_14_revoked_mapping_remains_rejected(owner_keys):
+    """EC-14: 已撤销映射仍然被拒绝。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, recorded_proposal_state="REVOKED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "MAPPING_REVOKED" in decision.rejection_codes
+
+
+def test_ec_15_superseded_mapping_remains_rejected(owner_keys):
+    """EC-15: 已取代映射仍然被拒绝。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, recorded_proposal_state="SUPERSEDED"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "MAPPING_SUPERSEDED" in decision.rejection_codes
+
+
+def test_ec_16_stale_baseline_remains_rejected(owner_keys):
+    """EC-16: 陈旧基线仍然被拒绝，且旧 ELIGIBLE 判定不构成永久授权。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    before = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert before.is_eligible
+
+    after = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation,
+        _context(owner_keys, proposal, current_baseline_fingerprint="baseline-B"),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert after.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "BASELINE_STALE" in after.rejection_codes
+    # 基线变化 -> 判定身份随之改变（必须重新评估）。
+    assert after.decision_id != before.decision_id
+    assert after.baseline_fingerprint != before.baseline_fingerprint
+
+
+def test_ec_17_unverified_provider_identity_remains_rejected(owner_keys):
+    """EC-17: 未验证的 provider 身份仍然被拒绝。"""
+    provider_row = _market_row(number=None)
+    provider_key = ScopedSourceIdentityKey.for_observation(
+        observe_source_row(
+            provider_row,
+            adapter="market_xml",
+            raw_provider_id="12345",
+            raw_provider_id_type="PROVIDER_MATCH_ID",
+        )
+    )
+    assert provider_key.identity_kind == IdentityKeyKind.UNVERIFIED_PROVIDER_ID.value
+    proposal = _synthetic_proposal(key_dict=provider_key.as_dict())
+    observation = observe_source_row(
+        provider_row,
+        adapter="market_xml",
+        raw_provider_id="12345",
+        raw_provider_id_type="PROVIDER_MATCH_ID",
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "UNVERIFIED_PROVIDER_ID" in decision.rejection_codes
+
+
+def test_ec_18_row_position_identity_remains_rejected(owner_keys):
+    """EC-18: 行位置派生身份仍然被拒绝。"""
+    finished = {
+        "id": "500w-2030-05-01-0", "sport": "football", "league": "英超",
+        "date": "2030-05-01", "time": "15:30", "kickoff_time_known": True,
+        "status": "finished", "home": "甲队", "away": "乙队",
+        "score": {"ft": [2, 1]}, "odds": None,
+    }
+    observation = observe_source_row(finished, adapter="finished_feed")
+    proposal = _synthetic_proposal(
+        key_dict=ScopedSourceIdentityKey.for_observation(observation).as_dict()
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert "ROW_POSITION_UNSTABLE" in decision.rejection_codes
+    assert "RAW_IDENTIFIER_TYPE_NOT_DURABLE" in decision.rejection_codes
+
+
+def test_ec_19_cross_sport_shared_aliases_remain_ineligible(owner_keys):
+    """EC-19: 跨运动共用源别名的身份证明不足时仍然不合格。"""
+    football_row = _market_row(match_id="500j-2030-05-01-001", number="001")
+    basketball_row = _market_row(
+        match_id="500j-2030-05-01-001", number="001", sport="basketball",
+        home="湖人", away="勇士",
+    )
+    football = observe_source_row(football_row, adapter="market_xml")
+    basketball = observe_source_row(basketball_row, adapter="market_xml")
+    assert football.derived_source_id == basketball.derived_source_id
+    key_football = ScopedSourceIdentityKey.for_observation(football)
+    key_basketball = ScopedSourceIdentityKey.for_observation(basketball)
+    assert key_football.source_key() != key_basketball.source_key()
+
+    proposal = proposal_from_observations(
+        [football],
+        requested_action=ProposalAction.BIND_SOURCE_TO_EXISTING_CANONICAL.value,
+        candidate_canonical_id="500j-2030-05-01-001",
+        existing_canonical_owner="500j-2030-05-01-001",
+        ingestion_plan_reference="planner:ACCEPTED",
+        expected_baseline_fingerprint=BASELINE,
+        reason="cross-sport alias",
+        identity_evidence_type="strong_competition_number",
+        operator=OPERATOR,
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, None, basketball, _context(owner_keys, proposal),
+        evaluated_at=EVALUATED_AT,
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value
+    assert "SOURCE_IDENTITY_KEY_MISMATCH" in decision.rejection_codes
+    assert "SOURCE_SCOPE_MISMATCH" in decision.rejection_codes
+
+    # 既有摄取预检继续对该批次 fail closed。
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        plan_ingestion_identity([], [dict(football_row), dict(basketball_row)])
+    assert exc.value.category == "SAME_SOURCE_ALIAS_DIFFERENT_EVENT"
+
+
+# ---------------------------------------------------------------------------
+# EC-20 / EC-21 — 注册表完整性
+# ---------------------------------------------------------------------------
+
+def test_ec_20_policy_registry_and_dispatch_remain_complete():
+    """EC-20: 声明式策略注册表与规则分派表保持完整、自洽。"""
+    from utils.runtime_mapping_eligibility import _RULE_CHECKS
+
+    declared = {rule.code for rule in RUNTIME_ELIGIBILITY_RULES}
+    assert declared == set(_RULE_CHECKS)
+    assert len(declared) == len(RUNTIME_ELIGIBILITY_RULES) == 45
+    assert len(REJECTION_CODES) == 45
+    assert {rule.rejection_code for rule in RUNTIME_ELIGIBILITY_RULES} == REJECTION_CODES
+    assert len(rule_codes()) == len(set(rule_codes()))
+
+    # 新增类别与来源声明齐备。
+    categories = runtime_policy_status()["rules_by_category"]
+    assert categories["EVIDENCE_BINDING"] == [
+        "SOURCE_OBSERVATION_IN_PROPOSAL",
+        "SOURCE_IDENTITY_KEY_MATCHES",
+        "SOURCE_SCOPE_MATCHES",
+    ]
+    assert len(categories["GOVERNANCE"]) == 20
+    assert runtime_policy_status()["known_proposal_states"] == sorted(
+        KNOWN_PROPOSAL_STATES
+    )
+    assert set(ALLOWED_CONTEXT_EVIDENCE_PROVENANCE).isdisjoint(
+        BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+    )
+
+    # 版本号已按语义变化提升。
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
+
+
+def test_ec_21_every_new_rejection_code_has_an_executable_reproducer(owner_keys):
+    """EC-21: 每条**新增**拒绝码都有可执行复现。"""
+    observation, proposal, approval, _ = _valid_setup(owner_keys)
+    unrelated = _unrelated_observation()
+
+    reproducers = {
+        "PROPOSAL_FINGERPRINT_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        ),
+        "SOURCE_OBSERVATION_NOT_IN_PROPOSAL": (
+            proposal, approval, unrelated, _context(owner_keys, proposal),
+        ),
+        "SOURCE_IDENTITY_KEY_MISMATCH": (
+            proposal, approval, unrelated, _context(owner_keys, proposal),
+        ),
+        "SOURCE_SCOPE_MISMATCH": (
+            _recompose_proposal(proposal, scope_overrides={"event_date": "2030-05-02"}),
+            approval, observation, _context(owner_keys, proposal),
+        ),
+        "RECORDED_STATE_MISSING": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state=None),
+        ),
+        "RECORDED_STATE_UNKNOWN": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_state="NOPE"),
+        ),
+        "RECORDED_STATE_PROPOSAL_MISMATCH": (
+            proposal, approval, observation,
+            _context(owner_keys, proposal, recorded_proposal_id="nope"),
+        ),
+        "EVIDENCE_PROVENANCE_UNSUPPORTED": (
+            proposal, approval, observation,
+            _context(
+                owner_keys, proposal,
+                evidence_provenance=GovernanceEvidenceProvenance(
+                    source=CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER
+                ),
+            ),
+        ),
+    }
+    new_codes = {
+        "PROPOSAL_FINGERPRINT_MISSING",
+        "SOURCE_OBSERVATION_NOT_IN_PROPOSAL",
+        "SOURCE_IDENTITY_KEY_MISMATCH",
+        "SOURCE_SCOPE_MISMATCH",
+        "RECORDED_STATE_MISSING",
+        "RECORDED_STATE_UNKNOWN",
+        "RECORDED_STATE_PROPOSAL_MISMATCH",
+        "EVIDENCE_PROVENANCE_UNSUPPORTED",
+    }
+    assert set(reproducers) == new_codes
+    assert new_codes <= REJECTION_CODES
+
+    for code, (candidate_proposal, candidate_approval, candidate_observation, ctx) in (
+        reproducers.items()
+    ):
+        decision = evaluate_runtime_mapping_eligibility(
+            candidate_proposal, candidate_approval, candidate_observation, ctx,
+            evaluated_at=EVALUATED_AT,
+        )
+        assert decision.eligibility_result == RuntimeEligibilityResult.NOT_ELIGIBLE.value, code
+        assert code in decision.rejection_codes, (code, decision.rejection_codes)
+
+
+# ---------------------------------------------------------------------------
+# EC-22 / EC-23 — 确定性与不可执行
+# ---------------------------------------------------------------------------
+
+def test_ec_22_repeated_identical_evaluations_remain_deterministic(owner_keys):
+    """EC-22: 重复的相同评估保持确定（判定身份与时钟无关）。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    decisions = [
+        evaluate_runtime_mapping_eligibility(
+            proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+        )
+        for _ in range(5)
+    ]
+    assert len({d.decision_id for d in decisions}) == 1
+    assert len(set(decisions)) == 1
+    assert all(d.is_eligible and d.is_conditional for d in decisions)
+
+    clock_shifted = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context,
+        evaluated_at="2099-12-31T23:59:59+00:00",
+    )
+    assert clock_shifted.decision_id == decisions[0].decision_id
+    assert clock_shifted.evaluated_at != decisions[0].evaluated_at
+
+
+def test_ec_23_readiness_manifests_remain_non_executable(owner_keys):
+    """EC-23: 就绪清单仍然不可执行，并显式标注条件式判定。"""
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    eligible = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    rejected = evaluate_runtime_mapping_eligibility(
+        proposal, None, observation, context, evaluated_at=EVALUATED_AT
+    )
+    manifest = build_runtime_readiness_manifest(
+        fixture_identity="ec23",
+        decisions=[eligible, rejected],
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    assert manifest["executable"] is False
+    assert manifest["activation_api"] is None
+    assert manifest["production_authorization_granted"] is False
+    assert manifest["conditional_decision_count"] == 2
+    assert manifest["verified_evidence_decision_count"] == 0
+    assert manifest["conditional_decisions_are_production_authorization"] is False
+    assert manifest["evidence_provenance_histogram"] == {
+        CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED: 2
+    }
+    assert manifest["eligible_count"] == 1
+    assert manifest["rejected_count"] == 1
+    assert_runtime_manifest_not_executable(manifest)
+    with pytest.raises(RuntimeEligibilityPolicyError):
+        assert_runtime_manifest_not_executable(dict(manifest, executable=True))
+    with pytest.raises(RuntimeEligibilityPolicyError):
+        assert_runtime_manifest_not_executable(dict(manifest, activate=True))
+
+
+# ---------------------------------------------------------------------------
+# EC-24 / EC-25 — 隔离与七存储
+# ---------------------------------------------------------------------------
+
+def test_ec_24_shadow_evaluation_creates_no_binding_ledger_or_write(
+    tmp_path, owner_keys
+):
+    """EC-24: 影子评估不创建绑定、不写账本、不写生产数据。"""
+    workspace = tmp_path / "ec24"
+    workspace.mkdir()
+    (workspace / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    before_listing = sorted(os.listdir(workspace))
+    before_bytes = (workspace / "sentinel.txt").read_bytes()
+
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    report = shadow_runtime_eligibility_check(
+        workspace=str(workspace),
+        proposal=proposal,
+        approval=approval,
+        source_observation=observation,
+        runtime_context=context,
+        evaluated_at=EVALUATED_AT,
+        scenario="EC-24",
+    )
+    assert report["eligibility_result"] == RuntimeEligibilityResult.ELIGIBLE.value
+    assert report["ledger_written"] is False
+    assert report["files_written"] == 0
+    assert report["bindings_created"] == 0
+    assert report["canonical_records_modified"] == 0
+    assert report["is_production_authority"] is False
+    assert report["runtime_mapping_activation"] == RUNTIME_MAPPING_ACTIVATION
+    assert report["decision"]["is_production_authorization"] is False
+
+    assert sorted(os.listdir(workspace)) == before_listing
+    assert (workspace / "sentinel.txt").read_bytes() == before_bytes
+    assert not (workspace / "mapping_governance_ledger.jsonl").exists()
+
+
+def test_ec_25_all_seven_stores_remain_byte_identical(
+    isolated_data_dir, monkeypatch, owner_keys
+):
+    """EC-25: 修正后的判定与拒绝路径都不改动七个持久化存储。"""
+    _seed_seven_stores(isolated_data_dir)
+    _fake_sources(
+        monkeypatch,
+        live_football=[
+            _market_row(
+                match_id="m-live",
+                odds={"home_win": 1.9, "draw": 3.4, "away_win": 3.8},
+            )
+        ],
+    )
+    scraper.refresh(verbose=False)
+    before = _hash_seven_stores(isolated_data_dir)
+    assert len(before) == 7 and all(len(v) == 64 for v in before.values())
+
+    observation, proposal, approval, context = _valid_setup(owner_keys)
+    workspace = str(isolated_data_dir.parent / "ec25_shadow")
+
+    # 合格路径、拒绝路径、清单与影子入口全部执行一遍。
+    evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    for broken_context in (
+        _context(owner_keys, proposal, recorded_proposal_fingerprint=None),
+        _context(owner_keys, proposal, recorded_proposal_state=None),
+        _context(owner_keys, proposal, current_baseline_fingerprint="baseline-B"),
+        _context(owner_keys, proposal, required_rewrite_targets=("settlements.json",)),
+    ):
+        evaluate_runtime_mapping_eligibility(
+            proposal, approval, observation, broken_context, evaluated_at=EVALUATED_AT
+        )
+    build_runtime_readiness_manifest(
+        fixture_identity="ec25",
+        decisions=[
+            evaluate_runtime_mapping_eligibility(
+                proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+            )
+        ],
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    shadow_runtime_readiness_report(
+        workspace=workspace,
+        proposals=[proposal],
+        observations=[observation],
+        canonical_fixture=[_market_row()],
+        dataset_identity=DATASET,
+        baseline_fingerprint=BASELINE,
+        trusted_public_key_path=owner_keys["public"],
+    )
+
+    assert _hash_seven_stores(isolated_data_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# EC-26 / EC-27 / EC-28 — 既有行为与审计不变
+# ---------------------------------------------------------------------------
+
+def test_ec_26_existing_ingestion_identity_behavior_remains_unchanged():
+    """EC-26: 既有摄取身份行为不变（规划器语义与权威归属均未改）。"""
+    with pytest.raises(CanonicalIdentityCollisionError) as exc:
+        plan_ingestion_identity(
+            [],
+            [
+                _market_row(match_id="500j-2030-05-01-001", number="001"),
+                _market_row(
+                    match_id="500j-2030-05-01-001", number="001",
+                    sport="basketball", home="湖人", away="勇士",
+                ),
+            ],
+        )
+    assert exc.value.category == "SAME_SOURCE_ALIAS_DIFFERENT_EVENT"
+
+    with pytest.raises(CanonicalIdentityCollisionError) as dup:
+        plan_ingestion_identity(
+            [_market_row(match_id="dup-1"), _market_row(match_id="dup-1")], []
+        )
+    assert dup.value.category == "PREEXISTING_DUPLICATE"
+
+    for name in ("ingestion_identity.py", "match_identity.py", "scraper.py"):
+        source = open(os.path.join(REPO_ROOT, "utils", name), encoding="utf-8").read()
+        assert "runtime_mapping" not in source, name
+    assert governance_status()["runtime_identity_authority"] == (
+        "utils.ingestion_identity.validate_ingestion_identity"
+    )
+
+
+def test_ec_27_historical_ed25519_approval_audit_continues_to_work(
+    tmp_path, owner_keys
+):
+    """EC-27: 历史 Ed25519 批准审计继续工作；隔离快照只读且保留信任锚警告。"""
+    observation = _observation()
+    proposal = _proposal(observation)
+    workspace = tmp_path / "ec27_gov"
+    workspace.mkdir()
+    ledger = GovernanceLedger(
+        str(workspace / "mapping_governance_ledger.jsonl"), dataset_identity=DATASET
+    )
+    ledger.append(
+        proposal=proposal,
+        to_state="PROPOSED",
+        actor=OPERATOR,
+        actor_role="operator",
+        reason="propose",
+        baseline_fingerprint=BASELINE,
+    )
+    approval = _approval(proposal, observation, owner_keys)
+    ledger.append(
+        proposal=proposal,
+        to_state="APPROVED",
+        actor=APPROVER,
+        actor_role="owner",
+        reason="approve",
+        baseline_fingerprint=BASELINE,
+        approval=approval,
+        trusted_public_key_path=owner_keys["public"],
+        source_observation_fingerprint=observation.semantic_fingerprint(),
+    )
+
+    audit = audit_historical_approvals(
+        ledger, trusted_public_key_path=owner_keys["public"], dataset_identity=DATASET
+    )
+    assert audit["approved_decisions"] == 1
+    assert audit["failures"] == []
+
+    with open(ledger.path, "rb") as handle:
+        ledger_bytes = handle.read()
+    snapshot = build_isolated_governance_snapshot(
+        ledger,
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+        trusted_public_key_path=owner_keys["public"],
+    )
+    # 只读：账本逐字节不变。
+    with open(ledger.path, "rb") as handle:
+        assert handle.read() == ledger_bytes
+
+    assert isinstance(snapshot, IsolatedGovernanceSnapshot)
+    assert snapshot.structural_integrity == "OK"
+    assert snapshot.authenticated_approval_audit == (
+        "AUTHENTICATED_MAPPING_APPROVAL_AUDIT"
+    )
+    assert snapshot.state_of(proposal.proposal_id) == "APPROVED"
+    assert snapshot.fingerprint_of(proposal.proposal_id) == proposal.fingerprint()
+    assert snapshot.provenance.source == CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    # 账本信任锚警告被原样保留（哈希链不是外部信任锚）。
+    assert "NONE" in snapshot.provenance.ledger_trust_anchor
+    assert snapshot.as_dict()["is_production_authority"] is False
+
+    context = RuntimeMappingContext(
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+        evidence_provenance=snapshot.provenance,
+        canonical_ids=(CANONICAL_ID,),
+        trusted_public_key_path=owner_keys["public"],
+        expected_approver=APPROVER,
+        expected_operator=OPERATOR,
+        recorded_proposal_id=proposal.proposal_id,
+        recorded_proposal_fingerprint=snapshot.fingerprint_of(proposal.proposal_id),
+        recorded_proposal_state=snapshot.state_of(proposal.proposal_id),
+    )
+    decision = evaluate_runtime_mapping_eligibility(
+        proposal, approval, observation, context, evaluated_at=EVALUATED_AT
+    )
+    assert decision.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+    assert decision.evidence_provenance == CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+    assert decision.is_conditional is True
+    assert decision.is_production_authorization is False
+
+    # 缺少可信公钥时审计**不**执行，并如实记录限制（绝不信任内嵌公钥）。
+    without_key = build_isolated_governance_snapshot(
+        ledger,
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=BASELINE,
+    )
+    assert without_key.authenticated_approval_audit == "NOT_PERFORMED"
+    assert any(
+        "trusted public key" in limitation
+        for limitation in without_key.provenance.verification_limitations
+    )
+
+
+def test_ec_28_ci_declares_ubuntu_and_windows_regressions():
+    """EC-28: CI 声明的四个必需 job 与双平台矩阵保持存在。"""
+    workflow = _ci_workflow()
+    for job in (
+        "Offline pytest suite",
+        "Isolated Canonical repair lifecycle",
+    ):
+        assert job in workflow, job
+    assert "ubuntu-latest" in workflow
+    assert "windows-latest" in workflow
+    assert re.search(r"os:\s*\[ubuntu-latest,\s*windows-latest\]", workflow)
+    assert re.search(r'python-version:\s*\["3\.12"\]', workflow)

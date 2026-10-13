@@ -39,6 +39,23 @@
 ``evaluated_at`` 是元数据，刻意**不**参与 ``decision_id`` —— 与治理账本的
 ``_decision_fingerprint`` 排除 ``occurred_at`` 的口径一致，因此同一组输入的判定
 身份与时钟无关，重复评估天然幂等。
+
+证据绑定与来源
+--------------
+判定不只看「签名是否有效」，还要求**证据本身自洽**：
+
+- 当前 ``SourceObservation`` 必须真正被提案的证据覆盖（观测指纹属于提案的观测指纹
+  集合；单一观测提案还要求观测引用与当前观测 ID 一致）；
+- 由观测**独立推导**的作用域身份键与作用域必须与提案一致 —— 因此「用另一个观测的
+  指纹签名的有效批准」无法把不一致的证据变成合格证据；
+- **已记录**的提案指纹与治理状态必须存在且与当前提案一致；缺失即拒绝，
+  绝不回退到提案自述状态（提案无法自证「已被批准」）；
+- 治理事实的**来源**必须显式声明：调用方断言 / 隔离快照产生的判定是
+  **条件式影子就绪判定**，绝不是生产授权；声称「独立验证过的账本证据」在本阶段
+  一律阻断（没有代码路径能建立该证据）。
+
+> 一条曾经为 ELIGIBLE 的判定**不是**永久授权：任何实质性的治理或 Canonical 基线
+> 变化之后都必须重新评估。
 """
 from __future__ import annotations
 
@@ -49,6 +66,7 @@ from typing import Any, Mapping, Sequence
 
 from utils.mapping_governance import (
     GovernanceError,
+    LEDGER_TRUST_ANCHOR_STATEMENT,
     MappingProposal,
     PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
     RUNTIME_LEDGER_ENFORCEMENT,
@@ -60,17 +78,23 @@ from utils.runtime_mapping_policy import (
     ALLOWED_ACTIONS,
     ALLOWED_APPROVAL_PURPOSES,
     ALLOWED_APPROVAL_VERSIONS,
+    ALLOWED_CONTEXT_EVIDENCE_PROVENANCE,
     ALLOWED_IDENTITY_KEY_VERSIONS,
     ALLOWED_PROVIDER_ID_UNIQUENESS_SCOPES,
     ALLOWED_PROPOSAL_STATES,
     ALLOWED_RUNTIME_IDENTITY_KEYS,
     ALLOWED_SOURCE_SCOPES,
     BLOCKED_ACTIONS,
+    BLOCKED_CONTEXT_EVIDENCE_PROVENANCE,
     BLOCKED_IDENTITY_TYPES,
     BLOCKED_IDENTITY_STABILITIES,
     BLOCKED_PROVIDER_ID_UNIQUENESS_SCOPES,
     BLOCKED_RAW_IDENTIFIER_TYPES,
+    CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+    CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT,
+    CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER,
     EVALUATION_STORES,
+    KNOWN_PROPOSAL_STATES,
     REJECTION_CODES,
     RUNTIME_ELIGIBILITY_RULES,
     RUNTIME_MAPPING_ACTIVATION,
@@ -85,6 +109,7 @@ from utils.source_identity import (
     IdentifierStability,
     IdentityKeyKind,
     ProviderIdUniquenessScope,
+    ScopedSourceIdentityKey,
     SourceObservation,
     canonical_json,
     fingerprint,
@@ -92,10 +117,16 @@ from utils.source_identity import (
 )
 
 #: 评估器版本。任何影响判定结果的变化都必须提升该版本。
-RUNTIME_ELIGIBILITY_EVALUATOR_VERSION = "1.0.0"
+#:
+#: ``1.1.0``：新增证据绑定（观测 ↔ 提案）、记录指纹完整性、记录状态完整性与
+#: 上下文证据来源规则；移除「缺失记录状态回退到提案自述状态」的路径。
+RUNTIME_ELIGIBILITY_EVALUATOR_VERSION = "1.1.0"
 
 #: 决策对象 schema 版本。
-RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION = "1.0.0"
+#:
+#: ``1.1.0``：新增 ``evidence_provenance`` 字段（治理证据来源），
+#: 使「条件式影子就绪判定」与「独立验证过的证据」在工件层面无法混淆。
+RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION = "1.1.0"
 
 #: 就绪清单 schema 版本。
 RUNTIME_READINESS_MANIFEST_SCHEMA_VERSION = "1.0.0"
@@ -136,16 +167,159 @@ def _utc_now() -> str:
 # =============================================================================
 
 @dataclass(frozen=True)
+class GovernanceEvidenceProvenance:
+    """
+    治理上下文的**证据来源**契约（只读、不可变）。
+
+    它回答四个问题，且刻意**不**把「自述的布尔值」当作「验证确实发生过」：
+
+    1. 已记录的提案指纹 / 状态来自哪里？
+    2. 这些信息指向哪个数据集与哪个基线？
+    3. 结构性账本校验**是否真的**执行过？
+    4. Ed25519 历史批准审计**是否真的**执行过？
+
+    ``source`` 取值受策略注册表约束：
+
+    - ``CALLER_ASSERTED_CONTEXT``：调用方自行断言 —— 由此产生的判定是
+      **条件式影子就绪判定**，绝不是生产授权。
+    - ``ISOLATED_SNAPSHOT_CONTEXT``：来自隔离的合成治理夹具快照；结构校验 / 批准审计
+      可能已执行，但账本哈希链本身不是外部信任锚。
+    - ``VERIFIED_GOVERNANCE_EVIDENCE``：声称由独立验证过的账本证据支撑。
+      本阶段**没有**任何代码路径能建立该证据，因此该来源一律被阻断。
+
+    ``structural_ledger_validation_performed`` 与
+    ``authenticated_approval_audit_performed`` 是**自述声明**，评估器绝不据此升级信任；
+    它们只用于如实报告「哪些验证据称执行过」，并在决策中连同
+    ``verification_limitations`` 一起暴露。
+    """
+
+    source: str
+    recorded_proposal_fingerprint_origin: str = ""
+    recorded_proposal_state_origin: str = ""
+    dataset_identity: str = ""
+    baseline_fingerprint: str = ""
+    structural_ledger_validation_performed: bool = False
+    authenticated_approval_audit_performed: bool = False
+    verification_limitations: tuple[str, ...] = ()
+    ledger_trust_anchor: str = ""
+
+    # -- 派生视图（只读） ---------------------------------------------------
+
+    @property
+    def is_conditional(self) -> bool:
+        """该来源是否只支持**条件式**判定（未独立验证 -> 是）。"""
+        return self.source != CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER
+
+    @property
+    def is_supported(self) -> bool:
+        """该来源是否为本阶段可支持的来源。"""
+        return self.source in ALLOWED_CONTEXT_EVIDENCE_PROVENANCE
+
+    def as_dict(self) -> dict:
+        return {
+            "source": self.source,
+            "recorded_proposal_fingerprint_origin": (
+                self.recorded_proposal_fingerprint_origin
+            ),
+            "recorded_proposal_state_origin": self.recorded_proposal_state_origin,
+            "dataset_identity": self.dataset_identity,
+            "baseline_fingerprint": self.baseline_fingerprint,
+            "structural_ledger_validation_performed": (
+                self.structural_ledger_validation_performed
+            ),
+            "authenticated_approval_audit_performed": (
+                self.authenticated_approval_audit_performed
+            ),
+            "verification_limitations": list(self.verification_limitations),
+            "ledger_trust_anchor": self.ledger_trust_anchor,
+            "is_conditional": self.is_conditional,
+        }
+
+
+def caller_asserted_provenance(
+    *,
+    dataset_identity: str = "",
+    baseline_fingerprint: str = "",
+    recorded_proposal_fingerprint_origin: str = "caller-supplied",
+    recorded_proposal_state_origin: str = "caller-supplied",
+) -> GovernanceEvidenceProvenance:
+    """
+    构造一份**调用方断言**来源（本阶段默认、且唯一无需外部文件即可构造的来源）。
+
+    明确记录限制：没有结构性账本校验、没有历史批准审计、账本不是信任锚。
+    """
+    return GovernanceEvidenceProvenance(
+        source=CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+        recorded_proposal_fingerprint_origin=recorded_proposal_fingerprint_origin,
+        recorded_proposal_state_origin=recorded_proposal_state_origin,
+        dataset_identity=dataset_identity,
+        baseline_fingerprint=baseline_fingerprint,
+        structural_ledger_validation_performed=False,
+        authenticated_approval_audit_performed=False,
+        verification_limitations=(
+            "The recorded governance facts were supplied by the caller; no structural "
+            "ledger validation and no authenticated approval audit were performed.",
+            "A conditional shadow-readiness decision is not a production authorization.",
+        ),
+        ledger_trust_anchor=LEDGER_TRUST_ANCHOR_STATEMENT,
+    )
+
+
+def isolated_snapshot_provenance(
+    *,
+    dataset_identity: str = "",
+    baseline_fingerprint: str = "",
+    recorded_proposal_fingerprint_origin: str = "",
+    recorded_proposal_state_origin: str = "",
+    structural_ledger_validation_performed: bool = False,
+    authenticated_approval_audit_performed: bool = False,
+    verification_limitations: Sequence[str] = (),
+    ledger_trust_anchor: str = LEDGER_TRUST_ANCHOR_STATEMENT,
+) -> GovernanceEvidenceProvenance:
+    """
+    构造一份**隔离快照**来源。
+
+    ``ledger_trust_anchor`` 默认为账本自身的信任锚声明（哈希链只证明内部一致性，
+    不是外部信任锚），且调用方无法静默把它改成「已防篡改」。
+    """
+    limitations = tuple(str(item) for item in verification_limitations)
+    if not limitations:
+        limitations = (
+            "The recorded governance facts come from an isolated synthetic governance "
+            "fixture; they are not production ledger authority.",
+        )
+    return GovernanceEvidenceProvenance(
+        source=CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT,
+        recorded_proposal_fingerprint_origin=recorded_proposal_fingerprint_origin,
+        recorded_proposal_state_origin=recorded_proposal_state_origin,
+        dataset_identity=dataset_identity,
+        baseline_fingerprint=baseline_fingerprint,
+        structural_ledger_validation_performed=bool(
+            structural_ledger_validation_performed
+        ),
+        authenticated_approval_audit_performed=bool(
+            authenticated_approval_audit_performed
+        ),
+        verification_limitations=limitations,
+        ledger_trust_anchor=ledger_trust_anchor,
+    )
+
+
+@dataclass(frozen=True)
 class RuntimeMappingContext:
     """
     评估所需的**全部**运行期事实（不可变）。
 
     刻意把「运行期知道什么」显式化，使评估成为纯函数：同样的上下文 + 同样的输入
     必然得到同样的判定。本类型不持有任何写入能力。
+
+    ``evidence_provenance`` 是**必填**的：调用方必须显式声明治理事实的来源，
+    否则无法区分「条件式影子就绪判定」与「独立验证过的证据」。
     """
 
     dataset_identity: str
     current_baseline_fingerprint: str
+    evidence_provenance: GovernanceEvidenceProvenance
     #: 运行期已知的 Canonical ID 集合。
     canonical_ids: tuple[str, ...] = ()
     #: 显式可信的所有者公钥路径（**必须**由调用方提供；内嵌公钥永不作为信任锚）。
@@ -153,7 +327,8 @@ class RuntimeMappingContext:
     #: 运行期期望的批准人 / 操作者身份。
     expected_approver: str | None = None
     expected_operator: str | None = None
-    #: 治理账本中记录的提案指纹与当前状态（只读快照）。
+    #: 治理账本中记录的提案 ID / 指纹 / 当前状态（只读快照）。
+    recorded_proposal_id: str | None = None
     recorded_proposal_fingerprint: str | None = None
     recorded_proposal_state: str | None = None
     #: 是否显式允许「新事件」模式（目标 Canonical ID 尚不存在）。
@@ -198,10 +373,12 @@ class RuntimeMappingContext:
         return {
             "dataset_identity": self.dataset_identity,
             "current_baseline_fingerprint": self.current_baseline_fingerprint,
+            "evidence_provenance": self.evidence_provenance.as_dict(),
             "canonical_ids": sorted(self.canonical_id_set()),
             "trust_anchor_supplied": self.trusted_public_key_path is not None,
             "expected_approver": self.expected_approver,
             "expected_operator": self.expected_operator,
+            "recorded_proposal_id": self.recorded_proposal_id,
             "recorded_proposal_fingerprint": self.recorded_proposal_fingerprint,
             "recorded_proposal_state": self.recorded_proposal_state,
             "allow_new_event": self.allow_new_event,
@@ -244,12 +421,34 @@ class RuntimeMappingEligibilityDecision:
     evidence_fingerprint: str
     approval_fingerprint: str
     baseline_fingerprint: str
+    #: 治理证据来源（见 ``GovernanceEvidenceProvenance``）。ELIGIBLE 且来源为
+    #: 条件式（调用方断言 / 隔离快照）时，该判定**只是**条件式影子就绪判定，
+    #: 绝不是生产授权。
+    evidence_provenance: str = CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED
 
     # -- 视图 -------------------------------------------------------------
 
     @property
     def is_eligible(self) -> bool:
         return self.eligibility_result == RuntimeEligibilityResult.ELIGIBLE.value
+
+    @property
+    def is_conditional(self) -> bool:
+        """
+        该判定是否为**条件式**（治理事实未经独立验证）。
+
+        只要来源不是独立验证过的账本证据，即为条件式 —— 无论结果是
+        ELIGIBLE 还是 NOT_ELIGIBLE。
+        """
+        return self.evidence_provenance != CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER
+
+    @property
+    def is_production_authorization(self) -> bool:
+        """
+        是否构成生产授权。**永远为 False**：本阶段不存在生产映射授权，
+        且独立验证过的证据来源不可达。
+        """
+        return False
 
     @property
     def rejection_reasons(self) -> tuple[str, ...]:
@@ -271,12 +470,15 @@ class RuntimeMappingEligibilityDecision:
             "evidence_fingerprint": self.evidence_fingerprint,
             "approval_fingerprint": self.approval_fingerprint,
             "baseline_fingerprint": self.baseline_fingerprint,
+            "evidence_provenance": self.evidence_provenance,
         }
 
     def as_dict(self) -> dict:
         payload = self.identity_payload()
         payload["decision_id"] = self.decision_id
         payload["evaluated_at"] = self.evaluated_at
+        payload["is_conditional"] = self.is_conditional
+        payload["is_production_authorization"] = self.is_production_authorization
         return payload
 
     def to_json(self) -> str:
@@ -304,6 +506,9 @@ class _EvaluationFacts:
         "raw_identifier_type",
         "identifier_stability",
         "observation_fingerprint",
+        "observation_id",
+        "derived_identity_key",
+        "derived_scope",
         "approval_fp",
         "proposal_fingerprint",
         "canonical_id",
@@ -348,6 +553,17 @@ class _EvaluationFacts:
             if observation is not None and hasattr(observation, "semantic_fingerprint")
             else ""
         )
+        self.observation_id = (
+            str(getattr(observation, "observation_id", "")) if observation else ""
+        )
+        # 由观测**独立推导**的身份键与作用域（绝不复用提案自述值）。
+        if observation is not None and hasattr(observation, "stability_scope"):
+            derived_key = ScopedSourceIdentityKey.for_observation(observation)
+            self.derived_identity_key = derived_key.as_dict()
+            self.derived_scope = dict(observation.stability_scope.as_dict())
+        else:
+            self.derived_identity_key = {}
+            self.derived_scope = {}
         self.approval_fp = (
             approval_fingerprint(approval) if isinstance(approval, Mapping) else ""
         )
@@ -419,6 +635,74 @@ def _approval_absent(facts: _EvaluationFacts) -> bool:
     if not isinstance(facts.approval, Mapping):
         return True
     return not dict(facts.approval)
+
+
+# ---------------------------------------------------------------------------
+# 证据绑定检查（SourceObservation ↔ MappingProposal）
+# ---------------------------------------------------------------------------
+
+def _check_source_observation_in_proposal(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """
+    当前观测必须**真正被提案的证据覆盖**。
+
+    - 观测缺失 / 无有效指纹 -> 拒绝；
+    - 提案的观测引用必须非空；
+    - 观测指纹必须属于提案的观测指纹集合（提案可合法携带**多个**观测指纹，
+      因此绝不要求它必须是第一个）；
+    - 提案只携带单个观测指纹时，其观测引用必须与当前观测 ID 一致。
+    """
+    if not isinstance(facts.proposal, MappingProposal):
+        return ()
+    if not facts.observation_fingerprint or not facts.observation_id:
+        return ("SOURCE_OBSERVATION_NOT_IN_PROPOSAL",)
+
+    reference = str(facts.proposal.source_observation_ref or "").strip()
+    if not reference:
+        return ("SOURCE_OBSERVATION_NOT_IN_PROPOSAL",)
+
+    fingerprints = tuple(str(f) for f in facts.proposal.observation_fingerprints)
+    if facts.observation_fingerprint not in fingerprints:
+        return ("SOURCE_OBSERVATION_NOT_IN_PROPOSAL",)
+
+    if len(fingerprints) == 1 and reference != facts.observation_id:
+        return ("SOURCE_OBSERVATION_NOT_IN_PROPOSAL",)
+    return ()
+
+
+def _check_source_identity_key_matches(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """
+    由 SourceObservation **独立推导**的作用域身份键必须与提案的身份键一致。
+
+    因此「用另一个观测的指纹签名的有效批准」无法把不一致的证据变成合格证据。
+    """
+    if not isinstance(facts.proposal, MappingProposal):
+        return ()
+    if not facts.derived_identity_key:
+        return ()
+    if canonical_json(facts.derived_identity_key) != facts.proposal.source_key:
+        return ("SOURCE_IDENTITY_KEY_MISMATCH",)
+    return ()
+
+
+def _check_source_scope_matches(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """观测的源作用域必须与提案声明的作用域一致（逐维比较可独立推导的维度）。"""
+    if not isinstance(facts.proposal, MappingProposal):
+        return ()
+    if not facts.derived_scope:
+        return ()
+    claimed = facts.proposal.scope_dict
+    for dimension in (
+        "adapter",
+        "sport",
+        "event_date",
+        "provider_namespace",
+        "raw_identifier_type",
+    ):
+        if dimension not in claimed:
+            continue
+        if str(claimed.get(dimension, "")) != str(facts.derived_scope.get(dimension, "")):
+            return ("SOURCE_SCOPE_MISMATCH",)
+    return ()
 
 
 def _check_identity_key_version_current(facts: _EvaluationFacts) -> tuple[str, ...]:
@@ -508,19 +792,103 @@ def _check_proposal_present(facts: _EvaluationFacts) -> tuple[str, ...]:
     return ()
 
 
-def _check_proposal_fingerprint_matches(facts: _EvaluationFacts) -> tuple[str, ...]:
+def _check_governance_evidence_provenance_supported(
+    facts: _EvaluationFacts,
+) -> tuple[str, ...]:
+    """
+    上下文必须声明一个本阶段**可支持**的治理证据来源。
+
+    刻意**不**把 ``structural_ledger_validation_performed`` /
+    ``authenticated_approval_audit_performed`` 这两个自述布尔值当作验证确实发生的证据：
+    本阶段没有任何代码路径能独立建立「已由独立验证过的账本证据支撑」这一档，
+    因此任何声称该来源的上下文一律阻断。
+    """
+    provenance = facts.context.evidence_provenance
+    if provenance is None:
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    if provenance.source in BLOCKED_CONTEXT_EVIDENCE_PROVENANCE:
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    if provenance.source not in ALLOWED_CONTEXT_EVIDENCE_PROVENANCE:
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    return ()
+
+
+def _check_proposal_fingerprint_present(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """
+    **必须**存在已记录的提案指纹。
+
+    缺失 / 空白 / 非字符串一律拒绝 —— 绝不把「没有记录」当作「校验可选」。
+    """
     recorded = facts.context.recorded_proposal_fingerprint
     if recorded is None:
+        return ("PROPOSAL_FINGERPRINT_MISSING",)
+    if not isinstance(recorded, str) or not recorded.strip():
+        return ("PROPOSAL_FINGERPRINT_MISSING",)
+    return ()
+
+
+def _check_proposal_fingerprint_matches(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """
+    已记录的提案指纹必须与当前提案指纹逐字一致。
+
+    格式不合法（非 64 位小写十六进制）同样按不一致处理。
+    指纹匹配**只**说明与已记录值一致，并不证明账本本身可信（那是来源契约的事）。
+    """
+    recorded = facts.context.recorded_proposal_fingerprint
+    if not isinstance(recorded, str) or not recorded.strip():
         return ()
+    if not _is_sha256_hex(recorded):
+        return ("PROPOSAL_FINGERPRINT_MISMATCH",)
     if recorded != facts.proposal_fingerprint:
         return ("PROPOSAL_FINGERPRINT_MISMATCH",)
     return ()
 
 
-def _check_proposal_state_active(facts: _EvaluationFacts) -> tuple[str, ...]:
+def _is_sha256_hex(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    return all(character in "0123456789abcdef" for character in value)
+
+
+def _check_recorded_state_present(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """**必须**存在已记录的治理状态；缺失即拒绝（绝不回退到提案自述状态）。"""
     state = facts.context.recorded_proposal_state
     if state is None:
-        state = facts.proposal.status if isinstance(facts.proposal, MappingProposal) else ""
+        return ("RECORDED_STATE_MISSING",)
+    if not isinstance(state, str) or not state.strip():
+        return ("RECORDED_STATE_MISSING",)
+    return ()
+
+
+def _check_recorded_state_known(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """已记录状态必须是已知状态之一。"""
+    state = facts.context.recorded_proposal_state
+    if not isinstance(state, str) or not state.strip():
+        return ()
+    if state not in KNOWN_PROPOSAL_STATES:
+        return ("RECORDED_STATE_UNKNOWN",)
+    return ()
+
+
+def _check_recorded_state_proposal_matches(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """已记录状态必须对应**被评估的那个提案 ID**。"""
+    if not isinstance(facts.proposal, MappingProposal):
+        return ()
+    recorded_id = facts.context.recorded_proposal_id
+    if recorded_id is None or not str(recorded_id).strip():
+        return ("RECORDED_STATE_PROPOSAL_MISMATCH",)
+    if str(recorded_id) != facts.proposal.proposal_id:
+        return ("RECORDED_STATE_PROPOSAL_MISMATCH",)
+    return ()
+
+
+def _check_proposal_state_active(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """
+    已记录状态必须是活动终态。
+
+    刻意**不再**回退到 ``proposal.status``：提案本身无法自证「已被批准」。
+    """
+    state = facts.context.recorded_proposal_state
     if state not in ALLOWED_PROPOSAL_STATES:
         return ("MAPPING_STATE_NOT_ACTIVE",)
     return ()
@@ -750,6 +1118,9 @@ def _check_no_pending_ambiguity(facts: _EvaluationFacts) -> tuple[str, ...]:
 
 #: 规则码 -> 纯检查函数。**唯一**的分派表。
 _RULE_CHECKS = {
+    "SOURCE_OBSERVATION_IN_PROPOSAL": _check_source_observation_in_proposal,
+    "SOURCE_IDENTITY_KEY_MATCHES": _check_source_identity_key_matches,
+    "SOURCE_SCOPE_MATCHES": _check_source_scope_matches,
     "IDENTITY_KEY_VERSION_CURRENT": _check_identity_key_version_current,
     "IDENTITY_KEY_KIND_ALLOWED": _check_identity_key_kind_allowed,
     "IDENTITY_EVIDENCE_SUFFICIENT": _check_identity_evidence_sufficient,
@@ -762,7 +1133,14 @@ _RULE_CHECKS = {
     "IDENTITY_NOT_AMBIGUOUS": _check_identity_not_ambiguous,
     "NO_COMPETING_CANONICAL_OWNERS": _check_no_competing_canonical_owners,
     "PROPOSAL_PRESENT": _check_proposal_present,
+    "GOVERNANCE_EVIDENCE_PROVENANCE_SUPPORTED": (
+        _check_governance_evidence_provenance_supported
+    ),
+    "PROPOSAL_FINGERPRINT_PRESENT": _check_proposal_fingerprint_present,
     "PROPOSAL_FINGERPRINT_MATCHES": _check_proposal_fingerprint_matches,
+    "RECORDED_STATE_PRESENT": _check_recorded_state_present,
+    "RECORDED_STATE_KNOWN": _check_recorded_state_known,
+    "RECORDED_STATE_PROPOSAL_MATCHES": _check_recorded_state_proposal_matches,
     "PROPOSAL_STATE_ACTIVE": _check_proposal_state_active,
     "MAPPING_NOT_REVOKED": _check_mapping_not_revoked,
     "MAPPING_NOT_SUPERSEDED": _check_mapping_not_superseded,
@@ -870,6 +1248,7 @@ def evaluate_runtime_mapping_eligibility(
         "evidence_fingerprint": facts.observation_fingerprint,
         "approval_fingerprint": facts.approval_fp,
         "baseline_fingerprint": current_runtime_context.current_baseline_fingerprint,
+        "evidence_provenance": current_runtime_context.evidence_provenance.source,
     }
 
     return RuntimeMappingEligibilityDecision(
@@ -885,6 +1264,7 @@ def evaluate_runtime_mapping_eligibility(
         evidence_fingerprint=facts.observation_fingerprint,
         approval_fingerprint=facts.approval_fp,
         baseline_fingerprint=current_runtime_context.current_baseline_fingerprint,
+        evidence_provenance=current_runtime_context.evidence_provenance.source,
     )
 
 
@@ -916,6 +1296,13 @@ def build_runtime_readiness_manifest(
         for code in decision.rejection_codes:
             reason_histogram[code] = reason_histogram.get(code, 0) + 1
 
+    provenance_histogram: dict[str, int] = {}
+    for decision in ordered:
+        provenance_histogram[decision.evidence_provenance] = (
+            provenance_histogram.get(decision.evidence_provenance, 0) + 1
+        )
+    conditional = [d for d in ordered if d.is_conditional]
+
     manifest = {
         "kind": RUNTIME_READINESS_MANIFEST_KIND,
         "executable": False,
@@ -925,6 +1312,7 @@ def build_runtime_readiness_manifest(
         "production_mapping_write_authorization": (
             PRODUCTION_MAPPING_WRITE_AUTHORIZATION
         ),
+        "production_authorization_granted": False,
         "manifest_schema_version": RUNTIME_READINESS_MANIFEST_SCHEMA_VERSION,
         "policy_version": RUNTIME_MAPPING_POLICY_VERSION,
         "evaluator_version": RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
@@ -935,6 +1323,13 @@ def build_runtime_readiness_manifest(
         "evaluated_proposal_count": len(ordered),
         "eligible_count": len(eligible),
         "rejected_count": len(rejected),
+        "conditional_decision_count": len(conditional),
+        "verified_evidence_decision_count": len(ordered) - len(conditional),
+        "evidence_provenance_histogram": {
+            source: provenance_histogram[source]
+            for source in sorted(provenance_histogram)
+        },
+        "conditional_decisions_are_production_authorization": False,
         "rejection_reason_histogram": {
             code: reason_histogram[code] for code in sorted(reason_histogram)
         },
@@ -945,8 +1340,11 @@ def build_runtime_readiness_manifest(
         "read_only_stores": list(RUNTIME_READ_ONLY_STORES),
         "forbidden_operations": list(FORBIDDEN_RUNTIME_MANIFEST_KEYS),
         "non_executable_marker": (
-            "This manifest is a read-only readiness analysis. It activates nothing and "
-            "contains no runtime binding operation."
+            "This manifest is a read-only readiness analysis. It activates nothing, "
+            "contains no runtime binding operation, and grants no production "
+            "authorization. An ELIGIBLE conditional decision is not permanent "
+            "authorization: re-evaluation is required after any material governance or "
+            "Canonical baseline change."
         ),
     }
     assert_runtime_manifest_not_executable(manifest)
@@ -998,17 +1396,30 @@ def runtime_eligibility_status() -> dict:
         "production_mapping_write_authorization": (
             PRODUCTION_MAPPING_WRITE_AUTHORIZATION
         ),
+        "production_authorization_granted": False,
         "runtime_identity_authority": (
             "utils.ingestion_identity.validate_ingestion_identity"
         ),
         "rule_count": len(RUNTIME_ELIGIBILITY_RULES),
         "rejection_code_count": len(REJECTION_CODES),
+        "allowed_context_evidence_provenance": sorted(
+            ALLOWED_CONTEXT_EVIDENCE_PROVENANCE
+        ),
+        "blocked_context_evidence_provenance": sorted(
+            BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+        ),
+        "known_proposal_states": sorted(KNOWN_PROPOSAL_STATES),
         "blocked_provider_id_uniqueness_scopes": sorted(
             BLOCKED_PROVIDER_ID_UNIQUENESS_SCOPES
         ),
         "allowed_provider_id_uniqueness_scopes": sorted(
             ALLOWED_PROVIDER_ID_UNIQUENESS_SCOPES
         ),
+        "conditional_decision_source": CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+        "isolated_snapshot_decision_source": (
+            CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT
+        ),
+        "verified_evidence_source_reachable": False,
         "writes_files": False,
         "creates_bindings": False,
         "modifies_canonical_records": False,

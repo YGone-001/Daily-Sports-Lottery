@@ -37,7 +37,9 @@ from utils.source_identity import (
 )
 
 #: 策略注册表版本。任何影响**判定含义**的变化都必须提升该版本。
-RUNTIME_MAPPING_POLICY_VERSION = "1.0.0"
+#:
+#: ``1.1.0``：新增证据绑定规则、记录指纹 / 记录状态完整性规则与上下文证据来源规则。
+RUNTIME_MAPPING_POLICY_VERSION = "1.1.0"
 
 #: 运行期映射激活状态：本阶段**未启用**。
 RUNTIME_MAPPING_ACTIVATION = "NOT_ENABLED"
@@ -87,6 +89,42 @@ ALLOWED_PROVIDER_ID_UNIQUENESS_SCOPES: frozenset[str] = frozenset(
 
 #: 运行期允许的**提案状态**（只有活动终态可被消费）。
 ALLOWED_PROPOSAL_STATES: frozenset[str] = frozenset({MappingState.APPROVED.value})
+
+#: 全部**已知**提案状态。未知状态一律 fail closed（绝不退化为「非活动」而静默放过）。
+KNOWN_PROPOSAL_STATES: frozenset[str] = frozenset(state.value for state in MappingState)
+
+
+# ---------------------------------------------------------------------------
+# 上下文证据来源（Context Evidence Provenance）
+# ---------------------------------------------------------------------------
+
+#: 调用方自行断言治理事实（提案指纹 / 状态 / 绑定）。**不是**独立验证过的证据。
+CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED = "CALLER_ASSERTED_CONTEXT"
+
+#: 治理事实来自一个**隔离的合成治理夹具快照**；结构校验与历史批准审计可能已执行，
+#: 但账本哈希链本身**不是**外部信任锚（见账本信任锚声明）。
+CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT = "ISOLATED_SNAPSHOT_CONTEXT"
+
+#: 治理事实由**独立验证过的账本证据**支撑。
+#:
+#: 本阶段**没有任何代码路径**能独立建立这一档证据（不读取生产账本、不执行生产批准审计），
+#: 因此任何声称该来源的上下文一律被阻断（``EVIDENCE_PROVENANCE_UNSUPPORTED``）。
+#: 将来若接入真实账本验证，应在此处实现该判定，而不是放宽本声明。
+CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER = "VERIFIED_GOVERNANCE_EVIDENCE"
+
+#: 本阶段**允许**的上下文证据来源：调用方断言 与 隔离快照。
+#: 两者产生的判定都是**条件式影子就绪判定**，绝不是生产授权。
+ALLOWED_CONTEXT_EVIDENCE_PROVENANCE: frozenset[str] = frozenset(
+    {
+        CONTEXT_EVIDENCE_PROVENANCE_CALLER_ASSERTED,
+        CONTEXT_EVIDENCE_PROVENANCE_ISOLATED_SNAPSHOT,
+    }
+)
+
+#: 本阶段**阻断**的上下文证据来源（声称即拒绝，绝不据以升级信任）。
+BLOCKED_CONTEXT_EVIDENCE_PROVENANCE: frozenset[str] = frozenset(
+    {CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER}
+)
 
 
 # =============================================================================
@@ -196,6 +234,7 @@ RUNTIME_READ_ONLY_STORES: tuple[str, ...] = (
 # =============================================================================
 
 #: 规则类别。
+RULE_CATEGORY_EVIDENCE_BINDING = "EVIDENCE_BINDING"
 RULE_CATEGORY_IDENTITY = "IDENTITY"
 RULE_CATEGORY_GOVERNANCE = "GOVERNANCE"
 RULE_CATEGORY_RUNTIME_SAFETY = "RUNTIME_SAFETY"
@@ -217,8 +256,32 @@ class RuntimeEligibilityRule:
     rejection_code: str
 
 
-#: **有序**规则表：先身份、再治理、最后运行期安全。
+#: **有序**规则表：先证据绑定、再身份、再治理、最后运行期安全。
 RUNTIME_ELIGIBILITY_RULES: tuple[RuntimeEligibilityRule, ...] = (
+    # -- 证据绑定（SourceObservation ↔ MappingProposal） ---------------------
+    RuntimeEligibilityRule(
+        code="SOURCE_OBSERVATION_IN_PROPOSAL",
+        category=RULE_CATEGORY_EVIDENCE_BINDING,
+        requirement=(
+            "当前观测必须真正被提案的证据覆盖：观测指纹属于提案的观测指纹集合，"
+            "且提案的观测引用与该证据一致。"
+        ),
+        rejection_code="SOURCE_OBSERVATION_NOT_IN_PROPOSAL",
+    ),
+    RuntimeEligibilityRule(
+        code="SOURCE_IDENTITY_KEY_MATCHES",
+        category=RULE_CATEGORY_EVIDENCE_BINDING,
+        requirement=(
+            "由 SourceObservation **独立推导**的作用域身份键必须与提案的身份键一致。"
+        ),
+        rejection_code="SOURCE_IDENTITY_KEY_MISMATCH",
+    ),
+    RuntimeEligibilityRule(
+        code="SOURCE_SCOPE_MATCHES",
+        category=RULE_CATEGORY_EVIDENCE_BINDING,
+        requirement="观测的源作用域必须与提案声明的作用域一致。",
+        rejection_code="SOURCE_SCOPE_MISMATCH",
+    ),
     # -- 身份 ---------------------------------------------------------------
     RuntimeEligibilityRule(
         code="IDENTITY_KEY_VERSION_CURRENT",
@@ -294,15 +357,54 @@ RUNTIME_ELIGIBILITY_RULES: tuple[RuntimeEligibilityRule, ...] = (
         rejection_code="PROPOSAL_MISSING",
     ),
     RuntimeEligibilityRule(
+        code="GOVERNANCE_EVIDENCE_PROVENANCE_SUPPORTED",
+        category=RULE_CATEGORY_GOVERNANCE,
+        requirement=(
+            "上下文必须显式声明治理证据来源，且该来源必须是本阶段可支持的来源"
+            "（调用方断言 / 隔离快照）；声称独立验证过的账本证据一律阻断。"
+        ),
+        rejection_code="EVIDENCE_PROVENANCE_UNSUPPORTED",
+    ),
+    RuntimeEligibilityRule(
+        code="PROPOSAL_FINGERPRINT_PRESENT",
+        category=RULE_CATEGORY_GOVERNANCE,
+        requirement=(
+            "必须存在**已记录**的提案指纹；缺失 / 空白即拒绝，"
+            "绝不把「没有记录」当作「校验可选」。"
+        ),
+        rejection_code="PROPOSAL_FINGERPRINT_MISSING",
+    ),
+    RuntimeEligibilityRule(
         code="PROPOSAL_FINGERPRINT_MATCHES",
         category=RULE_CATEGORY_GOVERNANCE,
-        requirement="提案指纹必须与运行期记录的指纹一致。",
+        requirement=(
+            "已记录的提案指纹必须与当前提案指纹逐字一致"
+            "（格式不合法同样按不一致处理）。"
+        ),
         rejection_code="PROPOSAL_FINGERPRINT_MISMATCH",
+    ),
+    RuntimeEligibilityRule(
+        code="RECORDED_STATE_PRESENT",
+        category=RULE_CATEGORY_GOVERNANCE,
+        requirement="必须存在**已记录**的治理状态；缺失即拒绝（绝不回退到提案自述状态）。",
+        rejection_code="RECORDED_STATE_MISSING",
+    ),
+    RuntimeEligibilityRule(
+        code="RECORDED_STATE_KNOWN",
+        category=RULE_CATEGORY_GOVERNANCE,
+        requirement="已记录状态必须是已知状态之一。",
+        rejection_code="RECORDED_STATE_UNKNOWN",
+    ),
+    RuntimeEligibilityRule(
+        code="RECORDED_STATE_PROPOSAL_MATCHES",
+        category=RULE_CATEGORY_GOVERNANCE,
+        requirement="已记录状态必须对应**被评估的那个提案 ID**。",
+        rejection_code="RECORDED_STATE_PROPOSAL_MISMATCH",
     ),
     RuntimeEligibilityRule(
         code="PROPOSAL_STATE_ACTIVE",
         category=RULE_CATEGORY_GOVERNANCE,
-        requirement="提案状态必须是活动终态（APPROVED）。",
+        requirement="已记录状态必须是活动终态（APPROVED）。",
         rejection_code="MAPPING_STATE_NOT_ACTIVE",
     ),
     RuntimeEligibilityRule(
@@ -487,6 +589,13 @@ def runtime_policy_status() -> dict:
         "allowed_approval_versions": sorted(ALLOWED_APPROVAL_VERSIONS),
         "allowed_actions": sorted(ALLOWED_ACTIONS),
         "allowed_proposal_states": sorted(ALLOWED_PROPOSAL_STATES),
+        "known_proposal_states": sorted(KNOWN_PROPOSAL_STATES),
+        "allowed_context_evidence_provenance": sorted(
+            ALLOWED_CONTEXT_EVIDENCE_PROVENANCE
+        ),
+        "blocked_context_evidence_provenance": sorted(
+            BLOCKED_CONTEXT_EVIDENCE_PROVENANCE
+        ),
         "allowed_source_scopes": [list(scope) for scope in ALLOWED_SOURCE_SCOPES],
         "blocked_identity_types": sorted(BLOCKED_IDENTITY_TYPES),
         "blocked_identity_key_versions": sorted(BLOCKED_IDENTITY_KEY_VERSIONS),
@@ -529,6 +638,22 @@ def _assert_policy_registry_is_coherent() -> None:
     if ALLOWED_PROPOSAL_STATES & BLOCKED_PROPOSAL_STATES:
         raise AssertionError(
             "runtime policy: allowed proposal states overlap blocked states"
+        )
+    if ALLOWED_CONTEXT_EVIDENCE_PROVENANCE & BLOCKED_CONTEXT_EVIDENCE_PROVENANCE:
+        raise AssertionError(
+            "runtime policy: allowed context evidence provenance overlaps blocked provenance"
+        )
+    if not ALLOWED_CONTEXT_EVIDENCE_PROVENANCE:
+        raise AssertionError(
+            "runtime policy: at least one context evidence provenance must be allowed"
+        )
+    if not BLOCKED_PROPOSAL_STATES <= KNOWN_PROPOSAL_STATES:
+        raise AssertionError(
+            "runtime policy: blocked proposal states must be known states"
+        )
+    if not ALLOWED_PROPOSAL_STATES <= KNOWN_PROPOSAL_STATES:
+        raise AssertionError(
+            "runtime policy: allowed proposal states must be known states"
         )
     if not ALLOWED_APPROVAL_PURPOSES:
         raise AssertionError("runtime policy: at least one approval purpose is required")

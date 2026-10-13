@@ -37,16 +37,18 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 from utils.ingestion_identity import CanonicalIdentityCollisionError, plan_ingestion_identity
 from utils.mapping_governance import (
     ACTIVE_STATES,
     GOVERNANCE_SCHEMA_VERSION,
+    LEDGER_TRUST_ANCHOR_STATEMENT,
     PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
     PROPOSAL_SCHEMA_VERSION,
     RUNTIME_LEDGER_ENFORCEMENT,
+    GovernanceError,
     GovernanceLedger,
     MappingProposal,
     MappingState,
@@ -70,9 +72,12 @@ from utils.provider_evidence import (
 from utils.runtime_mapping_eligibility import (
     RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
     RUNTIME_READINESS_MANIFEST_KIND,
+    GovernanceEvidenceProvenance,
     RuntimeMappingContext,
     build_runtime_readiness_manifest,
+    caller_asserted_provenance,
     evaluate_runtime_mapping_eligibility,
+    isolated_snapshot_provenance,
     runtime_eligibility_status,
 )
 from utils.runtime_mapping_policy import (
@@ -568,9 +573,172 @@ def proposed_mapping_from_payload(payload: Mapping[str, Any]) -> ProposedSourceM
 # 影子入口：运行期资格模拟（只读、无激活、无账本写入）
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 隔离治理证据快照（只读；绝不修改账本）
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class IsolatedGovernanceSnapshot:
+    """
+    从一个**隔离的合成治理夹具账本**读取的只读证据快照。
+
+    它明确区分「结构性校验确实执行过」与「自述已完成校验」，并原样保留账本自身的
+    信任锚警告（哈希链只证明内部一致性，不是外部信任锚）。
+
+    本类型**不是**生产权威：它不写账本、不激活映射、不创建批准、不触碰生产数据。
+    """
+
+    dataset_identity: str
+    baseline_fingerprint: str
+    provenance: GovernanceEvidenceProvenance
+    proposal_states: tuple[tuple[str, str], ...] = ()
+    proposal_fingerprints: tuple[tuple[str, str], ...] = ()
+    active_bindings: tuple[tuple[str, str, str], ...] = ()
+    structural_integrity: str = "NOT_PERFORMED"
+    authenticated_approval_audit: str = "NOT_PERFORMED"
+    ledger_exists: bool = False
+    ledger_path: str = ""
+
+    def state_of(self, proposal_id: str) -> str | None:
+        for candidate, state in self.proposal_states:
+            if candidate == proposal_id:
+                return state
+        return None
+
+    def fingerprint_of(self, proposal_id: str) -> str | None:
+        for candidate, value in self.proposal_fingerprints:
+            if candidate == proposal_id:
+                return value
+        return None
+
+    def as_dict(self) -> dict:
+        return {
+            "dataset_identity": self.dataset_identity,
+            "baseline_fingerprint": self.baseline_fingerprint,
+            "provenance": self.provenance.as_dict(),
+            "proposal_states": [list(pair) for pair in self.proposal_states],
+            "proposal_fingerprints": [
+                list(pair) for pair in self.proposal_fingerprints
+            ],
+            "active_bindings": [list(triple) for triple in self.active_bindings],
+            "structural_integrity": self.structural_integrity,
+            "authenticated_approval_audit": self.authenticated_approval_audit,
+            "ledger_exists": self.ledger_exists,
+            "ledger_path": self.ledger_path,
+            "is_production_authority": False,
+        }
+
+
+def build_isolated_governance_snapshot(
+    ledger: GovernanceLedger,
+    *,
+    dataset_identity: str,
+    current_baseline_fingerprint: str,
+    trusted_public_key_path: str | None = None,
+) -> IsolatedGovernanceSnapshot:
+    """
+    只读地构造隔离治理证据快照。
+
+    边界
+    ----
+    - **只读**：只调用 ``ledger.verify()`` / ``ledger.proposal_states()`` /
+      ``ledger.entries()`` / ``ledger.active_bindings()`` 与历史批准审计，
+      绝不追加条目、绝不修改账本文件。
+    - 账本存在但结构校验失败时**直接抛出**（绝不据损坏账本构造「证据」）。
+    - 未提供可信公钥时**不**执行历史批准审计，并在限制中如实记录
+      （绝不退化为信任内嵌公钥）。
+    - 原样保留账本信任锚警告。
+    """
+    limitations: list[str] = [LEDGER_TRUST_ANCHOR_STATEMENT]
+    ledger_exists = ledger.exists()
+    structural_integrity = "NOT_PERFORMED"
+    audit_status = "NOT_PERFORMED"
+
+    states: tuple[tuple[str, str], ...] = ()
+    fingerprints: tuple[tuple[str, str], ...] = ()
+    bindings: tuple[tuple[str, str, str], ...] = ()
+
+    if ledger_exists:
+        report = ledger.verify()
+        structural_integrity = str(report["integrity"])
+        limitations.append(
+            "Structural ledger validation was performed; it proves internal "
+            "consistency only and cannot detect tail truncation."
+        )
+        states = tuple(sorted(ledger.proposal_states().items()))
+        fingerprints = tuple(
+            sorted({(e.proposal_id, e.proposal_fingerprint) for e in ledger.entries()})
+        )
+        try:
+            active = ledger.active_bindings()
+        except GovernanceError as exc:  # noqa: BLE001
+            limitations.append(
+                f"Active bindings could not be read under the current key contract: {exc}"
+            )
+        else:
+            bindings = tuple(
+                sorted(
+                    (key, value["canonical_id"], value["proposal_id"])
+                    for key, value in active.items()
+                )
+            )
+    else:
+        limitations.append(
+            "The isolated governance ledger does not exist; no structural validation "
+            "was possible and no recorded governance facts are available."
+        )
+
+    if trusted_public_key_path and ledger_exists:
+        audit = audit_historical_approvals(
+            ledger,
+            trusted_public_key_path=trusted_public_key_path,
+            dataset_identity=dataset_identity,
+        )
+        audit_status = str(audit["verification_category"])
+        limitations.append(
+            "Authenticated approval audit verified "
+            f"{audit['approved_decisions']} decision(s) against the supplied trusted key."
+        )
+    elif not trusted_public_key_path:
+        limitations.append(
+            "No explicitly trusted public key was supplied; the authenticated approval "
+            "audit was not performed and an embedded key is never accepted."
+        )
+    else:
+        limitations.append(
+            "No isolated ledger exists; the authenticated approval audit was not performed."
+        )
+
+    provenance = isolated_snapshot_provenance(
+        dataset_identity=dataset_identity,
+        baseline_fingerprint=current_baseline_fingerprint,
+        recorded_proposal_fingerprint_origin=(
+            "isolated governance ledger (recorded proposal fingerprint)"
+        ),
+        recorded_proposal_state_origin="isolated governance ledger (recorded state)",
+        structural_ledger_validation_performed=bool(ledger_exists),
+        authenticated_approval_audit_performed=bool(
+            trusted_public_key_path and ledger_exists
+        ),
+        verification_limitations=tuple(limitations),
+    )
+
+    return IsolatedGovernanceSnapshot(
+        dataset_identity=dataset_identity,
+        baseline_fingerprint=current_baseline_fingerprint,
+        provenance=provenance,
+        proposal_states=states,
+        proposal_fingerprints=fingerprints,
+        active_bindings=bindings,
+        structural_integrity=structural_integrity,
+        authenticated_approval_audit=audit_status,
+        ledger_exists=ledger_exists,
+        ledger_path=ledger.path,
+    )
+
+
 #: 运行期资格模拟的必需场景：``(场景名, 期望结果, 说明)``。
-RUNTIME_SCENARIO_MATRIX: tuple[tuple[str, str, str], ...] = (
-    (
+RUNTIME_SCENARIO_MATRIX: tuple[tuple[str, str, str], ...] = (    (
         "VALID_APPROVED_MAPPING",
         "ELIGIBLE",
         "已批准的作用域身份、无历史影响 -> 应判为 ELIGIBLE（且不做任何变更）。",
@@ -732,10 +900,18 @@ def shadow_runtime_scenario_matrix(
     base_context = RuntimeMappingContext(
         dataset_identity=dataset_identity,
         current_baseline_fingerprint=baseline_fingerprint,
+        evidence_provenance=caller_asserted_provenance(
+            dataset_identity=dataset_identity,
+            baseline_fingerprint=baseline_fingerprint,
+            recorded_proposal_fingerprint_origin="shadow scenario matrix (caller supplied)",
+            recorded_proposal_state_origin="shadow scenario matrix (caller supplied)",
+        ),
         canonical_ids=(canonical_id,),
         trusted_public_key_path=trusted_public_key_path,
         expected_approver=approver,
         expected_operator=operator,
+        recorded_proposal_id=base_proposal.proposal_id,
+        recorded_proposal_fingerprint=base_proposal.fingerprint(),
         recorded_proposal_state=MappingState.APPROVED.value,
     )
 
@@ -774,7 +950,14 @@ def shadow_runtime_scenario_matrix(
                 }
             )
             return
-
+        if isinstance(proposal, MappingProposal):
+            # 每个场景都必须把「已记录的提案身份」对准它自己评估的提案，
+            # 否则会掩盖该场景真正要暴露的拒绝原因。
+            context = replace(
+                context,
+                recorded_proposal_id=proposal.proposal_id,
+                recorded_proposal_fingerprint=proposal.fingerprint(),
+            )
         report = shadow_runtime_eligibility_check(
             workspace=workspace,
             proposal=proposal,
@@ -885,33 +1068,62 @@ def shadow_runtime_readiness_report(
     dataset_identity: str = "synthetic-runtime-fixture",
     baseline_fingerprint: str = "",
     trusted_public_key_path: str | None = None,
+    governance_snapshot: IsolatedGovernanceSnapshot | None = None,
     evaluated_at: str | None = None,
 ) -> dict:
     """
-    汇总运行期就绪清单（只读）。默认**不提供任何批准件**，因此结论必然是
-    NOT_ELIGIBLE —— 这正是本阶段的预期状态：闸门存在，但没有任何映射被激活。
+    汇总运行期就绪清单（只读）。
+
+    默认**不提供任何批准件、也不提供任何已记录治理事实**，因此结论必然是
+    NOT_ELIGIBLE（记录指纹缺失 / 记录状态缺失 / 批准缺失）—— 这正是本阶段的预期
+    状态：闸门存在，但没有任何映射被激活，也没有任何治理事实被当作已验证证据。
+
+    提供 ``governance_snapshot`` 时，已记录事实来自该**隔离快照**，决策来源标记为
+    ``ISOLATED_SNAPSHOT_CONTEXT``（仍是条件式判定，不是生产授权）。
     """
     canonical_ids = tuple(
         str(m.get("id") or "") for m in canonical_fixture if m.get("id")
     )
     approval_list = list(approvals) if approvals is not None else [None] * len(proposals)
-    context = RuntimeMappingContext(
-        dataset_identity=dataset_identity,
-        current_baseline_fingerprint=baseline_fingerprint,
-        canonical_ids=canonical_ids,
-        trusted_public_key_path=trusted_public_key_path,
-        recorded_proposal_state=None,
-    )
-    decisions = [
-        evaluate_runtime_mapping_eligibility(
-            proposal,
-            approval_list[index] if index < len(approval_list) else None,
-            observations[index] if index < len(observations) else None,
-            context,
-            evaluated_at=evaluated_at,
+
+    decisions = []
+    for index, proposal in enumerate(proposals):
+        if governance_snapshot is not None:
+            provenance = governance_snapshot.provenance
+            recorded_fingerprint = governance_snapshot.fingerprint_of(
+                proposal.proposal_id
+            )
+            recorded_state = governance_snapshot.state_of(proposal.proposal_id)
+        else:
+            provenance = caller_asserted_provenance(
+                dataset_identity=dataset_identity,
+                baseline_fingerprint=baseline_fingerprint,
+                recorded_proposal_fingerprint_origin="not supplied",
+                recorded_proposal_state_origin="not supplied",
+            )
+            recorded_fingerprint = None
+            recorded_state = None
+
+        context = RuntimeMappingContext(
+            dataset_identity=dataset_identity,
+            current_baseline_fingerprint=baseline_fingerprint,
+            evidence_provenance=provenance,
+            canonical_ids=canonical_ids,
+            trusted_public_key_path=trusted_public_key_path,
+            recorded_proposal_id=proposal.proposal_id,
+            recorded_proposal_fingerprint=recorded_fingerprint,
+            recorded_proposal_state=recorded_state,
         )
-        for index, proposal in enumerate(proposals)
-    ]
+        decisions.append(
+            evaluate_runtime_mapping_eligibility(
+                proposal,
+                approval_list[index] if index < len(approval_list) else None,
+                observations[index] if index < len(observations) else None,
+                context,
+                evaluated_at=evaluated_at,
+            )
+        )
+
     manifest = build_runtime_readiness_manifest(
         fixture_identity="shadow-runtime-readiness",
         decisions=decisions,
@@ -932,6 +1144,10 @@ def shadow_runtime_readiness_report(
         "manifest_kind": RUNTIME_READINESS_MANIFEST_KIND,
         "runtime_readiness_manifest": manifest,
         "runtime_eligibility_status": runtime_eligibility_status(),
+        "governance_snapshot": (
+            governance_snapshot.as_dict() if governance_snapshot is not None else None
+        ),
+        "governance_snapshot_used": governance_snapshot is not None,
         "ledger_written": False,
         "files_written": 0,
         "bindings_created": 0,
@@ -1082,6 +1298,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="also run the runtime eligibility scenario matrix (read-only)",
     )
+    parser.add_argument(
+        "--runtime-snapshot",
+        action="store_true",
+        help=(
+            "read recorded governance facts from the isolated workspace ledger "
+            "(read-only) and label the decisions as isolated-snapshot sourced"
+        ),
+    )
     args = parser.parse_args(argv)
 
     evidence_report: dict | None = None
@@ -1175,7 +1399,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_canonical_id = (
             str(canonical_fixture[0].get("id") or "") if canonical_fixture else ""
         )
+        governance_snapshot: IsolatedGovernanceSnapshot | None = None
+        if args.runtime_snapshot:
+            snapshot_ledger = GovernanceLedger(
+                os.path.join(
+                    os.path.realpath(os.path.abspath(args.workspace)),
+                    SHADOW_LEDGER_NAME,
+                ),
+                dataset_identity=args.dataset_identity,
+            )
+            governance_snapshot = build_isolated_governance_snapshot(
+                snapshot_ledger,
+                dataset_identity=args.dataset_identity,
+                current_baseline_fingerprint=baseline,
+                trusted_public_key_path=args.trusted_public_key,
+            )
         runtime_proposals: list[MappingProposal] = []
+        runtime_observations: list[SourceObservation] = []
         skipped: list[dict] = []
         for observation in observations:
             if not ScopedSourceIdentityKey.for_observation(observation).is_sufficient:
@@ -1202,14 +1442,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     identity_evidence_type="strong_competition_number",
                 )
             )
+            runtime_observations.append(observation)
         readiness = shadow_runtime_readiness_report(
             workspace=args.workspace,
             proposals=runtime_proposals,
-            observations=observations,
+            observations=runtime_observations,
             canonical_fixture=canonical_fixture,
             dataset_identity=args.dataset_identity,
             baseline_fingerprint=baseline,
             trusted_public_key_path=args.trusted_public_key,
+            governance_snapshot=governance_snapshot,
         )
         readiness["skipped_observations"] = skipped
         report["runtime_readiness"] = readiness
