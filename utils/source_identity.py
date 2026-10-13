@@ -37,6 +37,23 @@
     本地合成标识符，不对应任何数据源值。
 ``UNKNOWN``
     无法分类。
+
+Provider ID 唯一性作用域（本模块新增，见 §Provider ID uniqueness scope）
+------------------------------------------------------------------------
+「数据源提供了某个标识符」与「该标识符在某个作用域内唯一、且跨刷新稳定」是**三个
+互不等价**的保证：
+
+======================  ==========================================================
+provider-supplied       数据源确实给出了这个值（可观测事实）。
+provider-unique         在**显式声明的作用域**内唯一（需要独立文档化的支持证据）。
+provider-stable         跨刷新保持同一含义（同样需要独立证据）。
+======================  ==========================================================
+
+本仓库目前**没有**任何一份独立文档化的 provider 唯一性保证，因此
+``VERIFIED_PROVIDER_ID_SCOPES`` 默认为空 —— 一切 provider 标识符一律按
+``UNVERIFIED`` 处理，只能被**观测 / 复核**，绝不自动成为权威映射证据
+（活动绑定 fail closed）。身份键取值显式携带唯一性作用域，因此
+「同一 provider 数字在不同日期 / 不同运动」不再碰撞成同一个绑定身份。
 """
 from __future__ import annotations
 
@@ -53,7 +70,13 @@ from utils.match_identity import (
 )
 
 #: 溯源 schema 版本。任何字段语义变化都必须提升该版本。
-PROVENANCE_SCHEMA_VERSION = "1.0.0"
+#:
+#: ``2.0.0``：``SourceObservation`` 新增 ``raw_provider_id_uniqueness_scope``，
+#: 语义指纹随之变化；旧 ``1.0.0`` 记录保持只读，绝不静默重新解释。
+PROVENANCE_SCHEMA_VERSION = "2.0.0"
+
+#: 历史溯源 schema 版本（只读；绝不静默迁移）。
+LEGACY_PROVENANCE_SCHEMA_VERSION = "1.0.0"
 
 #: 缺失证据的显式标记。源未提供即记为缺失，绝不用其他字段合成。
 MISSING = "MISSING"
@@ -79,9 +102,92 @@ class RawIdentifierType(str, Enum):
 
     PROVIDER_MATCH_ID = "PROVIDER_MATCH_ID"
     COMPETITION_NUMBER = "COMPETITION_NUMBER"
+    #: HTML 元素 ``id`` 属性。**不假定**它是稳定的 provider 比赛标识符：
+    #: 其语义在仓库内无法证实，因此一律按未验证处理。
+    HTML_ELEMENT_ID = "HTML_ELEMENT_ID"
     ROW_INDEX = "ROW_INDEX"
     NONE = "NONE"
     UNKNOWN = "UNKNOWN"
+
+
+class ProviderIdUniquenessScope(str, Enum):
+    """
+    provider 标识符的**唯一性作用域**声明。
+
+    ``VERIFIED_SCOPED``
+        存在独立文档化的保证：该标识符在显式声明的作用域内唯一（当前仓库为空集）。
+    ``UNVERIFIED``
+        数据源提供了该值，但**没有**独立文档化的唯一性/跨刷新稳定性保证。
+    ``UNKNOWN``
+        无法判定其唯一性作用域 —— 与 ``UNVERIFIED`` 一样，绝不授权活动绑定。
+    ``NOT_APPLICABLE``
+        该身份键不涉及 provider 标识符（例如竞彩编号作用域身份）。
+    """
+
+    VERIFIED_SCOPED = "VERIFIED_SCOPED"
+    UNVERIFIED = "UNVERIFIED"
+    UNKNOWN = "UNKNOWN"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+#: 唯一性作用域中「已获独立文档支持」的那一档。
+VERIFIED_UNIQUENESS_SCOPE = ProviderIdUniquenessScope.VERIFIED_SCOPED.value
+
+
+@dataclass(frozen=True)
+class ProviderIdScopeDeclaration:
+    """
+    一份**独立文档化**的 provider 标识符唯一性作用域声明。
+
+    ``documentation_reference`` 必须指向仓库内可复核的证据（文档 / 契约 / 外部规范
+    的固定引用）。没有该引用，任何声明都不得进入 ``VERIFIED_PROVIDER_ID_SCOPES``。
+    """
+
+    adapter: str
+    provider_namespace: str
+    sport: str
+    raw_identifier_type: str
+    uniqueness_scope: str
+    documentation_reference: str
+
+    def covers(self, *, sport: str, raw_identifier_type: str) -> bool:
+        """该声明是否覆盖给定运动 / 原始标识符类型（``*`` 表示任意）。"""
+        if self.sport not in ("*", sport):
+            return False
+        if self.raw_identifier_type not in ("*", raw_identifier_type):
+            return False
+        return True
+
+
+#: **已独立文档化**的 provider 唯一性作用域注册表，键为 ``(adapter, namespace)``。
+#:
+#: 刻意**为空**：本仓库目前没有对任何 provider 标识符的全局唯一性 / 跨刷新稳定性
+#: 作出独立文档化保证。因此一切 provider 标识符都按 ``UNVERIFIED`` / ``UNKNOWN``
+#: 处理，绝不自动成为权威映射证据。新增条目必须同时给出可复核的文档引用。
+VERIFIED_PROVIDER_ID_SCOPES: dict[tuple[str, str], ProviderIdScopeDeclaration] = {}
+
+
+def resolve_provider_id_uniqueness_scope(
+    *,
+    adapter: str,
+    provider_namespace: str,
+    sport: str,
+    raw_identifier_type: str,
+) -> str:
+    """
+    解析 provider 标识符的唯一性作用域（只读，绝不推断未文档化的保证）。
+
+    只有在注册表中存在**覆盖该 (adapter, namespace, sport, raw_type)** 的独立
+    文档化声明时，才返回 ``VERIFIED_SCOPED``；否则返回 ``UNKNOWN``。
+
+    刻意不依据 ID 的形状 / 长度 / 是否为数字来推断唯一性。
+    """
+    declaration = VERIFIED_PROVIDER_ID_SCOPES.get((adapter, provider_namespace))
+    if declaration is None:
+        return ProviderIdUniquenessScope.UNKNOWN.value
+    if not declaration.covers(sport=sport, raw_identifier_type=raw_identifier_type):
+        return ProviderIdUniquenessScope.UNKNOWN.value
+    return declaration.uniqueness_scope
 
 
 class ObservationCategory(str, Enum):
@@ -210,6 +316,133 @@ def pattern_for_adapter(adapter: str) -> SourceIdPattern | None:
 
 
 # ---------------------------------------------------------------------------
+# Provider 证据清单（Provider Evidence Inventory）
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ProviderEvidenceInventoryEntry:
+    """
+    一个源解析路径的**原始标识符证据清单**（只读审计记录）。
+
+    与 ``SourceIdPattern`` 的分工：后者描述**推导出的**源 ID 构造路径，
+    本清单描述**原始表示中实际存在什么标识符**，以及它当前是否被丢弃。
+    """
+
+    adapter: str
+    parser: str
+    input_field_or_attribute: str
+    observed_meaning: str
+    evidence_availability: str
+    stability_limitation: str
+    current_data_loss: str
+    safe_preservation_mechanism: str
+
+
+#: 五个已审计的源解析路径的原始标识符证据清单。
+#:
+#: 结论（**全部经合成夹具与真实解析器核对**）：
+#: - live football / live basketball / market XML 的原始表示中**确实存在** provider
+#:   行标识符与竞彩编号，但规范化比赛行**两者都不保留**（除竞彩编号有时落到
+#:   ``jczq_no``）。
+#: - finished feed 的规范化行**既无** provider 标识符**也无**竞彩编号，唯一可用的
+#:   值是行序号；解析器甚至不读取 ``<tr>`` 上可能存在的 ``id``。
+#: - HTML 兜底路径同样只有行序号；渲染页可能携带 ``data-mid``，但
+#:   ``_parse_jczq_html`` 从不读取它。
+#: 任何一条都**不**假定 provider 标识符全局唯一。
+PROVIDER_EVIDENCE_INVENTORY: tuple[ProviderEvidenceInventoryEntry, ...] = (
+    ProviderEvidenceInventoryEntry(
+        adapter="live_football",
+        parser="utils.fetcher_500._parse_live",
+        input_field_or_attribute='<tr id="a{digits}">（provider 行号）与 <tr order="...">（竞彩编号）',
+        observed_meaning=(
+            "tr id 的数字部分是 provider 自己的行/比赛标识；order 属性是竞彩编号。"
+            "二者语义不同，却在同一 ID 形状中混用。"
+        ),
+        evidence_availability="源确实提供了两种原始值；解析器可读到（fid / attrs['order']）。",
+        stability_limitation=(
+            "无任何独立文档证明 tr id 跨刷新稳定；order 只在当日竞彩编号作用域内有效。"
+        ),
+        current_data_loss=(
+            "规范化行只保留派生 id（order 或 fid 二者其一），另一个原始值被丢弃；"
+            "事后无法判定某个 500l ID 嵌入的是竞彩编号还是 provider 行号。"
+        ),
+        safe_preservation_mechanism=(
+            "可选启用的侧车抽取（utils/provider_evidence.py）在归一化之前分别捕获 "
+            "tr id 与 order，并显式标注唯一性作用域为 UNKNOWN。"
+        ),
+    ),
+    ProviderEvidenceInventoryEntry(
+        adapter="live_basketball",
+        parser="utils.fetcher_500._parse_lq",
+        input_field_or_attribute="matchList[_LQ_ID]（provider 比赛号）与 matchList[_LQ_NO]（竞彩编号）",
+        observed_meaning="两个不同下标承载两种不同语义：provider 比赛号与竞彩编号。",
+        evidence_availability="内联 JSON 数组中两者都存在且可读。",
+        stability_limitation="无独立文档证明 provider 比赛号跨刷新稳定。",
+        current_data_loss="规范化行只保留 _LQ_NO 或 _LQ_ID 之一（另一个被丢弃）。",
+        safe_preservation_mechanism=(
+            "侧车抽取分别捕获 _LQ_ID 与 _LQ_NO；provider 比赛号按 UNKNOWN 作用域记录。"
+        ),
+    ),
+    ProviderEvidenceInventoryEntry(
+        adapter="market_xml",
+        parser="utils.fetcher_500.fetch_jczq_xml",
+        input_field_or_attribute='XML <m id="...">（provider 比赛号）与 <m matchnum="...">（竞彩编号）',
+        observed_meaning=(
+            "XML id 是聚合键（provider 比赛号），matchnum 是竞彩编号；足球与篮球共用 "
+            "500j 前缀但编号序列相互独立。"
+        ),
+        evidence_availability="两种属性都存在；解析器用 id 聚合，用 matchnum 派生 ID。",
+        stability_limitation=(
+            "无独立文档证明 XML id 跨刷新稳定；matchnum 仅在 (sport, date) 内有效。"
+        ),
+        current_data_loss="规范化行不保留 XML id；跨运动共用 500j 前缀的歧义被保留下来。",
+        safe_preservation_mechanism=(
+            "侧车抽取保留 XML id 与 matchnum，并显式标注 provider 比赛号作用域为 UNKNOWN。"
+        ),
+    ),
+    ProviderEvidenceInventoryEntry(
+        adapter="finished_feed",
+        parser="utils.fetcher_500._parse_wanchang",
+        input_field_or_attribute="响应中的行序号 len(matches)；<tr> 上可能存在的 id 属性未被读取",
+        observed_meaning="唯一的可用标识符是响应中的行位置。",
+        evidence_availability="行位置总是存在；provider 标识符与竞彩编号**均不可用**。",
+        stability_limitation="行位置取决于响应顺序，两次刷新可能把同一 500w ID 分配给不同比赛。",
+        current_data_loss=(
+            "解析器不读取 <tr> 的 id 属性；即便源提供了元素 id，也被直接丢弃且语义未证实。"
+        ),
+        safe_preservation_mechanism=(
+            "侧车抽取仅在源确实给出 <tr id> 时按 HTML_ELEMENT_ID 记录，并标注语义未证实；"
+            "绝不把行位置提升为稳定 provider 标识符。"
+        ),
+    ),
+    ProviderEvidenceInventoryEntry(
+        adapter="html_fallback",
+        parser="utils.fetcher_500._parse_jczq_html",
+        input_field_or_attribute="渲染后 HTML 的行序号 len(matches)；data-mid 属性未被读取",
+        observed_meaning="唯一可用标识符是渲染后 HTML 中的行位置。",
+        evidence_availability=(
+            "行位置总是存在；渲染页可能携带 data-mid（选择器 tr[data-mid] 的存在暗示），"
+            "但解析器从不读取它，仓库内也没有对其语义的独立验证。"
+        ),
+        stability_limitation="行位置跨刷新不稳定，且与 market_xml 共享 500j 前缀却语义完全不同。",
+        current_data_loss="data-mid（若存在）被丢弃；无法事后恢复。",
+        safe_preservation_mechanism=(
+            "侧车抽取在源确实给出 data-mid 时按 PROVIDER_MATCH_ID + UNKNOWN 作用域记录，"
+            "仅用于复核，绝不用于活动绑定。"
+        ),
+    ),
+)
+
+
+def inventory_for_adapter(adapter: str) -> ProviderEvidenceInventoryEntry | None:
+    """按适配器名取原始证据清单条目（只读）。"""
+    for entry in PROVIDER_EVIDENCE_INVENTORY:
+        if entry.adapter == adapter:
+            return entry
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 确定性序列化与哈希（证据完整性）
 # ---------------------------------------------------------------------------
 
@@ -286,10 +519,19 @@ def competition_identity_key(
 # ---------------------------------------------------------------------------
 
 #: 绑定键契约版本。任何影响绑定键**含义**的变化都必须提升该版本。
-IDENTITY_KEY_SCHEMA_VERSION = "2.0.0"
+#:
+#: ``3.0.0``：``RAW_PROVIDER_ID`` 的取值显式携带 provider 唯一性作用域与
+#: ``(sport, date)``，因此「同一 provider 数字在不同日期 / 不同运动」不再碰撞成
+#: 同一个绑定身份；同时新增 ``UNVERIFIED_PROVIDER_ID``（永不充分）。
+#: 旧 ``2.0.0`` 键的含义因此改变，**绝不**被静默重新解释。
+IDENTITY_KEY_SCHEMA_VERSION = "3.0.0"
 
 #: 旧契约的版本标记：缺失 ``identity_key_schema_version`` 即为旧契约（仅作用域元数据）。
 LEGACY_IDENTITY_KEY_SCHEMA_VERSION = "1.0.0"
+
+#: 已被本契约取代的版本（``2.0.0`` 的 RAW_PROVIDER_ID 取值不含 sport/date/作用域）。
+#: 只读保留：其历史工件仍然可审计，但**不再**被解释为当前契约。
+SUPERSEDED_IDENTITY_KEY_SCHEMA_VERSION = "2.0.0"
 
 
 class IdentityKeyKind(str, Enum):
@@ -297,19 +539,32 @@ class IdentityKeyKind(str, Enum):
     绑定键中承载的判别性身份证据种类。
 
     ``COMPETITION_NUMBER`` / ``RAW_PROVIDER_ID`` 是**充分**证据；
-    ``AMBIGUOUS_SHARED_SOURCE_ID`` / ``INSUFFICIENT`` **不足以**授权活动绑定。
+    ``UNVERIFIED_PROVIDER_ID`` / ``AMBIGUOUS_SHARED_SOURCE_ID`` / ``INSUFFICIENT``
+    **不足以**授权活动绑定。
     """
 
     COMPETITION_NUMBER = "COMPETITION_NUMBER"
     RAW_PROVIDER_ID = "RAW_PROVIDER_ID"
+    #: 数据源确实提供了标识符，但其唯一性作用域**未经验证**（或未知）。
+    #: 该标识符仍被记录、仍可用于复核与冲突检测，但绝不授权活动绑定。
+    UNVERIFIED_PROVIDER_ID = "UNVERIFIED_PROVIDER_ID"
     AMBIGUOUS_SHARED_SOURCE_ID = "AMBIGUOUS_SHARED_SOURCE_ID"
     INSUFFICIENT = "INSUFFICIENT"
 
 
 #: 足以支撑一个活动绑定的身份证据种类。
+#:
+#: ``RAW_PROVIDER_ID`` 只在**唯一性作用域已验证**（``VERIFIED_SCOPED``）时才可达；
+#: 未验证的 provider 标识符一律落到 ``UNVERIFIED_PROVIDER_ID``，因此这里的集合
+#: 成员关系本身就是充分性判定的唯一权威。
 SUFFICIENT_IDENTITY_KEY_KINDS: frozenset[str] = frozenset(
     {IdentityKeyKind.COMPETITION_NUMBER.value, IdentityKeyKind.RAW_PROVIDER_ID.value}
 )
+
+
+def identity_kind_is_sufficient(identity_kind: str) -> bool:
+    """身份证据种类是否足以授权活动绑定（单一权威判定）。"""
+    return identity_kind in SUFFICIENT_IDENTITY_KEY_KINDS
 
 
 @dataclass(frozen=True)
@@ -323,8 +578,11 @@ class ScopedSourceIdentityKey:
 
     - ``COMPETITION_NUMBER``：带 sport + date 作用域的规范化竞彩编号
       （``sport|date|jczq|number``）；绝不使用裸数字编号。
-    - ``RAW_PROVIDER_ID``：**数据源确实提供**的 provider 标识符
-      （含 adapter / namespace / 类型；绝不凭空合成）。
+    - ``RAW_PROVIDER_ID``：**数据源确实提供**的 provider 标识符，且其唯一性作用域
+      已有独立文档支持（``VERIFIED_SCOPED``）。取值显式携带 adapter / namespace /
+      sport / date / 类型 / 唯一性作用域 / 原始值；绝不凭空合成。
+    - ``UNVERIFIED_PROVIDER_ID``：数据源确实提供了标识符，但唯一性作用域**未经验证**
+      （或未知）。只可观测 / 复核，**不得**授权活动绑定。
     - ``AMBIGUOUS_SHARED_SOURCE_ID``：一条被判定为歧义的共享源字符串
       （仅用于复核类提案，**不得**用于活动绑定）。
     - ``INSUFFICIENT``：缺乏受支持的稳定证据（行位置派生、含义不可确认等）
@@ -336,6 +594,7 @@ class ScopedSourceIdentityKey:
     identity_value: str
     supporting_evidence_fingerprint: str
     identity_key_schema_version: str = IDENTITY_KEY_SCHEMA_VERSION
+    provider_id_uniqueness_scope: str = ProviderIdUniquenessScope.NOT_APPLICABLE.value
     detail: tuple[tuple[str, str], ...] = ()
 
     # -- 充分性 -----------------------------------------------------------
@@ -343,7 +602,7 @@ class ScopedSourceIdentityKey:
     @property
     def is_sufficient(self) -> bool:
         """是否承载足以授权活动绑定的判别性身份证据。"""
-        return self.identity_kind in SUFFICIENT_IDENTITY_KEY_KINDS
+        return identity_kind_is_sufficient(self.identity_kind)
 
     @property
     def requires_review(self) -> bool:
@@ -355,13 +614,15 @@ class ScopedSourceIdentityKey:
         """
         绑定键载荷。
 
-        刻意**只**包含版本、证据种类与判别性取值 —— 宽泛的命名空间元数据
-        不构成身份键。
+        刻意**只**包含版本、证据种类、判别性取值与 provider 唯一性作用域 ——
+        宽泛的命名空间元数据不构成身份键，但「该 provider 标识符的唯一性是否
+        经过验证」是身份含义的一部分，必须随键一起被签名。
         """
         return {
             "identity_key_schema_version": self.identity_key_schema_version,
             "identity_kind": self.identity_kind,
             "identity_value": self.identity_value,
+            "provider_id_uniqueness_scope": self.provider_id_uniqueness_scope,
         }
 
     def source_key(self) -> str:
@@ -391,7 +652,11 @@ class ScopedSourceIdentityKey:
         """
         由一次源观测推导其判别性身份键（纯函数，只读）。
 
-        优先级：带作用域的竞彩编号 > 数据源确实提供的 provider 标识符 > 证据不足。
+        优先级：带作用域的竞彩编号 > **唯一性已验证**的 provider 标识符 > 证据不足。
+
+        provider 标识符若其唯一性作用域未经独立文档验证，则落到
+        ``UNVERIFIED_PROVIDER_ID``（不充分）—— 仍被记录、仍参与冲突检测，
+        但绝不授权活动绑定。
         """
         scope = observation.stability_scope
 
@@ -411,6 +676,9 @@ class ScopedSourceIdentityKey:
                     identity_kind=IdentityKeyKind.COMPETITION_NUMBER.value,
                     identity_value=value,
                     supporting_evidence_fingerprint=observation.semantic_fingerprint(),
+                    provider_id_uniqueness_scope=(
+                        ProviderIdUniquenessScope.NOT_APPLICABLE.value
+                    ),
                     detail=(
                         ("sport", observation.sport),
                         ("event_date", observation.event_date),
@@ -422,20 +690,44 @@ class ScopedSourceIdentityKey:
                 )
 
         if observation.raw_provider_id is not None:
+            uniqueness_scope = observation.provider_id_uniqueness_scope
+            if uniqueness_scope not in (
+                ProviderIdUniquenessScope.VERIFIED_SCOPED.value,
+                ProviderIdUniquenessScope.UNVERIFIED.value,
+                ProviderIdUniquenessScope.UNKNOWN.value,
+            ):
+                # 缺失 / 非法作用域 -> 保守地按 UNKNOWN（= 不可验证）处理。
+                uniqueness_scope = ProviderIdUniquenessScope.UNKNOWN.value
+            # 取值显式携带 (sport, date)：同一 provider 数字在不同日期 / 不同运动
+            # 不再碰撞成同一个绑定身份。
             value = "|".join(
                 (
                     scope.adapter,
                     scope.provider_namespace,
+                    scope.sport or MISSING,
+                    scope.event_date or MISSING,
                     scope.raw_identifier_type,
+                    uniqueness_scope,
                     observation.raw_provider_id,
                 )
             )
+            verified = uniqueness_scope == ProviderIdUniquenessScope.VERIFIED_SCOPED.value
             return cls(
                 scope=scope,
-                identity_kind=IdentityKeyKind.RAW_PROVIDER_ID.value,
+                identity_kind=(
+                    IdentityKeyKind.RAW_PROVIDER_ID.value
+                    if verified
+                    else IdentityKeyKind.UNVERIFIED_PROVIDER_ID.value
+                ),
                 identity_value=value,
                 supporting_evidence_fingerprint=observation.semantic_fingerprint(),
-                detail=(("raw_provider_id", observation.raw_provider_id),),
+                provider_id_uniqueness_scope=uniqueness_scope,
+                detail=(
+                    ("raw_provider_id", observation.raw_provider_id),
+                    ("provider_id_uniqueness_scope", uniqueness_scope),
+                    ("sport", scope.sport or MISSING),
+                    ("event_date", scope.event_date or MISSING),
+                ),
             )
 
         # 缺乏受支持的稳定证据 -> fail closed（不得授权活动绑定）。
@@ -444,6 +736,7 @@ class ScopedSourceIdentityKey:
             identity_kind=IdentityKeyKind.INSUFFICIENT.value,
             identity_value=observation.derived_source_id or MISSING,
             supporting_evidence_fingerprint=observation.semantic_fingerprint(),
+            provider_id_uniqueness_scope=ProviderIdUniquenessScope.NOT_APPLICABLE.value,
             detail=(
                 ("derived_source_id", observation.derived_source_id or MISSING),
                 ("identifier_stability", observation.identifier_stability),
@@ -529,6 +822,13 @@ class SourceObservation:
     evidence_completeness: tuple[tuple[str, bool], ...] = ()
     notes: tuple[str, ...] = ()
     identity_stability_reason: str = ""
+    #: provider 标识符的唯一性作用域（见模块 docstring）。
+    #: 未提供 provider 标识符时为 ``NOT_APPLICABLE``；提供了但无独立文档保证时为
+    #: ``UNKNOWN`` / ``UNVERIFIED``。该值参与语义指纹，因此「未验证」与「已验证」
+    #: 的同一原始值得到**不同**的证据指纹。
+    raw_provider_id_uniqueness_scope: str = (
+        ProviderIdUniquenessScope.NOT_APPLICABLE.value
+    )
 
     # -- 派生视图 ---------------------------------------------------------
 
@@ -536,6 +836,20 @@ class SourceObservation:
     def raw_provider_id_present(self) -> bool:
         """源是否**实际提供**了 provider 标识符（缺失即缺失，绝不合成）。"""
         return self.raw_provider_id is not None
+
+    @property
+    def provider_id_uniqueness_scope(self) -> str:
+        """provider 标识符的唯一性作用域（只读视图）。"""
+        return self.raw_provider_id_uniqueness_scope
+
+    @property
+    def provider_id_uniqueness_verified(self) -> bool:
+        """该 provider 标识符的唯一性是否已有独立文档支持。"""
+        return (
+            self.raw_provider_id is not None
+            and self.raw_provider_id_uniqueness_scope
+            == ProviderIdUniquenessScope.VERIFIED_SCOPED.value
+        )
 
     @property
     def is_row_position_unstable(self) -> bool:
@@ -575,6 +889,7 @@ class SourceObservation:
             "event_date": self.event_date,
             "raw_provider_id": self.raw_provider_id,
             "raw_provider_id_type": self.raw_provider_id_type,
+            "raw_provider_id_uniqueness_scope": self.raw_provider_id_uniqueness_scope,
             "derived_source_id": self.derived_source_id,
             "competition_number_raw": self.competition_number_raw,
             "competition_number_normalized": self.competition_number_normalized,
@@ -704,13 +1019,19 @@ def observe_source_row(
     adapter: str,
     canonical_match_id: str | None = None,
     raw_provider_id: str | None = None,
+    raw_provider_id_type: str | None = None,
+    raw_provider_id_uniqueness_scope: str | None = None,
 ) -> SourceObservation:
     """
     把一条规范化后的源比赛记录转成 ``SourceObservation``。
 
     - ``row`` 由现有解析器产出（``utils/fetcher_500``），本函数**不修改**它。
-    - ``raw_provider_id`` 只在**数据源确实提供且适配器已保留**时才传入；默认
-      ``None`` 表示源未提供该字段 —— 缺失即缺失，绝不用其他字段合成。
+    - ``raw_provider_id`` 只在**数据源确实提供**时才传入；默认 ``None`` 表示源未提供
+      该字段 —— 缺失即缺失，绝不用其他字段合成。
+    - ``raw_provider_id_type`` 显式给出该原始标识符的类型（例如 HTML 元素 id）。
+      省略时沿用既有稳定性分类结果，行为与历史版本完全一致。
+    - ``raw_provider_id_uniqueness_scope`` 显式给出唯一性作用域；省略时由
+      ``VERIFIED_PROVIDER_ID_SCOPES`` 解析，**默认 UNKNOWN**（不推断未文档化的保证）。
     - ``canonical_match_id`` 只能来自既有 Canonical 记录，本函数绝不生成。
     """
     if not isinstance(row, Mapping):
@@ -740,12 +1061,25 @@ def observe_source_row(
     kickoff_time = row.get("time")
     kickoff_known = bool(row.get("kickoff_time_known", False))
 
-    stability, raw_type, reason = classify_identifier_stability(
+    stability, classified_raw_type, reason = classify_identifier_stability(
         adapter=adapter,
         derived_source_id=derived_source_id,
         competition_number_normalized=normalized_cno,
         raw_provider_id_present=raw_provider_id is not None,
     )
+    raw_type = raw_provider_id_type or classified_raw_type
+
+    if raw_provider_id is None:
+        uniqueness_scope = ProviderIdUniquenessScope.NOT_APPLICABLE.value
+    else:
+        uniqueness_scope = raw_provider_id_uniqueness_scope or (
+            resolve_provider_id_uniqueness_scope(
+                adapter=adapter,
+                provider_namespace=namespace,
+                sport=str(row.get("sport") or MISSING),
+                raw_identifier_type=raw_type,
+            )
+        )
 
     scope = SourceIdentityScope(
         adapter=adapter,
@@ -770,12 +1104,21 @@ def observe_source_row(
         ("event_date", bool(row.get("date"))),
         ("kickoff_time_known", kickoff_known),
         ("canonical_match_id", canonical_match_id is not None),
+        (
+            "provider_id_uniqueness_verified",
+            uniqueness_scope == ProviderIdUniquenessScope.VERIFIED_SCOPED.value,
+        ),
     )
 
     notes: list[str] = []
     if raw_provider_id is None:
         notes.append(
             "源未提供可保留的 provider 标识符；记为缺失（MISSING），未用其他字段合成。"
+        )
+    else:
+        notes.append(
+            "provider 标识符由数据源提供，但其唯一性/跨刷新稳定性未经独立文档验证"
+            f"（uniqueness_scope={uniqueness_scope}）；不得据此授权活动绑定。"
         )
     if pattern is not None and not pattern.raw_provider_id_preserved:
         notes.append(f"{adapter}: 规范化比赛行未保留 provider 原始标识符。")
@@ -810,6 +1153,7 @@ def observe_source_row(
         evidence_completeness=completeness,
         notes=tuple(notes),
         identity_stability_reason=reason,
+        raw_provider_id_uniqueness_scope=uniqueness_scope,
     )
 
     # observation_id 由语义指纹派生：同一证据得到同一 ID，与输入顺序无关。

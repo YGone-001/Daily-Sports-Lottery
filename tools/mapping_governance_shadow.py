@@ -7,9 +7,11 @@ Canonical 映射治理的**只读影子校验**入口
 --------
 允许：
 - 检视一批合成源观测；
+- **只读**地从原始源夹具抽取 provider 证据观测（`utils.provider_evidence`）；
 - 生成提案工件（proposal artifacts）；
 - 与隔离的 Canonical 夹具对比；
 - **只读**地调用既有摄取规划器校验归属；
+- **只读**地生成迁移影响清单（`utils.source_id_migration`）；
 - 校验治理账本；
 - 产出确定性冲突报告。
 
@@ -20,8 +22,10 @@ Canonical 映射治理的**只读影子校验**入口
 - 改变源适配器的持久化 ID 格式；
 - 让账本决策阻断实时刷新；
 - 自动批准提案；
-- 自动迁移历史映射。
+- 自动迁移历史映射；
+- **执行任何迁移**（清单只是分析工件）。
 
+默认行为：无活动绑定、无生产权威、无迁移执行。
 运行期身份权威仍然是 ``utils.ingestion_identity.validate_ingestion_identity``；
 本工具**不是**额外的生产写入路径，``utils/scraper.py`` 也从不引用它。
 """
@@ -52,6 +56,19 @@ from utils.mapping_governance import (
     proposal_from_observations,
     sign_mapping_approval,
     verify_mapping_approval,
+)
+from utils.provider_evidence import (
+    PROVIDER_EVIDENCE_ADAPTERS,
+    PROVIDER_EVIDENCE_SCHEMA_VERSION,
+    extract_source_evidence,
+)
+from utils.source_id_migration import (
+    MARKET_SOURCE_ID_CONTRACT_VERSION,
+    MIGRATION_EXECUTION_AVAILABLE,
+    MIGRATION_MANIFEST_SCHEMA_VERSION,
+    ProposedSourceMapping,
+    build_migration_impact_manifest,
+    manifest_fingerprint,
 )
 from utils.source_identity import (
     PROVENANCE_SCHEMA_VERSION,
@@ -416,6 +433,119 @@ def _record(
 
 
 # ---------------------------------------------------------------------------
+# 影子入口：原始源证据检视（只读、离线）
+# ---------------------------------------------------------------------------
+
+def shadow_evidence_inspection(
+    *,
+    workspace: str,
+    fixture: Any,
+    adapter: str,
+    sport: str | None = None,
+    dataset_identity: str = "synthetic-evidence-fixture",
+) -> dict:
+    """
+    从**原始源夹具**抽取 provider 证据观测（只读、离线、无副作用）。
+
+    本入口绝不联网、绝不写盘、绝不产生提案或账本条目；返回确定性报告。
+    """
+    extraction = extract_source_evidence(fixture, adapter=adapter, sport=sport)
+    observations = list(extraction.provenance_observations)
+    return {
+        "shadow_report_schema_version": SHADOW_REPORT_SCHEMA_VERSION,
+        "analysis_kind": "SHADOW_PROVIDER_EVIDENCE_INSPECTION",
+        "evidence_schema_version": PROVIDER_EVIDENCE_SCHEMA_VERSION,
+        "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
+        "dataset_identity": dataset_identity,
+        "workspace": os.path.realpath(os.path.abspath(workspace)),
+        "adapter": adapter,
+        "supported_adapters": list(PROVIDER_EVIDENCE_ADAPTERS),
+        "normalized_row_count": len(extraction.normalized_rows),
+        "observation_count": len(observations),
+        "sidecar": extraction.sidecar.as_dict(),
+        "sidecar_fingerprint": extraction.sidecar.fingerprint(),
+        "provenance": build_provenance_report(observations),
+        "conflict_report": conflict_report(observations),
+        "production_mapping_write_authorization": PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
+        "runtime_ledger_enforcement": RUNTIME_LEDGER_ENFORCEMENT,
+        "migration_execution_available": MIGRATION_EXECUTION_AVAILABLE,
+        "active_bindings_created": 0,
+        "is_production_authority": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 影子入口：只读迁移影响分析（只读、无执行）
+# ---------------------------------------------------------------------------
+
+def shadow_migration_analysis(
+    *,
+    workspace: str,
+    canonical_fixture: Sequence[Mapping[str, Any]],
+    observations: Sequence[SourceObservation],
+    proposed_mappings: Sequence[ProposedSourceMapping],
+    dependent_stores: Mapping[str, Any] | None = None,
+    fixture_identity: str = "synthetic-migration-fixture",
+    dataset_identity: str = "synthetic-migration-fixture",
+) -> dict:
+    """
+    生成**只读**迁移影响清单（绝不执行迁移、绝不改写任何 ID）。
+
+    返回的报告显式声明：无活动绑定、无生产权威、无迁移执行。
+    """
+    manifest = build_migration_impact_manifest(
+        fixture_identity=fixture_identity,
+        canonical_fixture=canonical_fixture,
+        observations=observations,
+        proposed_mappings=proposed_mappings,
+        dependent_stores=dependent_stores,
+        dataset_identity=dataset_identity,
+    )
+    return {
+        "shadow_report_schema_version": SHADOW_REPORT_SCHEMA_VERSION,
+        "analysis_kind": "SHADOW_MIGRATION_IMPACT_ANALYSIS",
+        "manifest_schema_version": MIGRATION_MANIFEST_SCHEMA_VERSION,
+        "market_source_id_contract_version": MARKET_SOURCE_ID_CONTRACT_VERSION,
+        "dataset_identity": dataset_identity,
+        "workspace": os.path.realpath(os.path.abspath(workspace)),
+        "migration_impact_manifest": manifest,
+        "migration_manifest_fingerprint": manifest_fingerprint(manifest),
+        "migration_execution_available": MIGRATION_EXECUTION_AVAILABLE,
+        "production_mapping_write_authorization": PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
+        "runtime_ledger_enforcement": RUNTIME_LEDGER_ENFORCEMENT,
+        "active_bindings_created": 0,
+        "canonical_ownership_changed": False,
+        "identifiers_rewritten": 0,
+        "files_written": 0,
+        "is_production_authority": False,
+    }
+
+
+def proposed_mapping_from_payload(payload: Mapping[str, Any]) -> ProposedSourceMapping:
+    """由 JSON 载荷构造一条**提议**映射（仅用于分析；不批准、不执行）。"""
+    return ProposedSourceMapping(
+        legacy_source_id=str(payload["legacy_source_id"]),
+        proposed_source_id=str(payload["proposed_source_id"]),
+        existing_canonical_id=(
+            str(payload["existing_canonical_id"])
+            if payload.get("existing_canonical_id")
+            else None
+        ),
+        identity_kind=str(payload.get("identity_kind") or "COMPETITION_NUMBER"),
+        identity_value=str(payload.get("identity_value") or ""),
+        provider_id_uniqueness_scope=str(
+            payload.get("provider_id_uniqueness_scope") or "NOT_APPLICABLE"
+        ),
+        observation_fingerprints=tuple(
+            str(f) for f in (payload.get("observation_fingerprints") or ())
+        ),
+        mapping_proposal_reference=str(
+            payload.get("mapping_proposal_reference") or ""
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 合成演示夹具（仅用于演示与测试）
 # ---------------------------------------------------------------------------
 
@@ -508,7 +638,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Read-only shadow validation for Canonical mapping governance. "
-            "Never writes production data and is never consulted by refresh()."
+            "Never writes production data, never executes a migration, and is never "
+            "consulted by refresh()."
         )
     )
     parser.add_argument("--workspace", required=True, help="isolated workspace OUTSIDE the repository")
@@ -521,9 +652,67 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-ledger", action="store_true", help="do not write the isolated ledger")
     parser.add_argument("--demo", action="store_true", help="use the built-in synthetic demo fixture")
     parser.add_argument("--json-out", help="optional path to write the report JSON")
+    parser.add_argument(
+        "--evidence-fixture",
+        help="raw source fixture (HTML/XML text, or JSON with 'document'/'documents')",
+    )
+    parser.add_argument(
+        "--adapter",
+        choices=list(PROVIDER_EVIDENCE_ADAPTERS),
+        default="market_xml",
+        help="adapter used to extract evidence from --evidence-fixture",
+    )
+    parser.add_argument("--evidence-sport", help="sport for market_xml evidence extraction")
+    parser.add_argument(
+        "--migration-manifest",
+        action="store_true",
+        help="also build the read-only migration impact manifest (never executes)",
+    )
+    parser.add_argument(
+        "--proposed-mapping",
+        help="JSON file with a list of proposed legacy -> future source mappings",
+    )
+    parser.add_argument(
+        "--dependent-stores",
+        help="JSON file with synthetic dependent evidence stores (7-store fixture)",
+    )
     args = parser.parse_args(argv)
 
-    if args.demo or not args.observations:
+    evidence_report: dict | None = None
+
+    if args.evidence_fixture:
+        with open(args.evidence_fixture, "rb") as handle:
+            raw_fixture = handle.read().decode("utf-8", errors="replace")
+        fixture: Any = raw_fixture
+        if args.evidence_fixture.lower().endswith(".json"):
+            try:
+                parsed = json.loads(raw_fixture)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict) and isinstance(parsed.get("documents"), dict):
+                fixture = {str(k): str(v) for k, v in parsed["documents"].items()}
+            elif isinstance(parsed, dict) and "document" in parsed:
+                fixture = str(parsed["document"])
+            elif parsed is not None:
+                fixture = parsed
+        evidence_report = shadow_evidence_inspection(
+            workspace=args.workspace,
+            fixture=fixture,
+            adapter=args.adapter,
+            sport=args.evidence_sport,
+            dataset_identity=args.dataset_identity,
+        )
+        extraction = extract_source_evidence(
+            fixture, adapter=args.adapter, sport=args.evidence_sport
+        )
+        observations = list(extraction.provenance_observations)
+        incoming_rows = list(extraction.normalized_rows)
+        canonical_fixture: list[dict] = []
+        if args.canonical_fixture:
+            with open(args.canonical_fixture, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            canonical_fixture = payload["matches"] if isinstance(payload, dict) else payload
+    elif args.demo or not args.observations:
         observations, incoming_rows, canonical_fixture = demo_observations()
     else:
         with open(args.observations, "r", encoding="utf-8") as handle:
@@ -552,6 +741,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_ledger=not args.no_ledger,
         approve=bool(args.approve),
     )
+    if evidence_report is not None:
+        report["provider_evidence_inspection"] = evidence_report
+
+    if args.migration_manifest:
+        mappings: list[ProposedSourceMapping] = []
+        if args.proposed_mapping:
+            with open(args.proposed_mapping, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            entries = payload["mappings"] if isinstance(payload, dict) else payload
+            mappings = [proposed_mapping_from_payload(item) for item in entries]
+        dependent_stores: dict = {}
+        if args.dependent_stores:
+            with open(args.dependent_stores, "r", encoding="utf-8") as handle:
+                dependent_stores = json.load(handle)
+        report["migration_impact_analysis"] = shadow_migration_analysis(
+            workspace=args.workspace,
+            canonical_fixture=canonical_fixture,
+            observations=observations,
+            proposed_mappings=mappings,
+            dependent_stores=dependent_stores,
+            dataset_identity=args.dataset_identity,
+        )
 
     text = json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2)
     if args.json_out:

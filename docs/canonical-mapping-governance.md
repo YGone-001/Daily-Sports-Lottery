@@ -6,7 +6,8 @@
 **Governance schema version**: `GOVERNANCE_SCHEMA_VERSION = "1.0.0"`
 **Proposal schema version**: `PROPOSAL_SCHEMA_VERSION = "2.0.0"`
 **Approval schema version**: `MAPPING_APPROVAL_SCHEMA_VERSION = "2.0.0"`
-**Identity-key schema version**: `IDENTITY_KEY_SCHEMA_VERSION = "2.0.0"` (legacy `1.0.0` = scope-only)
+**Identity-key schema version**: `IDENTITY_KEY_SCHEMA_VERSION = "3.0.0"`
+  (superseded `2.0.0`; legacy `1.0.0` = scope-only — both read-only)
 **Production mapping write authorization**: `NOT_GRANTED`
 **Runtime ledger enforcement**: `NOT_ENABLED`
 
@@ -42,14 +43,18 @@ This phase builds and validates governance with **synthetic, isolated data only*
 | Capability | Status |
 | :--- | :--- |
 | Provenance model, stability classification, conflict classification | **implemented** |
+| Raw provider evidence inventory + opt-in, offline evidence extraction | **implemented** (`utils/provider_evidence.py`) |
 | Proposal contract + explicit state machine | **implemented** |
 | Scoped source identity key (distinct from scope metadata) | **implemented** |
+| Provider ID uniqueness scope (supplied ≠ unique ≠ stable) | **implemented** |
 | Ed25519 owner approval, bound to the identity key, with actor/operator attribution | **implemented** |
 | Retained approval evidence + independent historical approval audit | **implemented** |
 | Isolated append-only hash-chained ledger + structural verification | **implemented** |
 | Read-only shadow validation entry point | **implemented** |
+| Sport-scoped market source ID contract (design only, not wired into parsers) | **documented only** (`docs/source-id-migration-planning.md`) |
+| Read-only migration impact manifest | **implemented** (`utils/source_id_migration.py`) |
 | Runtime mapping enforcement / production mapping writes | **NOT implemented (not authorized)** |
-| Historical Canonical migration | **NOT implemented (not authorized)** |
+| Historical Canonical migration / migration executor | **NOT implemented (not authorized)** |
 
 ---
 
@@ -74,26 +79,47 @@ identical scope tuple, so a binding key built only from scope metadata would col
 falsely reject one of them.
 
 `ScopedSourceIdentityKey` therefore adds **discriminating identity evidence**, versioned by
-`IDENTITY_KEY_SCHEMA_VERSION = "2.0.0"`:
+`IDENTITY_KEY_SCHEMA_VERSION = "3.0.0"`:
 
 | Kind | `identity_value` | Sufficient for an active binding |
 | :--- | :--- | :--- |
 | `COMPETITION_NUMBER` | `sport\|date\|jczq\|normalized_number` | **yes** — the bare number is never used without sport and date scoping |
-| `RAW_PROVIDER_ID` | `adapter\|namespace\|raw_identifier_type\|raw_provider_id` | **yes** — only when the provider actually supplied it (never invented) |
+| `RAW_PROVIDER_ID` | `adapter\|namespace\|sport\|date\|raw_type\|uniqueness_scope\|raw_provider_id` | **yes** — only when the provider actually supplied it **and** its uniqueness scope is independently documented (`VERIFIED_SCOPED`) |
+| `UNVERIFIED_PROVIDER_ID` | the same tuple, with `uniqueness_scope` ∈ {`UNVERIFIED`, `UNKNOWN`} | **no** — recorded and reviewable, but never an active binding |
 | `AMBIGUOUS_SHARED_SOURCE_ID` | the disputed shared source string + member scopes | **no** — review only |
 | `INSUFFICIENT` | the derived source ID as observed | **no** — row-position-derived, meaning-unconfirmable or synthetic evidence |
+
+> The `provider_id_uniqueness_scope` is part of the key payload and therefore part of what an
+> owner signature binds. A provider identifier that is merely *supplied* is never treated as
+> globally unique: it lands in `UNVERIFIED_PROVIDER_ID` and cannot authorize a binding.
+
+The `RAW_PROVIDER_ID` value carries `sport` and `date`, so the **same** provider number on a
+different date or in a different sport no longer collapses into one binding identity.
 
 Fail-closed rules:
 
 - A **binding** action requires `identity_key.is_sufficient`; otherwise
-  `ProposalValidationError` (ambiguous / unstable / position-derived observations can
-  still be *observed* and sent to `REVIEW_REQUIRED`, but never actively bound).
+  `ProposalValidationError` (ambiguous / unstable / position-derived / unverified-provider
+  observations can still be *observed* and sent to `REVIEW_REQUIRED`, but never actively bound).
 - A provider identifier that was never supplied is never inferred into the key.
+- An HTML element `id` is never promoted to a stable provider identifier.
 - Row-position identifiers are never treated as durable mapping authority.
 - Two distinct events → two distinct keys; repeated observations of one identity → one key.
 - Football and basketball remain separate identity scopes; the same number on different
   dates stays distinct; different numbers on the same sport/date stay distinct.
 - The key never depends on observation order.
+
+### 2.2 Schema compatibility across key versions
+
+| Version | Meaning | Treatment |
+| :--- | :--- | :--- |
+| `3.0.0` (current) | provider identity value carries sport/date/uniqueness scope; `UNVERIFIED_PROVIDER_ID` exists | authoritative |
+| `2.0.0` (superseded) | provider identity value lacked sport/date/uniqueness scope — the same raw number could collide across dates and sports | read-only; `classify_binding_key` → `LEGACY_VERSION`, refused wherever active authority is requested |
+| `1.0.0` (legacy, absent marker) | scope-only metadata, no discriminating evidence | read-only; `LEGACY_SCOPE_ONLY` |
+
+An approval signed under an older key contract is **historical evidence only**. It is never
+silently migrated, reinterpreted, or reused to authorize a new-format key; a fresh owner
+decision under the current contract is required.
 
 ---
 
@@ -259,12 +285,15 @@ against a new baseline.
 ### 5.3 Schema compatibility boundary
 
 The binding-key contract moved from scope-only metadata (`IDENTITY_KEY_SCHEMA_VERSION`
-absent = legacy `1.0.0`) to discriminating identity evidence (`2.0.0`), and the approval
-contract gained `scoped_source_identity_key` (`MAPPING_APPROVAL_SCHEMA_VERSION` `1.0.0` →
-`2.0.0`). Consequences:
+absent = legacy `1.0.0`) to discriminating identity evidence (`2.0.0`), and then to
+scope-carrying provider identity evidence (`3.0.0`), while the approval contract gained
+`scoped_source_identity_key` (`MAPPING_APPROVAL_SCHEMA_VERSION` `1.0.0` → `2.0.0`).
+Consequences:
 
 - Legacy artifacts are **not** silently migrated, reinterpreted, or reused for a new
   identity-key meaning.
+- A `2.0.0` key means something different from a `3.0.0` key (its provider value lacked
+  sport/date/uniqueness scope), so it is refused as `LEGACY_VERSION` rather than re-read.
 - Legacy keys are preserved for read-only inspection (`legacy_active_bindings()`,
   `binding_key_contracts()`), and are refused whenever active authority is requested
   (`LegacyBindingKeyError`).
@@ -292,14 +321,16 @@ contract gained `scoped_source_identity_key` (`MAPPING_APPROVAL_SCHEMA_VERSION` 
 
 `tools/mapping_governance_shadow.py` — **read-only** entry point.
 
-Allowed: inspect a synthetic observation batch; create proposal artifacts; compare with an
+Allowed: inspect a synthetic observation batch; extract provider evidence from a raw source
+fixture (**offline**, `shadow_evidence_inspection`); create proposal artifacts; compare with an
 isolated Canonical fixture; validate ownership against the existing ingestion planner
-(**read-only**); verify a governance ledger; produce a deterministic conflict report.
+(**read-only**); verify a governance ledger; build a **read-only** migration impact manifest
+(`shadow_migration_analysis`); produce a deterministic conflict report.
 
 Forbidden (and not implemented): consulting the ledger as production authority; rewriting
 `daily_matches.json`; rewriting historical snapshots; changing source adapters' persisted ID
 formats; blocking the live refresh from ledger decisions; auto-approving proposals;
-auto-migrating historical mappings.
+auto-migrating historical mappings; executing any migration.
 
 CLI:
 
@@ -308,10 +339,17 @@ python -m tools.mapping_governance_shadow --demo --workspace /tmp/gov_shadow
 python -m tools.mapping_governance_shadow \
     --observations rows.json --canonical-fixture canonical.json \
     --workspace /tmp/gov_shadow --dataset-identity my-fixture
+python -m tools.mapping_governance_shadow \
+    --evidence-fixture market.xml --adapter market_xml \
+    --canonical-fixture canonical.json --workspace /tmp/gov_shadow \
+    --migration-manifest --proposed-mapping proposed.json \
+    --dependent-stores seven_stores.json
 ```
 
 > The current ingestion preflight remains the authoritative runtime identity guard.
-> Shadow governance is **not** an additional production write path.
+> Shadow governance is **not** an additional production write path. The migration impact
+> manifest is an analysis artifact: it carries `executable: false`, exposes no execution API,
+> and grants no authorization.
 
 ---
 
@@ -336,8 +374,13 @@ python -m tools.mapping_governance_shadow \
 **Problem**: football and basketball share the `500j-{date}-{matchnum}` string.
 
 **Future-safe design**: derive new market identities with the sport in the namespace
-(e.g. `500jzq-…` / `500jclq-…`, or `500j-{sport}-{date}-{number}`), and treat the legacy
+(e.g. `500jzq-…` / `500jlq-…`, or `500j-{sport}-{date}-{number}`), and treat the legacy
 `500j-…` string as an explicitly ambiguous alias.
+
+The versioned contract, the three evaluated candidates and the selected preferred format are
+specified in `docs/source-id-migration-planning.md` §1. Nothing there is wired into a
+production parser: `utils/source_id_migration.py` only *composes* and *classifies* future
+identifiers, and `utils/fetcher_500.py` is unchanged.
 
 **Compatibility**: existing `500j` records stay byte-identical. The legacy form is mapped
 only through a governance decision, never by a silent rewrite. Until such a decision exists,
@@ -363,6 +406,7 @@ Referential integrity across `daily_matches.json`, `prediction_snapshots.json`,
 `odds_snapshots.json`, `settlements.json` and `evaluation_rows.json` would require, in order:
 
 1. **Dry run** — compute the full impact manifest; write nothing.
+   (`utils/source_id_migration.build_migration_impact_manifest`, read-only.)
 2. **Full impact manifest** — every affected Canonical ID, every dependent snapshot /
    settlement / evaluation row, and the exact before/after identity mapping.
 3. **Owner approval** — an Ed25519 approval bound to the manifest fingerprint, the dataset
@@ -375,7 +419,8 @@ Referential integrity across `daily_matches.json`, `prediction_snapshots.json`,
    resolvable, all seven stores accounted for, and zero unintended changes.
 
 This is design documentation only. No migration code and no production repair execution are
-part of this phase.
+part of this phase. The manifest schema, the six impact classifications and the historical
+reference analysis are specified in `docs/source-id-migration-planning.md` §2.
 
 ---
 

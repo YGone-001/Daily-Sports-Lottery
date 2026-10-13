@@ -1,8 +1,10 @@
 # Source Identity Provenance
 
 **Module**: `utils/source_identity.py`
-**Tests**: `tests/test_source_identity_provenance.py` (PG-01 … PG-08 plus evidence-integrity cases)
-**Schema version**: `PROVENANCE_SCHEMA_VERSION = "1.0.0"`
+**Opt-in evidence extraction**: `utils/provider_evidence.py`
+**Tests**: `tests/test_source_identity_provenance.py` (PG-01 … PG-08 plus evidence-integrity cases),
+`tests/test_provider_identity_evidence.py` (PE-01 … PE-18)
+**Schema version**: `PROVENANCE_SCHEMA_VERSION = "2.0.0"` (legacy `1.0.0` is read-only)
 **Authorization status**: read-only evidence. No Canonical write path, no repair, no migration.
 
 ---
@@ -48,7 +50,7 @@ Three identifiers are **never collapsed into one field**:
 
 | Field | Type | Notes |
 | :--- | :--- | :--- |
-| `provenance_schema_version` | str | `"1.0.0"` |
+| `provenance_schema_version` | str | `"2.0.0"` |
 | `observation_id` | str | Deterministic; derived from the semantic fingerprint |
 | `adapter` | str | `live_football`, `live_basketball`, `market_xml`, `finished_feed`, `html_fallback` |
 | `observation_category` | str | `LIVE_FOOTBALL`, `LIVE_BASKETBALL`, `MARKET_XML`, `FINISHED_FEED`, `HTML_FALLBACK`, `SYNTHETIC` |
@@ -56,7 +58,8 @@ Three identifiers are **never collapsed into one field**:
 | `sport` | str | |
 | `event_date` | str \| None | |
 | `raw_provider_id` | str \| None | **Absent stays `None`** |
-| `raw_provider_id_type` | str | `PROVIDER_MATCH_ID`, `COMPETITION_NUMBER`, `ROW_INDEX`, `NONE`, `UNKNOWN` |
+| `raw_provider_id_type` | str | `PROVIDER_MATCH_ID`, `COMPETITION_NUMBER`, `HTML_ELEMENT_ID`, `ROW_INDEX`, `NONE`, `UNKNOWN` |
+| `raw_provider_id_uniqueness_scope` | str | `VERIFIED_SCOPED`, `UNVERIFIED`, `UNKNOWN`, `NOT_APPLICABLE` (see §3.1) |
 | `derived_source_id` | str \| None | |
 | `canonical_match_id` | str \| None | |
 | `competition_number_raw` | str \| None | Original value preserved |
@@ -68,12 +71,14 @@ Three identifiers are **never collapsed into one field**:
 | `extractor_identity` | str | Parser function + version, e.g. `utils.fetcher_500._parse_live@1` |
 | `raw_evidence_sha256` | str | Fingerprint of the raw field values actually read |
 | `raw_values` | tuple | Original values, `MISSING` when absent |
-| `evidence_completeness` | tuple | Per-dimension boolean |
+| `evidence_completeness` | tuple | Per-dimension boolean (includes `provider_id_uniqueness_verified`) |
 | `notes` | tuple | Explicit statements of what is *not* established |
 | `identity_stability_reason` | str | Why this stability class was chosen |
 
 `semantic_fingerprint()` covers only **what the observation asserts**; `raw_evidence_sha256`
-covers the raw bytes/fields. The two are deliberately different quantities (§7).
+covers the raw bytes/fields. The two are deliberately different quantities (§7). Because the
+uniqueness scope is part of what an observation asserts, the *same* raw provider value
+recorded as `VERIFIED_SCOPED` and as `UNKNOWN` produces **different** semantic fingerprints.
 
 ---
 
@@ -91,6 +96,38 @@ covers the raw bytes/fields. The two are deliberately different quantities (§7)
 > Provider-supplied is **not** equated with globally stable unless that guarantee is
 > independently documented. The default for a provider-supplied identifier is therefore
 > `PROVIDER_SUPPLIED_UNVERIFIED`.
+
+### 3.1 Provider ID uniqueness scope
+
+Three guarantees are **not** equivalent and are never collapsed:
+
+| Guarantee | Meaning | Independent evidence required |
+| :--- | :--- | :--- |
+| *provider-supplied* | The source really did emit this value. | none — it is directly observable |
+| *provider-unique* | Unique within an **explicitly declared** scope. | yes — a documented reference |
+| *provider-stable* | Same meaning across refreshes. | yes — a documented reference |
+
+`ProviderIdUniquenessScope` records which one holds:
+
+| Value | Meaning |
+| :--- | :--- |
+| `VERIFIED_SCOPED` | An independently documented guarantee covers `(adapter, namespace, sport, raw_type)`. |
+| `UNVERIFIED` | The provider supplied it, but no documented uniqueness/stability guarantee exists. |
+| `UNKNOWN` | The uniqueness scope cannot be determined. Behaves like `UNVERIFIED` for binding purposes. |
+| `NOT_APPLICABLE` | The identity key carries no provider identifier (e.g. a competition-number identity). |
+
+`VERIFIED_PROVIDER_ID_SCOPES` is **deliberately empty**: this repository holds no independently
+documented uniqueness guarantee for any provider identifier. Consequently every provider
+identifier observed today resolves to `UNKNOWN`, and:
+
+- the observation is still **recorded**;
+- the resulting identity key is `UNVERIFIED_PROVIDER_ID`, which is **never sufficient**;
+- a binding action built on it is refused (`ProposalValidationError` / `LedgerIntegrityError`
+  boundary), so it can only be observed, reviewed and used for conflict detection.
+
+A provider identifier is never inferred to be globally unique from its shape, length or
+numeric-ness. Adding a `VERIFIED_SCOPED` declaration requires a reviewable
+`documentation_reference` in the registry entry.
 
 ---
 
@@ -127,6 +164,54 @@ Declared in `SOURCE_ID_PATTERNS` and verified against the **real** parsers by
 provider identifier the system can no longer audit or re-derive. `observe_source_row`
 records this as `raw_provider_id = None` plus an explicit note — it never synthesizes a
 provider value.
+
+### 5.1 Raw evidence inventory (`PROVIDER_EVIDENCE_INVENTORY`)
+
+`SOURCE_ID_PATTERNS` describes the **derived** ID construction paths. The raw-evidence
+inventory is a separate, explicitly declared structure recording, per parser: the exact
+parser, the input field or attribute, the observed meaning, evidence availability, stability
+limitations, the current data loss, and the safe preservation mechanism.
+
+| Adapter | Parser | Raw identifiers actually present | Currently discarded |
+| :--- | :--- | :--- | :--- |
+| `live_football` | `_parse_live` | `<tr id="a…">` element id; `order` attribute (竞彩 number) | one of the two (whichever did not become the ID suffix) |
+| `live_basketball` | `_parse_lq` | `matchList[_LQ_ID]` (provider match id); `matchList[_LQ_NO]` (竞彩 number) | one of the two |
+| `market_xml` | `fetch_jczq_xml` | XML `<m id>` (provider match id); `<m matchnum>` (竞彩 number) | the XML `id` (used only as an aggregation key) |
+| `finished_feed` | `_parse_wanchang` | row ordinal only | the `<tr>` `id` attribute is never read, and no competition number exists |
+| `html_fallback` | `_parse_jczq_html` | row ordinal only | `data-mid` (if the rendered page carries it) is never read |
+
+> No entry in this inventory asserts that a provider identifier is globally unique or
+> stable across refreshes. The inventory records availability, not authority.
+
+### 5.2 Opt-in evidence extraction (`utils/provider_evidence.py`)
+
+`extract_source_evidence(fixture, adapter=…, sport=…)` returns a typed
+`SourceEvidenceExtraction` that unpacks to `(normalized_rows, provenance_observations)`, plus a
+`SourceProvenanceSidecar`. It runs on an **already obtained** source fixture and:
+
+- captures raw provider values **before** normalization discards them;
+- captures only values actually present in the supplied fixture (never synthesizes one);
+- keeps the provider field, the HTML element id and the competition number separate;
+- stores the exact raw value and the normalized interpretation separately;
+- records the parser/extractor identity and a deterministic observation fingerprint;
+- never mutates the fixture or the parser's input;
+- never changes `utils/fetcher_500`'s return values, and is never called by `scraper.refresh()`;
+- persists nothing — no `daily_matches.json` fields, no network, no ledger writes,
+  no automatic mapping proposals.
+
+Classification rule used by the extractor (deliberately conservative):
+
+| Raw source | Recorded `raw_provider_id_type` | Uniqueness scope |
+| :--- | :--- | :--- |
+| HTML `id` attribute | `HTML_ELEMENT_ID` | `UNKNOWN` |
+| explicitly named provider field (`<m id>`, `matchList[_LQ_ID]`, `data-mid`) | `PROVIDER_MATCH_ID` | `UNKNOWN` |
+| competition number field (`order`, `matchnum`, `_LQ_NO`) | `COMPETITION_NUMBER` | `NOT_APPLICABLE` (scoped to `sport\|date\|number`) |
+
+Because every provider identifier is `UNKNOWN`, the extracted observations can never
+authorize an active binding; they are evidence for review and conflict detection only.
+
+The sidecar is **not** part of the runtime match schema: it is a separate object that is never
+written into `daily_matches.json`.
 
 ---
 
@@ -196,7 +281,12 @@ sole ownership proof.
 - No Canonical ID rewriting, no historical migration, no `500j` / `500w` ID changes.
 - No fuzzy team matching, no invented provider identifiers, no promotion of row positions
   to stable IDs, no assumption that a source ID is globally unique.
+- No provider identifier is ever promoted to authoritative mapping evidence without an
+  independently documented uniqueness scope (see §3.1).
 - The provenance layer is **not** the runtime identity authority; that remains
   `utils.ingestion_identity.validate_ingestion_identity`.
+- The opt-in extraction path is **not** wired into the live refresh: it changes no parser
+  contract, no fetcher return value and no persisted runtime schema.
 - The migration designs that follow from these risks are documented in
-  `docs/canonical-mapping-governance.md` §9 and are **not executed**.
+  `docs/canonical-mapping-governance.md` §9 and `docs/source-id-migration-planning.md`, and are
+  **not executed**.
