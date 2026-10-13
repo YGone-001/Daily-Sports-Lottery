@@ -30,7 +30,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
@@ -108,6 +108,12 @@ FORBIDDEN_SCOPE_TOKENS: tuple[str, ...] = (
 
 #: 影子审计日志的创世前驱哈希。
 GENESIS_PREVIOUS_HASH = "0" * 64
+
+#: 影子快照构建器版本。
+#:
+#: ``1.1.0``：空上下文列表 fail closed（不再抛裸 ``IndexError``）、拒绝跨上下文
+#: 数据集 / 基线不一致、完全等价的重复绑定幂等去重。
+SHADOW_SNAPSHOT_BUILDER_VERSION = "1.1.0"
 
 #: 允许为空的授权字段（其余字段在签名时必须非空）。
 MAY_BE_EMPTY_FIELDS: tuple[str, ...] = (
@@ -1080,15 +1086,71 @@ class ShadowActivationSnapshot:
     def is_consumable(self) -> bool:
         return self.status in CONSUMABLE_LIFECYCLE_STATES
 
+    def content_payload(self) -> dict:
+        """
+        快照的**内容载荷**（用于独立重算内容指纹）。
+
+        刻意只包含内容本身，不含 ``snapshot_id`` / ``snapshot_fingerprint``，
+        因此任何「手工构造 / 反序列化」的快照都能被独立复算校验。
+        """
+        return {
+            "kind": "SHADOW_ACTIVATION_SNAPSHOT",
+            "prototype_only": True,
+            "activation_ids": sorted(self.activation_ids),
+            "baseline_fingerprint": self.baseline_fingerprint,
+            "policy_version": self.policy_version,
+            "evaluator_version": self.evaluator_version,
+            "generated_at": self.generated_at,
+            "status": self.status,
+            "dataset_identity": self.dataset_identity,
+            "bindings": [binding.as_dict() for binding in self.bindings],
+        }
+
+    def content_fingerprint(self) -> str:
+        """独立重算的内容指纹（供读取器做快照完整性校验）。"""
+        return fingerprint(self.content_payload())
+
     def resolve(self, source_identity_key: str) -> ShadowActivationBinding | None:
+        """
+        解析一个源身份键。
+
+        同一键可以出现**多条等价**绑定（同一 Canonical 目标）；只要目标一致即解析成功。
+        目标不一致（所有权冲突）时返回 ``None`` —— 调用方必须据此判定为冲突，
+        绝不退化为「未找到」。
+        """
         matches = [
             binding
             for binding in self.bindings
             if binding.source_identity_key == source_identity_key
         ]
-        if len(matches) != 1:
+        if not matches:
             return None
-        return matches[0]
+        targets = {binding.candidate_canonical_id for binding in matches}
+        if len(targets) != 1:
+            return None
+        return sorted(
+            matches,
+            key=lambda binding: (
+                binding.activation_id,
+                binding.eligibility_decision_fingerprint,
+            ),
+        )[0]
+
+    def bindings_for(self, source_identity_key: str) -> tuple[ShadowActivationBinding, ...]:
+        """某源身份键的全部绑定（只读；供冲突诊断使用）。"""
+        return tuple(
+            sorted(
+                (
+                    binding
+                    for binding in self.bindings
+                    if binding.source_identity_key == source_identity_key
+                ),
+                key=lambda binding: (
+                    binding.activation_id,
+                    binding.candidate_canonical_id,
+                ),
+            )
+        )
 
     def as_dict(self) -> dict:
         return {
@@ -1151,6 +1213,25 @@ def build_shadow_activation_snapshot(
             "verification_contexts must align with authorizations by index",
             rejection_codes=("MALFORMED_ARTIFACT",),
         )
+    if verification_contexts is not None:
+        # 一个快照只能有**一个**数据集身份与**一个**基线；缺少上下文即无法确定身份。
+        if not verification_contexts:
+            raise ShadowActivationSnapshotError(
+                "at least one verification context is required to establish the "
+                "snapshot's dataset and baseline identity",
+                rejection_codes=("VERIFICATION_CONTEXT_MISSING",),
+            )
+        datasets = {context.dataset_identity for context in verification_contexts}
+        baselines = {
+            context.current_baseline_fingerprint for context in verification_contexts
+        }
+        if len(datasets) > 1 or len(baselines) > 1:
+            raise ShadowActivationSnapshotError(
+                "per-authorization verification contexts disagree on dataset identity or "
+                "Canonical baseline; a shadow snapshot has exactly one dataset and one "
+                "baseline",
+                rejection_codes=("INCONSISTENT_VERIFICATION_CONTEXTS",),
+            )
 
     rejections: list[str] = []
     bindings: list[ShadowActivationBinding] = []
@@ -1189,6 +1270,20 @@ def build_shadow_activation_snapshot(
             )
         )
 
+    # 完全等价的重复绑定只保留一条（幂等）；不兼容的重复绑定仍由
+    # AMBIGUOUS_SHADOW_BINDING 拒绝。
+    deduplicated: dict[tuple[str, ...], ShadowActivationBinding] = {}
+    for binding in bindings:
+        signature = (
+            binding.activation_id,
+            binding.source_identity_key,
+            binding.candidate_canonical_id,
+            binding.eligibility_decision_fingerprint,
+            binding.authorized_scope,
+        )
+        deduplicated.setdefault(signature, binding)
+    bindings = list(deduplicated.values())
+
     # 同一源身份键必须唯一指向一个 Canonical ID。
     by_key: dict[str, set[str]] = {}
     for binding in bindings:
@@ -1205,39 +1300,35 @@ def build_shadow_activation_snapshot(
         )
 
     ordered_bindings = tuple(sorted(bindings, key=lambda b: b.source_identity_key))
-    payload = {
-        "kind": "SHADOW_ACTIVATION_SNAPSHOT",
-        "prototype_only": True,
-        "activation_ids": sorted(binding.activation_id for binding in ordered_bindings),
-        "baseline_fingerprint": (
+    provisional = ShadowActivationSnapshot(
+        snapshot_id="",
+        snapshot_fingerprint="",
+        activation_ids=tuple(
+            sorted(binding.activation_id for binding in ordered_bindings)
+        ),
+        baseline_fingerprint=(
             verification_context.current_baseline_fingerprint
             if verification_context is not None
             else verification_contexts[0].current_baseline_fingerprint  # type: ignore[index]
         ),
-        "policy_version": RUNTIME_MAPPING_POLICY_VERSION,
-        "evaluator_version": RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
-        "generated_at": str(generated_at),
-        "status": status,
-        "dataset_identity": dataset_identity
+        policy_version=RUNTIME_MAPPING_POLICY_VERSION,
+        evaluator_version=RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
+        generated_at=str(generated_at),
+        status=status,
+        dataset_identity=dataset_identity
         or (
             verification_context.dataset_identity
             if verification_context is not None
             else verification_contexts[0].dataset_identity  # type: ignore[index]
         ),
-        "bindings": [binding.as_dict() for binding in ordered_bindings],
-    }
-    snapshot_fingerprint = fingerprint(payload)
-    return ShadowActivationSnapshot(
+        bindings=ordered_bindings,
+    )
+    # 快照指纹**就是**独立重算的内容指纹（单一真源，杜绝两处漂移）。
+    snapshot_fingerprint = provisional.content_fingerprint()
+    return replace(
+        provisional,
         snapshot_id=snapshot_fingerprint,
         snapshot_fingerprint=snapshot_fingerprint,
-        activation_ids=tuple(payload["activation_ids"]),
-        baseline_fingerprint=payload["baseline_fingerprint"],
-        policy_version=payload["policy_version"],
-        evaluator_version=payload["evaluator_version"],
-        generated_at=payload["generated_at"],
-        status=payload["status"],
-        dataset_identity=payload["dataset_identity"],
-        bindings=ordered_bindings,
     )
 
 
@@ -1361,6 +1452,7 @@ def shadow_activation_prototype_status() -> dict:
         "consumable_lifecycle_states": sorted(CONSUMABLE_LIFECYCLE_STATES),
         "audit_event_types": list(SHADOW_AUDIT_EVENT_TYPES),
         "audit_persisted": False,
+        "shadow_snapshot_builder_version": SHADOW_SNAPSHOT_BUILDER_VERSION,
         "rejection_code_count": len(AUTHORIZATION_REJECTION_CODE_SET),
         "production_activation": PRODUCTION_ACTIVATION,
         "production_runtime_reader": PRODUCTION_RUNTIME_READER,
