@@ -50,7 +50,11 @@ from utils.runtime_mapping_policy import (
 )
 
 #: 激活架构设计契约版本。任何设计语义变化都必须提升该版本。
-RUNTIME_ACTIVATION_DESIGN_VERSION = "1.0.0"
+#:
+#: ``1.1.0``：授权工件的字段名与原型实现对齐（``authorization_schema_version``），
+#: 并补齐资格判定指纹与密码学三件套（``signature_algorithm`` /
+#: ``signer_public_key_id`` / ``signature``）。
+RUNTIME_ACTIVATION_DESIGN_VERSION = "1.1.0"
 
 #: 激活实现状态：本阶段**未实现**。不要把该值改成 IMPLEMENTED。
 ACTIVATION_IMPLEMENTATION_STATUS = "NOT_IMPLEMENTED"
@@ -289,10 +293,11 @@ ACTIVATION_AUTHORIZATION_REQUIRED_FIELDS: tuple[str, ...] = (
     "expected_baseline_fingerprint",
     "approval_fingerprint",
     # 激活特有项
-    "activation_authorization_schema_version",
+    "authorization_schema_version",
     "purpose",
     "activation_id",
     "eligibility_decision_id",
+    "eligibility_decision_fingerprint",
     "eligibility_evaluator_version",
     "policy_version",
     "runtime_snapshot_id",
@@ -303,6 +308,10 @@ ACTIVATION_AUTHORIZATION_REQUIRED_FIELDS: tuple[str, ...] = (
     "expires_at",
     "revocation_reference",
     "reason",
+    # 密码学三件套
+    "signature_algorithm",
+    "signer_public_key_id",
+    "signature",
 )
 
 #: 允许的激活范围（最小权限：只允许「只读解析参与」，不允许任何写入语义）。
@@ -707,10 +716,14 @@ def _assert_design_is_coherent() -> None:
         raise AssertionError("activation design: the activation artifact must be distinct")
     for field in (
         "eligibility_decision_id",
+        "eligibility_decision_fingerprint",
         "expires_at",
         "authorized_scope",
         "runtime_snapshot_id",
         "authorizer",
+        "signature_algorithm",
+        "signer_public_key_id",
+        "signature",
     ):
         if field not in ACTIVATION_AUTHORIZATION_REQUIRED_FIELDS:
             raise AssertionError(

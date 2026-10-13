@@ -1,8 +1,10 @@
 # Runtime Activation Architecture (design only)
 
 **Design contract**: `utils/runtime_activation_design.py`
-**Design version**: `RUNTIME_ACTIVATION_DESIGN_VERSION = "1.0.0"`
+**Design version**: `RUNTIME_ACTIVATION_DESIGN_VERSION = "1.1.0"`
+**Prototype**: `utils/runtime_activation_authorization.py` (isolated, shadow-only)
 **Design guard tests**: `tests/test_runtime_activation_design.py`
+**Prototype tests**: `tests/test_runtime_activation_authorization.py`
 **Classification**: architecture design only
 
 | Flag | Value |
@@ -114,10 +116,12 @@ Required bound fields:
 proposal_id, proposal_content_fingerprint, scoped_source_identity_key,
 candidate_canonical_id, dataset_identity, expected_baseline_fingerprint,
 approval_fingerprint,
-activation_authorization_schema_version, purpose, activation_id,
-eligibility_decision_id, eligibility_evaluator_version, policy_version,
+authorization_schema_version, purpose, activation_id,
+eligibility_decision_id, eligibility_decision_fingerprint,
+eligibility_evaluator_version, policy_version,
 runtime_snapshot_id, authorized_scope, operator, authorizer, authorized_at,
-expires_at, revocation_reference, reason
+expires_at, revocation_reference, reason,
+signature_algorithm, signer_public_key_id, signature
 ```
 
 The first block is **isomorphic to the owner approval** so the same evidence is bound;

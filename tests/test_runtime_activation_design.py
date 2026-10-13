@@ -121,7 +121,7 @@ def test_ad_01_design_contract_declares_no_activation():
     """AD-01: 设计契约自洽，且明确声明「未实现 / 未启用 / 未授权」。"""
     status = activation_design_status()
 
-    assert RUNTIME_ACTIVATION_DESIGN_VERSION == "1.0.0"
+    assert RUNTIME_ACTIVATION_DESIGN_VERSION == "1.1.0"
     assert ACTIVATION_IMPLEMENTATION_STATUS == "NOT_IMPLEMENTED"
     assert status["activation_implementation_status"] == "NOT_IMPLEMENTED"
     assert RUNTIME_ACTIVATION == "NOT_ENABLED"
