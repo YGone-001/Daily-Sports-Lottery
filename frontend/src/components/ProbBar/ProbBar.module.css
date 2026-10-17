@@ -1,0 +1,30 @@
+.bar {
+  display: flex;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--bg-sunken);
+  width: 100%;
+}
+
+.largeBar {
+  height: 6px;
+  border-radius: 3px;
+}
+
+.segment {
+  height: 100%;
+  transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.segHome {
+  background: var(--side-home);
+}
+
+.segDraw {
+  background: var(--side-draw);
+}
+
+.segAway {
+  background: var(--side-away);
+}

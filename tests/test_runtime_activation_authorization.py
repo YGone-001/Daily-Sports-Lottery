@@ -1269,7 +1269,7 @@ def test_aa_24_no_production_signing_keys_are_required(tmp_path, env):
     """AA-24: 不需要任何生产签名密钥；仓库内私钥一律被拒绝。"""
     # 仓库内不存在任何 PEM 私钥。
     for root, _dirs, files in os.walk(REPO_ROOT):
-        if ".git" in root or "__pycache__" in root:
+        if any(skip in root for skip in (".git", "__pycache__", ".venv", "venv", "node_modules")):
             continue
         for name in files:
             assert not name.lower().endswith(".pem"), os.path.join(root, name)

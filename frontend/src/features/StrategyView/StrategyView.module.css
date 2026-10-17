@@ -1,0 +1,356 @@
+/* ==========================================================================
+   每日体彩预测终端 - 智能策略舱样式 (StrategyView)
+   ========================================================================== */
+
+.strategyHead {
+    text-align: center;
+    margin-bottom: 24px;
+}
+
+.shTitle {
+    font-size: var(--fs-xl);
+    font-weight: 900;
+    letter-spacing: -.02em;
+}
+
+.shSub {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    margin-top: 6px;
+}
+
+.bankrollCard {
+    max-width: 720px;
+    margin: 0 auto 24px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    box-shadow: var(--shadow-sm);
+}
+
+.bcTitle {
+    font-size: var(--fs-xs);
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--text-faint);
+    margin-bottom: 12px;
+}
+
+.kellySliderRow {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 16px;
+}
+
+.sliderLabel {
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.kellySliderMain {
+    min-width: 0;
+}
+
+.kellySliderMain input[type=range] {
+    display: block;
+    width: 100%;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.sliderScale {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+    font-family: var(--mono);
+    font-size: var(--fs-2xs);
+    color: var(--text-faint);
+}
+
+.kellyAmount {
+    font-family: var(--mono);
+    font-size: var(--fs-md);
+    font-weight: 800;
+    color: var(--accent);
+    min-width: 70px;
+    text-align: right;
+}
+
+.chipRowTight {
+    display: flex;
+    gap: 8px;
+}
+
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    font-family: inherit;
+    line-height: inherit;
+    color: var(--text-secondary);
+    background: var(--bg-overlay);
+    border: 1px solid transparent;
+    transition: all .15s;
+    cursor: pointer;
+}
+
+.chip:hover {
+    border-color: var(--border-strong);
+    color: var(--text-primary);
+}
+
+.chipOn {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.chipIcon {
+    font-size: 1.1em;
+}
+
+.loadingState {
+    text-align: center;
+    padding: 60px 24px;
+    color: var(--text-muted);
+}
+
+.spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    margin: 0 auto 14px;
+    animation: spin .8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.valueTable {
+    max-width: 720px;
+    margin: 0 auto 24px;
+}
+
+.dataCard {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    box-shadow: var(--shadow-sm);
+}
+
+.dcTitle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--fs-xs);
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--text-secondary);
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+.comboList {
+    max-width: 720px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.comboCard {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 18px;
+    box-shadow: var(--shadow-sm);
+}
+
+.ccHead {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 14px;
+    gap: 12px;
+}
+
+.ccTitle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--fs-base);
+    font-weight: 800;
+}
+
+.ccDot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--text-faint);
+}
+
+.ccDot.double {
+    background: var(--side-away);
+}
+
+.ccDot.treble {
+    background: var(--signal-value);
+}
+
+.ccDot.four {
+    background: var(--side-draw);
+}
+
+.ccNote {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.ccMetrics {
+    text-align: right;
+    font-size: var(--fs-xs);
+}
+
+.ccMetric {
+    color: var(--text-secondary);
+}
+
+.ccMetric strong {
+    font-family: var(--mono);
+    font-weight: 800;
+}
+
+.ccLegs {
+    background: var(--bg-overlay);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    margin-bottom: 12px;
+}
+
+.ccLeg {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    font-size: var(--fs-xs);
+    border-bottom: 1px dashed var(--border);
+}
+
+.ccLeg:last-child {
+    border-bottom: none;
+}
+
+.ccLegName {
+    font-weight: 600;
+}
+
+.ccLegRight {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.ccLegOutcome {
+    font-weight: 700;
+    color: var(--side-home);
+}
+
+.ccLegOdds {
+    font-family: var(--mono);
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+}
+
+.legEv {
+    font-family: var(--mono);
+    color: var(--signal-value);
+    font-weight: 800;
+}
+
+.legKelly {
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+}
+
+.kellyRow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    background: var(--bg-overlay);
+    border-radius: var(--radius-sm);
+    margin-top: 10px;
+}
+
+.krLabel {
+    font-size: var(--fs-xs);
+    font-weight: 600;
+}
+
+.krBet {
+    font-family: var(--mono);
+    font-size: var(--fs-sm);
+    font-weight: 800;
+    color: var(--accent);
+}
+
+.krRet {
+    font-family: var(--mono);
+    font-size: var(--fs-sm);
+    font-weight: 700;
+    color: var(--accent);
+}
+
+.emptyInline {
+    text-align: center;
+    padding: 28px 20px;
+    color: var(--text-muted);
+}
+
+.eiTitle {
+    font-size: var(--fs-sm);
+    font-weight: 700;
+    color: var(--text-secondary);
+}
+
+.eiSub {
+    font-size: var(--fs-xs);
+    margin-top: 8px;
+    line-height: 1.7;
+}
+
+@media (max-width: 600px) {
+    .kellySliderRow {
+        grid-template-columns: 1fr;
+        gap: 8px;
+    }
+    .kellyAmount {
+        text-align: left;
+    }
+    .ccHead {
+        flex-direction: column;
+    }
+    .ccMetrics {
+        text-align: left;
+    }
+}

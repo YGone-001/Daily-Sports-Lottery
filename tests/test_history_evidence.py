@@ -1209,6 +1209,43 @@ def test_pc_19_no_production_runtime_file_written_by_history_requests(isolated_d
     assert files_before == files_after
 
 
+def test_history_api_returns_the_immutable_evidence_view_without_writes(
+    isolated_data_dir, monkeypatch, make_match
+):
+    """The React-facing API must preserve /history evidence semantics and remain read-only."""
+    match = make_match(id="history_api_01", status="finished", score={"ft": [2, 1]})
+    snapshot, settlement, evaluation = _make_pipeline_evidence(
+        "history_api_01", final_score={"home": 2, "away": 1}
+    )
+    _write_runtime_data(
+        str(isolated_data_dir),
+        [match],
+        [evaluation],
+        snapshots=[snapshot],
+        settlements=[settlement],
+    )
+
+    import app as app_module
+    import models.predictor
+
+    def mock_predict(*args, **kwargs):
+        raise RuntimeError("CRITICAL: predict_match was called by /api/history!")
+
+    monkeypatch.setattr(models.predictor, "predict_match", mock_predict)
+    monkeypatch.setattr(app_module, "predict_match", mock_predict)
+
+    files_before = set(os.listdir(str(isolated_data_dir)))
+    response = app_module.app.test_client().get("/api/history?sport=football")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["total_finished"] == 1
+    assert payload["stats"]["football"]["verified_evaluations"] == 1
+    assert payload["matches"][0]["comparison"]["evidence_status"] == "verified"
+    assert payload["matches"][0]["comparison"]["correct"] is True
+    assert set(os.listdir(str(isolated_data_dir))) == files_before
+
+
 def test_pc_20_existing_sport_model_version_pagination_empty_data_preserved(isolated_data_dir, make_match):
     """20. Existing sport, model-version, pagination, and empty-data behavior remains unchanged."""
     # Empty data

@@ -1,0 +1,141 @@
+/* ==========================================================================
+   每日体彩预测终端 - 历史复盘样式 (HistoryView)
+   ========================================================================== */
+
+.calibBar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+}
+
+.terminalHeader {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding-bottom: 20px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+}
+
+.title {
+    font-size: var(--fs-2xl);
+    font-weight: 900;
+    letter-spacing: -.025em;
+}
+
+.subtitle {
+    margin-top: 6px;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+}
+
+.calibPod {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    text-align: center;
+    box-shadow: var(--shadow-sm);
+}
+
+.historyList {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.historyRow {
+    display: grid;
+    grid-template-columns: 140px 1fr 90px 180px;
+    gap: 12px;
+    align-items: center;
+    padding: 12px 16px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    text-decoration: none;
+    color: inherit;
+    font-size: var(--fs-xs);
+    transition: border-color .15s, background .15s;
+}
+
+.historyRow:hover {
+    border-color: var(--border-strong);
+    background: var(--bg-overlay);
+}
+
+.hrDate {
+    font-family: var(--mono);
+    font-size: var(--fs-xs);
+    color: var(--text-muted);
+}
+
+.hrMatch {
+    font-weight: 600;
+}
+
+.hrVs {
+    color: var(--text-faint);
+    margin: 0 4px;
+}
+
+.hrLeague {
+    font-size: var(--fs-xs);
+    color: var(--text-faint);
+    margin-left: 8px;
+}
+
+.hrScore {
+    font-family: var(--mono);
+    font-weight: 800;
+    text-align: center;
+    font-size: var(--fs-sm);
+}
+
+.hrVerdict {
+    text-align: right;
+    font-size: var(--fs-xs);
+    font-weight: 700;
+}
+
+.hrVerdict.ok {
+    color: var(--state-ok);
+}
+
+.hrVerdict.bad {
+    color: var(--state-bad);
+}
+
+.hrVerdict.unverified {
+    color: var(--text-muted);
+}
+
+.hrVerdict.historical {
+    color: var(--side-draw);
+}
+
+.hrVerdict.ambiguous {
+    color: var(--side-away);
+}
+
+.hrVerdict em {
+    display: block;
+    font-style: normal;
+    font-size: var(--fs-2xs);
+    color: var(--text-muted);
+    font-weight: 500;
+    margin-top: 2px;
+}
+
+@media (max-width: 860px) {
+    .historyRow {
+        grid-template-columns: 1fr auto;
+        gap: 8px;
+    }
+    .hrDate {
+        grid-column: 1 / -1;
+    }
+}

@@ -1,0 +1,60 @@
+.emptyState {
+  text-align: center;
+  padding: 80px 24px;
+  color: var(--text-muted);
+}
+
+.esIcon {
+  font-size: var(--fs-3xl);
+  color: var(--text-faint);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.esTitle {
+  font-size: var(--fs-base);
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.esSub {
+  font-size: var(--fs-xs);
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.emptyInline {
+  text-align: center;
+  padding: 28px 20px;
+  color: var(--text-muted);
+}
+
+.eiIcon {
+  font-size: var(--fs-xl);
+  color: var(--text-faint);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.eiTitle {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.eiSub {
+  font-size: var(--fs-xs);
+  margin-top: 8px;
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+
+.action {
+  margin-top: 16px;
+  display: flex;
+  justify-content: center;
+}

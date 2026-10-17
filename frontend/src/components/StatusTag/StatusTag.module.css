@@ -1,0 +1,44 @@
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.tagUp {
+  background: var(--bg-overlay);
+  color: var(--text-muted);
+}
+
+.tagDone {
+  background: var(--bg-overlay);
+  color: var(--text-faint);
+}
+
+.tagLive {
+  background: var(--state-live);
+  color: var(--on-solid);
+}
+
+.pulse {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #ffffff;
+  animation: blink 1.2s infinite;
+}
+
+@keyframes blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}

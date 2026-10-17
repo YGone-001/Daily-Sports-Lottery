@@ -1,0 +1,97 @@
+/* ==========================================================================
+   每日体彩预测终端 - 主题设计变量 (Theme Variables)
+   设计语言：数据终端 × 金融看板
+   包含：基础调色板、语义色、字阶系统、圆角与投影、暗色主题覆盖
+   ========================================================================== */
+
+:root {
+    --bg-base: #f7f8fa;
+    --bg-elev: #ffffff;
+    --bg-sunken: #eef0f4;
+    --bg-overlay: #f2f4f7;
+    --border: #e3e6ec;
+    --border-strong: #d0d5dd;
+
+    --text-primary: #0f1729;
+    --text-secondary: #566173;
+    --text-muted: #5b6577;
+    --text-faint: #667085;
+
+    --accent: #2563eb;
+    --accent-soft: #eff4ff;
+
+    /* 侧别语义色 —— 全站唯一的颜色定义处 */
+    --side-home: #e11d48;
+    --side-draw: #8b5cf6;
+    --side-away: #059669;
+
+    /* 信号色：正 EV 价值 */
+    --signal-value: #b45309;
+
+    /* 状态色 —— 一律复用上面的色值，不引入新颜色 */
+    --state-live: var(--side-home);
+    --state-ok: var(--side-away);
+    --state-bad: var(--side-home);
+
+    /* 实心色块上的文字色：亮色主题配白字，暗色主题配深字 */
+    --on-solid: #ffffff;
+
+    --radius-sm: 6px;
+    --radius: 10px;
+    --radius-lg: 14px;
+
+    --shadow-sm: 0 1px 2px rgba(16, 24, 40, .05);
+    --shadow: 0 2px 8px rgba(16, 24, 40, .07);
+    --shadow-lg: 0 8px 24px rgba(16, 24, 40, .1);
+
+    /* 字阶 —— 全站唯一字号来源。角标最低 11px，正文一律 >=13px。 */
+    --fs-2xs: 11px;   /* 角标：仅用于非关键信息 */
+    --fs-xs: 13px;    /* 次要信息、标签、表格 */
+    --fs-sm: 15px;    /* 正文、队名 */
+    --fs-base: 16px;  /* 强调正文、导航 */
+    --fs-md: 18px;    /* 重点数字 */
+    --fs-lg: 20px;    /* 小标题 */
+    --fs-xl: 22px;    /* 汇总数字 */
+    --fs-2xl: 26px;   /* 页面标题 */
+    --fs-3xl: 32px;   /* 大数字、详情比分 */
+
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    --sans: 'Inter', 'Noto Sans SC', -apple-system, sans-serif;
+}
+
+[data-theme="dark"] {
+    --bg-base: #0b0e14;
+    --bg-elev: #131822;
+    --bg-sunken: #0e121a;
+    --bg-overlay: #1a212e;
+    --border: #232b3a;
+    --border-strong: #333d50;
+
+    --text-primary: #e8ecf3;
+    --text-secondary: #9aa6ba;
+    --text-muted: #8b96a8;
+    --text-faint: #7d879a;
+
+    --accent: #60a5fa;
+    --accent-soft: #16233a;
+
+    /* 侧别语义色 —— 全站唯一的颜色定义处 */
+    --side-home: #f43f5e;
+    --side-draw: #a78bfa;
+    --side-away: #10b981;
+
+    /* 信号色：正 EV 价值 */
+    --signal-value: #fbbf24;
+
+    /* 状态色 —— 一律复用上面的色值，不引入新颜色 */
+    --state-live: var(--side-home);
+    --state-ok: var(--side-away);
+    --state-bad: var(--side-home);
+
+    /* 实心色块上的文字色：亮色主题配白字，暗色主题配深字 */
+    --on-solid: #0b0e14;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
+    --shadow: 0 2px 8px rgba(0, 0, 0, .4);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, .5);
+}

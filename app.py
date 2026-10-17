@@ -20,13 +20,16 @@ API：
   /api/strategy                 策略推荐
   /api/refresh                  手动触发抓取
   /api/status                   系统状态
+  /api/history                  历史复盘的不可变证据视图（只读）
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
+from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_from_directory
 
 import config
 from models.predictor import predict_match
@@ -52,6 +55,21 @@ from utils.settlements import get_settlements_for_match
 app = Flask(__name__)
 app.config.from_object(config)
 
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_FRONTEND_DIST = _PROJECT_ROOT / "frontend" / "dist"
+
+
+def _serve_frontend() -> bool:
+    """Whether this process should serve the compiled React application."""
+    return (
+        os.environ.get("SERVE_FRONTEND") == "1"
+        and (_FRONTEND_DIST / "index.html").is_file()
+    )
+
+
+def _frontend_index():
+    return send_from_directory(_FRONTEND_DIST, "index.html")
+
 
 # ---------------------------------------------------------------------------
 # 页面路由
@@ -59,6 +77,9 @@ app.config.from_object(config)
 
 @app.route("/")
 def index():
+    if _serve_frontend():
+        return _frontend_index()
+
     date = request.args.get("date")
     sport = request.args.get("sport")  # football / basketball / None(全部)
     if sport == "all":
@@ -89,6 +110,9 @@ def index():
 
 @app.route("/match/<match_id>")
 def match_detail(match_id):
+    if _serve_frontend():
+        return _frontend_index()
+
     raw = get_match_by_id(match_id)
     if not raw:
         return render_template("match.html", match=None, active_page="index"), 404
@@ -109,6 +133,9 @@ def match_detail(match_id):
 
 @app.route("/history")
 def history():
+    if _serve_frontend():
+        return _frontend_index()
+
     sport = request.args.get("sport")
     if sport == "all":
         sport = None
@@ -127,12 +154,22 @@ def history():
 
 @app.route("/strategy")
 def strategy():
+    if _serve_frontend():
+        return _frontend_index()
+
     return render_template("strategy.html", active_page="strategy")
 
 
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
+
+@app.route("/assets/<path:filename>")
+def frontend_assets(filename):
+    """Serve hashed build assets only when the compiled frontend is enabled."""
+    if not _serve_frontend():
+        return "Not Found", 404
+    return send_from_directory(_FRONTEND_DIST / "assets", filename)
 
 @app.route("/api/today")
 def api_today():
@@ -252,6 +289,20 @@ def api_status():
             "today_stats": get_daily_stats(),
         }
     )
+
+
+@app.route("/api/history")
+def api_history():
+    """只读：返回与 ``/history`` 页面一致的不可变赛前证据视图。
+
+    该接口特意复用 ``build_history_view_data``，避免任何客户端或调用方
+    以当前模型重算已完赛赛事的历史结论。
+    """
+    sport = request.args.get("sport")
+    if sport == "all":
+        sport = None
+    matches = get_matches_by_date("all", sport)
+    return jsonify(build_history_view_data(matches, sport=sport))
 
 
 # ---------------------------------------------------------------------------

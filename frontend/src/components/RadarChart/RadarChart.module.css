@@ -1,0 +1,19 @@
+.container {
+  width: 100%;
+  position: relative;
+}
+
+.emptyWrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 240px;
+  background: var(--bg-overlay);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+}
+
+.emptyText {
+  font-weight: 600;
+}

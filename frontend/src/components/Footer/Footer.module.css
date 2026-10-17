@@ -1,0 +1,18 @@
+.siteFooter {
+  border-top: 1px solid var(--border);
+  padding: 20px 24px 28px;
+  text-align: center;
+  background: var(--bg-elev);
+}
+
+.footerMain {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.footerSub {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  margin-top: 4px;
+}

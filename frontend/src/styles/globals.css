@@ -1,0 +1,72 @@
+/* ==========================================================================
+   每日体彩预测终端 - 全局基础样式 (Global Styles)
+   设计语言：数据终端 × 金融看板
+   包含：CSS Reset、Body 基准排版、排版辅助、图标基类、焦点状态、动效偏好
+   ========================================================================== */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--sans);
+    background: var(--bg-base);
+    color: var(--text-primary);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ---------------------------------------------------------------- 等宽数字排版 */
+.mono {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- 链接重置 */
+a {
+    color: inherit;
+    text-decoration: none;
+}
+
+/* ---------------------------------------------------------------- 图标系统 */
+.icon-sprite {
+    display: none;
+}
+
+/* 内联图标：尺寸随字号（1em），颜色随文字（currentColor），描边统一 1.75 */
+.icon {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.75;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    vertical-align: -.125em;
+}
+
+/* ------------------------------------------------------------ 焦点可见性 */
+/* 键盘导航时的可见焦点环。用 :focus-visible 而非 :focus，鼠标点击不触发。 */
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- 动效偏好 */
+/* 尊重系统的"减弱动态效果"设置：闪烁、脉冲、旋转与过渡全部停下。 */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+        scroll-behavior: auto !important;
+    }
+}

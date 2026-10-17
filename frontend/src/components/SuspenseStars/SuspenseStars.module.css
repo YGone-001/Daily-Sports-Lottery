@@ -1,0 +1,23 @@
+.suspenseWrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  line-height: 1;
+}
+
+.sOn {
+  color: var(--signal-value);
+  font-size: var(--fs-xs);
+}
+
+.sOff {
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+}
+
+.sTxt {
+  margin-left: 4px;
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: var(--fs-xs);
+}

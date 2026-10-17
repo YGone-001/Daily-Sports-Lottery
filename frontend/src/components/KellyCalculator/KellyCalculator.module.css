@@ -1,0 +1,122 @@
+.kellyBox {
+  padding: 4px 0;
+}
+
+.kellySliderRow {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.sliderLabel {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.kellySliderMain {
+  min-width: 0;
+}
+
+.kellySliderMain input[type='range'] {
+  display: block;
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.sliderScale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+}
+
+.kellyAmount {
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  font-weight: 800;
+  color: var(--accent);
+  min-width: 80px;
+  text-align: right;
+}
+
+.kellyList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kellyRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-overlay);
+  border-radius: var(--radius-sm);
+  flex-wrap: wrap;
+}
+
+.krLeft {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.krLabel {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.krPct {
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  color: var(--text-muted);
+}
+
+.krDetails {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: auto;
+}
+
+.krMetric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: var(--fs-xs);
+}
+
+.krMetricLabel {
+  font-size: var(--fs-2xs);
+  color: var(--text-muted);
+}
+
+.krBet {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: 800;
+  color: var(--accent);
+}
+
+.krRet {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--side-away);
+}
+
+.emptyHint {
+  text-align: center;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  padding: 16px;
+}
