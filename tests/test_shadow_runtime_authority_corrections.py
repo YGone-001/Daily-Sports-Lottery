@@ -1013,7 +1013,7 @@ def test_gc_23_read_only_verification_and_recovery_still_work(tmp_path):
 
 def test_gc_25_generation_validity_is_documented_as_generation_only(env):
     """GC-25: 代际有效性绝不冒充当前授权有效性。"""
-    assert SHADOW_READER_VERSION == "1.2.0"
+    assert SHADOW_READER_VERSION == "1.3.0"
     assert len(REENABLE_REJECTION_CODE_SET) == len(REENABLE_REJECTION_CODES)
     doc = ShadowRuntimeReader.is_generation_current.__doc__ or ""
     assert "仅代际" in doc

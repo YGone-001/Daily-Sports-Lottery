@@ -639,7 +639,7 @@ def test_sg_48_existing_activation_authorization_contracts_remain():
     assert len(AUTHORIZATION_REJECTION_CODE_SET) == 27
     assert SHADOW_SNAPSHOT_BUILDER_VERSION == "1.1.0"
     assert len(READER_REJECTION_CODE_SET) >= 15
-    assert SHADOW_READER_VERSION == "1.2.0"
+    assert SHADOW_READER_VERSION == "1.3.0"
     assert governance_status()["production_mapping_write_authorization"] == (
         "NOT_GRANTED"
     )

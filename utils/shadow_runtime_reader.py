@@ -52,7 +52,11 @@ from utils.observation_authority import (
     ObservationAttestationError,
     verify_observation_attestation,
 )
-from utils.recovery_authority import RecoveryEvidenceError, verify_recovery_evidence
+from utils.recovery_authority import (
+    RecoveryEvidenceError,
+    recovery_state_fingerprint,
+    verify_recovery_evidence,
+)
 from utils.trusted_artifacts import SignedTrustedArtifact, TrustedArtifactError
 from utils.runtime_activation_authorization import (
     ActivationPrototypeError,
@@ -81,7 +85,9 @@ from utils.source_identity import (
 #: ``1.1.0``：注册表驱动的读取强制显式选择权威、完整所有权冲突判定、
 #: 停用后的再启用必须携带已校验的激活证据、句柄有效性显式限定为代际校验。
 #: ``1.2.0``：新增严格模式（权威治理视图、观测来源证明、恢复证据前置）。
-SHADOW_READER_VERSION = "1.2.0"
+#: ``1.3.0``：严格再启用要求恢复证据与**当前**审计存储身份、链尖、条目数、
+#: 完成事件、选中快照与有效指针对齐；空历史/旧状态一律拒绝。
+SHADOW_READER_VERSION = "1.3.0"
 
 #: 原型标记。
 PROTOTYPE_ONLY = True
@@ -150,6 +156,10 @@ REENABLE_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("RE_ENABLE_AUTHORIZATION_NOT_CONSUMABLE", "所提供授权在当前条件下不可消费。"),
     ("RE_ENABLE_CLOCK_UNAVAILABLE", "未提供可解析的受控时钟。"),
     ("RE_ENABLE_EVIDENCE_MALFORMED", "再启用证据缺失或类型错误。"),
+    ("RE_ENABLE_RECOVERY_STATE_SOURCE_MISSING", "严格恢复缺少受信任的当前审计状态源。"),
+    ("RE_ENABLE_RECOVERY_STATE_INVALID", "当前审计状态无法独立读取或校验。"),
+    ("RE_ENABLE_RECOVERY_STATE_MISMATCH", "恢复证据与当前审计/快照状态不一致。"),
+    ("RE_ENABLE_RECOVERY_EMPTY_HISTORY", "空审计历史不得证明已恢复选中激活。"),
     ("RE_ENABLE_RECOVERY_EVIDENCE_MISSING", "严格模式要求已验证的审计恢复证据。"),
     ("RE_ENABLE_RECOVERY_EVIDENCE_INVALID", "恢复证据无法验证、已过期或未消解差异。"),
     ("RE_ENABLE_AUTHORITATIVE_VIEW_MISSING", "严格模式要求已签名的权威治理视图。"),
@@ -374,6 +384,7 @@ class ShadowRuntimeReader:
         *,
         registry: Any = None,
         reader_id: str = "shadow-reader",
+        audit_store: Any = None,
         require_authoritative_governance: bool = False,
         require_observation_attestation: bool = False,
         require_recovery_evidence_for_reenable: bool = False,
@@ -382,6 +393,8 @@ class ShadowRuntimeReader:
         self._reader_id = str(reader_id)
         self._enabled = True
         self._generation = 0
+        #: 严格恢复所需的**只读**当前审计状态源（绝不写入）。
+        self._audit_store = audit_store
         self._require_authoritative_governance = bool(
             require_authoritative_governance
         )
@@ -429,6 +442,7 @@ class ShadowRuntimeReader:
             "require_recovery_evidence_for_reenable": (
                 self._require_recovery_evidence_for_reenable
             ),
+            "recovery_audit_store_attached": self._audit_store is not None,
             "production_runtime_reader": PRODUCTION_RUNTIME_READER,
             "production_activation": PRODUCTION_ACTIVATION,
             "writes_files": False,
@@ -678,22 +692,66 @@ class ShadowRuntimeReader:
                             )
 
         if self._require_recovery_evidence_for_reenable:
-            try:
-                verify_recovery_evidence(
-                    recovery_evidence,
-                    trusted_public_key_path=(
-                        read_context.recovery_trusted_public_key_path
-                    ),
-                    current_time=read_context.current_time,
-                    max_age_seconds=read_context.recovery_max_age_seconds,
-                    expected_dataset_identity=read_context.dataset_identity,
-                )
-            except RecoveryEvidenceError:
-                rejections.append(
-                    "RE_ENABLE_RECOVERY_EVIDENCE_MISSING"
-                    if recovery_evidence is None
-                    else "RE_ENABLE_RECOVERY_EVIDENCE_INVALID"
-                )
+            if self._audit_store is None:
+                # 调用方断言（例如 expected_store_identity）不得替代实际审计证据。
+                rejections.append("RE_ENABLE_RECOVERY_STATE_SOURCE_MISSING")
+            else:
+                try:
+                    recovery_payload = verify_recovery_evidence(
+                        recovery_evidence,
+                        trusted_public_key_path=(
+                            read_context.recovery_trusted_public_key_path
+                        ),
+                        current_time=read_context.current_time,
+                        max_age_seconds=read_context.recovery_max_age_seconds,
+                        expected_dataset_identity=read_context.dataset_identity,
+                    )
+                except RecoveryEvidenceError:
+                    rejections.append(
+                        "RE_ENABLE_RECOVERY_EVIDENCE_MISSING"
+                        if recovery_evidence is None
+                        else "RE_ENABLE_RECOVERY_EVIDENCE_INVALID"
+                    )
+                else:
+                    try:
+                        records = tuple(self._audit_store.records())
+                        self._audit_store.verify()
+                        store_identity = str(self._audit_store.store_identity())
+                        chain_tip = str(self._audit_store.chain_tip())
+                        entry_count = len(records)
+                    except Exception:  # noqa: BLE001
+                        rejections.append("RE_ENABLE_RECOVERY_STATE_INVALID")
+                    else:
+                        if not records:
+                            rejections.append("RE_ENABLE_RECOVERY_EMPTY_HISTORY")
+                        else:
+                            completion = records[-1]
+                            completion_event_id = (
+                                completion.event_id
+                                if completion.event_type
+                                == "SHADOW_ROLLBACK_COMPLETED"
+                                else ""
+                            )
+                            expected_state = {
+                                "dataset_identity": read_context.dataset_identity,
+                                "store_identity": store_identity,
+                                "chain_tip": chain_tip,
+                                "entry_count": entry_count,
+                                "completion_event_id": completion_event_id,
+                                "selected_snapshot_id": active.snapshot_id,
+                                "effective_snapshot_id": active.snapshot_id,
+                                "divergence": "NONE",
+                            }
+                            mismatch = any(
+                                str(recovery_payload.get(key, "")) != str(value)
+                                for key, value in expected_state.items()
+                            )
+                            if mismatch or str(
+                                recovery_payload.get("recovery_generation", "")
+                            ) != recovery_state_fingerprint(expected_state):
+                                rejections.append(
+                                    "RE_ENABLE_RECOVERY_STATE_MISMATCH"
+                                )
 
         verification = verify_runtime_activation_authorization(
             authorization,

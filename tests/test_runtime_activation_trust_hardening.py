@@ -653,7 +653,9 @@ def test_b05_strict_reenable_requires_recovery_evidence(env, tmp_path):
     registry.register(env.snapshot)
     registry.select(env.snapshot.snapshot_id)
     reader = ShadowRuntimeReader(
-        registry=registry, require_recovery_evidence_for_reenable=True
+        registry=registry,
+        audit_store=store,
+        require_recovery_evidence_for_reenable=True,
     )
     simulator = ShadowActivationSimulator(
         registry=registry, reader=reader, audit_store=store
@@ -685,6 +687,7 @@ def test_b05_strict_reenable_requires_recovery_evidence(env, tmp_path):
         signing_private_key_path=authority_private,
         current_time=WITHIN_WINDOW,
         recovery_actor="shadow-recovery-operator",
+        selected_snapshot_id=registry.active_snapshot_id,
         effective_snapshot_id=registry.active_snapshot_id,
         max_age_seconds=3600,
     )
@@ -705,7 +708,9 @@ def test_b05_divergence_blocks_reenable(env, tmp_path):
     registry.register(env.snapshot)
     registry.select(env.snapshot.snapshot_id)
     reader = ShadowRuntimeReader(
-        registry=registry, require_recovery_evidence_for_reenable=True
+        registry=registry,
+        audit_store=store,
+        require_recovery_evidence_for_reenable=True,
     )
     simulator = ShadowActivationSimulator(
         registry=registry, reader=reader, audit_store=store
@@ -725,6 +730,7 @@ def test_b05_divergence_blocks_reenable(env, tmp_path):
         signing_private_key_path=authority_private,
         current_time=WITHIN_WINDOW,
         recovery_actor="shadow-recovery-operator",
+        selected_snapshot_id=registry.active_snapshot_id,
         effective_snapshot_id="unexpected-snapshot",
         max_age_seconds=3600,
     )
@@ -1069,6 +1075,7 @@ def test_ti_21_stale_or_forged_recovery_evidence_is_rejected(env, tmp_path):
         signing_private_key_path=authority_private,
         current_time=WITHIN_WINDOW,
         recovery_actor="shadow-recovery-operator",
+        selected_snapshot_id=registry.active_snapshot_id,
         effective_snapshot_id=registry.active_snapshot_id,
         max_age_seconds=3600,
     )

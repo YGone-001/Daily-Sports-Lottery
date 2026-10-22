@@ -24,10 +24,40 @@ from utils.trusted_artifacts import (
 #: 工件类型。
 RECOVERY_EVIDENCE_TYPE = "SHADOW_RECOVERY_EVIDENCE"
 
+#: 恢复证据 schema 版本。
+#:
+#: ``1.1.0``：新增 selected snapshot、completion event identity 与
+#: recovery generation；旧工件在严格模式下缺少这些绑定时一律拒绝。
+RECOVERY_EVIDENCE_SCHEMA_VERSION = "1.1.0"
+
 #: 差异分类。
 DIVERGENCE_NONE = "NONE"
 DIVERGENCE_EVENT_WITHOUT_POINTER = "EVENT_WITHOUT_POINTER"
 DIVERGENCE_POINTER_WITHOUT_EVENT = "POINTER_WITHOUT_EVENT"
+
+#: 构成恢复状态身份（generation）的字段。
+_RECOVERY_STATE_FIELDS: tuple[str, ...] = (
+    "dataset_identity",
+    "store_identity",
+    "chain_tip",
+    "entry_count",
+    "completion_event_id",
+    "selected_snapshot_id",
+    "effective_snapshot_id",
+    "divergence",
+)
+
+
+def recovery_state_fingerprint(payload: Mapping[str, Any]) -> str:
+    """
+    由恢复证据载荷计算**状态转换身份**。
+
+    调用方必须用独立读取到的当前审计状态重算并比较；旧证据在链尖、长度、
+    快照选择或完成事件变化后必然得到不同指纹。
+    """
+    return fingerprint(
+        {field: str(payload.get(field, "")) for field in _RECOVERY_STATE_FIELDS}
+    )
 
 #: 拒绝码。
 RECOVERY_EVIDENCE_REJECTION_CODES: tuple[tuple[str, str], ...] = (
@@ -49,6 +79,7 @@ def build_recovery_evidence(
     signing_private_key_path: str,
     current_time: str,
     recovery_actor: str,
+    selected_snapshot_id: str,
     effective_snapshot_id: str,
     max_age_seconds: float,
 ) -> SignedTrustedArtifact:
@@ -91,13 +122,19 @@ def build_recovery_evidence(
         divergence = DIVERGENCE_NONE
 
     chain_tip = records[-1].entry_hash if records else "0" * 64
+    completion_event_id = (
+        completion.event_id if completion_present and completion is not None else ""
+    )
     payload = {
+        "recovery_schema_version": RECOVERY_EVIDENCE_SCHEMA_VERSION,
         "store_identity": audit_store.store_identity(),
         "dataset_identity": getattr(audit_store, "dataset_identity", ""),
         "chain_tip": chain_tip,
         "entry_count": len(records),
         "completion_event_present": completion_present,
+        "completion_event_id": completion_event_id,
         "audit_effective_snapshot_id": audit_effective,
+        "selected_snapshot_id": str(selected_snapshot_id),
         "effective_snapshot_id": str(effective_snapshot_id),
         "divergence": divergence,
         "verified_at": str(current_time),
@@ -105,6 +142,7 @@ def build_recovery_evidence(
         "recovery_actor": str(recovery_actor),
         "prototype_only": True,
     }
+    payload["recovery_generation"] = recovery_state_fingerprint(payload)
     payload["recovery_fingerprint"] = fingerprint(
         {k: v for k, v in payload.items() if k != "issued_at"}
     )
@@ -144,6 +182,18 @@ def verify_recovery_evidence(
             f"recovery evidence rejected: {exc}",
             rejection_codes=("RECOVERY_EVIDENCE_INVALID",),
         ) from exc
+    if str(payload.get("recovery_schema_version", "")) != (
+        RECOVERY_EVIDENCE_SCHEMA_VERSION
+    ):
+        raise RecoveryEvidenceError(
+            "recovery evidence schema is unsupported or missing mandatory state binding",
+            rejection_codes=("RECOVERY_EVIDENCE_INVALID",),
+        )
+    if str(payload.get("recovery_generation", "")) != recovery_state_fingerprint(payload):
+        raise RecoveryEvidenceError(
+            "recovery evidence state generation does not match its own facts",
+            rejection_codes=("RECOVERY_EVIDENCE_INVALID",),
+        )
     if str(payload.get("divergence")) != DIVERGENCE_NONE:
         raise RecoveryEvidenceError(
             "event/pointer divergence must be resolved before re-enablement",

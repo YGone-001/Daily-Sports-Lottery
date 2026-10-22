@@ -102,8 +102,8 @@
 
 | 问题 | 现状 | 结论 |
 | :--- | :--- | :--- |
-| 恢复是否强制？ | 默认否；严格模式（`require_recovery_evidence_for_reenable=True`）要求签名恢复证据 | **严格模式已实现 / 默认未强制**（B-05） |
-| 操作者能否绕过恢复？ | 默认能；严格模式在缺少/无效/有分歧的恢复证据时拒绝（`test_b05_*`） | **严格模式已阻断 / 默认未阻断** |
+| 恢复是否强制？ | 默认否；严格模式（`require_recovery_evidence_for_reenable=True`）要求签名恢复证据，并绑定当前审计存储/链尖/条目数/完成事件/选中快照 | **严格模式已实现 / 默认未强制**（B-05） |
+| 操作者能否绕过恢复？ | 默认能；严格模式在缺少/无效/有分歧/状态不匹配的恢复证据时拒绝（`test_re_*`） | **严格模式已阻断 / 默认未阻断** |
 | 恢复是否验证正确存储？ | `recover()` 作用于调用方提供的 store；无生产存储身份绑定 | 条件式 |
 | 最后一个已提交链尖是否被认证？ | 严格模式：由外部签名检查点认证链尖/长度；默认模式：无 | **严格模式已实现 / 默认缺失** |
 | 恢复能否识别事件/指针差异？ | `build_recovery_evidence` 输出 `NONE` / `EVENT_WITHOUT_POINTER` / `POINTER_WITHOUT_EVENT`；`verify_recovery_evidence` 仅在 `NONE` 时通过 | **已实现（隔离）** |
@@ -112,7 +112,34 @@
 | 需要什么显式授权？ | 已验证激活证据 + 显式选择；严格模式额外要求已验证恢复证据 | 已实现（严格模式） |
 | 恢复自身失败会怎样？ | `verify()` 抛错 -> fail closed，不激活 | 已实现 |
 
-### 4.1 未来恢复证据契约（建议）
+### 4.1 恢复状态绑定契约（Phase 2-I-C-C）
+
+恢复证据 schema `1.1.0` 现在必须绑定以下状态；严格读取器会用**独立读取到的当前状态**逐项比较：
+
+| 事实 | 来源 |
+| :--- | :--- |
+| `dataset_identity` | 当前读取上下文 |
+| `store_identity` | 读者绑定的只读审计存储 |
+| `chain_tip` / `entry_count` | 读者重新读取并 `verify()` 的完整链 |
+| `completion_event_id` | 当前链最后一条记录（仅当为 `SHADOW_ROLLBACK_COMPLETED`） |
+| `selected_snapshot_id` / `effective_snapshot_id` | 当前显式选中的快照 |
+| `recovery_generation` | 上述状态的确定性指纹 |
+| `divergence` | 必须为 `NONE` |
+
+规则：
+
+1. 空审计历史 -> `RE_ENABLE_RECOVERY_EMPTY_HISTORY`，绝不证明已恢复选中激活。
+2. 读者未绑定审计存储 -> `RE_ENABLE_RECOVERY_STATE_SOURCE_MISSING`；调用方断言不能替代实际证据。
+3. 链尖/条目数/完成事件/快照任一变化 -> `RE_ENABLE_RECOVERY_STATE_MISMATCH`（RE-04/RE-14）。
+4. 跨存储重用 -> 同上（RE-01）。
+5. 快照选择变化 -> 同上（RE-02/RE-18）。
+6. 读取/校验失败 -> `RE_ENABLE_RECOVERY_STATE_INVALID`，读取器保持停用。
+7. 失败绝不切换快照指针，也不恢复旧句柄（RE-17/RE-19）。
+8. 旧 schema 工件缺少强制绑定 -> 严格模式 fail closed。
+
+**残余**：审计存储仍是读者构造时传入的隔离对象；生产必须由受信任的只读状态源提供，且不得由请求调用方替换。
+
+### 4.2 未来恢复证据契约（建议）
 
 恢复不得自动激活。建议最小契约：
 

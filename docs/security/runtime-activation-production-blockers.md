@@ -84,8 +84,8 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 
 - **位置**：`ShadowRuntimeReader.re_enable`（[shadow_runtime_reader.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/shadow_runtime_reader.py)）；`ShadowActivationSimulator._fail_closed_after_audit_failure`。
 - **受影响属性**：不确定提交后的恢复完整性。
-- **现状**：严格模式（`require_recovery_evidence_for_reenable=True`）已要求签名恢复证据且 `divergence=NONE`；但该模式是可选构造参数，默认关闭，未构成生产强制策略。
-- **复现**：`test_b05_strict_reenable_requires_recovery_evidence`（严格模式拒绝缺失证据）、`test_sr_19`（默认模式未强制恢复）。
+- **现状**：严格模式（`require_recovery_evidence_for_reenable=True`）已要求签名恢复证据，并绑定当前审计存储身份、链尖、条目数、完成事件、选中快照与 `recovery_generation`；空历史、跨存储、指针不匹配、链推进后的旧证据均拒绝。但该模式是可选构造参数，默认关闭，未构成生产强制策略。
+- **复现**：`test_b05_strict_reenable_requires_recovery_evidence`、`test_re_01` ~ `test_re_19`（严格模式拒绝）；`test_sr_19`（默认模式未强制恢复）。
 - **整改标准**：`re_enable()` 必须要求已验证的恢复证据，并识别事件/指针差异；差异未消解前拒绝再启用。
 - **验收测试**：`test_reenable_requires_recovery_evidence`、`test_event_without_pointer_blocks_reenable`。
 
