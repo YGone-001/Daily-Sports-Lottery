@@ -27,20 +27,31 @@ from tools.shadow_runtime_activation import (
 )
 from utils.authoritative_governance import (
     CANONICAL_MANIFEST_TYPE,
+    GOVERNANCE_VIEW_ATTESTATION_TYPE,
     LEDGER_CHECKPOINT_TYPE,
     REVOCATION_MANIFEST_TYPE,
     build_authoritative_governance_view,
     ledger_identity,
+    verify_authoritative_governance_view,
 )
 from utils.mapping_governance import (
     MappingState,
+    MissingApprovalEvidenceError,
     generate_mapping_owner_keypair,
     GovernanceLedger,
+    load_trusted_public_key,
+    reconstruct_proposal_from_evidence,
 )
-from utils.observation_authority import sign_observation_attestation
+from utils.observation_authority import (
+    ObservationAttestationError,
+    sign_observation_attestation,
+    verify_observation_attestation,
+)
 from utils.recovery_authority import (
     DIVERGENCE_EVENT_WITHOUT_POINTER,
+    RecoveryEvidenceError,
     build_recovery_evidence,
+    verify_recovery_evidence,
 )
 from utils.runtime_activation_authorization import (
     ActivationVerificationContext,
@@ -65,7 +76,7 @@ from utils.shadow_runtime_reader import (
     ShadowRuntimeReader,
     ShadowReenablementError,
 )
-from utils.trusted_artifacts import sign_trusted_artifact
+from utils.trusted_artifacts import TrustedArtifactError, sign_trusted_artifact
 
 WITHIN_WINDOW = "2030-01-15T00:00:00+00:00"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -95,6 +106,7 @@ def _build_governance(
 ):
     """构建账本、签名检查点 / 清单与权威视图（全部隔离）。"""
     authority_private, authority_public = _keys(tmp_path, "authority")
+    view_private, view_public = _keys(tmp_path, "view_authority")
     ledger_dir = tmp_path / "ledger"
     ledger_dir.mkdir(parents=True, exist_ok=True)
     ledger = GovernanceLedger(
@@ -168,16 +180,21 @@ def _build_governance(
         canonical_manifest_trusted_public_key_path=authority_public,
         revocation_manifest=revocation,
         revocation_manifest_trusted_public_key_path=authority_public,
-        view_signing_private_key_path=authority_private,
+        view_signing_private_key_path=view_private,
+        view_trusted_public_key_path=view_public,
         current_time=WITHIN_WINDOW,
     )
     return {
         "view": view,
         "authority_private": authority_private,
         "authority_public": authority_public,
+        "view_private": view_private,
+        "view_public": view_public,
         "ledger": ledger,
         "baseline": baseline,
         "checkpoint": checkpoint,
+        "canonical": canonical,
+        "revocation": revocation,
     }
 
 
@@ -205,7 +222,7 @@ def _verified_decision(env, governance):
             (key, canonical_id) for key, canonical_id, _ in view.active_bindings
         ),
         authoritative_view=view,
-        authoritative_view_trusted_public_key_path=governance["authority_public"],
+        authoritative_view_trusted_public_key_path=governance["view_public"],
     )
     return evaluate_runtime_mapping_eligibility(
         env.proposal,
@@ -263,7 +280,7 @@ def _strict_context(env, governance, authorization, decision, snapshot):
             ),
         ),
         authoritative_view=governance["view"],
-        authoritative_view_trusted_public_key_path=governance["authority_public"],
+        authoritative_view_trusted_public_key_path=governance["view_public"],
         observation_trusted_public_key_path=governance["authority_public"],
         recovery_trusted_public_key_path=governance["authority_public"],
         revocation_registry=(),
@@ -324,7 +341,7 @@ def test_b01_self_asserted_or_tampered_view_is_rejected(env, tmp_path):
     tampered_context = dataclasses.replace(
         base_context,
         authoritative_view=tampered_view,
-        authoritative_view_trusted_public_key_path=governance["authority_public"],
+        authoritative_view_trusted_public_key_path=governance["view_public"],
     )
     tampered = evaluate_runtime_mapping_eligibility(
         env.proposal,
@@ -399,6 +416,7 @@ def test_b02_strict_reader_uses_authoritative_canonical_view(env, tmp_path):
     attestation = sign_observation_attestation(
         restricted["authority_private"],
         env.observation,
+        dataset_identity=DATASET,
         adapter="market_xml",
         captured_at=WITHIN_WINDOW,
     )
@@ -436,6 +454,7 @@ def test_b02_strict_reader_uses_authoritative_revocations(env, tmp_path):
     attestation = sign_observation_attestation(
         revoked["authority_private"],
         env.observation,
+        dataset_identity=DATASET,
         adapter="market_xml",
         captured_at=WITHIN_WINDOW,
     )
@@ -481,6 +500,7 @@ def test_b03_strict_reader_requires_observation_attestation(env, tmp_path):
     attestation = sign_observation_attestation(
         governance["authority_private"],
         env.observation,
+        dataset_identity=DATASET,
         adapter="market_xml",
         captured_at=WITHIN_WINDOW,
     )
@@ -722,6 +742,390 @@ def test_b05_divergence_blocks_reenable(env, tmp_path):
             recovery_evidence=divergent,
         )
     assert "RE_ENABLE_RECOVERY_EVIDENCE_INVALID" in exc.value.rejection_codes
+
+
+# ---------------------------------------------------------------------------
+# TI-01 ~ TI-23 — trust-boundary acceptance matrix
+# ---------------------------------------------------------------------------
+
+def _rebuild(env, governance, **overrides):
+    """用同一组已签名工件重新构建视图（仅覆盖指定参数）。"""
+    kwargs = dict(
+        ledger_path=governance["ledger"].path,
+        dataset_identity=DATASET,
+        current_baseline_fingerprint=governance["baseline"],
+        trusted_owner_public_key_path=env.owner_public,
+        ledger_checkpoint=governance["checkpoint"],
+        ledger_checkpoint_trusted_public_key_path=governance["authority_public"],
+        canonical_manifest=governance["canonical"],
+        canonical_manifest_trusted_public_key_path=governance["authority_public"],
+        revocation_manifest=governance["revocation"],
+        revocation_manifest_trusted_public_key_path=governance["authority_public"],
+        view_signing_private_key_path=governance["view_private"],
+        view_trusted_public_key_path=governance["view_public"],
+        current_time=WITHIN_WINDOW,
+    )
+    kwargs.update(overrides)
+    return build_authoritative_governance_view(**kwargs)
+
+
+def test_ti_01_separate_checkpoint_and_view_signers_are_supported(env, tmp_path):
+    """TI-01: 检查点签名者与视图签名者可以是不同密钥。"""
+    governance = _build_governance(env, tmp_path)
+    checkpoint_key = load_trusted_public_key(governance["authority_public"])
+    view_key = load_trusted_public_key(governance["view_public"])
+    assert checkpoint_key["public_key_id"] != view_key["public_key_id"]
+    assert governance["view"].attestation.signer_public_key_id == (
+        view_key["public_key_id"]
+    )
+    # 检查点仍由检查点密钥签发。
+    assert governance["checkpoint"].signer_public_key_id == (
+        checkpoint_key["public_key_id"]
+    )
+
+
+def test_ti_02_invalid_view_signer_is_rejected(env, tmp_path):
+    """TI-02: 视图签名者不在视图信任锚内 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    other_private, _other_public = _keys(tmp_path, "ti02_other")
+    with pytest.raises(TrustedArtifactError) as exc:
+        _rebuild(env, governance, view_signing_private_key_path=other_private)
+    assert "TRUSTED_ARTIFACT_SIGNER_UNTRUSTED" in exc.value.rejection_codes
+
+
+def test_ti_03_trust_anchor_role_substitution_is_rejected(env, tmp_path):
+    """TI-03: 交换检查点 / 视图信任锚 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    with pytest.raises(TrustedArtifactError) as checkpoint_swap:
+        _rebuild(
+            env,
+            governance,
+            ledger_checkpoint_trusted_public_key_path=governance["view_public"],
+        )
+    assert "TRUSTED_ARTIFACT_SIGNER_UNTRUSTED" in (
+        checkpoint_swap.value.rejection_codes
+    )
+    with pytest.raises(TrustedArtifactError) as view_swap:
+        _rebuild(
+            env,
+            governance,
+            view_trusted_public_key_path=governance["authority_public"],
+        )
+    assert "TRUSTED_ARTIFACT_SIGNER_UNTRUSTED" in view_swap.value.rejection_codes
+
+
+def test_ti_04_tampered_governance_facts_are_rejected(env, tmp_path):
+    """TI-04: 修改已签名视图的提案状态 / 所有权 / 撤销事实 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    view = governance["view"]
+    for tampered in (
+        dataclasses.replace(
+            view,
+            proposal_states=((env.proposal.proposal_id, MappingState.REVOKED.value),),
+        ),
+        dataclasses.replace(
+            view,
+            active_bindings=(("forged-key", "forged-canonical", "forged-proposal"),),
+        ),
+        dataclasses.replace(
+            view, revocations=(("forged-activation", "forged-revocation"),)
+        ),
+    ):
+        with pytest.raises(TrustedArtifactError) as exc:
+            verify_authoritative_governance_view(
+                tampered,
+                trusted_public_key_path=governance["view_public"],
+                current_time=WITHIN_WINDOW,
+                max_age_seconds=3600,
+            )
+        assert "TRUSTED_ARTIFACT_SIGNATURE_INVALID" in exc.value.rejection_codes
+
+
+def test_ti_05_valid_signed_checkpoint_is_accepted(env, tmp_path):
+    """TI-05: 与当前链完全一致的有效签名检查点被接受。"""
+    authority_private, authority_public = _keys(tmp_path, "ti05_authority")
+    store = _audit_store(tmp_path, "ti05")
+    registry, _reader = _registry_reader(env)
+    ShadowActivationSimulator(
+        registry=registry, reader=ShadowRuntimeReader(registry=registry), audit_store=store
+    ).rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    checkpoint = store.export_checkpoint(authority_private, issued_at=WITHIN_WINDOW)
+    payload = store.verify_external_checkpoint(
+        checkpoint,
+        trusted_public_key_path=authority_public,
+        current_time=WITHIN_WINDOW,
+        max_age_seconds=3600,
+    )
+    assert payload["chain_tip"] == store.chain_tip()
+    assert int(payload["entry_count"]) == len(store.records())
+
+
+def test_ti_07_checkpoint_ledger_identity_mismatch_is_rejected(env, tmp_path):
+    """TI-07: 检查点绑定其他账本身份 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    payload = dict(governance["checkpoint"].payload())
+    payload["ledger_identity"] = "0" * 64
+    payload["issued_at"] = WITHIN_WINDOW
+    forged = sign_trusted_artifact(
+        governance["authority_private"],
+        artifact_type=LEDGER_CHECKPOINT_TYPE,
+        payload=payload,
+    )
+    with pytest.raises(TrustedArtifactError) as exc:
+        _rebuild(env, governance, ledger_checkpoint=forged)
+    assert "TRUSTED_ARTIFACT_TYPE_MISMATCH" in exc.value.rejection_codes
+
+
+def test_ti_08_missing_historical_approval_evidence_is_rejected():
+    """TI-08: 缺失历史批准 / 提案证据 -> 独立复核拒绝。"""
+    with pytest.raises(MissingApprovalEvidenceError):
+        reconstruct_proposal_from_evidence({})
+    with pytest.raises(MissingApprovalEvidenceError):
+        reconstruct_proposal_from_evidence(
+            {
+                "proposal_schema_version": "1.0.0",
+                "source_identity_scope": {},
+                "scoped_source_identity_key": {},
+                "candidate_canonical_id": "canon-x",
+                "identity_evidence_type": "x",
+                "observation_fingerprints": [],
+                "ingestion_plan_reference": "x",
+                "reason": "x",
+                "expected_baseline_fingerprint": "b",
+                "requested_action": "BIND_SOURCE_TO_EXISTING_CANONICAL",
+            }
+        )
+
+
+def test_ti_09_wrong_dataset_identity_is_rejected(env, tmp_path):
+    """TI-09: 视图 / 工件的数据集身份不一致 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    with pytest.raises(TrustedArtifactError):
+        _rebuild(env, governance, dataset_identity="another-dataset")
+
+
+def test_ti_10_stale_canonical_baseline_is_rejected(env, tmp_path):
+    """TI-10: Canonical 基线清单与当前基线不一致 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    with pytest.raises(TrustedArtifactError) as exc:
+        _rebuild(
+            env, governance, current_baseline_fingerprint="baseline-stale"
+        )
+    assert "TRUSTED_ARTIFACT_TYPE_MISMATCH" in exc.value.rejection_codes
+
+
+def test_ti_12_missing_strict_governance_evidence_is_rejected(env):
+    """TI-12: 严格读取器缺少权威治理视图 -> 拒绝。"""
+    registry = ShadowSnapshotRegistry()
+    registry.register(env.snapshot)
+    registry.select(env.snapshot.snapshot_id)
+    reader = ShadowRuntimeReader(
+        registry=registry, require_authoritative_governance=True
+    )
+    result = reader.read(
+        observation=env.observation,
+        snapshot=env.snapshot,
+        read_context=_ctx(env),
+    )
+    assert result.resolution_status == "REJECTED_SHADOW"
+    assert "AUTHORITATIVE_GOVERNANCE_VIEW_MISSING" in result.rejection_codes
+
+
+def test_ti_15_empty_ownership_manifest_cannot_become_authority(env, tmp_path):
+    """TI-15: 空 Canonical 清单不得被当作完整的生产所有权集合。"""
+    governance = _build_governance(env, tmp_path)
+    empty = sign_trusted_artifact(
+        governance["authority_private"],
+        artifact_type=CANONICAL_MANIFEST_TYPE,
+        payload={
+            "dataset_identity": DATASET,
+            "baseline_fingerprint": governance["baseline"],
+            "canonical_ids": [],
+            "issued_at": WITHIN_WINDOW,
+        },
+    )
+    with pytest.raises(TrustedArtifactError) as exc:
+        _rebuild(env, governance, canonical_manifest=empty)
+    assert "TRUSTED_ARTIFACT_MALFORMED" in exc.value.rejection_codes
+
+
+def test_ti_15b_resigned_empty_ownership_view_is_rejected(env, tmp_path):
+    """TI-15b: 即使签名有效，空所有权视图也不得充当完整权威证据。"""
+    governance = _build_governance(env, tmp_path)
+    empty_view = dataclasses.replace(governance["view"], canonical_ids=())
+    attestation = sign_trusted_artifact(
+        governance["view_private"],
+        artifact_type=GOVERNANCE_VIEW_ATTESTATION_TYPE,
+        payload=empty_view.attestation_payload(),
+    )
+    empty_view = dataclasses.replace(empty_view, attestation=attestation)
+    with pytest.raises(TrustedArtifactError) as exc:
+        verify_authoritative_governance_view(
+            empty_view,
+            trusted_public_key_path=governance["view_public"],
+            current_time=WITHIN_WINDOW,
+            max_age_seconds=3600,
+        )
+    assert "TRUSTED_ARTIFACT_MALFORMED" in exc.value.rejection_codes
+
+
+def test_ti_16b_observation_attestation_is_dataset_bound(env, tmp_path):
+    """TI-16b: 观测来源证明必须绑定数据集身份，不能被跨数据集重用。"""
+    governance = _build_governance(env, tmp_path)
+    attestation = sign_observation_attestation(
+        governance["authority_private"],
+        env.observation,
+        dataset_identity=DATASET,
+        adapter="market_xml",
+        captured_at=WITHIN_WINDOW,
+    )
+    with pytest.raises(ObservationAttestationError) as exc:
+        verify_observation_attestation(
+            attestation,
+            env.observation,
+            trusted_public_key_path=governance["authority_public"],
+            current_time=WITHIN_WINDOW,
+            max_age_seconds=3600,
+            expected_dataset_identity="another-dataset",
+            expected_adapter="market_xml",
+        )
+    assert "OBSERVATION_ATTESTATION_MISMATCH" in exc.value.rejection_codes
+
+
+def test_ti_18_cross_sport_observation_confusion_is_rejected(env, tmp_path):
+    """TI-18: 用同一签名观测伪装成另一运动 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    attestation = sign_observation_attestation(
+        governance["authority_private"],
+        env.observation,
+        dataset_identity=DATASET,
+        adapter="market_xml",
+        captured_at=WITHIN_WINDOW,
+    )
+    other_sport = dataclasses.replace(env.observation, sport="basketball")
+    with pytest.raises(ObservationAttestationError) as exc:
+        verify_observation_attestation(
+            attestation,
+            other_sport,
+            trusted_public_key_path=governance["authority_public"],
+            current_time=WITHIN_WINDOW,
+            max_age_seconds=3600,
+            expected_dataset_identity=DATASET,
+            expected_adapter="market_xml",
+        )
+    assert "OBSERVATION_ATTESTATION_MISMATCH" in exc.value.rejection_codes
+
+
+def test_ti_19_cross_date_observation_confusion_is_rejected(env, tmp_path):
+    """TI-19: 用同一签名观测伪装成另一日期 -> 拒绝。"""
+    governance = _build_governance(env, tmp_path)
+    attestation = sign_observation_attestation(
+        governance["authority_private"],
+        env.observation,
+        dataset_identity=DATASET,
+        adapter="market_xml",
+        captured_at=WITHIN_WINDOW,
+    )
+    other_date = dataclasses.replace(
+        env.observation, event_date="2030-05-02"
+    )
+    with pytest.raises(ObservationAttestationError) as exc:
+        verify_observation_attestation(
+            attestation,
+            other_date,
+            trusted_public_key_path=governance["authority_public"],
+            current_time=WITHIN_WINDOW,
+            max_age_seconds=3600,
+            expected_dataset_identity=DATASET,
+            expected_adapter="market_xml",
+        )
+    assert "OBSERVATION_ATTESTATION_MISMATCH" in exc.value.rejection_codes
+
+
+def test_ti_21_stale_or_forged_recovery_evidence_is_rejected(env, tmp_path):
+    """TI-21: 过期 / 错误签名 / 篡改的恢复证据 -> 拒绝。"""
+    authority_private, authority_public = _keys(tmp_path, "ti21_authority")
+    _other_private, other_public = _keys(tmp_path, "ti21_other")
+    store = _audit_store(tmp_path, "ti21")
+    registry, _reader = _registry_reader(env)
+    ShadowActivationSimulator(
+        registry=registry,
+        reader=ShadowRuntimeReader(registry=registry),
+        audit_store=store,
+    ).rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    checkpoint = store.export_checkpoint(authority_private, issued_at=WITHIN_WINDOW)
+    evidence = build_recovery_evidence(
+        audit_store=store,
+        audit_checkpoint=checkpoint,
+        checkpoint_trusted_public_key_path=authority_public,
+        signing_private_key_path=authority_private,
+        current_time=WITHIN_WINDOW,
+        recovery_actor="shadow-recovery-operator",
+        effective_snapshot_id=registry.active_snapshot_id,
+        max_age_seconds=3600,
+    )
+    assert verify_recovery_evidence(
+        evidence,
+        trusted_public_key_path=authority_public,
+        current_time=WITHIN_WINDOW,
+        max_age_seconds=3600,
+        expected_dataset_identity=DATASET,
+    )["divergence"] == "NONE"
+
+    with pytest.raises(RecoveryEvidenceError):
+        verify_recovery_evidence(
+            evidence,
+            trusted_public_key_path=other_public,
+            current_time=WITHIN_WINDOW,
+            max_age_seconds=3600,
+            expected_dataset_identity=DATASET,
+        )
+    with pytest.raises(RecoveryEvidenceError) as stale:
+        verify_recovery_evidence(
+            evidence,
+            trusted_public_key_path=authority_public,
+            current_time="2030-01-15T02:00:00+00:00",
+            max_age_seconds=3600,
+            expected_dataset_identity=DATASET,
+        )
+    assert "RECOVERY_EVIDENCE_INVALID" in stale.value.rejection_codes
+    forged = dataclasses.replace(evidence, signature="")
+    with pytest.raises(RecoveryEvidenceError):
+        verify_recovery_evidence(
+            forged,
+            trusted_public_key_path=authority_public,
+            current_time=WITHIN_WINDOW,
+            max_age_seconds=3600,
+            expected_dataset_identity=DATASET,
+        )
+    with pytest.raises(RecoveryEvidenceError) as wrong_dataset:
+        verify_recovery_evidence(
+            evidence,
+            trusted_public_key_path=authority_public,
+            current_time=WITHIN_WINDOW,
+            max_age_seconds=3600,
+            expected_dataset_identity="another-dataset",
+        )
+    assert "RECOVERY_EVIDENCE_INVALID" in wrong_dataset.value.rejection_codes
+
+
+def test_ti_23_strict_mode_defaults_are_not_production_apis():
+    """TI-23: 严格模式默认为关闭，且不构成生产运行期 API。"""
+    reader = ShadowRuntimeReader()
+    status = reader.status()
+    assert status["require_authoritative_governance"] is False
+    assert status["require_observation_attestation"] is False
+    assert status["require_recovery_evidence_for_reenable"] is False
+    assert status["production_runtime_reader"] == "NOT_ENABLED"
+    assert status["production_activation"] == "NOT_ENABLED"
 
 
 # ---------------------------------------------------------------------------

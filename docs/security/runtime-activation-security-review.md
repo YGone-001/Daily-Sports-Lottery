@@ -66,7 +66,7 @@
 | 3 | `MappingProposal` | 操作者构造 | 任意字段 | `validate_proposal` / 状态机 | 无签名（内容指纹） | 操作者角色 | `expected_baseline_fingerprint` | 无 | 无 | 结构非法拒绝 | 提案本身不可信，但需所有者批准 | 批准件签名 | **CONDITIONAL** |
 | 4 | `Owner Approval` | 所有者外部私钥 | 任何未签名/错用途/错主体工件 | schema 2.0.0、用途、主体分离 | Ed25519 + 可信公钥路径 | 所有者 | 数据集 + 基线 | 状态迁移表达 | 无内在过期（由基线变化失效） | 任何不匹配 fail closed | 可信公钥路径由调用方给出 | 可信公钥分发 / 轮换 / 吊销 | **VERIFIED（密码学）** |
 | 5 | `Runtime Eligibility` | 调用方提供的提案、批准、观测、上下文 | 调用方断言的记录状态/指纹/Canonical 集合 | 45 条规则、版本/证据/基线绑定 | 复核批准签名 | 无权威账本 | 绑定当前基线 | 依赖调用方 `recorded_proposal_state` 与撤销 | 无（重新评估时点） | 不满足 -> `NOT_ELIGIBLE` | 调用方可提供“已批准”状态 | 权威治理读取视图 | **CONDITIONAL** |
-| 6 | 权威治理证据 | — | 自称 `VERIFIED_GOVERNANCE_EVIDENCE` | 策略直接阻断该来源 | — | **不存在** | — | **无权威撤销源** | — | `EVIDENCE_PROVENANCE_UNSUPPORTED` | 不适用（不可达） | 见 §4 | **UNVERIFIED** |
+| 6 | 权威治理证据 | 签名权威视图（隔离原型） | 自称 `VERIFIED_GOVERNANCE_EVIDENCE` 但无可验证视图 | 视图签名 + 事实逐项匹配 | Ed25519（视图/检查点角色分离） | 隔离账本 + 历史批准审计 | 数据集 + 基线 | 签名撤销清单 | 工件新鲜度 | 缺失/不匹配 -> `EVIDENCE_PROVENANCE_UNSUPPORTED` | 生产账本/信任锚仍由调用方提供 | 见 §4 | **CONDITIONAL（隔离）** |
 | 7 | `Activation Authorization` | 授权人外部私钥 | 任意工件/重放 | 字段/用途/范围/schema | Ed25519 + 可信公钥路径 | 授权人（与所有者分离） | 数据集 + 基线 | `revocation_registry`（调用方） | `now >= expires_at` | 任一不满足不可消费 | 无最大寿命；`approval_fingerprint` 可为空 | 可信时间 + 撤销权威 + 最长寿命 | **CONDITIONAL** |
 | 8 | `Shadow Activation Snapshot` | 构建器 | 手工构造/反序列化 | ID==内容指纹、绑定去重/冲突 | 无签名 | 无 | 快照基线 | 无 | 状态字段 | 冲突/不可复算拒绝 | 注册不授权，选择才授权 | 持久化发布与审计 | **VERIFIED（影子）** |
 | 9 | `Shadow Runtime Reader` | 显式选择的已登记快照 | 任意快照对象/ID/观测/上下文 | 注册 + 选择 + 指纹 + 身份键 | 读时复核 Ed25519 | 无 | 当前基线 | 读时撤销登记 | 读时过期 | 拒绝且不降级 | 所有权证据由调用方提供 | 权威 Canonical 视图 | **CONDITIONAL** |
@@ -76,17 +76,19 @@
 
 ---
 
-## 4. 治理证据真实性（为什么 `VERIFIED_GOVERNANCE_EVIDENCE` 不可达）
+## 4. 治理证据真实性（`VERIFIED_GOVERNANCE_EVIDENCE` 的边界）
 
 ### 4.1 现状
 
 | 事实 | 位置 |
 | :--- | :--- |
-| 允许的来源只有 `CALLER_ASSERTED_CONTEXT` 与 `ISOLATED_SNAPSHOT_CONTEXT` | [runtime_mapping_policy.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/runtime_mapping_policy.py) |
-| `VERIFIED_GOVERNANCE_EVIDENCE` 被显式列入阻断集合 | 同上 |
-| 资格评估器对声称该来源的上下文直接拒绝 | `_check_governance_evidence_provenance_supported`，[runtime_mapping_eligibility.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/runtime_mapping_eligibility.py) |
-| 隔离快照可以执行结构校验与历史批准审计，但来源仍是 `ISOLATED_SNAPSHOT_CONTEXT` | `build_isolated_governance_snapshot`，[mapping_governance_shadow.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/tools/mapping_governance_shadow.py) |
+| 默认来源为 `CALLER_ASSERTED_CONTEXT` 与 `ISOLATED_SNAPSHOT_CONTEXT` | [runtime_mapping_policy.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/runtime_mapping_policy.py) |
+| `VERIFIED_GOVERNANCE_EVIDENCE` 仅在提供**已签名、未过期、事实逐项匹配**的权威视图时被接受；仅声称该来源仍被阻断 | 同上 + `_verified_authoritative_view_codes`，[runtime_mapping_eligibility.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/runtime_mapping_eligibility.py) |
+| 隔离视图由 `build_authoritative_governance_view` 从账本 + 签名检查点 / Canonical 清单 / 撤销清单派生，并由独立 view 签名角色背书 | [authoritative_governance.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/authoritative_governance.py) |
+| 隔离快照仍可执行结构校验与历史批准审计，但来源是 `ISOLATED_SNAPSHOT_CONTEXT` | `build_isolated_governance_snapshot`，[mapping_governance_shadow.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/tools/mapping_governance_shadow.py) |
 | 账本路径必须在仓库外且无默认位置 | `_assert_isolated_ledger_path`，[mapping_governance.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/mapping_governance.py) |
+
+**生产边界**：签名只证明“可信视图签名者声称观察到了这些事实”；`verify_authoritative_governance_view` 不重新读取账本、不重跑批准审计，因此一个被攻陷的视图签名者可以签署任意事实。生产必须由独立受信任组件运行构建器并保护其密钥；在此之前不得把隔离签名视图升级为生产权威。
 
 ### 4.2 缺失组件（最小清单）
 

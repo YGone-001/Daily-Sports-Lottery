@@ -33,11 +33,23 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 
 严重度：**Critical**（可导致身份/授权被伪造或历史被重写）/ **High**（可导致越权消费或恢复绕过）/ **Medium**（可用性/一致性问题）。
 
+### 1.1 Phase 2-I-C 状态核对
+
+| 阻断项 | 组件实现 | 隔离验证 | 生产控制 | 结论 |
+| :--- | :--- | :--- | :--- | :--- |
+| B-01 | `build_authoritative_governance_view` + 签名检查点/清单 | 是（TI-01~TI-15b） | 否：无生产账本位置/读取服务 | `ISOLATED_PROTOTYPE_ONLY` / `PRODUCTION_CONTROL_NOT_READY` |
+| B-02 | 签名 Canonical / 撤销清单 + 严格读取器 | 是（B-02、TI-13/15） | 否：信任锚与视图仍由调用方提供 | `ISOLATED_PROTOTYPE_ONLY` / `PRODUCTION_CONTROL_NOT_READY` |
+| B-03 | 签名观测来源证明（含数据集、身份契约、sport/date、唯一性作用域） | 是（B-03、TI-16b~19） | 否：无生产采集权威 | `ISOLATED_PROTOTYPE_ONLY` / `PRODUCTION_CONTROL_NOT_READY` |
+| B-04 | 外部签名审计检查点 + 恢复证据 | 是（B-04、TI-05~07/21） | 否：无独立审计服务/检查点发布方 | `ISOLATED_PROTOTYPE_ONLY` / `PRODUCTION_CONTROL_NOT_READY` |
+| B-05 | 严格再启用要求恢复证据 + `NONE` 差异 | 是（B-05、TI-20~22） | 否：严格模式为可选构造参数，非生产强制策略 | `ISOLATED_PROTOTYPE_ONLY` / `PRODUCTION_CONTROL_NOT_READY` |
+
+**结论**：B-01~B-05 的组件已实现并在隔离夹具中验证，但**没有一个**达到 `PRODUCTION_CONTROL_VERIFIED`；生产激活仍为 NO-GO。
+
 ### B-01 权威治理证据不可达（Critical）
 
 - **位置**：[runtime_mapping_policy.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/runtime_mapping_policy.py) 的 provenance 常量；`_check_governance_evidence_provenance_supported`（[runtime_mapping_eligibility.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/runtime_mapping_eligibility.py)）。
 - **受影响属性**：治理事实真实性与生产授权资格。
-- **现状**：`VERIFIED_GOVERNANCE_EVIDENCE` 被策略阻断；仅允许调用方断言与隔离快照。
+- **现状**：`VERIFIED_GOVERNANCE_EVIDENCE` 仅在提供**已签名、未过期、事实逐项匹配**的权威视图时被接受；仅声称来源仍被阻断。隔离原型已实现，但没有生产账本位置、生产读取服务或生产锚分布。
 - **复现**：`tests/test_runtime_mapping_readiness.py::test_ec_12...`（声称该来源 -> `EVIDENCE_PROVENANCE_UNSUPPORTED`）。
 - **整改标准**：存在生产治理读取视图，能独立执行结构校验 + 可信公钥批准审计 + 当前状态派生，并在策略中启用该来源（且仅在该视图可用时）。
 - **验收测试**：新增 `test_production_governance_view_*`：缺失账本/签名失败/证据缺失/状态陈旧 -> NOT_ELIGIBLE；完整证据 -> VERIFIED（仍需独立评审）。
@@ -54,7 +66,7 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 
 - **位置**：`ShadowRuntimeReader.read` 第 4 步；`ScopedSourceIdentityKey.for_observation`（[source_identity.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/source_identity.py)）。
 - **受影响属性**：身份真实性。
-- **现状**：读取器接受任何调用方构造的 `SourceObservation`；语义指纹只证明字段自洽，不证明来自真实采集。
+- **现状**：读取器接受任何调用方构造的 `SourceObservation`；隔离原型现提供签名来源证明（绑定数据集、身份契约、sport/date、唯一性作用域），但生产采集权威不存在，且严格模式为可选参数。
 - **复现**：手工构造与夹具同键的观测即可让读取器解析（静态可构造；现有夹具本身即合成观测）。
 - **整改标准**：生产运行期只能消费由受控采集/解析管线签发、带来源签名或不可伪造句柄的观测；读取器必须验证该来源。
 - **验收测试**：`test_forged_observation_without_provenance_is_rejected`、`test_observation_source_signature_required`。
@@ -63,7 +75,8 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 
 - **位置**：`ShadowActivationAuditStore.verify/append/store_identity/receipt_for`（[shadow_activation_audit_store.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/shadow_activation_audit_store.py)）。
 - **受影响属性**：审计真实性与不可否认性。
-- **复现**：`test_sr_17`（有效链尾截断后 `verify()` 仍 OK）、`test_sr_18`（无检查点）、全链重写为静态可构造攻击。
+- **现状**：隔离原型已实现 `export_checkpoint` / `verify_external_checkpoint` 与恢复证据签名；严格模式下可检测尾部截断、追加与整链替换。检查点发布方仍是调用方提供的密钥，生产独立审计服务不存在；未启用严格模式时截断仍不可检测。
+- **复现**：`test_b04_checkpoint_detects_tail_truncation`（严格模式检出）、`test_sr_17`（无检查点模式仍不可检测）、`test_sr_18`（默认声明无外部锚）。
 - **整改标准**：引入外部签名/可信检查点（链尖 + 长度 + 时间），并规定审计适配器为受信任、最小权限的独立组件；哈希链只作为内部一致性校验。
 - **验收测试**：`test_tail_truncation_is_detected_by_checkpoint`、`test_full_chain_rewrite_is_detected`、`test_audit_adapter_identity_is_authenticated`。
 
@@ -71,7 +84,8 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 
 - **位置**：`ShadowRuntimeReader.re_enable`（[shadow_runtime_reader.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/shadow_runtime_reader.py)）；`ShadowActivationSimulator._fail_closed_after_audit_failure`。
 - **受影响属性**：不确定提交后的恢复完整性。
-- **复现**：`test_sr_19`（UNCERTAIN 停用后，未执行 `recover()` 即可显式选择 + 证据再启用）。
+- **现状**：严格模式（`require_recovery_evidence_for_reenable=True`）已要求签名恢复证据且 `divergence=NONE`；但该模式是可选构造参数，默认关闭，未构成生产强制策略。
+- **复现**：`test_b05_strict_reenable_requires_recovery_evidence`（严格模式拒绝缺失证据）、`test_sr_19`（默认模式未强制恢复）。
 - **整改标准**：`re_enable()` 必须要求已验证的恢复证据，并识别事件/指针差异；差异未消解前拒绝再启用。
 - **验收测试**：`test_reenable_requires_recovery_evidence`、`test_event_without_pointer_blocks_reenable`。
 
@@ -111,7 +125,7 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 
 - **位置**：回滚成功事件提交后指针应用失败路径。
 - **受影响属性**：审计与有效状态一致性。
-- **现状**：已检测并 fail closed（`SR-14`），但无自动对账。
+- **现状**：隔离原型已实现外部签名检查点与恢复证据，严格模式下可检测尾部截断/追加/重写与事件-指针差异；但检查点发布方仍是调用方提供的密钥，生产独立审计服务不存在。未启用严格模式时仍无法检测截断。
 - **整改标准**：恢复流程必须识别并消解 `EVENT_WITHOUT_POINTER` / `POINTER_WITHOUT_EVENT`。
 - **验收测试**：`test_recovery_reconciles_event_pointer_divergence`。
 

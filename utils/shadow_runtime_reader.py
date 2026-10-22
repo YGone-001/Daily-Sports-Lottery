@@ -686,6 +686,7 @@ class ShadowRuntimeReader:
                     ),
                     current_time=read_context.current_time,
                     max_age_seconds=read_context.recovery_max_age_seconds,
+                    expected_dataset_identity=read_context.dataset_identity,
                 )
             except RecoveryEvidenceError:
                 rejections.append(
@@ -845,6 +846,7 @@ class ShadowRuntimeReader:
                         ),
                         current_time=read_context.current_time,
                         max_age_seconds=read_context.observation_max_age_seconds,
+                        expected_dataset_identity=read_context.dataset_identity,
                     )
                 except ObservationAttestationError:
                     rejections.append("OBSERVATION_PROVENANCE_INVALID")

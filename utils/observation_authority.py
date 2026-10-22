@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from utils.source_identity import SourceObservation
+from utils.source_identity import ScopedSourceIdentityKey, SourceObservation
 from utils.trusted_artifacts import (
     SignedTrustedArtifact,
     TrustedArtifactError,
@@ -42,15 +42,24 @@ def sign_observation_attestation(
     private_key_path: str,
     observation: SourceObservation,
     *,
+    dataset_identity: str,
     adapter: str,
     captured_at: str,
 ) -> SignedTrustedArtifact:
     """
     由可信采集权威为一次观测签发来源证明（私钥必须在仓库外）。
+
+    证明显式绑定数据集身份、身份键契约版本、adapter、sport / date 与
+    provider 唯一性作用域，避免同一观测跨数据集或跨语义域重用。
     """
     if not isinstance(observation, SourceObservation):
         raise ObservationAttestationError(
             "only a SourceObservation can be attested",
+            rejection_codes=("OBSERVATION_ATTESTATION_INVALID",),
+        )
+    if not dataset_identity or not str(dataset_identity).strip():
+        raise ObservationAttestationError(
+            "a dataset identity is required for an observation attestation",
             rejection_codes=("OBSERVATION_ATTESTATION_INVALID",),
         )
     if not adapter or not str(adapter).strip():
@@ -58,12 +67,20 @@ def sign_observation_attestation(
             "an adapter identity is required",
             rejection_codes=("OBSERVATION_ATTESTATION_ADAPTER_MISMATCH",),
         )
+    identity_key = ScopedSourceIdentityKey.for_observation(observation)
     return sign_trusted_artifact(
         private_key_path,
         artifact_type=SOURCE_OBSERVATION_ATTESTATION_TYPE,
         payload={
+            "dataset_identity": str(dataset_identity),
             "observation_fingerprint": observation.semantic_fingerprint(),
             "observation_id": str(getattr(observation, "observation_id", "")),
+            "identity_key_schema_version": identity_key.identity_key_schema_version,
+            "identity_kind": identity_key.identity_kind,
+            "identity_value": identity_key.identity_value,
+            "provider_id_uniqueness_scope": identity_key.provider_id_uniqueness_scope,
+            "sport": observation.sport or "",
+            "event_date": observation.event_date or "",
             "adapter": str(adapter),
             "captured_at": str(captured_at),
             "issued_at": str(captured_at),
@@ -78,10 +95,11 @@ def verify_observation_attestation(
     trusted_public_key_path: str | None,
     current_time: str,
     max_age_seconds: float,
+    expected_dataset_identity: str,
     expected_adapter: str | None = None,
 ) -> dict:
     """
-    **只读**验证来源证明：签名、新鲜度、观测指纹与 adapter 绑定。
+    **只读**验证来源证明：签名、新鲜度、数据集、身份契约与观测绑定。
     """
     if attestation is None:
         raise ObservationAttestationError(
@@ -106,6 +124,11 @@ def verify_observation_attestation(
             f"observation attestation rejected: {exc}",
             rejection_codes=("OBSERVATION_ATTESTATION_INVALID",),
         ) from exc
+    if str(payload.get("dataset_identity", "")) != str(expected_dataset_identity):
+        raise ObservationAttestationError(
+            "observation attestation does not bind the current dataset identity",
+            rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
+        )
     if str(payload.get("observation_fingerprint")) != observation.semantic_fingerprint():
         raise ObservationAttestationError(
             "observation attestation does not bind this observation",
@@ -115,6 +138,41 @@ def verify_observation_attestation(
     if str(payload.get("observation_id", "")) != expected_id:
         raise ObservationAttestationError(
             "observation attestation does not bind this observation id",
+            rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
+        )
+    identity_key = ScopedSourceIdentityKey.for_observation(observation)
+    if str(payload.get("identity_key_schema_version", "")) != (
+        identity_key.identity_key_schema_version
+    ):
+        raise ObservationAttestationError(
+            "observation attestation identity key contract mismatch",
+            rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
+        )
+    if str(payload.get("identity_kind", "")) != identity_key.identity_kind:
+        raise ObservationAttestationError(
+            "observation attestation identity kind mismatch",
+            rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
+        )
+    if str(payload.get("identity_value", "")) != identity_key.identity_value:
+        raise ObservationAttestationError(
+            "observation attestation identity value mismatch",
+            rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
+        )
+    if str(payload.get("provider_id_uniqueness_scope", "")) != (
+        identity_key.provider_id_uniqueness_scope
+    ):
+        raise ObservationAttestationError(
+            "observation attestation provider uniqueness scope mismatch",
+            rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
+        )
+    if str(payload.get("sport", "")) != str(observation.sport or ""):
+        raise ObservationAttestationError(
+            "observation attestation sport mismatch",
+            rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
+        )
+    if str(payload.get("event_date", "")) != str(observation.event_date or ""):
+        raise ObservationAttestationError(
+            "observation attestation event date mismatch",
             rejection_codes=("OBSERVATION_ATTESTATION_MISMATCH",),
         )
     observed_adapter = str(getattr(observation.stability_scope, "adapter", ""))

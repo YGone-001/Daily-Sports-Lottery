@@ -121,9 +121,10 @@ def verify_recovery_evidence(
     trusted_public_key_path: str | None,
     current_time: str,
     max_age_seconds: float,
+    expected_dataset_identity: str | None = None,
 ) -> dict:
     """
-    **只读**验证恢复证据：签名、新鲜度与 ``divergence == NONE``。
+    **只读**验证恢复证据：签名、新鲜度、数据集绑定与 ``divergence == NONE``。
     """
     if evidence is None:
         raise RecoveryEvidenceError(
@@ -151,6 +152,13 @@ def verify_recovery_evidence(
     if not str(payload.get("store_identity", "")).strip():
         raise RecoveryEvidenceError(
             "recovery evidence does not bind an audit store identity",
+            rejection_codes=("RECOVERY_EVIDENCE_INVALID",),
+        )
+    if expected_dataset_identity is not None and str(
+        payload.get("dataset_identity", "")
+    ) != str(expected_dataset_identity):
+        raise RecoveryEvidenceError(
+            "recovery evidence does not bind the current dataset identity",
             rejection_codes=("RECOVERY_EVIDENCE_INVALID",),
         )
     return payload

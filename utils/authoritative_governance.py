@@ -191,6 +191,7 @@ def build_authoritative_governance_view(
     revocation_manifest: SignedTrustedArtifact | Mapping[str, Any],
     revocation_manifest_trusted_public_key_path: str,
     view_signing_private_key_path: str,
+    view_trusted_public_key_path: str,
     current_time: str,
     max_age_seconds: float = DEFAULT_GOVERNANCE_MAX_AGE_SECONDS,
 ) -> AuthoritativeGovernanceView:
@@ -199,6 +200,11 @@ def build_authoritative_governance_view(
 
     所有外部工件必须显式提供并验证；任何缺失、签名失败、过期、类型不符、
     链尖/长度不一致都会 fail closed。
+
+    **签名角色分离**：账本检查点、Canonical 清单、撤销清单与所有者批准各自
+    使用独立的信任锚；视图证明由 ``view_signing_private_key_path`` 对应的
+    **view 签名角色**签发，并必须由 ``view_trusted_public_key_path`` 验证。
+    绝不使用检查点公钥验证视图签名。
     """
     if not dataset_identity or not current_baseline_fingerprint:
         raise TrustedArtifactError(
@@ -361,7 +367,7 @@ def build_authoritative_governance_view(
     )
     verify_authoritative_governance_view(
         view,
-        trusted_public_key_path=ledger_checkpoint_trusted_public_key_path,
+        trusted_public_key_path=view_trusted_public_key_path,
         current_time=current_time,
         max_age_seconds=max_age_seconds,
     )
@@ -397,6 +403,12 @@ def verify_authoritative_governance_view(
         raise TrustedArtifactError(
             "authoritative governance view attestation does not match its facts",
             rejection_codes=("TRUSTED_ARTIFACT_SIGNATURE_INVALID",),
+        )
+    if not view.canonical_ids:
+        # 空的 Canonical 集合不得被当作“完整且为空”的生产所有权证据。
+        raise TrustedArtifactError(
+            "authoritative governance view must carry a non-empty Canonical ownership set",
+            rejection_codes=("TRUSTED_ARTIFACT_MALFORMED",),
         )
     return payload
 
