@@ -589,8 +589,8 @@ def test_ad_12_no_runtime_module_references_the_activation_design():
 
 def test_ad_13_existing_semantics_are_unchanged():
     """AD-13: 本设计阶段未改动既有资格 / 策略语义与版本。"""
-    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
-    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.2.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.2.0"
     assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
     assert len(RUNTIME_ELIGIBILITY_RULES) == 45
     assert RUNTIME_READINESS_MANIFEST_KIND == "READ_ONLY_RUNTIME_READINESS"

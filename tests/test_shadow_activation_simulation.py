@@ -728,7 +728,7 @@ def test_sg_24_disable_requires_no_activation_signature(env):
     # 生产激活与读取器标志不变。
     assert shadow_simulation_status()["production_activation"] == "NOT_ENABLED"
     assert shadow_simulation_status()["production_runtime_reader"] == "NOT_ENABLED"
-    assert SHADOW_SIMULATION_VERSION == "1.2.0"
+    assert SHADOW_SIMULATION_VERSION == "1.3.0"
 
 
 def test_sg_25_rollback_to_still_valid_snapshot_succeeds(env):

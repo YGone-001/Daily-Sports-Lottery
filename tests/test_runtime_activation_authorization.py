@@ -1410,11 +1410,11 @@ def test_shadow_audit_log_is_append_only_and_hash_chained(env):
 
 def test_rejection_code_registry_is_coherent():
     """补充：拒绝码注册表自洽，且非可消费码是拒绝码的子集。"""
-    assert len(AUTHORIZATION_REJECTION_CODE_SET) == 26
+    assert len(AUTHORIZATION_REJECTION_CODE_SET) == 27
     assert NON_CONSUMABLE_REJECTION_CODES <= AUTHORIZATION_REJECTION_CODE_SET
     assert MAY_BE_EMPTY_FIELDS
     # 允许为空的字段必须是设计必填字段的子集。
     assert set(MAY_BE_EMPTY_FIELDS) <= set(ACTIVATION_AUTHORIZATION_REQUIRED_FIELDS)
     # 策略注册表与资格规则未被本阶段改动。
     assert len(RUNTIME_ELIGIBILITY_RULES) == 45
-    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.2.0"

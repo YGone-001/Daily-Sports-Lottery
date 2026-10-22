@@ -42,7 +42,18 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from utils.mapping_governance import MappingProposal
+from utils.mapping_governance import ACTIVE_STATES, MappingProposal
+from utils.authoritative_governance import (
+    AuthoritativeGovernanceView,
+    DEFAULT_GOVERNANCE_MAX_AGE_SECONDS,
+    verify_authoritative_governance_view,
+)
+from utils.observation_authority import (
+    ObservationAttestationError,
+    verify_observation_attestation,
+)
+from utils.recovery_authority import RecoveryEvidenceError, verify_recovery_evidence
+from utils.trusted_artifacts import SignedTrustedArtifact, TrustedArtifactError
 from utils.runtime_activation_authorization import (
     ActivationPrototypeError,
     ActivationVerificationContext,
@@ -69,7 +80,8 @@ from utils.source_identity import (
 #:
 #: ``1.1.0``：注册表驱动的读取强制显式选择权威、完整所有权冲突判定、
 #: 停用后的再启用必须携带已校验的激活证据、句柄有效性显式限定为代际校验。
-SHADOW_READER_VERSION = "1.1.0"
+#: ``1.2.0``：新增严格模式（权威治理视图、观测来源证明、恢复证据前置）。
+SHADOW_READER_VERSION = "1.2.0"
 
 #: 原型标记。
 PROTOTYPE_ONLY = True
@@ -105,6 +117,12 @@ READER_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("AUTHORIZATION_NOT_CONSUMABLE", "绑定背后的授权在读取时已不可消费。"),
     ("OWNERSHIP_CONFLICT", "同一源身份键存在不兼容的 Canonical 所有权声明。"),
     ("CANONICAL_OWNER_UNKNOWN", "绑定目标不是当前已知的 Canonical 所有者。"),
+    ("AUTHORITATIVE_GOVERNANCE_VIEW_MISSING", "严格模式要求已签名的权威治理视图。"),
+    ("AUTHORITATIVE_GOVERNANCE_VIEW_INVALID", "权威治理视图无法验证或与当前上下文不一致。"),
+    ("GOVERNANCE_STATE_NOT_ACTIVE", "权威治理视图显示该提案已不在活动状态。"),
+    ("GOVERNANCE_CONTENT_MISMATCH", "权威治理视图的提案内容指纹与授权不一致。"),
+    ("OBSERVATION_PROVENANCE_MISSING", "严格模式要求源观测来源证明。"),
+    ("OBSERVATION_PROVENANCE_INVALID", "源观测来源证明无法验证。"),
 )
 
 #: 拒绝码集合。
@@ -132,6 +150,12 @@ REENABLE_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("RE_ENABLE_AUTHORIZATION_NOT_CONSUMABLE", "所提供授权在当前条件下不可消费。"),
     ("RE_ENABLE_CLOCK_UNAVAILABLE", "未提供可解析的受控时钟。"),
     ("RE_ENABLE_EVIDENCE_MALFORMED", "再启用证据缺失或类型错误。"),
+    ("RE_ENABLE_RECOVERY_EVIDENCE_MISSING", "严格模式要求已验证的审计恢复证据。"),
+    ("RE_ENABLE_RECOVERY_EVIDENCE_INVALID", "恢复证据无法验证、已过期或未消解差异。"),
+    ("RE_ENABLE_AUTHORITATIVE_VIEW_MISSING", "严格模式要求已签名的权威治理视图。"),
+    ("RE_ENABLE_AUTHORITATIVE_VIEW_INVALID", "权威治理视图无法验证或不匹配。"),
+    ("RE_ENABLE_GOVERNANCE_STATE_NOT_ACTIVE", "权威视图显示该提案已不活动。"),
+    ("RE_ENABLE_GOVERNANCE_CONTENT_MISMATCH", "权威视图的提案内容指纹不匹配。"),
 )
 
 #: 再启用拒绝码集合。
@@ -196,6 +220,16 @@ class ShadowReadContext:
     known_source_bindings: tuple[tuple[str, str], ...] = ()
     #: 可复核的治理证据集合。
     evidence: tuple[ShadowAuthorizationEvidence, ...] = ()
+    #: 严格模式：已签名、未过期的权威治理视图。
+    authoritative_view: AuthoritativeGovernanceView | None = None
+    authoritative_view_trusted_public_key_path: str | None = None
+    authoritative_view_max_age_seconds: float = DEFAULT_GOVERNANCE_MAX_AGE_SECONDS
+    #: 严格模式：源观测来源证明的可信公钥与新鲜度。
+    observation_trusted_public_key_path: str | None = None
+    observation_max_age_seconds: float = 3600.0
+    #: 严格模式：恢复证据的可信公钥与新鲜度。
+    recovery_trusted_public_key_path: str | None = None
+    recovery_max_age_seconds: float = 3600.0
 
     def evidence_for(self, activation_id: str) -> ShadowAuthorizationEvidence | None:
         for record in self.evidence:
@@ -232,6 +266,21 @@ class ShadowReadContext:
             "known_canonical_ids": sorted(self.canonical_id_set()),
             "known_source_bindings": [list(pair) for pair in self.known_source_bindings],
             "evidence": [record.as_dict() for record in self.evidence],
+            "authoritative_view_supplied": self.authoritative_view is not None,
+            "authoritative_view_fingerprint": (
+                self.authoritative_view.fingerprint()
+                if self.authoritative_view is not None
+                else ""
+            ),
+            "authoritative_view_trust_anchor_supplied": (
+                self.authoritative_view_trusted_public_key_path is not None
+            ),
+            "observation_trust_anchor_supplied": (
+                self.observation_trusted_public_key_path is not None
+            ),
+            "recovery_trust_anchor_supplied": (
+                self.recovery_trusted_public_key_path is not None
+            ),
         }
 
 
@@ -320,11 +369,28 @@ class ShadowRuntimeReader:
     - 停用后立即不可消费；句柄以 ``reader_generation`` 为准判定是否仍然有效。
     """
 
-    def __init__(self, *, registry: Any = None, reader_id: str = "shadow-reader") -> None:
+    def __init__(
+        self,
+        *,
+        registry: Any = None,
+        reader_id: str = "shadow-reader",
+        require_authoritative_governance: bool = False,
+        require_observation_attestation: bool = False,
+        require_recovery_evidence_for_reenable: bool = False,
+    ) -> None:
         self._registry = registry
         self._reader_id = str(reader_id)
         self._enabled = True
         self._generation = 0
+        self._require_authoritative_governance = bool(
+            require_authoritative_governance
+        )
+        self._require_observation_attestation = bool(
+            require_observation_attestation
+        )
+        self._require_recovery_evidence_for_reenable = bool(
+            require_recovery_evidence_for_reenable
+        )
 
     # -- 只读状态 ---------------------------------------------------------
 
@@ -354,6 +420,15 @@ class ShadowRuntimeReader:
             ),
             "requires_explicit_selection": registry_backed,
             "re_enable_requires_verified_evidence": True,
+            "require_authoritative_governance": (
+                self._require_authoritative_governance
+            ),
+            "require_observation_attestation": (
+                self._require_observation_attestation
+            ),
+            "require_recovery_evidence_for_reenable": (
+                self._require_recovery_evidence_for_reenable
+            ),
             "production_runtime_reader": PRODUCTION_RUNTIME_READER,
             "production_activation": PRODUCTION_ACTIVATION,
             "writes_files": False,
@@ -421,6 +496,7 @@ class ShadowRuntimeReader:
         at: str,
         read_context: ShadowReadContext,
         evidence: ShadowAuthorizationEvidence,
+        recovery_evidence: SignedTrustedArtifact | Mapping[str, Any] | None = None,
         reason: str = "",
     ) -> dict:
         """
@@ -446,7 +522,9 @@ class ShadowRuntimeReader:
                 rejection_codes=("RE_ENABLE_READER_NOT_DISABLED",),
             )
         rejections = self._reenable_rejections(
-            read_context=read_context, evidence=evidence
+            read_context=read_context,
+            evidence=evidence,
+            recovery_evidence=recovery_evidence,
         )
         if rejections:
             raise ShadowReenablementError(
@@ -477,6 +555,18 @@ class ShadowRuntimeReader:
             "grants_production_authorization": False,
             "partial_enablement": False,
             "stale_handles_invalidated": True,
+            "recovery_evidence_fingerprint": (
+                recovery_evidence.fingerprint()
+                if isinstance(recovery_evidence, SignedTrustedArtifact)
+                else ""
+            ),
+            "authoritative_view_fingerprint": (
+                read_context.authoritative_view.fingerprint()
+                if isinstance(
+                    read_context.authoritative_view, AuthoritativeGovernanceView
+                )
+                else ""
+            ),
         }
         report["fingerprint"] = fingerprint(report)
         return report
@@ -486,6 +576,7 @@ class ShadowRuntimeReader:
         *,
         read_context: ShadowReadContext,
         evidence: ShadowAuthorizationEvidence,
+        recovery_evidence: SignedTrustedArtifact | Mapping[str, Any] | None = None,
     ) -> list[str]:
         """再启用前的完整只读校验（绝不修改状态）。"""
         rejections: list[str] = []
@@ -542,6 +633,67 @@ class ShadowRuntimeReader:
                 ):
                     rejections.append("RE_ENABLE_ACTIVATION_NOT_SELECTED")
 
+        governance_view: AuthoritativeGovernanceView | None = None
+        if self._require_authoritative_governance:
+            candidate = read_context.authoritative_view
+            if (
+                not isinstance(candidate, AuthoritativeGovernanceView)
+                or not read_context.authoritative_view_trusted_public_key_path
+            ):
+                rejections.append("RE_ENABLE_AUTHORITATIVE_VIEW_MISSING")
+            else:
+                try:
+                    verify_authoritative_governance_view(
+                        candidate,
+                        trusted_public_key_path=(
+                            read_context.authoritative_view_trusted_public_key_path
+                        ),
+                        current_time=read_context.current_time,
+                        max_age_seconds=(
+                            read_context.authoritative_view_max_age_seconds
+                        ),
+                    )
+                except TrustedArtifactError:
+                    rejections.append("RE_ENABLE_AUTHORITATIVE_VIEW_INVALID")
+                else:
+                    if (
+                        candidate.dataset_identity != read_context.dataset_identity
+                        or candidate.baseline_fingerprint
+                        != read_context.current_baseline_fingerprint
+                    ):
+                        rejections.append("RE_ENABLE_AUTHORITATIVE_VIEW_INVALID")
+                    else:
+                        governance_view = candidate
+                        proposal_id = authorization.proposal_id
+                        if not candidate.is_active_proposal(proposal_id):
+                            rejections.append(
+                                "RE_ENABLE_GOVERNANCE_STATE_NOT_ACTIVE"
+                            )
+                        if (
+                            candidate.content_fingerprint_of(proposal_id)
+                            != authorization.proposal_content_fingerprint
+                        ):
+                            rejections.append(
+                                "RE_ENABLE_GOVERNANCE_CONTENT_MISMATCH"
+                            )
+
+        if self._require_recovery_evidence_for_reenable:
+            try:
+                verify_recovery_evidence(
+                    recovery_evidence,
+                    trusted_public_key_path=(
+                        read_context.recovery_trusted_public_key_path
+                    ),
+                    current_time=read_context.current_time,
+                    max_age_seconds=read_context.recovery_max_age_seconds,
+                )
+            except RecoveryEvidenceError:
+                rejections.append(
+                    "RE_ENABLE_RECOVERY_EVIDENCE_MISSING"
+                    if recovery_evidence is None
+                    else "RE_ENABLE_RECOVERY_EVIDENCE_INVALID"
+                )
+
         verification = verify_runtime_activation_authorization(
             authorization,
             ActivationVerificationContext(
@@ -551,7 +703,14 @@ class ShadowRuntimeReader:
                 trusted_public_key_path=read_context.trusted_public_key_path,
                 eligibility_decision=evidence.decision,
                 proposal=evidence.proposal,
-                revocation_registry=read_context.revocation_registry,
+                revocation_registry=(
+                    governance_view.revocations
+                    if governance_view is not None
+                    else read_context.revocation_registry
+                ),
+                require_verified_governance=(
+                    self._require_authoritative_governance
+                ),
             ),
         )
         if not verification.is_consumable:
@@ -614,6 +773,7 @@ class ShadowRuntimeReader:
         read_context: ShadowReadContext,
         snapshot: ShadowActivationSnapshot | None = None,
         snapshot_id: str | None = None,
+        observation_attestation: SignedTrustedArtifact | Mapping[str, Any] | None = None,
     ) -> ShadowReadResult:
         """
         **只读**影子读取。校验顺序（确定性）：
@@ -638,6 +798,56 @@ class ShadowRuntimeReader:
             rejections.append("READER_DISABLED")
         if _parse_timestamp(read_context.current_time) is None:
             rejections.append("CLOCK_UNAVAILABLE")
+
+        # 1b. 严格模式：权威治理视图与观测来源证明
+        governance_view: AuthoritativeGovernanceView | None = None
+        if self._require_authoritative_governance:
+            candidate_view = read_context.authoritative_view
+            if (
+                not isinstance(candidate_view, AuthoritativeGovernanceView)
+                or not read_context.authoritative_view_trusted_public_key_path
+            ):
+                rejections.append("AUTHORITATIVE_GOVERNANCE_VIEW_MISSING")
+            else:
+                try:
+                    verify_authoritative_governance_view(
+                        candidate_view,
+                        trusted_public_key_path=(
+                            read_context.authoritative_view_trusted_public_key_path
+                        ),
+                        current_time=read_context.current_time,
+                        max_age_seconds=(
+                            read_context.authoritative_view_max_age_seconds
+                        ),
+                    )
+                except TrustedArtifactError:
+                    rejections.append("AUTHORITATIVE_GOVERNANCE_VIEW_INVALID")
+                else:
+                    if (
+                        candidate_view.dataset_identity
+                        != read_context.dataset_identity
+                        or candidate_view.baseline_fingerprint
+                        != read_context.current_baseline_fingerprint
+                    ):
+                        rejections.append("AUTHORITATIVE_GOVERNANCE_VIEW_INVALID")
+                    else:
+                        governance_view = candidate_view
+        if self._require_observation_attestation:
+            if observation_attestation is None:
+                rejections.append("OBSERVATION_PROVENANCE_MISSING")
+            else:
+                try:
+                    verify_observation_attestation(
+                        observation_attestation,
+                        observation,
+                        trusted_public_key_path=(
+                            read_context.observation_trusted_public_key_path
+                        ),
+                        current_time=read_context.current_time,
+                        max_age_seconds=read_context.observation_max_age_seconds,
+                    )
+                except ObservationAttestationError:
+                    rejections.append("OBSERVATION_PROVENANCE_INVALID")
 
         # 2. 快照
         if (
@@ -766,10 +976,14 @@ class ShadowRuntimeReader:
 
         # 6. 既有 Canonical 所有权兼容性（**全部**所有者参与判定，顺序无关）
         owner_conflicts: list[str] = []
-        existing_owners = read_context.existing_owners_for(source_key)
+        if governance_view is not None:
+            existing_owners = governance_view.active_binding_owners_for(source_key)
+            known_ids = governance_view.canonical_id_set()
+        else:
+            existing_owners = read_context.existing_owners_for(source_key)
+            known_ids = read_context.canonical_id_set()
         if existing_owners and set(existing_owners) != {binding.candidate_canonical_id}:
             owner_conflicts.append("OWNERSHIP_CONFLICT")
-        known_ids = read_context.canonical_id_set()
         if known_ids and binding.candidate_canonical_id not in known_ids:
             owner_conflicts.append("CANONICAL_OWNER_UNKNOWN")
         if owner_conflicts:
@@ -786,6 +1000,11 @@ class ShadowRuntimeReader:
 
         # 7. 读时再验证：绑定背后的**全部**授权都必须仍然可消费
         revalidation_codes: list[str] = []
+        effective_revocations = (
+            governance_view.revocations
+            if governance_view is not None
+            else read_context.revocation_registry
+        )
         for candidate in matches:
             evidence = read_context.evidence_for(candidate.activation_id)
             if evidence is None:
@@ -794,6 +1013,15 @@ class ShadowRuntimeReader:
             if candidate.activation_id not in resolved_snapshot.activation_ids:
                 revalidation_codes.append("SNAPSHOT_MALFORMED")
                 continue
+            if governance_view is not None:
+                proposal_id = evidence.authorization.proposal_id
+                if not governance_view.is_active_proposal(proposal_id):
+                    revalidation_codes.append("GOVERNANCE_STATE_NOT_ACTIVE")
+                if (
+                    governance_view.content_fingerprint_of(proposal_id)
+                    != evidence.authorization.proposal_content_fingerprint
+                ):
+                    revalidation_codes.append("GOVERNANCE_CONTENT_MISMATCH")
             verification = verify_runtime_activation_authorization(
                 evidence.authorization,
                 ActivationVerificationContext(
@@ -805,7 +1033,10 @@ class ShadowRuntimeReader:
                     trusted_public_key_path=read_context.trusted_public_key_path,
                     eligibility_decision=evidence.decision,
                     proposal=evidence.proposal,
-                    revocation_registry=read_context.revocation_registry,
+                    revocation_registry=effective_revocations,
+                    require_verified_governance=(
+                        self._require_authoritative_governance
+                    ),
                 ),
             )
             if not verification.is_consumable:

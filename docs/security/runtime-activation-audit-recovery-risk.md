@@ -4,6 +4,12 @@
 **范围**：`ShadowActivationAuditStore`、`ShadowAuditCommitReceipt`、`ShadowActivationSimulator`、`ShadowRuntimeReader.re_enable()`
 **性质**：只读评审；不实现生产审计服务
 
+> **整改更新（B-04 / B-05）**：新增外部签名审计链检查点
+> （`ShadowActivationAuditStore.verify_external_checkpoint`，要求链尖与长度**精确匹配**）
+> 与签名恢复证据（`utils/recovery_authority.py`，要求 `divergence=NONE`）。
+> 严格回滚与严格再启用会强制使用它们；基础 `verify()` 仍然只证明内部一致性，
+> 不单独检测尾部截断。
+
 ---
 
 ## 1. 现状与不变量

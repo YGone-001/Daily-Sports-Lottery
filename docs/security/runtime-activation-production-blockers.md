@@ -6,6 +6,29 @@
 
 ---
 
+## 0. 整改状态更新（B-01 ~ B-05 已按组件/契约关闭）
+
+以下关闭表示**隔离原型中已存在可执行、可验证的信任控制**，且严格模式会强制使用；
+生产标志仍为 `NOT_ENABLED`，尚未接入任何生产入口。
+
+| 阻断项 | 状态 | 证据 |
+| :--- | :--- | :--- |
+| B-01 权威治理证据 | **CLOSED（组件）** | `utils/authoritative_governance.py` + 签名检查点/清单；`tests/test_runtime_activation_trust_hardening.py::test_b01_*` |
+| B-02 治理/撤销/Canonical 视图 | **CLOSED（组件）** | 资格评估器校验签名视图并逐项匹配；严格读取器使用视图中的活动绑定 / Canonical 集合 / 撤销；`test_b02_*` |
+| B-03 观测来源认证 | **CLOSED（组件）** | `utils/observation_authority.py`；严格读取器要求签名观测证明；`test_b03_*` |
+| B-04 审计外部信任锚 | **CLOSED（检查点/截断/重写）** | `ShadowActivationAuditStore.verify_external_checkpoint`；严格回滚要求检查点；`test_b04_*`。**残余**：生产审计适配器的信任仍属部署控制，需独立审计服务 |
+| B-05 恢复前置 | **CLOSED（组件）** | `utils/recovery_authority.py`；严格再启用要求 `divergence=NONE` 的签名恢复证据；`test_b05_*` |
+
+**仍未关闭**：B-06（可信时间/最大寿命）、B-07（`approval_fingerprint`）、B-08（空所有权证据）、
+B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产激活、生产读取器或生产审计服务。
+
+关闭 B-01 ~ B-05 的实现均位于**仓库内隔离原型**，密钥只在测试临时目录生成；
+严格模式由调用方显式开启（`require_authoritative_governance` /
+`require_observation_attestation` / `require_trusted_audit_checkpoint` /
+`require_recovery_evidence_for_reenable`），默认影子行为保持不变。
+
+---
+
 ## 1. 阻断项登记
 
 严重度：**Critical**（可导致身份/授权被伪造或历史被重写）/ **High**（可导致越权消费或恢复绕过）/ **Medium**（可用性/一致性问题）。

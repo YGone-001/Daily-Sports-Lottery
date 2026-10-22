@@ -2080,8 +2080,8 @@ def test_ec_20_policy_registry_and_dispatch_remain_complete():
     )
 
     # 版本号已按语义变化提升。
-    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
-    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.2.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.2.0"
     assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
 
 
@@ -2981,8 +2981,8 @@ def test_ec_20_policy_registry_and_dispatch_remain_complete():
     )
 
     # 版本号已按语义变化提升。
-    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
-    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.2.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.2.0"
     assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
 
 
@@ -3887,8 +3887,8 @@ def test_ec_20_policy_registry_and_dispatch_remain_complete():
     )
 
     # 版本号已按语义变化提升。
-    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
-    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.2.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.2.0"
     assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
 
 

@@ -65,6 +65,7 @@ from enum import Enum
 from typing import Any, Mapping, Sequence
 
 from utils.mapping_governance import (
+    ACTIVE_STATES,
     GovernanceError,
     LEDGER_TRUST_ANCHOR_STATEMENT,
     MappingProposal,
@@ -74,6 +75,12 @@ from utils.mapping_governance import (
     approval_fingerprint,
     verify_mapping_approval,
 )
+from utils.authoritative_governance import (
+    AuthoritativeGovernanceView,
+    DEFAULT_GOVERNANCE_MAX_AGE_SECONDS,
+    verify_authoritative_governance_view,
+)
+from utils.trusted_artifacts import TrustedArtifactError
 from utils.runtime_mapping_policy import (
     ALLOWED_ACTIONS,
     ALLOWED_APPROVAL_PURPOSES,
@@ -120,7 +127,8 @@ from utils.source_identity import (
 #:
 #: ``1.1.0``：新增证据绑定（观测 ↔ 提案）、记录指纹完整性、记录状态完整性与
 #: 上下文证据来源规则；移除「缺失记录状态回退到提案自述状态」的路径。
-RUNTIME_ELIGIBILITY_EVALUATOR_VERSION = "1.1.0"
+#: ``1.2.0``：``VERIFIED_GOVERNANCE_EVIDENCE`` 只在签名权威视图逐项匹配时可接受。
+RUNTIME_ELIGIBILITY_EVALUATOR_VERSION = "1.2.0"
 
 #: 决策对象 schema 版本。
 #:
@@ -346,6 +354,12 @@ class RuntimeMappingContext:
     #: 显式标志：该映射是否要求改写 Canonical ID / 要求迁移。
     canonical_rename_required: bool = False
     migration_required: bool = False
+    #: 权威治理视图（仅在 ``VERIFIED_GOVERNANCE_EVIDENCE`` 来源下被验证与使用）。
+    authoritative_view: AuthoritativeGovernanceView | None = None
+    #: 验证权威视图证明的显式可信公钥路径。
+    authoritative_view_trusted_public_key_path: str | None = None
+    #: 权威视图允许的最大新鲜度（秒）。
+    authoritative_view_max_age_seconds: float = DEFAULT_GOVERNANCE_MAX_AGE_SECONDS
 
     # -- 派生视图（只读，纯函数） -------------------------------------------
 
@@ -393,6 +407,18 @@ class RuntimeMappingContext:
             },
             "canonical_rename_required": self.canonical_rename_required,
             "migration_required": self.migration_required,
+            "authoritative_view_supplied": self.authoritative_view is not None,
+            "authoritative_view_fingerprint": (
+                self.authoritative_view.fingerprint()
+                if self.authoritative_view is not None
+                else ""
+            ),
+            "authoritative_view_trust_anchor_supplied": (
+                self.authoritative_view_trusted_public_key_path is not None
+            ),
+            "authoritative_view_max_age_seconds": (
+                self.authoritative_view_max_age_seconds
+            ),
         }
 
 
@@ -517,6 +543,7 @@ class _EvaluationFacts:
         "rewrite_targets",
         "rewrite_effects",
         "approval_verification_error",
+        "evaluation_time",
     )
 
     def __init__(
@@ -526,11 +553,13 @@ class _EvaluationFacts:
         approval: Mapping[str, Any] | None,
         observation: SourceObservation | None,
         context: RuntimeMappingContext,
+        evaluated_at: str | None = None,
     ) -> None:
         self.proposal = proposal
         self.approval = approval
         self.observation = observation
         self.context = context
+        self.evaluation_time = str(evaluated_at or _utc_now())
 
         key: dict[str, str] = {}
         if isinstance(proposal, MappingProposal):
@@ -798,18 +827,68 @@ def _check_governance_evidence_provenance_supported(
     """
     上下文必须声明一个本阶段**可支持**的治理证据来源。
 
-    刻意**不**把 ``structural_ledger_validation_performed`` /
-    ``authenticated_approval_audit_performed`` 这两个自述布尔值当作验证确实发生的证据：
-    本阶段没有任何代码路径能独立建立「已由独立验证过的账本证据支撑」这一档，
-    因此任何声称该来源的上下文一律阻断。
+    ``VERIFIED_GOVERNANCE_EVIDENCE`` 只在同时提供**已签名、未过期、事实逐项匹配**
+    的权威治理视图时才被接受；仅声称该来源而没有可验证证明一律阻断。
     """
     provenance = facts.context.evidence_provenance
     if provenance is None:
         return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    if provenance.source == CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER:
+        return _verified_authoritative_view_codes(facts)
     if provenance.source in BLOCKED_CONTEXT_EVIDENCE_PROVENANCE:
         return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
     if provenance.source not in ALLOWED_CONTEXT_EVIDENCE_PROVENANCE:
         return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    return ()
+
+
+def _verified_authoritative_view_codes(facts: _EvaluationFacts) -> tuple[str, ...]:
+    """验证 ``VERIFIED_GOVERNANCE_EVIDENCE`` 所需的签名视图与事实绑定。"""
+    context = facts.context
+    view = context.authoritative_view
+    if not isinstance(view, AuthoritativeGovernanceView):
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    if not context.authoritative_view_trusted_public_key_path:
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    try:
+        verify_authoritative_governance_view(
+            view,
+            trusted_public_key_path=context.authoritative_view_trusted_public_key_path,
+            current_time=facts.evaluation_time,
+            max_age_seconds=context.authoritative_view_max_age_seconds,
+        )
+    except TrustedArtifactError:
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    if (
+        view.dataset_identity != context.dataset_identity
+        or view.baseline_fingerprint != context.current_baseline_fingerprint
+    ):
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    if view.canonical_id_set() != context.canonical_id_set():
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+    view_bindings = tuple(
+        sorted((key, canonical_id) for key, canonical_id, _pid in view.active_bindings)
+    )
+    if tuple(sorted(context.known_source_bindings)) != view_bindings:
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
+
+    proposal = facts.proposal
+    if not isinstance(proposal, MappingProposal):
+        return ()
+    recorded_id = context.recorded_proposal_id
+    if recorded_id is None or str(recorded_id).strip() != proposal.proposal_id:
+        return ("RECORDED_STATE_PROPOSAL_MISMATCH",)
+    recorded_state = context.recorded_proposal_state
+    if recorded_state is not None and view.state_of(proposal.proposal_id) != recorded_state:
+        return ("RECORDED_STATE_PROPOSAL_MISMATCH",)
+    recorded_fingerprint = context.recorded_proposal_fingerprint
+    if recorded_fingerprint is not None and (
+        view.content_fingerprint_of(proposal.proposal_id)
+        != proposal.content_fingerprint()
+    ):
+        return ("PROPOSAL_FINGERPRINT_MISMATCH",)
+    if not view.is_active_proposal(proposal.proposal_id):
+        return ("MAPPING_STATE_NOT_ACTIVE",)
     return ()
 
 
@@ -1216,6 +1295,7 @@ def evaluate_runtime_mapping_eligibility(
         approval=approval,
         observation=source_observation,
         context=current_runtime_context,
+        evaluated_at=evaluated_at,
     )
 
     rejection: list[str] = []

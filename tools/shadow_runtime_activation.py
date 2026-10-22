@@ -133,6 +133,7 @@ class SyntheticShadowFixture:
     observation: Any
     other_observation: Any
     proposal: Any
+    approval: Any
     decision: Any
     authorization: Any
     verification_context: ActivationVerificationContext
@@ -262,6 +263,7 @@ def build_synthetic_shadow_fixture(workspace: str) -> SyntheticShadowFixture:
         observation=observation,
         other_observation=other_observation,
         proposal=proposal,
+        approval=approval,
         decision=decision,
         authorization=authorization,
         verification_context=verification_context,

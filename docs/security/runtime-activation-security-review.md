@@ -19,6 +19,10 @@
 **权威治理证据读取视图、可信观测来源、可信时间权威、外部审计信任锚、恢复前置约束、权威 Canonical 所有权视图**均不存在或仍由调用方提供。
 这些缺口不能由原型测试通过来抵消。
 
+> **整改更新**：B-01 ~ B-05 已按“隔离组件 + 显式严格模式”关闭（权威治理视图、观测来源证明、
+> 外部审计检查点、恢复证据）；B-06 ~ B-14 仍未关闭，生产决策仍为 **NO-GO**。
+> 详见 [阻断项登记](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/docs/security/runtime-activation-production-blockers.md)。
+
 ---
 
 ## 2. 评审范围与信任模型
@@ -218,8 +222,8 @@
 | SR-14 事件已提交但指针未应用 | `test_sr_14` | `ROLLBACK_COMMIT_APPLY_FAILED`、差异报告、停用 | 不得静默不一致 | PASS（已检测） |
 | SR-15 不确定 fsync | `RC-09` | `UNCERTAIN`、停用、字节保留 | 不谎报确定结果 | PASS |
 | SR-16 篡改哈希链 | `GC-17/18` | `MODIFIED_ENTRY` / `BROKEN_PREVIOUS_HASH` | 篡改拒绝 | PASS |
-| SR-17 有效链尾截断 | `test_sr_17` | `verify()` 仍为 OK、条目减少 | 截断应被检出 | **UNVERIFIED（生产阻断）** |
-| SR-18 缺少可信检查点 | `test_sr_18` | 如实声明无检查点/无外部认证 | 不得声称防篡改 | **UNVERIFIED（生产阻断）** |
+| SR-17 有效链尾截断 | `test_sr_17` / `test_b04_*` | 基础 `verify()` 仍无法发现；**严格模式外部检查点可检出** | 截断应被检出 | PASS（严格模式）/ 基础链仅内部一致 |
+| SR-18 缺少可信检查点 | `test_sr_18` / `test_b04_*` | 基础存储如实声明无检查点；新增外部签名检查点契约 | 不得声称防篡改 | PASS（严格模式） |
 | SR-19 恢复不需要当前授权 | `RC-13`、`test_sr_19` | `recover()` 不激活；`re_enable()` 仍需证据；但恢复非强制 | 恢复不得自动激活 | PASS（附带 B-05） |
 | SR-20 生产导入/激活隔离 | `SR-20`、`SG-41`、`RC-14` | 无生产导入/路由 | 无生产触达 | PASS |
 | SR-21 受保护路径逃逸 | `SG-37`、`test_sr_21` | 仓库内账本/审计、`../` 逃逸拒绝 | 隔离工作区 | PASS |

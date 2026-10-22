@@ -57,6 +57,7 @@ from utils.runtime_mapping_eligibility import (
     RuntimeMappingEligibilityDecision,
 )
 from utils.runtime_mapping_policy import (
+    CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER,
     RUNTIME_MAPPING_ACTIVATION,
     RUNTIME_MAPPING_POLICY_VERSION,
 )
@@ -187,6 +188,7 @@ AUTHORIZATION_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("ACTIVATION_AUTHORIZATION_EXPIRED", "授权已过期。"),
     ("ACTIVATION_AUTHORIZATION_REVOKED", "授权已被撤销。"),
     ("REVOCATION_REFERENCE_MISMATCH", "撤销登记与工件的撤销引用不一致。"),
+    ("GOVERNANCE_EVIDENCE_NOT_VERIFIED", "资格判定的治理证据不是独立验证过的权威来源。"),
 )
 
 #: 拒绝码集合（声明式）。
@@ -522,6 +524,8 @@ class ActivationVerificationContext:
     revocation_registry: tuple[tuple[str, str], ...] = ()
     expected_purpose: str = RUNTIME_ACTIVATION_AUTHORIZATION_PURPOSE
     expected_schema_version: str = RUNTIME_ACTIVATION_AUTHORIZATION_SCHEMA_VERSION
+    #: 严格生产模式：资格判定必须来自已验证的权威治理证据。
+    require_verified_governance: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -540,6 +544,7 @@ class ActivationVerificationContext:
             "revocation_registry": [list(pair) for pair in self.revocation_registry],
             "expected_purpose": self.expected_purpose,
             "expected_schema_version": self.expected_schema_version,
+            "require_verified_governance": self.require_verified_governance,
         }
 
 
@@ -648,6 +653,12 @@ def _collect_rejections(
             rejections.append("ELIGIBILITY_EVALUATOR_VERSION_MISMATCH")
         if decision.eligibility_result != RuntimeEligibilityResult.ELIGIBLE.value:
             rejections.append("ELIGIBILITY_NOT_ELIGIBLE")
+        if (
+            context.require_verified_governance
+            and decision.evidence_provenance
+            != CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER
+        ):
+            rejections.append("GOVERNANCE_EVIDENCE_NOT_VERIFIED")
 
     if authorization.policy_version != RUNTIME_MAPPING_POLICY_VERSION:
         rejections.append("POLICY_VERSION_MISMATCH")

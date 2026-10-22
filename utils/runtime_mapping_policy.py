@@ -39,7 +39,9 @@ from utils.source_identity import (
 #: 策略注册表版本。任何影响**判定含义**的变化都必须提升该版本。
 #:
 #: ``1.1.0``：新增证据绑定规则、记录指纹 / 记录状态完整性规则与上下文证据来源规则。
-RUNTIME_MAPPING_POLICY_VERSION = "1.1.0"
+#: ``1.2.0``：允许**经签名权威视图证明**的 ``VERIFIED_GOVERNANCE_EVIDENCE``；
+#: 仅声称该来源仍一律阻断。
+RUNTIME_MAPPING_POLICY_VERSION = "1.2.0"
 
 #: 运行期映射激活状态：本阶段**未启用**。
 RUNTIME_MAPPING_ACTIVATION = "NOT_ENABLED"

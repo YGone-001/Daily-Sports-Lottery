@@ -613,8 +613,8 @@ def test_sg_46_all_seven_stores_remain_byte_identical(
 
 def test_sg_47_existing_eligibility_and_approval_contracts_remain(env):
     """SG-47: 既有资格评估与 Ed25519 批准契约保持成功。"""
-    assert RUNTIME_MAPPING_POLICY_VERSION == "1.1.0"
-    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.1.0"
+    assert RUNTIME_MAPPING_POLICY_VERSION == "1.2.0"
+    assert RUNTIME_ELIGIBILITY_EVALUATOR_VERSION == "1.2.0"
     assert RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION == "1.1.0"
     assert len(RUNTIME_ELIGIBILITY_RULES) == 45
     assert env.decision.eligibility_result == "ELIGIBLE"
@@ -636,10 +636,10 @@ def test_sg_48_existing_activation_authorization_contracts_remain():
     """SG-48: 既有激活授权契约保持成功（含本阶段对原型缺陷的修正）。"""
     assert RUNTIME_ACTIVATION_AUTHORIZATION_SCHEMA_VERSION == "1.0.0"
     assert RUNTIME_ACTIVATION_AUTHORIZATION_PURPOSE != MAPPING_APPROVAL_PURPOSE
-    assert len(AUTHORIZATION_REJECTION_CODE_SET) == 26
+    assert len(AUTHORIZATION_REJECTION_CODE_SET) == 27
     assert SHADOW_SNAPSHOT_BUILDER_VERSION == "1.1.0"
     assert len(READER_REJECTION_CODE_SET) >= 15
-    assert SHADOW_READER_VERSION == "1.1.0"
+    assert SHADOW_READER_VERSION == "1.2.0"
     assert governance_status()["production_mapping_write_authorization"] == (
         "NOT_GRANTED"
     )

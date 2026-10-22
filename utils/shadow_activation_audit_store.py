@@ -33,6 +33,12 @@ from typing import Any, Mapping, Sequence
 from utils.mapping_governance import _ledger_lock
 from utils.runtime_activation_authorization import ActivationPrototypeError
 from utils.source_identity import canonical_json, fingerprint
+from utils.trusted_artifacts import (
+    SignedTrustedArtifact,
+    TrustedArtifactError,
+    sign_trusted_artifact,
+    verify_trusted_artifact,
+)
 
 #: 审计存储原型版本。
 #:
@@ -40,7 +46,11 @@ from utils.source_identity import canonical_json, fingerprint
 #: 严格终止符、禁止空白物理行）；校验与加锁彻底分离，避免递归加锁。
 #: ``1.2.0``：新增**持久提交收据**（存储身份 + 记录身份 + 持久化确认），
 #: 供回滚提交边界回读验证；磁盘事件格式保持不变。
-SHADOW_AUDIT_STORE_VERSION = "1.2.0"
+#: ``1.3.0``：新增**外部签名链检查点**，用于检测尾部截断与全链重写。
+SHADOW_AUDIT_STORE_VERSION = "1.3.0"
+
+#: 外部审计链检查点工件类型。
+SHADOW_AUDIT_CHECKPOINT_TYPE = "SHADOW_AUDIT_CHAIN_CHECKPOINT"
 
 #: 审计文件名（**只在显式工作区内**）。
 SHADOW_AUDIT_FILENAME = "shadow_activation_audit.jsonl"
@@ -94,6 +104,8 @@ AUDIT_INTEGRITY_CODES: tuple[tuple[str, str], ...] = (
     ("MODIFIED_ENTRY", "条目内容与其记录哈希不一致（被篡改）。"),
     ("DUPLICATE_EVENT_ID", "同一事件 ID 出现多次（重放）。"),
     ("UNSUPPORTED_EVENT_TYPE", "事件类型不在允许列表内。"),
+    ("CHECKPOINT_INVALID", "外部签名检查点无法验证或已过期。"),
+    ("CHECKPOINT_MISMATCH", "外部检查点与当前链尖 / 长度不一致（截断或重写）。"),
 )
 
 #: 路径拒绝码。
@@ -312,6 +324,87 @@ class ShadowActivationAuditStore:
     def chain_tip(self) -> str:
         records = self._read_strict()
         return records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
+
+    # -- 外部签名检查点 ---------------------------------------------------
+
+    def checkpoint_payload(self, *, issued_at: str) -> dict:
+        """当前完整链的检查点载荷（链尖 + 长度 + 存储身份 + 时间）。"""
+        records = self._read_strict()
+        self._validate_records(records)
+        return {
+            "subject_identity": self.store_identity(),
+            "dataset_identity": self.dataset_identity,
+            "chain_tip": (
+                records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
+            ),
+            "entry_count": len(records),
+            "issued_at": str(issued_at),
+        }
+
+    def export_checkpoint(
+        self, signing_private_key_path: str, *, issued_at: str
+    ) -> SignedTrustedArtifact:
+        """
+        用仓库外的审计权威私钥签发当前链检查点。
+
+        只读：不追加、不修改任何审计事件。
+        """
+        return sign_trusted_artifact(
+            signing_private_key_path,
+            artifact_type=SHADOW_AUDIT_CHECKPOINT_TYPE,
+            payload=self.checkpoint_payload(issued_at=issued_at),
+        )
+
+    def verify_external_checkpoint(
+        self,
+        checkpoint: SignedTrustedArtifact | Mapping[str, Any] | None,
+        *,
+        trusted_public_key_path: str | None,
+        current_time: str,
+        max_age_seconds: float,
+    ) -> dict:
+        """
+        **只读**验证外部签名检查点与当前链**完全一致**。
+
+        检查点长度/链尖必须精确匹配当前历史：任何尾部截断、尾部追加或全链重写
+        都会导致不匹配并 fail closed。
+        """
+        try:
+            payload = verify_trusted_artifact(
+                checkpoint,
+                expected_artifact_type=SHADOW_AUDIT_CHECKPOINT_TYPE,
+                trusted_public_key_path=trusted_public_key_path,
+                current_time=current_time,
+                max_age_seconds=max_age_seconds,
+            )
+        except TrustedArtifactError as exc:
+            raise ShadowAuditIntegrityError(
+                f"external audit checkpoint is invalid: {exc}",
+                rejection_codes=("CHECKPOINT_INVALID",),
+            ) from exc
+        if str(payload.get("subject_identity")) != self.store_identity():
+            raise ShadowAuditIntegrityError(
+                "external audit checkpoint does not bind this audit store",
+                rejection_codes=("CHECKPOINT_MISMATCH",),
+            )
+        if str(payload.get("dataset_identity")) != self.dataset_identity:
+            raise ShadowAuditIntegrityError(
+                "external audit checkpoint dataset identity mismatch",
+                rejection_codes=("CHECKPOINT_MISMATCH",),
+            )
+        records = self._read_strict()
+        self._validate_records(records)
+        expected_tip = records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
+        if (
+            int(payload.get("entry_count", -1)) != len(records)
+            or str(payload.get("chain_tip")) != expected_tip
+        ):
+            raise ShadowAuditIntegrityError(
+                "external audit checkpoint does not match the current chain "
+                "(truncation, append or rewrite detected)",
+                rejection_codes=("CHECKPOINT_MISMATCH",),
+            )
+        return payload
 
     def verify(self) -> dict:
         """
@@ -694,6 +787,8 @@ def shadow_audit_store_status() -> dict:
         "trust_anchor": TRUST_ANCHOR_STATEMENT,
         "strict_format": STRICT_AUDIT_FORMAT_STATEMENT,
         "append_validates_complete_history": True,
+        "trusted_checkpoint_supported": True,
+        "trusted_checkpoint_type": SHADOW_AUDIT_CHECKPOINT_TYPE,
         "silent_truncation_repair": False,
         "deletes_prior_events": False,
         "in_memory_log_replaced": False,

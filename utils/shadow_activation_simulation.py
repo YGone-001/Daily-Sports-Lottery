@@ -48,7 +48,8 @@ from utils.source_identity import fingerprint
 #:
 #: ``1.2.0``：回滚要求**已验证的持久审计提交收据**；缺少审计存储、
 #: 追加失败与提交结果不确定分别处理，任一情况都不得留下新的可消费快照。
-SHADOW_SIMULATION_VERSION = "1.2.0"
+#: ``1.3.0``：严格模式回滚要求外部签名审计链检查点（链尖 + 长度精确匹配）。
+SHADOW_SIMULATION_VERSION = "1.3.0"
 
 #: 注册表拒绝码。
 REGISTRY_REJECTION_CODES: tuple[tuple[str, str], ...] = (
@@ -74,6 +75,8 @@ ROLLBACK_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("ROLLBACK_AUDIT_PERSISTENCE_FAILED", "审计事件无法持久化；回滚未提交（fail closed）。"),
     ("ROLLBACK_AUDIT_COMMIT_UNVERIFIED", "审计提交结果不确定或收据无法验证；已 fail closed。"),
     ("ROLLBACK_AUDIT_STORE_MISSING", "未配置持久审计存储；回滚绝不视为已提交。"),
+    ("ROLLBACK_AUDIT_CHECKPOINT_MISSING", "严格模式要求外部签名审计链检查点。"),
+    ("ROLLBACK_AUDIT_CHECKPOINT_INVALID", "外部审计检查点无法验证或与当前链不一致。"),
     ("ROLLBACK_COMMIT_APPLY_FAILED", "审计已提交但有效指针应用失败；已 fail closed。"),
 )
 
@@ -346,11 +349,23 @@ class ShadowActivationSimulator:
         registry: ShadowSnapshotRegistry,
         reader: ShadowRuntimeReader,
         audit_store: Any = None,
+        require_trusted_audit_checkpoint: bool = False,
+        audit_checkpoint_trusted_public_key_path: str | None = None,
+        audit_checkpoint_max_age_seconds: float = 3600.0,
     ) -> None:
         self._registry = registry
         self._reader = reader
         self._audit = audit_store
         self._last_disable: dict | None = None
+        self._require_trusted_audit_checkpoint = bool(
+            require_trusted_audit_checkpoint
+        )
+        self._audit_checkpoint_trusted_public_key_path = (
+            audit_checkpoint_trusted_public_key_path
+        )
+        self._audit_checkpoint_max_age_seconds = float(
+            audit_checkpoint_max_age_seconds
+        )
 
     # -- 只读视图 ---------------------------------------------------------
 
@@ -371,6 +386,9 @@ class ShadowActivationSimulator:
             "reader_enabled": self._reader.enabled,
             "reader_generation": self._reader.generation,
             "audit_store_attached": self._audit is not None,
+            "require_trusted_audit_checkpoint": (
+                self._require_trusted_audit_checkpoint
+            ),
             "production_runtime_reader": PRODUCTION_RUNTIME_READER,
             "production_activation": PRODUCTION_ACTIVATION,
         }
@@ -442,6 +460,7 @@ class ShadowActivationSimulator:
         at: str,
         actor: str = "shadow-operator",
         reason: str = "deterministic rollback",
+        audit_checkpoint: Any = None,
     ) -> ShadowRollbackReport:
         """
         **确定性**回滚到显式指定的历史快照。
@@ -479,6 +498,54 @@ class ShadowActivationSimulator:
                     "was attempted"
                 ),
             )
+
+        if self._require_trusted_audit_checkpoint:
+            if (
+                audit_checkpoint is None
+                or not self._audit_checkpoint_trusted_public_key_path
+            ):
+                return self._rollback_report(
+                    status="ROLLBACK_AUDIT_FAILED",
+                    target_snapshot_id=str(target_snapshot_id),
+                    previous=previous,
+                    effective=previous,
+                    rejection_codes=("ROLLBACK_AUDIT_CHECKPOINT_MISSING",),
+                    read_context=read_context,
+                    audit_event_types=(),
+                    audit_committed=False,
+                    audit_store_attached=True,
+                    commit_outcome="NOT_ATTEMPTED",
+                    discrepancy=(
+                        "strict mode requires an externally signed audit chain "
+                        "checkpoint; no transition was attempted"
+                    ),
+                )
+            try:
+                self._audit.verify_external_checkpoint(
+                    audit_checkpoint,
+                    trusted_public_key_path=(
+                        self._audit_checkpoint_trusted_public_key_path
+                    ),
+                    current_time=read_context.current_time,
+                    max_age_seconds=self._audit_checkpoint_max_age_seconds,
+                )
+            except Exception:  # noqa: BLE001
+                return self._rollback_report(
+                    status="ROLLBACK_AUDIT_FAILED",
+                    target_snapshot_id=str(target_snapshot_id),
+                    previous=previous,
+                    effective=previous,
+                    rejection_codes=("ROLLBACK_AUDIT_CHECKPOINT_INVALID",),
+                    read_context=read_context,
+                    audit_event_types=(),
+                    audit_committed=False,
+                    audit_store_attached=True,
+                    commit_outcome="NOT_ATTEMPTED",
+                    discrepancy=(
+                        "external audit checkpoint does not match the current chain; "
+                        "truncation or rewrite is possible; no transition was attempted"
+                    ),
+                )
 
         requested = self._emit_verified_event(
             "SHADOW_ROLLBACK_REQUESTED",
