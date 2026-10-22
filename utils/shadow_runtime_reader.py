@@ -21,6 +21,11 @@
    ``REJECTED_SHADOW``，绝不退化为 ``NOT_FOUND``。
 5. **不缓存权威**。缓存键只用于可观测性；每次读取都执行完整校验。
 6. **停用即刻生效**。紧急停用后所有读取（含此前取得的句柄）一律不可消费。
+7. **选择先于消费**。注册表驱动的读取只消费**显式选择**的活动影子快照；
+   登记、传入快照对象或传入快照 ID 都不得覆盖活动指针。独立（未附加注册表）
+   读取仅用于历史快照检视，不得被表述为当前激活权威。
+8. **再启用需要新证据**。停用后的恢复必须重新验证一份仍可消费的激活授权，
+   并且该授权必须已被当前选中的快照引用；裸时间戳 / 理由字符串不足以恢复。
 
 状态语义（与 2-F 保持一致）
 ---------------------------
@@ -61,7 +66,10 @@ from utils.source_identity import (
 )
 
 #: 读取器版本。
-SHADOW_READER_VERSION = "1.0.0"
+#:
+#: ``1.1.0``：注册表驱动的读取强制显式选择权威、完整所有权冲突判定、
+#: 停用后的再启用必须携带已校验的激活证据、句柄有效性显式限定为代际校验。
+SHADOW_READER_VERSION = "1.1.0"
 
 #: 原型标记。
 PROTOTYPE_ONLY = True
@@ -83,6 +91,7 @@ READER_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("CLOCK_UNAVAILABLE", "未提供可解析的受控时钟。"),
     ("SNAPSHOT_NOT_PROVIDED", "未提供快照，且无法通过快照 ID 解析。"),
     ("SNAPSHOT_NOT_REGISTERED", "快照 ID 未在影子注册表中登记。"),
+    ("SNAPSHOT_NOT_SELECTED", "快照已登记但未被显式选择为活动影子快照。"),
     ("SNAPSHOT_MALFORMED", "快照类型错误或缺少必要身份。"),
     ("SNAPSHOT_FINGERPRINT_MISMATCH", "快照内容指纹无法独立复算或与记录不一致。"),
     ("SNAPSHOT_NOT_CONSUMABLE", "快照状态不可消费。"),
@@ -106,6 +115,37 @@ READER_REJECTION_CODE_SET: frozenset[str] = frozenset(
 
 class ShadowReaderError(ActivationPrototypeError):
     """影子读取器错误。"""
+
+
+#: 再启用拒绝码（停用后的恢复必须重新验证证据）。
+REENABLE_REJECTION_CODES: tuple[tuple[str, str], ...] = (
+    ("RE_ENABLE_READER_NOT_DISABLED", "读取器当前未停用；再启用没有意义。"),
+    ("RE_ENABLE_REGISTRY_REQUIRED", "未附加注册表，无法确定被选中的目标快照。"),
+    ("RE_ENABLE_NO_SELECTED_SNAPSHOT", "没有显式选择的影子快照，拒绝再启用。"),
+    ("RE_ENABLE_SNAPSHOT_FINGERPRINT_MISMATCH", "被选中快照的指纹不可复算。"),
+    ("RE_ENABLE_SNAPSHOT_NOT_CONSUMABLE", "被选中快照状态不可消费。"),
+    ("RE_ENABLE_DATASET_MISMATCH", "被选中快照的数据集身份与当前上下文不一致。"),
+    ("RE_ENABLE_BASELINE_STALE", "被选中快照的 Canonical 基线已变化。"),
+    ("RE_ENABLE_POLICY_VERSION_MISMATCH", "被选中快照的策略版本不一致。"),
+    ("RE_ENABLE_EVALUATOR_VERSION_MISMATCH", "被选中快照的评估器版本不一致。"),
+    ("RE_ENABLE_ACTIVATION_NOT_SELECTED", "所提供授权未被当前选中的快照引用。"),
+    ("RE_ENABLE_AUTHORIZATION_NOT_CONSUMABLE", "所提供授权在当前条件下不可消费。"),
+    ("RE_ENABLE_CLOCK_UNAVAILABLE", "未提供可解析的受控时钟。"),
+    ("RE_ENABLE_EVIDENCE_MALFORMED", "再启用证据缺失或类型错误。"),
+)
+
+#: 再启用拒绝码集合。
+REENABLE_REJECTION_CODE_SET: frozenset[str] = frozenset(
+    code for code, _ in REENABLE_REJECTION_CODES
+)
+
+
+class ShadowReenablementError(ShadowReaderError):
+    """停用后的再启用缺少可验证的授权证据。"""
+
+    def __init__(self, message: str, *, rejection_codes: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.rejection_codes = tuple(str(code) for code in rejection_codes)
 
 
 # =============================================================================
@@ -163,11 +203,19 @@ class ShadowReadContext:
                 return record
         return None
 
-    def existing_owner_for(self, source_identity_key: str) -> str | None:
-        for key, canonical_id in self.known_source_bindings:
-            if key == source_identity_key:
-                return str(canonical_id)
-        return None
+    def existing_owners_for(self, source_identity_key: str) -> tuple[str, ...]:
+        """
+        收集某源身份键关联的**全部** Canonical 所有者（去重、排序）。
+
+        绝不返回「第一个匹配」：调用方必须按集合判定冲突，结果与输入顺序无关。
+        空元组表示当前没有记录到任何所有者（按当前影子契约视为缺少证据）。
+        """
+        owners = {
+            str(canonical_id)
+            for key, canonical_id in self.known_source_bindings
+            if key == source_identity_key
+        }
+        return tuple(sorted(owners))
 
     def canonical_id_set(self) -> frozenset[str]:
         return frozenset(str(value) for value in self.known_canonical_ids)
@@ -206,6 +254,9 @@ class ShadowReadResult(ShadowRuntimeResolutionResult):
     cache_key: str = ""
     reader_generation: int = 0
     checked_at: str = ""
+    #: 快照权威来源：``REGISTRY_SELECTED``（注册表驱动的活动消费）或
+    #: ``STANDALONE_INSPECTION``（独立历史检视；**不**主张当前激活权威）。
+    snapshot_authority: str = "STANDALONE_INSPECTION"
 
     @property
     def is_shadow_only(self) -> bool:
@@ -214,6 +265,11 @@ class ShadowReadResult(ShadowRuntimeResolutionResult):
     @property
     def is_production_authorization(self) -> bool:
         return False
+
+    @property
+    def is_standalone_inspection(self) -> bool:
+        """独立检视结果绝不能被当作注册表活动快照的消费权威。"""
+        return self.snapshot_authority == "STANDALONE_INSPECTION"
 
     def as_dict(self) -> dict:
         payload = {
@@ -228,6 +284,7 @@ class ShadowReadResult(ShadowRuntimeResolutionResult):
             "cache_key": self.cache_key,
             "reader_generation": self.reader_generation,
             "checked_at": self.checked_at,
+            "snapshot_authority": self.snapshot_authority,
             "prototype_only": True,
             "shadow_only": True,
             "is_production_authority": False,
@@ -284,13 +341,19 @@ class ShadowRuntimeReader:
         return self._generation
 
     def status(self) -> dict:
+        registry_backed = self._registry is not None
         return {
             "reader_id": self._reader_id,
             "shadow_reader_version": SHADOW_READER_VERSION,
             "prototype_only": True,
             "enabled": self._enabled,
             "generation": self._generation,
-            "registry_attached": self._registry is not None,
+            "registry_attached": registry_backed,
+            "snapshot_authority": (
+                "REGISTRY_SELECTED" if registry_backed else "STANDALONE_INSPECTION"
+            ),
+            "requires_explicit_selection": registry_backed,
+            "re_enable_requires_verified_evidence": True,
             "production_runtime_reader": PRODUCTION_RUNTIME_READER,
             "production_activation": PRODUCTION_ACTIVATION,
             "writes_files": False,
@@ -299,11 +362,15 @@ class ShadowRuntimeReader:
             "consumed_by_production_runtime": False,
         }
 
-    def is_result_current(self, result: ShadowReadResult) -> bool:
+    def is_generation_current(self, result: ShadowReadResult) -> bool:
         """
-        句柄有效性策略（文档化）：只有携带**当前代际**且读取器仍启用的结果才可消费。
+        **仅代际**有效性检查（文档化限制）。
 
-        紧急停用会递增代际，因此此前取得的任何结果都立即失效。
+        只回答「该结果是否由**当前启用且当前代际**的读取器产生」，
+        **不**校验授权有效期、撤销、基线、快照选择或所有权冲突。
+
+        因此它**不是**当前授权有效性的证明：治理状态可能已经变化，而旧结果
+        仍然「代际有效」。需要当前授权结论时必须重新执行 ``read()``。
         """
         return self._enabled and result.reader_generation == self._generation
 
@@ -348,30 +415,150 @@ class ShadowRuntimeReader:
         report["fingerprint"] = fingerprint(report)
         return report
 
-    def re_enable(self, *, at: str, reason: str = "") -> dict:
+    def re_enable(
+        self,
+        *,
+        at: str,
+        read_context: ShadowReadContext,
+        evidence: ShadowAuthorizationEvidence,
+        reason: str = "",
+    ) -> dict:
         """
-        影子重新启用。
+        停用后的**受限**再启用（SHADOW ONLY）。
 
-        **必须**由调用方在完成新的授权流程后显式调用；本方法本身不签发任何授权，
-        也不构成生产激活。
+        不是「翻转开关」：必须同时提供当前只读上下文与一份可复核的激活证据，
+        并在恢复消费前重新执行：
+
+        1. 受控时钟可用；
+        2. 注册表存在且**显式选择**了一个活动影子快照；
+        3. 该快照指纹可复算、状态可消费、数据集 / 基线 / 策略 / 评估器与当前一致；
+        4. 所提供授权确实被该选中快照引用且绑定一致；
+        5. 该授权在当前时钟、撤销登记与信任锚下仍**可消费**。
+
+        任一项失败即抛 ``ShadowReenablementError``，读取器保持停用，且代际不变。
+        成功时代际 +1，此前取得的所有句柄立即失效。
+
+        绝不签发任何授权、绝不构成生产激活、绝不要求新的生产签名密钥。
         """
+        if self._enabled:
+            raise ShadowReenablementError(
+                "the shadow reader is not disabled; re-enablement is not applicable",
+                rejection_codes=("RE_ENABLE_READER_NOT_DISABLED",),
+            )
+        rejections = self._reenable_rejections(
+            read_context=read_context, evidence=evidence
+        )
+        if rejections:
+            raise ShadowReenablementError(
+                "shadow re-enablement rejected: " + ", ".join(sorted(set(rejections))),
+                rejection_codes=tuple(sorted(set(rejections))),
+            )
+
+        active = self._registry.active()  # type: ignore[union-attr]
         previous_generation = self._generation
         self._enabled = True
         self._generation = previous_generation + 1
         report = {
-            "kind": "SHADOW_RUNTIME_ENABLE_RESULT",
+            "kind": "SHADOW_RUNTIME_REENABLE_RESULT",
             "prototype_only": True,
+            "shadow_only": True,
             "reader_id": self._reader_id,
             "enabled": True,
             "previous_generation": previous_generation,
             "reader_generation": self._generation,
             "at": str(at),
             "reason": str(reason),
+            "snapshot_id": active.snapshot_id if active is not None else "",
+            "activation_id": evidence.authorization.activation_id,
+            "verified_at": read_context.current_time,
+            "requires_activation_authorization": True,
+            "requires_owner_signing_key": False,
             "production_activation": PRODUCTION_ACTIVATION,
             "grants_production_authorization": False,
+            "partial_enablement": False,
+            "stale_handles_invalidated": True,
         }
         report["fingerprint"] = fingerprint(report)
         return report
+
+    def _reenable_rejections(
+        self,
+        *,
+        read_context: ShadowReadContext,
+        evidence: ShadowAuthorizationEvidence,
+    ) -> list[str]:
+        """再启用前的完整只读校验（绝不修改状态）。"""
+        rejections: list[str] = []
+        if not isinstance(read_context, ShadowReadContext):
+            return ["RE_ENABLE_EVIDENCE_MALFORMED"]
+        if _parse_timestamp(read_context.current_time) is None:
+            rejections.append("RE_ENABLE_CLOCK_UNAVAILABLE")
+        if not isinstance(evidence, ShadowAuthorizationEvidence):
+            rejections.append("RE_ENABLE_EVIDENCE_MALFORMED")
+            return sorted(set(rejections))
+        authorization = evidence.authorization
+        if not isinstance(authorization, RuntimeActivationAuthorization):
+            rejections.append("RE_ENABLE_EVIDENCE_MALFORMED")
+            return sorted(set(rejections))
+
+        if self._registry is None:
+            rejections.append("RE_ENABLE_REGISTRY_REQUIRED")
+            return sorted(set(rejections))
+        active = self._registry.active()
+        if active is None:
+            rejections.append("RE_ENABLE_NO_SELECTED_SNAPSHOT")
+            return sorted(set(rejections))
+
+        if (
+            active.snapshot_id != active.snapshot_fingerprint
+            or active.content_fingerprint() != active.snapshot_fingerprint
+        ):
+            rejections.append("RE_ENABLE_SNAPSHOT_FINGERPRINT_MISMATCH")
+        if not active.is_consumable:
+            rejections.append("RE_ENABLE_SNAPSHOT_NOT_CONSUMABLE")
+        if active.dataset_identity != read_context.dataset_identity:
+            rejections.append("RE_ENABLE_DATASET_MISMATCH")
+        if active.baseline_fingerprint != read_context.current_baseline_fingerprint:
+            rejections.append("RE_ENABLE_BASELINE_STALE")
+        if active.policy_version != read_context.policy_version:
+            rejections.append("RE_ENABLE_POLICY_VERSION_MISMATCH")
+        if active.evaluator_version != read_context.evaluator_version:
+            rejections.append("RE_ENABLE_EVALUATOR_VERSION_MISMATCH")
+
+        matching = tuple(
+            binding
+            for binding in active.bindings
+            if binding.activation_id == authorization.activation_id
+        )
+        if not matching:
+            rejections.append("RE_ENABLE_ACTIVATION_NOT_SELECTED")
+        else:
+            for binding in matching:
+                if (
+                    binding.source_identity_key
+                    != authorization.scoped_source_identity_key
+                    or binding.candidate_canonical_id
+                    != authorization.candidate_canonical_id
+                ):
+                    rejections.append("RE_ENABLE_ACTIVATION_NOT_SELECTED")
+
+        verification = verify_runtime_activation_authorization(
+            authorization,
+            ActivationVerificationContext(
+                dataset_identity=read_context.dataset_identity,
+                current_baseline_fingerprint=read_context.current_baseline_fingerprint,
+                current_time=read_context.current_time,
+                trusted_public_key_path=read_context.trusted_public_key_path,
+                eligibility_decision=evidence.decision,
+                proposal=evidence.proposal,
+                revocation_registry=read_context.revocation_registry,
+            ),
+        )
+        if not verification.is_consumable:
+            rejections.append("RE_ENABLE_AUTHORIZATION_NOT_CONSUMABLE")
+            rejections.extend(verification.rejection_codes)
+
+        return sorted(set(rejections))
 
     # -- 缓存键（仅用于可观测性；绝不用于跳过校验） --------------------------
 
@@ -453,6 +640,14 @@ class ShadowRuntimeReader:
             rejections.append("CLOCK_UNAVAILABLE")
 
         # 2. 快照
+        if (
+            snapshot is not None
+            and snapshot_id is not None
+            and isinstance(snapshot, ShadowActivationSnapshot)
+            and str(snapshot_id) != snapshot.snapshot_id
+        ):
+            # 显式传入的两份快照身份互相矛盾：绝不任选其一。
+            rejections.append("SNAPSHOT_MALFORMED")
         if resolved_snapshot is None:
             if snapshot_id is None or self._registry is None:
                 rejections.append("SNAPSHOT_NOT_PROVIDED")
@@ -466,6 +661,12 @@ class ShadowRuntimeReader:
                 rejections.append("SNAPSHOT_MALFORMED")
                 resolved_snapshot = None
             else:
+                if self._registry is not None and (
+                    resolved_snapshot.snapshot_id
+                    != self._registry.active_snapshot_id
+                ):
+                    # 注册表驱动：只消费**显式选择**的活动影子快照。
+                    rejections.append("SNAPSHOT_NOT_SELECTED")
                 if (
                     resolved_snapshot.snapshot_id
                     != resolved_snapshot.snapshot_fingerprint
@@ -563,10 +764,10 @@ class ShadowRuntimeReader:
                 rejection_codes=("OWNERSHIP_CONFLICT",),
             )
 
-        # 6. 既有 Canonical 所有权兼容性
+        # 6. 既有 Canonical 所有权兼容性（**全部**所有者参与判定，顺序无关）
         owner_conflicts: list[str] = []
-        existing_owner = read_context.existing_owner_for(source_key)
-        if existing_owner is not None and existing_owner != binding.candidate_canonical_id:
+        existing_owners = read_context.existing_owners_for(source_key)
+        if existing_owners and set(existing_owners) != {binding.candidate_canonical_id}:
             owner_conflicts.append("OWNERSHIP_CONFLICT")
         known_ids = read_context.canonical_id_set()
         if known_ids and binding.candidate_canonical_id not in known_ids:
@@ -670,6 +871,11 @@ class ShadowRuntimeReader:
             cache_key=cache_key,
             reader_generation=self._generation,
             checked_at=read_context.current_time,
+            snapshot_authority=(
+                "REGISTRY_SELECTED"
+                if self._registry is not None
+                else "STANDALONE_INSPECTION"
+            ),
         )
 
 
@@ -719,6 +925,9 @@ def _assert_reader_is_coherent() -> None:
     codes = [code for code, _ in READER_REJECTION_CODES]
     if len(set(codes)) != len(codes):
         raise AssertionError("shadow reader rejection codes must be unique")
+    reenable_codes = [code for code, _ in REENABLE_REJECTION_CODES]
+    if len(set(reenable_codes)) != len(reenable_codes):
+        raise AssertionError("shadow re-enablement rejection codes must be unique")
     result_fields = {field.name for field in fields(ShadowReadResult)}
     parent_fields = {field.name for field in fields(ShadowRuntimeResolutionResult)}
     if not parent_fields <= result_fields:

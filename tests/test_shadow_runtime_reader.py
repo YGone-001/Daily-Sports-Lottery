@@ -147,7 +147,7 @@ def test_sg_01_valid_shadow_mapping_resolves(env):
     )
 
     assert isinstance(result, ShadowRuntimeResolutionResult)
-    assert reader.is_result_current(result) is True
+    assert reader.is_generation_current(result) is True
 
 
 def test_sg_02_unknown_identity_returns_not_found(env):
@@ -639,7 +639,7 @@ def test_sg_48_existing_activation_authorization_contracts_remain():
     assert len(AUTHORIZATION_REJECTION_CODE_SET) == 26
     assert SHADOW_SNAPSHOT_BUILDER_VERSION == "1.1.0"
     assert len(READER_REJECTION_CODE_SET) >= 15
-    assert SHADOW_READER_VERSION == "1.0.0"
+    assert SHADOW_READER_VERSION == "1.1.0"
     assert governance_status()["production_mapping_write_authorization"] == (
         "NOT_GRANTED"
     )

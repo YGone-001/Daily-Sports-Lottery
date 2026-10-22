@@ -552,7 +552,7 @@ def _scenario(name: str, fixture: SyntheticShadowFixture) -> dict:
         return {
             "scenario": name,
             "handle_before_disable": handle.as_dict(),
-            "handle_still_current": reader.is_result_current(handle),
+            "handle_still_current": reader.is_generation_current(handle),
             "disable_report": disable_report,
             "after_disable": after.as_dict(),
             "active_snapshot_id": registry.active_snapshot_id,

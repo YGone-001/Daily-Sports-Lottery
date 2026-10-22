@@ -35,7 +35,10 @@ from utils.runtime_activation_authorization import ActivationPrototypeError
 from utils.source_identity import canonical_json, fingerprint
 
 #: 审计存储原型版本。
-SHADOW_AUDIT_STORE_VERSION = "1.0.0"
+#:
+#: ``1.1.0``：追加前完整校验既有历史（哈希链、序号、事件 ID、事件形状、
+#: 严格终止符、禁止空白物理行）；校验与加锁彻底分离，避免递归加锁。
+SHADOW_AUDIT_STORE_VERSION = "1.1.0"
 
 #: 审计文件名（**只在显式工作区内**）。
 SHADOW_AUDIT_FILENAME = "shadow_activation_audit.jsonl"
@@ -66,10 +69,24 @@ TRUST_ANCHOR_STATEMENT = (
     "event sequence. No trusted checkpoint is implemented by this prototype."
 )
 
+#: 严格物理格式（文档化契约）。
+#:
+#: 审计文件由**且仅由**以单个 ``\n`` 终止的规范 JSON 行组成：
+#: - 每条记录恰好一行，行内不含 ``\r``；
+#: - 除每条记录末尾的 ``\n`` 之外，**不允许**任何空白物理行；
+#: - 最后一条记录必须以 ``\n`` 终止（未终止即视为写入中断 / 撕裂）。
+STRICT_AUDIT_FORMAT_STATEMENT = (
+    "STRICT JSONL: every record is one canonical JSON line terminated by a single LF; "
+    "CR is rejected, blank physical lines are rejected, and an unterminated final "
+    "record is rejected as torn. Damaged history is never auto-repaired or truncated."
+)
+
 #: 完整性失败码。
 AUDIT_INTEGRITY_CODES: tuple[tuple[str, str], ...] = (
-    ("CORRUPT_EVENT_RECORD", "某条事件不是合法 JSON 对象。"),
+    ("CORRUPT_EVENT_RECORD", "某条事件不是合法 JSON 对象或字段形状不受支持。"),
     ("TORN_FINAL_RECORD", "最后一条记录不完整（写入被中断）；拒绝静默截断修复。"),
+    ("UNTERMINATED_FINAL_RECORD", "最后一条记录缺少 LF 终止符（未按严格格式终止）。"),
+    ("UNEXPECTED_BLANK_LINE", "出现空白物理行；拒绝静默忽略或规范化。"),
     ("SEQUENCE_GAP", "事件序号不连续。"),
     ("BROKEN_PREVIOUS_HASH", "前驱哈希绑定断裂。"),
     ("MODIFIED_ENTRY", "条目内容与其记录哈希不一致（被篡改）。"),
@@ -218,36 +235,14 @@ class ShadowActivationAuditStore:
 
     def verify(self) -> dict:
         """
-        **只读**完整性校验：重算哈希链、序号连续性、前驱绑定、事件 ID 唯一性。
+        **只读**完整性校验：重算哈希链、序号连续性、前驱绑定、事件 ID 唯一性、
+        事件类型与记录形状。
 
         任何不一致都抛 ``ShadowAuditIntegrityError``（fail closed，绝不修复）。
         """
         records = self._read_strict()
-        previous = GENESIS_PREVIOUS_HASH
-        seen_event_ids: dict[str, int] = {}
-        for index, record in enumerate(records):
-            if record.sequence != index:
-                raise ShadowAuditIntegrityError(
-                    f"audit sequence gap at index {index}",
-                    rejection_codes=("SEQUENCE_GAP",),
-                )
-            if record.previous_entry_hash != previous:
-                raise ShadowAuditIntegrityError(
-                    f"audit previous-entry hash broken at index {index}",
-                    rejection_codes=("BROKEN_PREVIOUS_HASH",),
-                )
-            if _entry_hash(record.as_dict()) != record.entry_hash:
-                raise ShadowAuditIntegrityError(
-                    f"audit entry {index} was modified",
-                    rejection_codes=("MODIFIED_ENTRY",),
-                )
-            if record.event_id in seen_event_ids:
-                raise ShadowAuditIntegrityError(
-                    f"audit entry {index} replays an already recorded event id",
-                    rejection_codes=("DUPLICATE_EVENT_ID",),
-                )
-            seen_event_ids[record.event_id] = index
-            previous = record.entry_hash
+        self._validate_records(records)
+        previous = records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
 
         return {
             "kind": "SHADOW_ACTIVATION_AUDIT_VERIFICATION",
@@ -263,6 +258,7 @@ class ShadowActivationAuditStore:
             "persisted": True,
             "production_event_emission": False,
             "trust_anchor": TRUST_ANCHOR_STATEMENT,
+            "strict_format": STRICT_AUDIT_FORMAT_STATEMENT,
             "externally_authenticated": False,
             "trusted_checkpoint_implemented": False,
         }
@@ -321,6 +317,8 @@ class ShadowActivationAuditStore:
 
         with _ledger_lock(self._lock_path):
             records = self._read_strict()
+            # 追加**之前**完整校验既有历史（不重新加锁，避免递归死锁）。
+            self._validate_records(records)
             previous = records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
             sequence = len(records)
 
@@ -387,18 +385,49 @@ class ShadowActivationAuditStore:
     # -- 内部 -------------------------------------------------------------
 
     def _read_strict(self) -> list[ShadowAuditRecord]:
+        """
+        按**严格格式**读取全部记录（只读；不做任何修复）。
+
+        绝不忽略空白物理行、绝不接受未终止的尾记录、绝不接受 ``\r``。
+        """
         if not self.exists():
             return []
-        with open(self._path, "r", encoding="utf-8") as handle:
-            raw = handle.read()
-        lines = raw.split("\n")
-        # 末尾换行是正常终止；只有「非空且非终止」的残行才算撕裂。
-        if lines and lines[-1] == "":
-            lines = lines[:-1]
+        with open(self._path, "rb") as handle:
+            raw_bytes = handle.read()
+        if not raw_bytes:
+            return []
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ShadowAuditIntegrityError(
+                "audit history is not valid UTF-8",
+                rejection_codes=("CORRUPT_EVENT_RECORD",),
+            ) from exc
+        if "\r" in raw:
+            raise ShadowAuditIntegrityError(
+                "audit history uses CR characters; the strict format is LF-only",
+                rejection_codes=("CORRUPT_EVENT_RECORD",),
+            )
+        if not raw.endswith("\n"):
+            raise ShadowAuditIntegrityError(
+                "audit history has an unterminated final record",
+                rejection_codes=("TORN_FINAL_RECORD", "UNTERMINATED_FINAL_RECORD"),
+            )
+        body = raw[:-1]
+        if body == "":
+            raise ShadowAuditIntegrityError(
+                "audit history contains a blank physical line",
+                rejection_codes=("UNEXPECTED_BLANK_LINE",),
+            )
+        lines = body.split("\n")
         records: list[ShadowAuditRecord] = []
+        names = {field.name for field in fields(ShadowAuditRecord)}
         for index, line in enumerate(lines):
             if not line.strip():
-                continue
+                raise ShadowAuditIntegrityError(
+                    f"audit line {index} is a blank physical line",
+                    rejection_codes=("UNEXPECTED_BLANK_LINE",),
+                )
             try:
                 payload = json.loads(line)
             except ValueError as exc:
@@ -414,21 +443,81 @@ class ShadowActivationAuditStore:
                     f"audit line {index} is not an object",
                     rejection_codes=("CORRUPT_EVENT_RECORD",),
                 )
-            names = {field.name for field in fields(ShadowAuditRecord)}
             missing = sorted(name for name in names if name not in payload)
             if missing:
                 raise ShadowAuditIntegrityError(
                     f"audit line {index} is missing fields {missing}",
                     rejection_codes=("CORRUPT_EVENT_RECORD",),
                 )
-            payload["payload"] = tuple(
-                sorted(
-                    (str(key), str(value))
-                    for key, value in dict(payload.get("payload") or {}).items()
+            unexpected = sorted(set(payload) - names)
+            if unexpected:
+                raise ShadowAuditIntegrityError(
+                    f"audit line {index} has unsupported fields {unexpected}",
+                    rejection_codes=("CORRUPT_EVENT_RECORD",),
                 )
-            )
-            records.append(ShadowAuditRecord(**payload))
+            try:
+                payload["payload"] = tuple(
+                    sorted(
+                        (str(key), str(value))
+                        for key, value in dict(payload.get("payload") or {}).items()
+                    )
+                )
+                records.append(ShadowAuditRecord(**payload))
+            except (TypeError, ValueError) as exc:
+                raise ShadowAuditIntegrityError(
+                    f"audit line {index} has an unsupported record shape: {exc}",
+                    rejection_codes=("CORRUPT_EVENT_RECORD",),
+                ) from exc
         return records
+
+    def _validate_records(self, records: Sequence[ShadowAuditRecord]) -> None:
+        """
+        完整校验既有历史（**不加锁**；供 verify / append / recover 复用）。
+
+        校验顺序固定：序号 -> 前驱哈希 -> 条目哈希 -> 事件 ID 唯一性 ->
+        事件类型 -> 事件 ID 内容绑定。
+        """
+        previous = GENESIS_PREVIOUS_HASH
+        seen_event_ids: dict[str, int] = {}
+        for index, record in enumerate(records):
+            if record.sequence != index:
+                raise ShadowAuditIntegrityError(
+                    f"audit sequence gap at index {index}",
+                    rejection_codes=("SEQUENCE_GAP",),
+                )
+            if record.previous_entry_hash != previous:
+                raise ShadowAuditIntegrityError(
+                    f"audit previous-entry hash broken at index {index}",
+                    rejection_codes=("BROKEN_PREVIOUS_HASH",),
+                )
+            if _entry_hash(record.as_dict()) != record.entry_hash:
+                raise ShadowAuditIntegrityError(
+                    f"audit entry {index} was modified",
+                    rejection_codes=("MODIFIED_ENTRY",),
+                )
+            if record.event_id in seen_event_ids:
+                raise ShadowAuditIntegrityError(
+                    f"audit entry {index} replays an already recorded event id",
+                    rejection_codes=("DUPLICATE_EVENT_ID",),
+                )
+            seen_event_ids[record.event_id] = index
+            if record.event_type not in SHADOW_AUDIT_EVENT_TYPES:
+                raise ShadowAuditIntegrityError(
+                    f"audit entry {index} has an unsupported event type",
+                    rejection_codes=("UNSUPPORTED_EVENT_TYPE",),
+                )
+            expected_event_id = fingerprint(
+                {
+                    "content_fingerprint": record.content_fingerprint(),
+                    "sequence": record.sequence,
+                }
+            )
+            if record.event_id != expected_event_id:
+                raise ShadowAuditIntegrityError(
+                    f"audit entry {index} event id does not bind its content",
+                    rejection_codes=("MODIFIED_ENTRY",),
+                )
+            previous = record.entry_hash
 
 
 # =============================================================================
@@ -523,6 +612,8 @@ def shadow_audit_store_status() -> dict:
         "trusted_checkpoint_implemented": False,
         "externally_authenticated": False,
         "trust_anchor": TRUST_ANCHOR_STATEMENT,
+        "strict_format": STRICT_AUDIT_FORMAT_STATEMENT,
+        "append_validates_complete_history": True,
         "silent_truncation_repair": False,
         "deletes_prior_events": False,
         "in_memory_log_replaced": False,

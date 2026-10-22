@@ -696,7 +696,7 @@ def test_sg_23_emergency_disable_makes_mappings_non_consumable(env):
     assert after.resolution_status == "REJECTED_SHADOW"
     assert "READER_DISABLED" in after.rejection_codes
     # 此前取得的句柄按代际失效。
-    assert reader.is_result_current(before) is False
+    assert reader.is_generation_current(before) is False
     # 活动影子指针失效；历史快照保留。
     assert registry.active_snapshot_id is None
     assert env.snapshot.snapshot_id in registry.history()
@@ -728,7 +728,7 @@ def test_sg_24_disable_requires_no_activation_signature(env):
     # 生产激活与读取器标志不变。
     assert shadow_simulation_status()["production_activation"] == "NOT_ENABLED"
     assert shadow_simulation_status()["production_runtime_reader"] == "NOT_ENABLED"
-    assert SHADOW_SIMULATION_VERSION == "1.0.0"
+    assert SHADOW_SIMULATION_VERSION == "1.1.0"
 
 
 def test_sg_25_rollback_to_still_valid_snapshot_succeeds(env):
@@ -840,9 +840,20 @@ def test_sg_29_failed_rollback_never_leaves_a_partially_enabled_reader(env):
         observation=env.observation, snapshot=env.snapshot, read_context=_ctx(env)
     ).resolution_status == "REJECTED_SHADOW"
 
-    # 失败的回滚不改变有效状态：重新启用后仍停留在原活动快照。
-    reader.re_enable(at=WITHIN_WINDOW, reason="separately re-enabled")
+    # 失败的回滚不改变有效状态：重新选择 + **已校验证据**的再启用后仍停留在原活动快照。
     registry.select(env.snapshot.snapshot_id)
+    from utils.shadow_runtime_reader import ShadowAuthorizationEvidence
+
+    reader.re_enable(
+        at=WITHIN_WINDOW,
+        read_context=_ctx(env),
+        evidence=ShadowAuthorizationEvidence(
+            authorization=env.authorization,
+            decision=env.decision,
+            proposal=env.proposal,
+        ),
+        reason="separately re-enabled",
+    )
     stale = simulator.rollback_shadow_snapshot(
         target_snapshot_id=env.snapshot.snapshot_id,
         read_context=_ctx(env, current_baseline_fingerprint="baseline-B"),

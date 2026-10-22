@@ -39,7 +39,10 @@ from utils.shadow_runtime_reader import (
 from utils.source_identity import fingerprint
 
 #: 模拟层版本。
-SHADOW_SIMULATION_VERSION = "1.0.0"
+#:
+#: ``1.1.0``：回滚以**审计持久化**为提交点（完成事件写入失败时绝不切换有效
+#: 快照并 fail closed）、完整所有权冲突判定、审计失败与校验失败分别处理。
+SHADOW_SIMULATION_VERSION = "1.1.0"
 
 #: 注册表拒绝码。
 REGISTRY_REJECTION_CODES: tuple[tuple[str, str], ...] = (
@@ -62,6 +65,8 @@ ROLLBACK_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("ROLLBACK_OWNERSHIP_CONFLICT", "目标快照与既有 Canonical 所有权冲突。"),
     ("ROLLBACK_READER_DISABLED", "读取器处于停用状态；回滚不得绕过紧急停用。"),
     ("ROLLBACK_CLOCK_UNAVAILABLE", "未提供可解析的受控时钟。"),
+    ("ROLLBACK_AUDIT_PERSISTENCE_FAILED", "审计事件无法持久化；回滚未提交（fail closed）。"),
+    ("ROLLBACK_COMMIT_APPLY_FAILED", "审计已提交但有效指针应用失败；已 fail closed。"),
 )
 
 
@@ -242,6 +247,10 @@ class ShadowRollbackReport:
     recovery_fingerprint: str
     checked_at: str
     audit_event_types: tuple[str, ...]
+    #: 完成事件的持久化是回滚的提交点；``False`` 表示有效指针从未切换。
+    audit_committed: bool = True
+    #: 审计失败时是否已 fail closed 停用读取器（绝不留部分启用状态）。
+    reader_disabled: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -260,6 +269,8 @@ class ShadowRollbackReport:
             "recovery_fingerprint": self.recovery_fingerprint,
             "checked_at": self.checked_at,
             "audit_event_types": list(self.audit_event_types),
+            "audit_committed": self.audit_committed,
+            "reader_disabled": self.reader_disabled,
             "canonical_writes": 0,
             "dependent_store_writes": 0,
             "restores_revoked_authorization": False,
@@ -403,15 +414,31 @@ class ShadowActivationSimulator:
         目标快照**不**因为「曾经发布过」就自动安全：必须通过数据集、基线、版本、
         授权可消费性（含撤销与有效期）与所有权兼容性的**当前**校验。
 
-        任何失败都不会改变有效影子状态（绝不部分启用）。
+        **提交点**：``SHADOW_ROLLBACK_COMPLETED`` 事件的持久化成功。
+        只有该事件被持久提交之后才切换有效影子指针；因此审计 I/O 失败绝不会
+        留下「已生效但未记录」的快照切换。审计失败时有效指针保持不变并立即
+        fail closed（停用读取器），绝不留部分启用的运行期。
+
+        校验失败与审计 I/O 失败分别处理，绝不混为一谈。
         """
-        self._emit(
+        requested_ok = self._emit_safely(
             "SHADOW_ROLLBACK_REQUESTED",
             at=at,
             actor=actor,
             actor_role="shadow-operator",
             payload={"target_snapshot_id": str(target_snapshot_id), "reason": reason},
         )
+        if not requested_ok:
+            return self._rollback_report(
+                status="ROLLBACK_AUDIT_FAILED",
+                target_snapshot_id=str(target_snapshot_id),
+                previous=self._registry.active_snapshot_id,
+                effective=self._registry.active_snapshot_id,
+                rejection_codes=("ROLLBACK_AUDIT_PERSISTENCE_FAILED",),
+                read_context=read_context,
+                audit_event_types=(),
+                audit_committed=False,
+            )
 
         rejection_codes = self._rollback_rejections(
             target_snapshot_id=str(target_snapshot_id), read_context=read_context
@@ -419,7 +446,7 @@ class ShadowActivationSimulator:
         previous = self._registry.active_snapshot_id
 
         if rejection_codes:
-            self._emit(
+            rejected_ok = self._emit_safely(
                 "SHADOW_ROLLBACK_REJECTED",
                 at=at,
                 actor=actor,
@@ -430,22 +457,26 @@ class ShadowActivationSimulator:
                     "effective_snapshot_id": previous or "",
                 },
             )
+            codes = set(rejection_codes)
+            if not rejected_ok:
+                codes.add("ROLLBACK_AUDIT_PERSISTENCE_FAILED")
             return self._rollback_report(
                 status="ROLLBACK_REJECTED",
                 target_snapshot_id=str(target_snapshot_id),
                 previous=previous,
                 effective=previous,
-                rejection_codes=tuple(sorted(rejection_codes)),
+                rejection_codes=tuple(sorted(codes)),
                 read_context=read_context,
                 audit_event_types=(
-                    "SHADOW_ROLLBACK_REQUESTED",
-                    "SHADOW_ROLLBACK_REJECTED",
+                    ("SHADOW_ROLLBACK_REQUESTED", "SHADOW_ROLLBACK_REJECTED")
+                    if rejected_ok
+                    else ("SHADOW_ROLLBACK_REQUESTED",)
                 ),
+                audit_committed=rejected_ok,
             )
 
-        self._registry.select(str(target_snapshot_id))
-        effective = self._registry.active_snapshot_id
-        self._emit(
+        # 提交点：先持久化成功事件；失败则绝不切换有效指针。
+        completed_ok = self._emit_safely(
             "SHADOW_ROLLBACK_COMPLETED",
             at=at,
             actor=actor,
@@ -453,9 +484,45 @@ class ShadowActivationSimulator:
             payload={
                 "target_snapshot_id": str(target_snapshot_id),
                 "previous_snapshot_id": previous or "",
-                "effective_snapshot_id": effective or "",
+                "effective_snapshot_id": str(target_snapshot_id),
             },
         )
+        if not completed_ok:
+            self._fail_closed_after_audit_failure(
+                at=at, actor=actor, reason="rollback audit persistence failed"
+            )
+            return self._rollback_report(
+                status="ROLLBACK_AUDIT_FAILED",
+                target_snapshot_id=str(target_snapshot_id),
+                previous=previous,
+                effective=self._registry.active_snapshot_id,
+                rejection_codes=("ROLLBACK_AUDIT_PERSISTENCE_FAILED",),
+                read_context=read_context,
+                audit_event_types=("SHADOW_ROLLBACK_REQUESTED",),
+                audit_committed=False,
+                reader_disabled=True,
+            )
+
+        # 审计已持久提交；有效指针切换是确定性的内存操作。
+        try:
+            self._registry.select(str(target_snapshot_id))
+        except BaseException:  # noqa: BLE001  (理论上不可达；保守 fail closed)
+            self._fail_closed_after_audit_failure(
+                at=at, actor=actor, reason="rollback commit could not be applied"
+            )
+            return self._rollback_report(
+                status="ROLLBACK_AUDIT_FAILED",
+                target_snapshot_id=str(target_snapshot_id),
+                previous=previous,
+                effective=self._registry.active_snapshot_id,
+                rejection_codes=("ROLLBACK_COMMIT_APPLY_FAILED",),
+                read_context=read_context,
+                audit_event_types=("SHADOW_ROLLBACK_REQUESTED",),
+                audit_committed=False,
+                reader_disabled=True,
+            )
+
+        effective = self._registry.active_snapshot_id
         return self._rollback_report(
             status="ROLLBACK_COMPLETED",
             target_snapshot_id=str(target_snapshot_id),
@@ -467,7 +534,25 @@ class ShadowActivationSimulator:
                 "SHADOW_ROLLBACK_REQUESTED",
                 "SHADOW_ROLLBACK_COMPLETED",
             ),
+            audit_committed=True,
         )
+
+    # -- 审计 / 失败路径 ---------------------------------------------------
+
+    def _emit_safely(self, event_type: str, **kwargs: Any) -> bool:
+        """持久化一条审计事件；任何失败都返回 ``False``（绝不静默声称成功）。"""
+        try:
+            self._emit(event_type, **kwargs)
+        except Exception:  # noqa: BLE001  (审计 I/O 与完整性失败一律 fail closed)
+            return False
+        return True
+
+    def _fail_closed_after_audit_failure(
+        self, *, at: str, actor: str, reason: str
+    ) -> None:
+        """审计失败后的非消费状态：停用读取器并让活动指针失效。"""
+        self._reader.disable(at=at, actor=actor, reason=reason)
+        self._registry_invalidate_active()
 
     # -- 内部 -------------------------------------------------------------
 
@@ -519,11 +604,12 @@ class ShadowActivationSimulator:
             )
             if not verification.is_consumable:
                 rejections.append("ROLLBACK_AUTHORIZATION_NOT_CONSUMABLE")
-            existing_owner = read_context.existing_owner_for(binding.source_identity_key)
-            if (
-                existing_owner is not None
-                and existing_owner != binding.candidate_canonical_id
-            ):
+            existing_owners = read_context.existing_owners_for(
+                binding.source_identity_key
+            )
+            if existing_owners and set(existing_owners) != {
+                binding.candidate_canonical_id
+            }:
                 rejections.append("ROLLBACK_OWNERSHIP_CONFLICT")
             if known_ids and binding.candidate_canonical_id not in known_ids:
                 rejections.append("ROLLBACK_OWNERSHIP_CONFLICT")
@@ -540,6 +626,8 @@ class ShadowActivationSimulator:
         rejection_codes: tuple[str, ...],
         read_context: ShadowReadContext,
         audit_event_types: tuple[str, ...],
+        audit_committed: bool = True,
+        reader_disabled: bool = False,
     ) -> ShadowRollbackReport:
         target = self._registry.get(target_snapshot_id)
         recovery_fingerprint = fingerprint(
@@ -569,6 +657,8 @@ class ShadowActivationSimulator:
             recovery_fingerprint=recovery_fingerprint,
             checked_at=read_context.current_time,
             audit_event_types=audit_event_types,
+            audit_committed=audit_committed,
+            reader_disabled=reader_disabled,
         )
 
 
