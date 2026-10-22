@@ -48,6 +48,7 @@ from utils.runtime_mapping_eligibility import (
 )
 from utils.shadow_activation_audit_store import (
     ShadowActivationAuditStore,
+    ShadowAuditCommitReceipt,
     ShadowAuditIntegrityError,
 )
 from utils.shadow_activation_simulation import (
@@ -66,6 +67,8 @@ from utils.shadow_runtime_reader import (
 
 WITHIN_WINDOW = "2030-01-15T00:00:00+00:00"
 AFTER_EXPIRY = "2030-03-01T00:00:00+00:00"
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.fixture(scope="module")
@@ -173,7 +176,7 @@ def _evidence(env) -> ShadowAuthorizationEvidence:
 
 @dataclass
 class _FailingAuditStore:
-    """注入审计追加失败的包装器（其余事件委托给真实存储）。"""
+    """注入审计追加失败的包装器（其余事件与回读委托给真实存储）。"""
 
     real: ShadowActivationAuditStore
     fail_event_types: tuple[str, ...] = ()
@@ -188,6 +191,21 @@ class _FailingAuditStore:
                     os.fsync(handle.fileno())
             raise OSError("injected shadow audit append failure")
         return self.real.append(**kwargs)
+
+    def records(self):
+        return self.real.records()
+
+    def verify(self) -> dict:
+        return self.real.verify()
+
+    def chain_tip(self) -> str:
+        return self.real.chain_tip()
+
+    def store_identity(self) -> str:
+        return self.real.store_identity()
+
+    def receipt_for(self, record):
+        return self.real.receipt_for(record)
 
 
 # ---------------------------------------------------------------------------
@@ -550,14 +568,18 @@ def test_gc_06_duplicate_identical_owner_entries_are_not_conflicts(env):
     assert "OWNERSHIP_CONFLICT" not in result.rejection_codes
 
 
-def test_gc_07_rollback_uses_complete_ownership_rules(env):
+def test_gc_07_rollback_uses_complete_ownership_rules(env, tmp_path):
     """GC-07: 回滚与读取器使用相同的完整所有权冲突语义。"""
     key = env.authorization.scoped_source_identity_key
     registry = ShadowSnapshotRegistry()
     registry.register(env.snapshot)
     registry.select(env.snapshot.snapshot_id)
     reader = ShadowRuntimeReader(registry=registry)
-    simulator = ShadowActivationSimulator(registry=registry, reader=reader)
+    simulator = ShadowActivationSimulator(
+        registry=registry,
+        reader=reader,
+        audit_store=_fresh_audit_store(tmp_path, "gc07"),
+    )
 
     for bindings in (
         ((key, CANONICAL_ID), (key, ALT_CANONICAL_ID)),
@@ -1014,4 +1036,557 @@ def test_gc_26_reader_results_are_deterministic(env):
     )
     assert first == second
     assert first.to_json() == second.to_json()
+
+
+# ---------------------------------------------------------------------------
+# RC-01 .. RC-03 — 审计提交边界（基线复现）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _SilentAuditStore:
+    """``append()`` 静默返回 ``None`` 且不记录事件的审计对象。"""
+
+    real: ShadowActivationAuditStore
+
+    @property
+    def path(self) -> str:
+        return self.real.path
+
+    def append(self, **kwargs):
+        return None
+
+    def records(self):
+        return self.real.records()
+
+    def verify(self) -> dict:
+        return self.real.verify()
+
+    def chain_tip(self) -> str:
+        return self.real.chain_tip()
+
+    def store_identity(self) -> str:
+        return self.real.store_identity()
+
+    def receipt_for(self, record):
+        return self.real.receipt_for(record)
+
+
+@dataclass
+class _AckLostAuditStore:
+    """完成事件已写入，但调用方收不到可靠成功确认。"""
+
+    real: ShadowActivationAuditStore
+    fail_event_type: str = "SHADOW_ROLLBACK_COMPLETED"
+
+    @property
+    def path(self) -> str:
+        return self.real.path
+
+    def append(self, **kwargs):
+        record = self.real.append(**kwargs)
+        if kwargs.get("event_type") == self.fail_event_type:
+            raise OSError("injected acknowledgment loss after persistence")
+        return record
+
+    def records(self):
+        return self.real.records()
+
+    def verify(self) -> dict:
+        return self.real.verify()
+
+    def chain_tip(self) -> str:
+        return self.real.chain_tip()
+
+    def store_identity(self) -> str:
+        return self.real.store_identity()
+
+    def receipt_for(self, record):
+        return self.real.receipt_for(record)
+
+
+def _two_snapshot_rollback_environment(env, store):
+    snapshot_b, _authorization, _evidence = _second_snapshot(env)
+    registry = ShadowSnapshotRegistry()
+    registry.register(env.snapshot)
+    registry.register(snapshot_b)
+    registry.select(snapshot_b.snapshot_id)
+    reader = ShadowRuntimeReader(registry=registry)
+    simulator = ShadowActivationSimulator(
+        registry=registry, reader=reader, audit_store=store
+    )
+    return registry, reader, simulator, snapshot_b
+
+
+def test_rc_01_missing_audit_store_never_reports_committed_rollback(env):
+    """RC-01: 没有持久审计存储时绝不报告已提交的回滚。"""
+    registry, reader, simulator, snapshot_b = _two_snapshot_rollback_environment(
+        env, None
+    )
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert report.status != "ROLLBACK_COMPLETED"
+    assert report.audit_committed is False
+    assert report.audit_store_attached is False
+    assert report.commit_outcome == "NOT_ATTEMPTED"
+    assert "ROLLBACK_AUDIT_STORE_MISSING" in report.rejection_codes
+    # 有效状态与读取器均未被改动。
+    assert registry.active_snapshot_id == snapshot_b.snapshot_id
+    assert reader.enabled is True
+
+
+def test_rc_02_silent_append_is_not_durable_commitment(env, tmp_path):
+    """RC-02: ``append()`` 返回 ``None`` 不得被当作持久提交。"""
+    store = _fresh_audit_store(tmp_path, "rc02")
+    registry, reader, simulator, snapshot_b = _two_snapshot_rollback_environment(
+        env, _SilentAuditStore(real=store)
+    )
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert report.status == "ROLLBACK_AUDIT_FAILED"
+    assert report.audit_committed is False
+    assert report.commit_outcome in {"NOT_COMMITTED", "UNCERTAIN"}
+    assert report.audit_store_attached is True
+    assert "ROLLBACK_AUDIT_COMMIT_UNVERIFIED" in report.rejection_codes or (
+        "ROLLBACK_AUDIT_PERSISTENCE_FAILED" in report.rejection_codes
+    )
+    # 请求事件即未能持久提交：有效状态必须保持原样（不得出现新快照）。
+    assert registry.active_snapshot_id == snapshot_b.snapshot_id
+    assert reader.enabled is True
+    assert store.records() == ()
+
+
+def test_rc_03_lost_acknowledgment_is_reported_as_uncertain(env, tmp_path):
+    """RC-03: 事件已写入但确认丢失时必须报告不确定提交，而非确定失败。"""
+    store = _fresh_audit_store(tmp_path, "rc03")
+    registry, reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env, _AckLostAuditStore(real=store)
+    )
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert report.status == "ROLLBACK_AUDIT_FAILED"
+    assert report.audit_committed is False
+    assert report.commit_outcome == "UNCERTAIN"
+    assert report.completion_event_observed is True
+    assert report.pointer_applied is False
+    assert report.discrepancy
+    assert "ROLLBACK_AUDIT_COMMIT_UNVERIFIED" in report.rejection_codes
+    assert registry.active_snapshot_id is None
+    assert reader.enabled is False
+    # 审计字节保留且链仍然有效；最后一条正是完成事件。
+    assert store.verify()["integrity"] == "OK"
+    assert store.records()[-1].event_type == "SHADOW_ROLLBACK_COMPLETED"
+
+
+# ---------------------------------------------------------------------------
+# RC-04 .. RC-15 — 收据契约、失败注入与既有修正保持
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _WrongReceiptStore:
+    """``append()`` 正常持久化，但返回无关 / 无效的提交收据。"""
+
+    real: ShadowActivationAuditStore
+    mode: str = "wrong_receipt"
+
+    @property
+    def path(self) -> str:
+        return self.real.path
+
+    def append(self, **kwargs):
+        return self.real.append(**kwargs)
+
+    def records(self):
+        return self.real.records()
+
+    def verify(self) -> dict:
+        return self.real.verify()
+
+    def chain_tip(self) -> str:
+        return self.real.chain_tip()
+
+    def store_identity(self) -> str:
+        return self.real.store_identity()
+
+    def receipt_for(self, record):
+        if record.event_type != "SHADOW_ROLLBACK_COMPLETED":
+            return self.real.receipt_for(record)
+        if self.mode == "none":
+            return None
+        return ShadowAuditCommitReceipt(
+            store_identity=self.real.store_identity(),
+            event_type="SHADOW_ROLLBACK_REQUESTED",
+            event_id="unrelated-event",
+            sequence=max(record.sequence - 1, 0),
+            entry_hash="0" * 64,
+            previous_entry_hash="0" * 64,
+            persisted=True,
+        )
+
+
+def test_rc_04_invalid_receipt_is_rejected(env, tmp_path):
+    """RC-04: 无效或无关收据绝不被接受为持久提交。"""
+    for mode in ("wrong_receipt", "none"):
+        store = _fresh_audit_store(tmp_path, f"rc04_{mode}")
+        registry, reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+            env, _WrongReceiptStore(real=store, mode=mode)
+        )
+        report = simulator.rollback_shadow_snapshot(
+            target_snapshot_id=env.snapshot.snapshot_id,
+            read_context=_ctx(env),
+            at=WITHIN_WINDOW,
+        )
+        assert report.status == "ROLLBACK_AUDIT_FAILED", mode
+        assert report.audit_committed is False, mode
+        assert report.commit_outcome == "UNCERTAIN", mode
+        assert "ROLLBACK_AUDIT_COMMIT_UNVERIFIED" in report.rejection_codes, mode
+        assert registry.active_snapshot_id is None, mode
+        assert reader.enabled is False, mode
+
+
+def test_rc_05_valid_receipt_allows_compatible_rollback(env, tmp_path):
+    """RC-05: 已验证持久收据允许兼容回滚。"""
+    store = _fresh_audit_store(tmp_path, "rc05")
+    registry, reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env, store
+    )
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert report.status == "ROLLBACK_COMPLETED"
+    assert report.audit_committed is True
+    assert report.audit_store_attached is True
+    assert report.commit_outcome == "COMMITTED"
+    assert report.completion_event_observed is True
+    assert report.pointer_applied is True
+    assert report.receipt_fingerprint
+    assert report.audit_event_types == (
+        "SHADOW_ROLLBACK_REQUESTED",
+        "SHADOW_ROLLBACK_COMPLETED",
+    )
+    assert registry.active_snapshot_id == env.snapshot.snapshot_id
+    assert reader.enabled is True
+    assert store.records()[-1].event_type == "SHADOW_ROLLBACK_COMPLETED"
+    assert store.verify()["integrity"] == "OK"
+
+
+def test_rc_06_requested_write_failure_keeps_effective_state(env, tmp_path):
+    """RC-06: 请求事件写入失败不改变有效状态。"""
+    store = _fresh_audit_store(tmp_path, "rc06")
+    registry, reader, simulator, snapshot_b = _two_snapshot_rollback_environment(
+        env,
+        _FailingAuditStore(
+            real=store, fail_event_types=("SHADOW_ROLLBACK_REQUESTED",)
+        ),
+    )
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert report.status == "ROLLBACK_AUDIT_FAILED"
+    assert report.commit_outcome == "NOT_COMMITTED"
+    assert "ROLLBACK_AUDIT_PERSISTENCE_FAILED" in report.rejection_codes
+    assert registry.active_snapshot_id == snapshot_b.snapshot_id
+    assert reader.enabled is True
+
+
+def test_rc_07_completed_write_failure_fails_closed(env, tmp_path):
+    """RC-07: 完成事件写入失败必须 fail closed 且不切换指针。"""
+    store = _fresh_audit_store(tmp_path, "rc07")
+    registry, reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env,
+        _FailingAuditStore(
+            real=store, fail_event_types=("SHADOW_ROLLBACK_COMPLETED",)
+        ),
+    )
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert report.status == "ROLLBACK_AUDIT_FAILED"
+    assert report.audit_committed is False
+    assert report.commit_outcome == "NOT_COMMITTED"
+    assert report.completion_event_observed is False
+    assert report.pointer_applied is False
+    assert report.reader_disabled is True
+    assert registry.active_snapshot_id is None
+    assert reader.enabled is False
+    assert store.records()[-1].event_type == "SHADOW_ROLLBACK_REQUESTED"
+
+
+def test_rc_08_partially_written_final_record_is_not_repaired(env, tmp_path):
+    """RC-08: 部分写入的尾记录被拒绝，且绝不修复。"""
+    store = _fresh_audit_store(tmp_path, "rc08")
+    registry, reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env,
+        _FailingAuditStore(
+            real=store,
+            fail_event_types=("SHADOW_ROLLBACK_COMPLETED",),
+            partial_write=True,
+        ),
+    )
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert report.status == "ROLLBACK_AUDIT_FAILED"
+    assert report.commit_outcome == "UNCERTAIN"
+    assert report.reader_disabled is True
+    assert registry.active_snapshot_id is None
+    with open(store.path, "rb") as handle:
+        damaged_bytes = handle.read()
+    with pytest.raises(ShadowAuditIntegrityError):
+        store.verify()
+    with pytest.raises(ShadowAuditIntegrityError):
+        store.append(
+            event_type="SHADOW_SNAPSHOT_REGISTERED",
+            occurred_at=WITHIN_WINDOW,
+            actor="shadow-operator",
+            actor_role="shadow-operator",
+        )
+    with open(store.path, "rb") as handle:
+        assert handle.read() == damaged_bytes  # 绝不截断或重写
+
+
+def test_rc_09_uncertain_fsync_outcome_is_explicit_and_non_consumable(
+    env, tmp_path, monkeypatch
+):
+    """RC-09: fsync 失败后的不确定结果必须显式标注且不可消费。"""
+    store = _fresh_audit_store(tmp_path, "rc09")
+    registry, reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env, store
+    )
+    real_fsync = os.fsync
+    calls = {"count": 0}
+
+    def _flaky_fsync(fd):  # noqa: ANN001
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            raise OSError("injected fsync failure after bytes reached storage")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _flaky_fsync)
+    report = simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    monkeypatch.undo()
+
+    assert report.status == "ROLLBACK_AUDIT_FAILED"
+    assert report.audit_committed is False
+    assert report.commit_outcome == "UNCERTAIN"
+    assert report.completion_event_observed is True
+    assert report.pointer_applied is False
+    assert report.discrepancy
+    assert "ROLLBACK_AUDIT_COMMIT_UNVERIFIED" in report.rejection_codes
+    assert registry.active_snapshot_id is None
+    assert reader.enabled is False
+    # 字节保留、链自洽；事件存在但不构成确定持久提交。
+    assert store.verify()["integrity"] == "OK"
+    assert store.records()[-1].event_type == "SHADOW_ROLLBACK_COMPLETED"
+
+
+def test_rc_10_historical_audit_records_remain_intact(env, tmp_path):
+    """RC-10: 失败的提交绝不改写既有历史字节。"""
+    store = _fresh_audit_store(tmp_path, "rc10")
+    store.append(
+        event_type="SHADOW_SNAPSHOT_REGISTERED",
+        occurred_at=WITHIN_WINDOW,
+        actor="shadow-operator",
+        actor_role="shadow-operator",
+        payload={"marker": "history"},
+    )
+    with open(store.path, "rb") as handle:
+        before_bytes = handle.read()
+
+    registry, _reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env, _FailingAuditStore(real=store, fail_event_types=("SHADOW_ROLLBACK_REQUESTED",))
+    )
+    simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    with open(store.path, "rb") as handle:
+        after_bytes = handle.read()
+    assert after_bytes == before_bytes
+    assert store.records()[0].payload == (("marker", "history"),)
+
+
+def test_rc_11_restart_recovery_cannot_activate_a_snapshot(env, tmp_path):
+    """RC-11: 重启恢复绝不自动激活任何影子快照。"""
+    store = _fresh_audit_store(tmp_path, "rc11")
+    registry, _reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env, _AckLostAuditStore(real=store)
+    )
+    simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    recovery = store.recover()
+    assert recovery["history_reconstructed"] is True
+    assert recovery["consumable"] is False
+    assert recovery["active_shadow_state"] == "NOT_RESTORED"
+    assert recovery["auto_activation_performed"] is False
+
+    reopened_registry = ShadowSnapshotRegistry()
+    reopened_registry.register(env.snapshot)
+    assert reopened_registry.active_snapshot_id is None
+    assert ShadowRuntimeReader(registry=reopened_registry).read(
+        observation=env.observation, snapshot=env.snapshot, read_context=_ctx(env)
+    ).resolution_status == "REJECTED_SHADOW"
+
+
+def test_rc_12_selection_and_ownership_corrections_remain_valid(env):
+    """RC-12: 既有选择权威与完整所有权冲突修正保持有效。"""
+    registry = ShadowSnapshotRegistry()
+    registry.register(env.snapshot)
+    assert "SNAPSHOT_NOT_SELECTED" in ShadowRuntimeReader(registry=registry).read(
+        observation=env.observation, snapshot=env.snapshot, read_context=_ctx(env)
+    ).rejection_codes
+
+    key = env.authorization.scoped_source_identity_key
+    for bindings in (
+        ((key, CANONICAL_ID), (key, ALT_CANONICAL_ID)),
+        ((key, ALT_CANONICAL_ID), (key, CANONICAL_ID)),
+    ):
+        result = ShadowRuntimeReader().read(
+            observation=env.observation,
+            snapshot=env.snapshot,
+            read_context=_ctx(env, known_source_bindings=bindings),
+        )
+        assert "OWNERSHIP_CONFLICT" in result.rejection_codes
+
+
+def test_rc_13_guarded_reenablement_remains_valid(env, tmp_path):
+    """RC-13: 失败回滚后的再启用仍必须经过显式选择 + 已验证证据。"""
+    store = _fresh_audit_store(tmp_path, "rc13")
+    registry, reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env,
+        _FailingAuditStore(
+            real=store, fail_event_types=("SHADOW_ROLLBACK_COMPLETED",)
+        ),
+    )
+    simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+    assert reader.enabled is False
+    with pytest.raises(TypeError):
+        reader.re_enable(at=WITHIN_WINDOW, reason="bare")  # type: ignore[call-arg]
+
+    registry.select(env.snapshot.snapshot_id)
+    report = reader.re_enable(
+        at=WITHIN_WINDOW, read_context=_ctx(env), evidence=_evidence(env)
+    )
+    assert report["enabled"] is True
+    assert reader.read(
+        observation=env.observation, snapshot=env.snapshot, read_context=_ctx(env)
+    ).resolution_status == "RESOLVED_SHADOW"
+
+
+def test_rc_14_production_modules_do_not_import_the_shadow_prototype():
+    """RC-14: 生产运行期模块绝不导入影子激活原型。"""
+    for name in ("scraper.py", "daily_loader.py", "ingestion_identity.py"):
+        with open(os.path.join(REPO_ROOT, "utils", name), encoding="utf-8") as handle:
+            source = handle.read()
+        for forbidden in (
+            "shadow_activation_simulation",
+            "shadow_runtime_reader",
+            "shadow_activation_audit_store",
+        ):
+            assert forbidden not in source, (name, forbidden)
+    with open(os.path.join(REPO_ROOT, "app.py"), encoding="utf-8") as handle:
+        app_source = handle.read()
+    for forbidden in (
+        "shadow_activation_simulation",
+        "shadow_runtime_reader",
+        "shadow_activation_audit_store",
+    ):
+        assert forbidden not in app_source, forbidden
+
+
+def test_rc_15_seven_stores_remain_byte_identical(isolated_data_dir, env, tmp_path):
+    """RC-15: 全部回滚路径之后七个体育数据存储逐字节不变。"""
+    from utils.daily_loader import save_json
+
+    save_json("daily_matches.json", {"meta": {}, "matches": []})
+    save_json("team_strength.json", {"teams": {}})
+    save_json("calibrated.json", {"ids": []})
+    save_json("prediction_snapshots.json", {"version": 1, "snapshots": {}})
+    save_json("odds_snapshots.json", {"version": 1, "snapshots": {}})
+    save_json("settlements.json", {"version": 1, "settlements": {}})
+    save_json("evaluation_rows.json", {"version": 1, "rows": {}})
+
+    names = (
+        "daily_matches.json",
+        "team_strength.json",
+        "calibrated.json",
+        "prediction_snapshots.json",
+        "odds_snapshots.json",
+        "settlements.json",
+        "evaluation_rows.json",
+    )
+
+    def _hashes() -> dict:
+        import hashlib
+
+        out = {}
+        for name in names:
+            with open(os.path.join(str(isolated_data_dir), name), "rb") as handle:
+                out[name] = hashlib.sha256(handle.read()).hexdigest()
+        return out
+
+    before = _hashes()
+
+    # 成功回滚。
+    store = _fresh_audit_store(tmp_path, "rc15_ok")
+    registry, _reader, simulator, _snapshot_b = _two_snapshot_rollback_environment(
+        env, store
+    )
+    assert simulator.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    ).status == "ROLLBACK_COMPLETED"
+
+    # 缺少审计存储。
+    registry2, _reader2, simulator2, _snapshot_b2 = _two_snapshot_rollback_environment(
+        env, None
+    )
+    simulator2.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+
+    # 不确定提交。
+    store3 = _fresh_audit_store(tmp_path, "rc15_uncertain")
+    registry3, _reader3, simulator3, _snapshot_b3 = _two_snapshot_rollback_environment(
+        env, _AckLostAuditStore(real=store3)
+    )
+    simulator3.rollback_shadow_snapshot(
+        target_snapshot_id=env.snapshot.snapshot_id,
+        read_context=_ctx(env),
+        at=WITHIN_WINDOW,
+    )
+
+    assert _hashes() == before
+
 

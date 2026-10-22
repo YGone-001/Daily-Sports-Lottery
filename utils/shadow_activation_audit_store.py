@@ -38,7 +38,9 @@ from utils.source_identity import canonical_json, fingerprint
 #:
 #: ``1.1.0``：追加前完整校验既有历史（哈希链、序号、事件 ID、事件形状、
 #: 严格终止符、禁止空白物理行）；校验与加锁彻底分离，避免递归加锁。
-SHADOW_AUDIT_STORE_VERSION = "1.1.0"
+#: ``1.2.0``：新增**持久提交收据**（存储身份 + 记录身份 + 持久化确认），
+#: 供回滚提交边界回读验证；磁盘事件格式保持不变。
+SHADOW_AUDIT_STORE_VERSION = "1.2.0"
 
 #: 审计文件名（**只在显式工作区内**）。
 SHADOW_AUDIT_FILENAME = "shadow_activation_audit.jsonl"
@@ -183,6 +185,50 @@ def _entry_hash(payload: Mapping[str, Any]) -> str:
     return fingerprint({k: v for k, v in payload.items() if k != "entry_hash"})
 
 
+@dataclass(frozen=True)
+class ShadowAuditCommitReceipt:
+    """
+    一次**持久化审计追加**的最小提交收据。
+
+    收据只证明「本隔离存储在该序号处记录了这个事件，且它是当前链尖」，
+    绝不是外部可信锚：它无法证明整链未被重写，也不构成生产授权。
+    """
+
+    store_identity: str
+    event_type: str
+    event_id: str
+    sequence: int
+    entry_hash: str
+    previous_entry_hash: str
+    persisted: bool = True
+
+    def as_dict(self) -> dict:
+        return {
+            "kind": "SHADOW_AUDIT_COMMIT_RECEIPT",
+            "prototype_only": True,
+            "store_identity": self.store_identity,
+            "event_type": self.event_type,
+            "event_id": self.event_id,
+            "sequence": self.sequence,
+            "entry_hash": self.entry_hash,
+            "previous_entry_hash": self.previous_entry_hash,
+            "persisted": self.persisted,
+            "external_trust_anchor": False,
+        }
+
+    def matches(self, record: ShadowAuditRecord) -> bool:
+        """收据必须逐字段对应**同一条**记录，且声明已持久化。"""
+        return bool(
+            self.persisted
+            and isinstance(record, ShadowAuditRecord)
+            and self.event_type == record.event_type
+            and self.event_id == record.event_id
+            and self.sequence == record.sequence
+            and self.entry_hash == record.entry_hash
+            and self.previous_entry_hash == record.previous_entry_hash
+        )
+
+
 # =============================================================================
 # 隔离持久化审计存储
 # =============================================================================
@@ -218,6 +264,40 @@ class ShadowActivationAuditStore:
     @property
     def path(self) -> str:
         return self._path
+
+    def store_identity(self) -> str:
+        """
+        本隔离审计存储的确定性身份（不含任何秘密）。
+
+        绑定工作区、审计文件路径、数据集身份与存储版本；用于让提交收据
+        只被**同一**存储接受。
+        """
+        return fingerprint(
+            {
+                "kind": "SHADOW_ACTIVATION_AUDIT_STORE_IDENTITY",
+                "store_version": SHADOW_AUDIT_STORE_VERSION,
+                "workspace": self._workspace,
+                "path": self._path,
+                "dataset_identity": self.dataset_identity,
+            }
+        )
+
+    def receipt_for(self, record: ShadowAuditRecord) -> ShadowAuditCommitReceipt:
+        """为一条已追加记录生成提交收据（不重新验证；由调用方回读校验）。"""
+        if not isinstance(record, ShadowAuditRecord):
+            raise ShadowAuditIntegrityError(
+                "a commit receipt can only be issued for a persisted audit record",
+                rejection_codes=("CORRUPT_EVENT_RECORD",),
+            )
+        return ShadowAuditCommitReceipt(
+            store_identity=self.store_identity(),
+            event_type=record.event_type,
+            event_id=record.event_id,
+            sequence=record.sequence,
+            entry_hash=record.entry_hash,
+            previous_entry_hash=record.previous_entry_hash,
+            persisted=True,
+        )
 
     def exists(self) -> bool:
         return os.path.exists(self._path)

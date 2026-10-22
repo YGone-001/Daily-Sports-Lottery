@@ -292,7 +292,7 @@ def test_sg_36_all_audit_files_remain_inside_the_authorized_workspace(tmp_path):
     status = shadow_audit_store_status()
     assert status["default_location"] is None
     assert status["audit_filename"] == SHADOW_AUDIT_FILENAME
-    assert SHADOW_AUDIT_STORE_VERSION == "1.1.0"
+    assert SHADOW_AUDIT_STORE_VERSION == "1.2.0"
 
 
 def test_sg_37_symlink_and_junction_escapes_are_rejected(tmp_path):
