@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, replace
 from typing import Any, Mapping, Sequence
 
 from utils.mapping_governance import (
@@ -27,6 +27,9 @@ from utils.mapping_governance import (
     GovernanceLedger,
     LEDGER_TRUST_ANCHOR_STATEMENT,
     audit_historical_approvals,
+    binding_key_is_current,
+    reconstruct_proposal_from_evidence,
+    validate_transition,
 )
 from utils.source_identity import canonical_json, fingerprint
 from utils.trusted_artifacts import (
@@ -37,7 +40,8 @@ from utils.trusted_artifacts import (
 )
 
 #: 权威治理视图 schema 版本。
-AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION = "1.0.0"
+AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION = "1.1.0"
+LEGACY_GOVERNANCE_VIEW_SCHEMA_VERSION = "1.0.0"
 
 #: 工件类型。
 LEDGER_CHECKPOINT_TYPE = "GOVERNANCE_LEDGER_CHECKPOINT"
@@ -47,6 +51,27 @@ GOVERNANCE_VIEW_ATTESTATION_TYPE = "GOVERNANCE_VIEW_ATTESTATION"
 
 #: 默认新鲜度窗口（秒）。调用方必须显式给出；此处仅作为构造默认值。
 DEFAULT_GOVERNANCE_MAX_AGE_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class AuthenticatedApprovalRecord:
+    """Proposal-specific facts derived only after checkpoint and owner authentication."""
+
+    proposal_id: str
+    proposal_content_fingerprint: str
+    approval_fingerprint: str
+    source_identity_key: str
+    candidate_canonical_id: str
+    baseline_fingerprint: str
+    dataset_identity: str
+    approved_transition_identity: str
+    ledger_entry_sequence: int
+    actor: str
+    actor_role: str
+    owner_public_key_id: str
+
+    def as_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -70,6 +95,8 @@ class AuthoritativeGovernanceView:
     approval_audit: str
     verified_at: str
     attestation: SignedTrustedArtifact
+    approved_records: tuple[AuthenticatedApprovalRecord, ...] = ()
+    schema_version: str = AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION
 
     # -- 只读查询 ---------------------------------------------------------
 
@@ -78,6 +105,10 @@ class AuthoritativeGovernanceView:
             if candidate == proposal_id:
                 return state
         return None
+
+    def approved_record_for(self, proposal_id: str) -> AuthenticatedApprovalRecord | None:
+        matches = tuple(record for record in self.approved_records if record.proposal_id == proposal_id)
+        return matches[0] if len(matches) == 1 else None
 
     def content_fingerprint_of(self, proposal_id: str) -> str | None:
         for candidate, value in self.proposal_content_fingerprints:
@@ -115,9 +146,9 @@ class AuthoritativeGovernanceView:
     # -- 签名载荷 ---------------------------------------------------------
 
     def facts_payload(self) -> dict:
-        return {
+        payload = {
             "kind": "AUTHORITATIVE_GOVERNANCE_VIEW",
-            "schema_version": AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "dataset_identity": self.dataset_identity,
             "baseline_fingerprint": self.baseline_fingerprint,
             "canonical_ids": sorted(self.canonical_ids),
@@ -136,6 +167,9 @@ class AuthoritativeGovernanceView:
             "prototype_only": True,
             "is_production_authority": False,
         }
+        if self.schema_version != LEGACY_GOVERNANCE_VIEW_SCHEMA_VERSION:
+            payload["approved_records"] = [record.as_dict() for record in self.approved_records]
+        return payload
 
     def fingerprint(self) -> str:
         return fingerprint(self.facts_payload())
@@ -176,6 +210,61 @@ def _normalize_pairs(values: Sequence[Any], *, code: str) -> tuple[tuple[str, st
             )
         pairs.add((str(item[0]), str(item[1])))
     return tuple(sorted(pairs))
+
+
+def _approval_error(message: str, code: str = "ACTIVATION_APPROVAL_NOT_AUTHENTICATED"):
+    raise TrustedArtifactError(message, rejection_codes=(code,))
+
+
+def _derive_approved_records(entries, audit: Mapping[str, Any], dataset_identity: str):
+    """Derive current records from the exact checkpoint-bound, authenticated history.
+
+    Historical signature authentication remains audit_historical_approvals' job.
+    Here we additionally enforce state-machine continuity and the entry/proposal
+    source and Canonical agreement needed for current approval identity.
+    """
+    latest = {}
+    approvals = {}
+    authenticated = {item["sequence"]: item for item in audit["verified"]}
+    for entry in entries:
+        previous = latest.get(entry.proposal_id)
+        if previous and entry.from_state != previous.to_state:
+            _approval_error("proposal transition history is contradictory")
+        if not previous and entry.from_state != "OBSERVED":
+            _approval_error("proposal history does not start at OBSERVED")
+        validate_transition(entry.from_state, entry.to_state)
+        latest[entry.proposal_id] = entry
+        if entry.to_state in ACTIVE_STATES:
+            approvals.setdefault(entry.proposal_id, []).append(entry)
+    records = []
+    for proposal_id, current in sorted(latest.items()):
+        if current.to_state not in ACTIVE_STATES:
+            continue
+        candidates = approvals.get(proposal_id, ())
+        if len(candidates) != 1 or candidates[0].transition_id != current.transition_id:
+            _approval_error("current approval is missing or ambiguous")
+        entry = candidates[0]
+        authenticated_entry = authenticated.get(entry.sequence)
+        if (not authenticated_entry or not entry.approval_fingerprint
+            or authenticated_entry["approval_fingerprint"] != entry.approval_fingerprint
+            or entry.actor_role != "owner"):
+            _approval_error("current approval lacks authenticated owner evidence")
+        proposal = reconstruct_proposal_from_evidence(entry.proposal_evidence)
+        if (not binding_key_is_current(entry.binding_source_key)
+            or entry.binding_source_key != proposal.source_key
+            or entry.binding_canonical_id != proposal.candidate_canonical_id
+            or entry.proposal_content_fingerprint != proposal.content_fingerprint()
+            or entry.baseline_fingerprint != proposal.expected_baseline_fingerprint):
+            _approval_error("ledger approval scope does not match retained proposal",
+                            "ACTIVATION_APPROVAL_SCOPE_MISMATCH")
+        records.append(AuthenticatedApprovalRecord(
+            proposal_id=proposal_id, proposal_content_fingerprint=entry.proposal_content_fingerprint,
+            approval_fingerprint=entry.approval_fingerprint, source_identity_key=entry.binding_source_key,
+            candidate_canonical_id=entry.binding_canonical_id, baseline_fingerprint=entry.baseline_fingerprint,
+            dataset_identity=dataset_identity, approved_transition_identity=entry.transition_id,
+            ledger_entry_sequence=entry.sequence, actor=entry.actor, actor_role=entry.actor_role,
+            owner_public_key_id=str(entry.approval_artifact["public_key_id"])))
+    return tuple(records)
 
 
 def build_authoritative_governance_view(
@@ -253,6 +342,9 @@ def build_authoritative_governance_view(
         trusted_public_key_path=trusted_owner_public_key_path,
         dataset_identity=dataset_identity,
     )
+    approved_records = _derive_approved_records(entries, audit, dataset_identity)
+    if ledger.entries() != entries:
+        _approval_error("governance history changed during approval authentication")
 
     canonical_payload = verify_trusted_artifact(
         canonical_manifest,
@@ -303,7 +395,7 @@ def build_authoritative_governance_view(
     latest: dict[str, Any] = {}
     for entry in entries:
         latest[entry.proposal_id] = entry
-    states = tuple(sorted(ledger.proposal_states().items()))
+    states = tuple(sorted((pid, entry.to_state) for pid, entry in latest.items()))
     state_by_id = dict(states)
     content_fingerprints = tuple(
         sorted(
@@ -344,32 +436,20 @@ def build_authoritative_governance_view(
             signer_public_key_id="",
             signature="",
         ),
+        approved_records=approved_records,
     )
     attestation = sign_trusted_artifact(
         view_signing_private_key_path,
         artifact_type=GOVERNANCE_VIEW_ATTESTATION_TYPE,
         payload=unsigned.attestation_payload(),
     )
-    view = AuthoritativeGovernanceView(
-        dataset_identity=unsigned.dataset_identity,
-        baseline_fingerprint=unsigned.baseline_fingerprint,
-        canonical_ids=unsigned.canonical_ids,
-        proposal_states=unsigned.proposal_states,
-        proposal_content_fingerprints=unsigned.proposal_content_fingerprints,
-        active_bindings=unsigned.active_bindings,
-        revocations=unsigned.revocations,
-        ledger_identity=unsigned.ledger_identity,
-        ledger_chain_tip=unsigned.ledger_chain_tip,
-        ledger_entry_count=unsigned.ledger_entry_count,
-        approval_audit=unsigned.approval_audit,
-        verified_at=unsigned.verified_at,
-        attestation=attestation,
-    )
+    view = replace(unsigned, attestation=attestation)
     verify_authoritative_governance_view(
         view,
         trusted_public_key_path=view_trusted_public_key_path,
         current_time=current_time,
         max_age_seconds=max_age_seconds,
+        require_authenticated_approvals=True,
     )
     return view
 
@@ -380,6 +460,7 @@ def verify_authoritative_governance_view(
     trusted_public_key_path: str | None,
     current_time: str,
     max_age_seconds: float = DEFAULT_GOVERNANCE_MAX_AGE_SECONDS,
+    require_authenticated_approvals: bool = False,
 ) -> dict:
     """
     验证视图签名与其自洽性（只读）。
@@ -391,6 +472,17 @@ def verify_authoritative_governance_view(
             "an authoritative governance view is required",
             rejection_codes=("TRUSTED_ARTIFACT_MALFORMED",),
         )
+    if view.schema_version not in (AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION,
+                                   LEGACY_GOVERNANCE_VIEW_SCHEMA_VERSION):
+        _approval_error("unsupported governance view schema")
+    if require_authenticated_approvals and view.schema_version != AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION:
+        _approval_error("legacy view cannot authenticate proposal-level approvals")
+    if require_authenticated_approvals:
+        try:
+            _validate_approved_records(view)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise TrustedArtifactError("malformed approval facts",
+                rejection_codes=("ACTIVATION_APPROVAL_NOT_AUTHENTICATED",)) from exc
     payload = verify_trusted_artifact(
         view.attestation,
         expected_artifact_type=GOVERNANCE_VIEW_ATTESTATION_TYPE,
@@ -413,8 +505,45 @@ def verify_authoritative_governance_view(
     return payload
 
 
+def _validate_approved_records(view: AuthoritativeGovernanceView) -> None:
+    """A view signature authenticates facts, but contradictory facts still fail closed."""
+    if not isinstance(view.approved_records, tuple) or any(
+        not isinstance(record, AuthenticatedApprovalRecord) for record in view.approved_records
+    ):
+        _approval_error("approval records must be immutable typed facts")
+    for record in view.approved_records:
+        if any(not isinstance(value, str) or not value.strip() for key, value in record.as_dict().items()
+               if key != "ledger_entry_sequence"):
+            _approval_error("approval identities must be nonempty strings")
+    ids = tuple(record.proposal_id for record in view.approved_records)
+    if ids != tuple(sorted(set(ids))):
+        _approval_error("duplicate or unordered approval records")
+    states = dict(view.proposal_states)
+    if len(states) != len(view.proposal_states):
+        _approval_error("contradictory proposal states")
+    contents = dict(view.proposal_content_fingerprints)
+    if len(contents) != len(view.proposal_content_fingerprints):
+        _approval_error("contradictory proposal content facts")
+    if set(ids) != {pid for pid, state in states.items() if state in ACTIVE_STATES}:
+        _approval_error("active proposals require authenticated approval records")
+    for record in view.approved_records:
+        if (not record.approval_fingerprint or len(record.approval_fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in record.approval_fingerprint)
+            or not record.approved_transition_identity or not record.owner_public_key_id
+            or not record.actor or record.actor_role != "owner"
+            or type(record.ledger_entry_sequence) is not int
+            or not 0 <= record.ledger_entry_sequence < view.ledger_entry_count
+            or record.dataset_identity != view.dataset_identity
+            or record.baseline_fingerprint != view.baseline_fingerprint
+            or record.proposal_content_fingerprint != contents.get(record.proposal_id)
+            or not binding_key_is_current(record.source_identity_key)
+            or (record.source_identity_key, record.candidate_canonical_id, record.proposal_id)
+               not in view.active_bindings):
+            _approval_error("signed approval facts are inconsistent")
+
+
 def _assert_authoritative_governance_is_coherent() -> None:
-    if AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION != "1.0.0":
+    if AUTHORITATIVE_GOVERNANCE_VIEW_SCHEMA_VERSION != "1.1.0":
         raise AssertionError("authoritative governance view schema version drifted")
     for required in (
         LEDGER_CHECKPOINT_TYPE,

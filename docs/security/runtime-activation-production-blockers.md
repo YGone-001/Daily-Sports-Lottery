@@ -23,7 +23,13 @@
 并接入 opt-in shadow 读取/再启用；详见 [可信时间验收说明](runtime-activation-trusted-time.md)。
 该实现**没有部署生产时间权威**，不能将其视为生产控制关闭。
 
-**仍未达到生产关闭**：B-06（生产时间权威与持久连续性）、B-07（`approval_fingerprint`）、B-08（空所有权证据）、
+**B-07 隔离组件更新**：已实现从已认证账本派生的逐提案批准记录、签名视图 schema 1.1.0、
+资格/激活批准指纹一致性及 strict shadow 读取/恢复/回滚保护，详见
+[已认证批准绑定验收说明](runtime-activation-approval-binding.md)。
+状态为 **COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**；
+不表示已部署生产批准服务。B-13 完整 supersession 和 B-14 生产撤销权威仍是独立待办。
+
+**仍未达到生产关闭**：B-06（生产时间权威与持久连续性）、B-07（生产批准权威）、B-08（空所有权证据）、
 B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产激活、生产读取器或生产审计服务。
 
 关闭 B-01 ~ B-05 的实现均位于**仓库内隔离原型**，密钥只在测试临时目录生成；
@@ -101,13 +107,13 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 - **整改标准**：部署独立认证的生产时间源与持久连续性，审批生产最大寿命策略并独立复评。24 小时仅为当前合成策略；更短风险分层须有单独批准的分类体系。
 - **验收测试**：`test_clock_rollback_fails_closed`、`test_max_authorization_lifetime_enforced`、`test_expiry_boundary_uses_trusted_time`。
 
-### B-07 激活授权未绑定 `approval_fingerprint`（High）
+### B-07 激活授权与已认证批准绑定（High；隔离组件已实现）
 
 - **位置**：`MAY_BE_EMPTY_FIELDS` 与 `_collect_rejections`；`build_activation_authorization_body`。
 - **受影响属性**：批准与激活的证据链完整性。
-- **现状**：`approval_fingerprint` 允许空字符串，验证时从不与资格判定/批准件比对。
-- **整改标准**：签发与验证都要求非空，且必须等于 `decision.approval_fingerprint` 与批准件指纹。
-- **验收测试**：`test_activation_requires_approval_fingerprint_binding`。
+- **现状**：legacy 工件仍可隔离检视。新的 opt-in strict 模式要求 activation、decision 与当前签名治理视图中已认证批准记录的指纹完全一致且非空；批准记录派生前必须验证检查点、owner Ed25519 与历史状态。新模式保持可信时间、寿命、撤销、Canonical 基线和恢复证据检查。
+- **整改标准**：隔离组件已实现并验证；生产 owner/view 服务、信任锚分发与全局当前性仍需部署和独立评审，不能标记生产关闭。
+- **验收测试**：`tests/test_runtime_activation_approval_binding.py`，AB-01～AB-34 与附加对抗测试；`tools/shadow_approval_binding_validation.py`。
 
 ### B-08 所有权保护在证据为空时被跳过（High）
 

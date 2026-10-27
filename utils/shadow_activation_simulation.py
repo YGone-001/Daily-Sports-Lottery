@@ -935,6 +935,15 @@ class ShadowActivationSimulator:
             )
             if not verification.is_consumable:
                 rejections.append("ROLLBACK_AUTHORIZATION_NOT_CONSUMABLE")
+                if self._reader._require_authenticated_approval:
+                    rejections.extend(verification.rejection_codes)
+            if self._reader._require_authenticated_approval and (
+                binding.source_identity_key != evidence.authorization.scoped_source_identity_key
+                or binding.candidate_canonical_id != evidence.authorization.candidate_canonical_id
+                or binding.eligibility_decision_fingerprint != evidence.authorization.eligibility_decision_fingerprint
+                or binding.authorized_scope != evidence.authorization.authorized_scope
+            ):
+                rejections.append("ROLLBACK_AUTHORIZATION_NOT_CONSUMABLE")
             existing_owners = read_context.existing_owners_for(
                 binding.source_identity_key
             )

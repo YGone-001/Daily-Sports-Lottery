@@ -393,8 +393,19 @@ class ShadowRuntimeReader:
         require_recovery_evidence_for_reenable: bool = False,
         require_trusted_time: bool = False,
         strict_activation_verifier: StrictActivationVerifier | None = None,
+        require_authenticated_approval: bool = False,
     ) -> None:
+        if require_authenticated_approval and (
+            registry is None or not require_trusted_time or not require_authoritative_governance
+            or not isinstance(strict_activation_verifier, StrictActivationVerifier)
+            or not strict_activation_verifier.require_authenticated_approval
+        ):
+            raise ValueError("authenticated approval reader requires registry, governance and strict trusted time")
+        if (isinstance(strict_activation_verifier, StrictActivationVerifier)
+            and strict_activation_verifier.require_authenticated_approval and not require_authenticated_approval):
+            raise ValueError("approval verifier requires explicit authenticated approval reader mode")
         self._registry = registry
+        self._require_authenticated_approval = bool(require_authenticated_approval)
         self._require_trusted_time = bool(require_trusted_time)
         self._strict_activation_verifier = strict_activation_verifier
         self._reader_id = str(reader_id)
@@ -431,6 +442,7 @@ class ShadowRuntimeReader:
         return {
             "reader_id": self._reader_id,
             "require_trusted_time": self._require_trusted_time,
+            "require_authenticated_approval": self._require_authenticated_approval,
             "shadow_reader_version": SHADOW_READER_VERSION,
             "prototype_only": True,
             "enabled": self._enabled,
@@ -659,6 +671,11 @@ class ShadowRuntimeReader:
                     != authorization.candidate_canonical_id
                 ):
                     rejections.append("RE_ENABLE_ACTIVATION_NOT_SELECTED")
+                if self._require_authenticated_approval and (
+                    binding.eligibility_decision_fingerprint != authorization.eligibility_decision_fingerprint
+                    or binding.authorized_scope != authorization.authorized_scope
+                ):
+                    rejections.append("RE_ENABLE_ACTIVATION_NOT_SELECTED")
 
         governance_view: AuthoritativeGovernanceView | None = None
         if self._require_authoritative_governance:
@@ -809,8 +826,11 @@ class ShadowRuntimeReader:
 
     def _verify_authorization(self, authorization, context, *, read_context):
         if self._require_trusted_time:
+            context = replace(context, require_verified_governance=(
+                context.require_verified_governance or self._require_authenticated_approval))
             return self._strict_activation_verifier.verify(authorization, context,
-                time_evidence=read_context.trusted_time_evidence)
+                time_evidence=read_context.trusted_time_evidence,
+                governance_view=read_context.authoritative_view)
         return verify_runtime_activation_authorization(authorization, context)
 
     def cache_key(
@@ -1150,6 +1170,12 @@ class ShadowRuntimeReader:
                 evidence.authorization.candidate_canonical_id
                 != candidate.candidate_canonical_id
                 or evidence.authorization.scoped_source_identity_key != source_key
+            ):
+                revalidation_codes.append("AUTHORIZATION_NOT_CONSUMABLE")
+
+            if self._require_authenticated_approval and (
+                candidate.eligibility_decision_fingerprint != evidence.authorization.eligibility_decision_fingerprint
+                or candidate.authorized_scope != evidence.authorization.authorized_scope
             ):
                 revalidation_codes.append("AUTHORIZATION_NOT_CONSUMABLE")
 

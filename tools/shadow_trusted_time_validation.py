@@ -62,7 +62,7 @@ class SyntheticReferenceClock:
 class SyntheticTimeScenario:
     """All signers, governance, audit bytes and authority are temporary fixtures."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, separate_governance_roles: bool = False):
         workspace.mkdir(parents=True, exist_ok=True)
         self.env = build_synthetic_shadow_fixture(str(workspace))
         self.clock = SyntheticReferenceClock(parse_utc(NOW))
@@ -72,6 +72,11 @@ class SyntheticTimeScenario:
         self.governance_private = str(workspace / "keys" / "governance-private.pem")
         self.governance_public = str(workspace / "keys" / "governance-public.pem")
         generate_mapping_owner_keypair(self.governance_private, self.governance_public)
+        self.checkpoint_private, self.checkpoint_public = self.governance_private, self.governance_public
+        if separate_governance_roles:
+            self.checkpoint_private = str(workspace / "keys" / "checkpoint-private.pem")
+            self.checkpoint_public = str(workspace / "keys" / "checkpoint-public.pem")
+            generate_mapping_owner_keypair(self.checkpoint_private, self.checkpoint_public)
         self.time = TrustedTimeVerifier(DATASET, "synthetic-time-authority", self.public, self.clock)
         self.strict = StrictActivationVerifier(self.time)
         self.ledger = GovernanceLedger(str(workspace / "governance.jsonl"), dataset_identity=DATASET)
@@ -102,6 +107,7 @@ class SyntheticTimeScenario:
         self.decision = evaluate_runtime_mapping_eligibility(self.env.proposal, self.env.approval,
             self.env.observation, eligibility_context, evaluated_at=NOW)
         require(self.decision.eligibility_result == "ELIGIBLE", "synthetic eligibility failed")
+        self.eligibility_context = eligibility_context
         self.auth = self.authorization()
         self.context = ActivationVerificationContext(DATASET,
             self.env.snapshot.baseline_fingerprint, NOW, self.env.authorizer_public,
@@ -125,7 +131,7 @@ class SyntheticTimeScenario:
 
     def governance_view(self, revocations=()):
         def sign(kind, **payload):
-            return sign_trusted_artifact(self.governance_private, artifact_type=kind,
+            return sign_trusted_artifact(self.checkpoint_private, artifact_type=kind,
                 payload={**payload, "dataset_identity": DATASET, "issued_at": self.clock().isoformat()})
         entries = self.ledger.entries()
         checkpoint = sign("GOVERNANCE_LEDGER_CHECKPOINT", ledger_identity=ledger_identity(self.ledger),
@@ -133,14 +139,15 @@ class SyntheticTimeScenario:
         canonical = sign("CANONICAL_BASELINE_MANIFEST", baseline_fingerprint=self.env.snapshot.baseline_fingerprint,
                          canonical_ids=list(self.env.read_context().known_canonical_ids))
         revocation = sign("ACTIVATION_REVOCATION_MANIFEST", revocations=list(revocations))
-        return build_authoritative_governance_view(ledger_path=self.ledger.path, dataset_identity=DATASET,
+        self.governance_inputs = dict(ledger_path=self.ledger.path, dataset_identity=DATASET,
             current_baseline_fingerprint=self.env.snapshot.baseline_fingerprint,
             trusted_owner_public_key_path=self.env.owner_public, ledger_checkpoint=checkpoint,
-            ledger_checkpoint_trusted_public_key_path=self.governance_public,
-            canonical_manifest=canonical, canonical_manifest_trusted_public_key_path=self.governance_public,
-            revocation_manifest=revocation, revocation_manifest_trusted_public_key_path=self.governance_public,
+            ledger_checkpoint_trusted_public_key_path=self.checkpoint_public,
+            canonical_manifest=canonical, canonical_manifest_trusted_public_key_path=self.checkpoint_public,
+            revocation_manifest=revocation, revocation_manifest_trusted_public_key_path=self.checkpoint_public,
             view_signing_private_key_path=self.governance_private,
             view_trusted_public_key_path=self.governance_public, current_time=self.clock().isoformat())
+        return build_authoritative_governance_view(**self.governance_inputs)
 
     def authorization(self, start=NOW, end="2030-01-15T00:10:00+00:00"):
         return sign_runtime_activation_authorization(self.env.authorizer_private,

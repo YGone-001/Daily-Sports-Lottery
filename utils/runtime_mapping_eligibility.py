@@ -360,6 +360,8 @@ class RuntimeMappingContext:
     authoritative_view_trusted_public_key_path: str | None = None
     #: 权威视图允许的最大新鲜度（秒）。
     authoritative_view_max_age_seconds: float = DEFAULT_GOVERNANCE_MAX_AGE_SECONDS
+    #: Opt-in approval integrity contract; caller assertions never satisfy it.
+    require_authenticated_approval: bool = False
 
     # -- 派生视图（只读，纯函数） -------------------------------------------
 
@@ -831,6 +833,10 @@ def _check_governance_evidence_provenance_supported(
     的权威治理视图时才被接受；仅声称该来源而没有可验证证明一律阻断。
     """
     provenance = facts.context.evidence_provenance
+    if facts.context.require_authenticated_approval and (
+        provenance is None or provenance.source != CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER
+    ):
+        return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
     if provenance is None:
         return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
     if provenance.source == CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER:
@@ -856,6 +862,7 @@ def _verified_authoritative_view_codes(facts: _EvaluationFacts) -> tuple[str, ..
             trusted_public_key_path=context.authoritative_view_trusted_public_key_path,
             current_time=facts.evaluation_time,
             max_age_seconds=context.authoritative_view_max_age_seconds,
+            require_authenticated_approvals=context.require_authenticated_approval,
         )
     except TrustedArtifactError:
         return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
@@ -889,6 +896,13 @@ def _verified_authoritative_view_codes(facts: _EvaluationFacts) -> tuple[str, ..
         return ("PROPOSAL_FINGERPRINT_MISMATCH",)
     if not view.is_active_proposal(proposal.proposal_id):
         return ("MAPPING_STATE_NOT_ACTIVE",)
+    if context.require_authenticated_approval:
+        record = view.approved_record_for(proposal.proposal_id)
+        if (record is None or record.approval_fingerprint != facts.approval_fp
+            or record.source_identity_key != proposal.source_key
+            or record.candidate_canonical_id != proposal.candidate_canonical_id
+            or record.baseline_fingerprint != context.current_baseline_fingerprint):
+            return ("EVIDENCE_PROVENANCE_UNSUPPORTED",)
     return ()
 
 

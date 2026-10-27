@@ -30,9 +30,11 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass, fields, replace
+import math
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from enum import Enum
+from threading import RLock
 from typing import Any, Iterable, Mapping, Sequence
 
 from utils.mapping_governance import (
@@ -53,6 +55,7 @@ from utils.runtime_activation_design import (
 )
 from utils.runtime_mapping_eligibility import (
     RUNTIME_ELIGIBILITY_EVALUATOR_VERSION,
+    RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION,
     RuntimeEligibilityResult,
     RuntimeMappingEligibilityDecision,
 )
@@ -69,6 +72,9 @@ from utils.source_identity import (
 )
 from utils.trusted_time_authority import TrustedTimeVerifier, parse_utc
 from utils.trusted_artifacts import TrustedArtifactError
+from utils.authoritative_governance import (
+    AuthoritativeGovernanceView, verify_authoritative_governance_view,
+)
 
 #: 原型标记。任何「这已经是生产能力」的解读都是错的。
 PROTOTYPE_ONLY = True
@@ -811,15 +817,59 @@ class StrictActivationVerifier:
 
     time_verifier: TrustedTimeVerifier
     max_lifetime_seconds: int = 86400
+    require_authenticated_approval: bool = False
+    governance_view_trusted_public_key_path: str | None = None
+    governance_view_max_age_seconds: float = 3600.0
+    _approval_view_state: tuple[str, int, str, str] | None = field(default=None, init=False, repr=False)
+    _approval_view_observed: bool = field(default=False, init=False, repr=False)
+    _approval_view_key_id: str = field(default="", init=False, repr=False)
+    _approval_lock: Any = field(default_factory=RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if (type(self.max_lifetime_seconds) is not int
             or not 0 < self.max_lifetime_seconds <= 86400
             or not isinstance(self.time_verifier, TrustedTimeVerifier)):
             raise ValueError("an established trusted-time verifier and bounded lifetime are required")
+        if self.require_authenticated_approval:
+            if (not self.governance_view_trusted_public_key_path
+                or not math.isfinite(self.governance_view_max_age_seconds)
+                or not 0 < self.governance_view_max_age_seconds <= 3600):
+                raise ValueError("strict approval requires an explicit view trust anchor and bounded freshness")
+            object.__setattr__(self, "_approval_view_key_id", load_trusted_public_key(
+                self.governance_view_trusted_public_key_path)["public_key_id"])
+
+    def _authenticated_approval_view(self, view, *, effective_time: str,
+                                     context: ActivationVerificationContext):
+        with self._approval_lock:
+            if self._approval_view_observed and self._approval_view_state is None:
+                raise TrustedArtifactError("approval continuity lost",
+                    rejection_codes=("ACTIVATION_APPROVAL_NOT_AUTHENTICATED",))
+            verify_authoritative_governance_view(view,
+                trusted_public_key_path=self.governance_view_trusted_public_key_path,
+                current_time=effective_time, max_age_seconds=self.governance_view_max_age_seconds,
+                require_authenticated_approvals=True)
+            if (view.attestation.signer_public_key_id != self._approval_view_key_id
+                or view.dataset_identity != context.dataset_identity
+                or view.baseline_fingerprint != context.current_baseline_fingerprint):
+                raise TrustedArtifactError("approval view scope mismatch",
+                    rejection_codes=("ACTIVATION_APPROVAL_SCOPE_MISMATCH",))
+            previous = self._approval_view_state
+            approval_state = fingerprint({"records": [record.as_dict() for record in view.approved_records],
+                "states": view.proposal_states, "contents": view.proposal_content_fingerprints,
+                "bindings": view.active_bindings})
+            if previous and (view.ledger_identity != previous[0]
+                or view.ledger_entry_count < previous[1]
+                or (view.ledger_entry_count == previous[1] and (
+                    view.ledger_chain_tip != previous[2] or approval_state != previous[3]))):
+                raise TrustedArtifactError("older or contradictory current governance view",
+                    rejection_codes=("ACTIVATION_APPROVAL_NOT_CURRENT",))
+            object.__setattr__(self, "_approval_view_state",
+                (view.ledger_identity, view.ledger_entry_count, view.ledger_chain_tip, approval_state))
+            object.__setattr__(self, "_approval_view_observed", True)
+            return view
 
     def verify(self, authorization, context: ActivationVerificationContext,
-               *, time_evidence=None) -> StrictAuthorizationVerificationResult:
+               *, time_evidence=None, governance_view=None) -> StrictAuthorizationVerificationResult:
         codes: list[str] = []
         verified_time = ""
         evidence_fingerprint = ""
@@ -830,11 +880,25 @@ class StrictActivationVerifier:
             evidence_fingerprint = observed.evidence_fingerprint
         except TrustedArtifactError as exc:
             codes.extend(exc.rejection_codes)
+        approved_view = None
+        if self.require_authenticated_approval:
+            if verified_time:
+                try:
+                    approved_view = self._authenticated_approval_view(governance_view,
+                        effective_time=verified_time, context=context)
+                except TrustedArtifactError as exc:
+                    codes.append("ACTIVATION_APPROVAL_NOT_AUTHENTICATED")
+                    codes.extend(exc.rejection_codes)
+            else:
+                codes.append("ACTIVATION_APPROVAL_NOT_AUTHENTICATED")
+        effective_context = replace(context, current_time=verified_time,
+            expected_purpose=RUNTIME_ACTIVATION_AUTHORIZATION_PURPOSE,
+            expected_schema_version=RUNTIME_ACTIVATION_AUTHORIZATION_SCHEMA_VERSION,
+            require_verified_governance=context.require_verified_governance or self.require_authenticated_approval,
+            revocation_registry=approved_view.revocations if approved_view is not None else context.revocation_registry)
         # Empty time on failure is deliberately unusable. Never reuse caller time.
         result = verify_runtime_activation_authorization(
-            authorization, replace(context, current_time=verified_time,
-                expected_purpose=RUNTIME_ACTIVATION_AUTHORIZATION_PURPOSE,
-                expected_schema_version=RUNTIME_ACTIVATION_AUTHORIZATION_SCHEMA_VERSION))
+            authorization, effective_context)
         codes.extend(result.rejection_codes)
         if isinstance(authorization, Mapping):
             try:
@@ -842,6 +906,8 @@ class StrictActivationVerifier:
             except ActivationAuthorizationError:
                 authorization = None
         if isinstance(authorization, RuntimeActivationAuthorization):
+            if self.require_authenticated_approval:
+                codes.extend(_approval_binding_rejections(authorization, effective_context, approved_view))
             try:
                 start = parse_utc(authorization.authorized_at)
                 end = parse_utc(authorization.expires_at)
@@ -864,6 +930,74 @@ class StrictActivationVerifier:
         return StrictAuthorizationVerificationResult(**payload,
             signature_valid=signature_valid, trusted_time_verified=bool(verified_time),
             time_evidence_fingerprint=evidence_fingerprint)
+
+
+def _approval_binding_rejections(authorization, context, view) -> list[str]:
+    """Only the additional approval relationship; all existing policy checks are reused."""
+    codes = []
+    if not authorization.approval_fingerprint:
+        codes.append("ACTIVATION_APPROVAL_MISSING")
+    if view is None:
+        return codes + ["ACTIVATION_APPROVAL_NOT_AUTHENTICATED"]
+    record = view.approved_record_for(authorization.proposal_id)
+    if not view.is_active_proposal(authorization.proposal_id) or record is None:
+        return codes + ["ACTIVATION_APPROVAL_NOT_CURRENT"]
+    decision = context.eligibility_decision
+    proposal = context.proposal
+    if not isinstance(decision, RuntimeMappingEligibilityDecision) or not isinstance(proposal, MappingProposal):
+        return codes + ["ACTIVATION_APPROVAL_NOT_AUTHENTICATED"]
+    if (authorization.approval_fingerprint != record.approval_fingerprint
+        or decision.approval_fingerprint != record.approval_fingerprint):
+        codes.append("ACTIVATION_APPROVAL_FINGERPRINT_MISMATCH")
+    if (decision.decision_id != fingerprint(decision.identity_payload())
+        or decision.evaluator_version != RUNTIME_ELIGIBILITY_EVALUATOR_VERSION
+        or decision.schema_version != RUNTIME_ELIGIBILITY_DECISION_SCHEMA_VERSION
+        or decision.evidence_fingerprint not in proposal.observation_fingerprints
+        or not decision.is_eligible or decision.rejection_codes
+        or decision.evidence_provenance != CONTEXT_EVIDENCE_PROVENANCE_VERIFIED_LEDGER):
+        codes.append("ACTIVATION_APPROVAL_NOT_AUTHENTICATED")
+    if (record.proposal_id != proposal.proposal_id or record.proposal_id != decision.proposal_id
+        or record.proposal_content_fingerprint != proposal.content_fingerprint()
+        or record.proposal_content_fingerprint != authorization.proposal_content_fingerprint
+        or record.source_identity_key != proposal.source_key
+        or record.source_identity_key != authorization.scoped_source_identity_key
+        or record.source_identity_key != decision.source_identity_key
+        or record.candidate_canonical_id != proposal.candidate_canonical_id
+        or record.candidate_canonical_id != authorization.candidate_canonical_id
+        or record.candidate_canonical_id != decision.canonical_id
+        or record.candidate_canonical_id not in view.canonical_id_set()
+        or record.baseline_fingerprint != context.current_baseline_fingerprint
+        or record.baseline_fingerprint != decision.baseline_fingerprint):
+        codes.append("ACTIVATION_APPROVAL_SCOPE_MISMATCH")
+    return codes
+
+
+def build_approval_bound_authorization_body(*, verifier: StrictActivationVerifier,
+        governance_view: AuthoritativeGovernanceView, time_evidence,
+        decision: RuntimeMappingEligibilityDecision, proposal: MappingProposal, **kwargs) -> dict:
+    """Explicit synthetic body construction from authenticated evidence; never signs."""
+    if not verifier.require_authenticated_approval:
+        raise ActivationAuthorizationError("authenticated approval verifier required",
+            rejection_codes=("ACTIVATION_APPROVAL_NOT_AUTHENTICATED",))
+    observed = verifier.time_verifier.verify(time_evidence, dataset_identity=kwargs["dataset_identity"])
+    context = ActivationVerificationContext(kwargs["dataset_identity"], proposal.expected_baseline_fingerprint,
+        observed.effective_time, eligibility_decision=decision, proposal=proposal, require_verified_governance=True)
+    view = verifier._authenticated_approval_view(governance_view,
+        effective_time=observed.effective_time, context=context)
+    record = view.approved_record_for(proposal.proposal_id)
+    if record is None:
+        raise ActivationAuthorizationError("no current approved record",
+            rejection_codes=("ACTIVATION_APPROVAL_NOT_CURRENT",))
+    provided = kwargs.pop("approval_fingerprint", None)
+    if provided is not None and provided != record.approval_fingerprint:
+        raise ActivationAuthorizationError("provided approval fingerprint conflicts with authenticated record",
+            rejection_codes=("ACTIVATION_APPROVAL_FINGERPRINT_MISMATCH",))
+    body = build_activation_authorization_body(decision=decision, proposal=proposal,
+        approval_fingerprint=record.approval_fingerprint, **kwargs)
+    codes = _approval_binding_rejections(RuntimeActivationAuthorization.from_dict(body), context, view)
+    if codes:
+        raise ActivationAuthorizationError("approval binding rejected", rejection_codes=tuple(sorted(set(codes))))
+    return body
 
 
 class ActivationLifecycleState(str, Enum):
