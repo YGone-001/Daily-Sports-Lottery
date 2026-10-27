@@ -61,6 +61,7 @@ from utils.trusted_artifacts import SignedTrustedArtifact, TrustedArtifactError
 from utils.runtime_activation_authorization import (
     ActivationPrototypeError,
     ActivationVerificationContext,
+    StrictActivationVerifier,
     RuntimeActivationAuthorization,
     ShadowActivationBinding,
     ShadowActivationSnapshot,
@@ -240,6 +241,8 @@ class ShadowReadContext:
     #: 严格模式：恢复证据的可信公钥与新鲜度。
     recovery_trusted_public_key_path: str | None = None
     recovery_max_age_seconds: float = 3600.0
+    #: Strict shadow time evidence; trust roots and policy belong to the reader.
+    trusted_time_evidence: SignedTrustedArtifact | Mapping[str, Any] | None = None
 
     def evidence_for(self, activation_id: str) -> ShadowAuthorizationEvidence | None:
         for record in self.evidence:
@@ -388,8 +391,12 @@ class ShadowRuntimeReader:
         require_authoritative_governance: bool = False,
         require_observation_attestation: bool = False,
         require_recovery_evidence_for_reenable: bool = False,
+        require_trusted_time: bool = False,
+        strict_activation_verifier: StrictActivationVerifier | None = None,
     ) -> None:
         self._registry = registry
+        self._require_trusted_time = bool(require_trusted_time)
+        self._strict_activation_verifier = strict_activation_verifier
         self._reader_id = str(reader_id)
         self._enabled = True
         self._generation = 0
@@ -402,7 +409,7 @@ class ShadowRuntimeReader:
             require_observation_attestation
         )
         self._require_recovery_evidence_for_reenable = bool(
-            require_recovery_evidence_for_reenable
+            require_recovery_evidence_for_reenable or require_trusted_time
         )
 
     # -- 只读状态 ---------------------------------------------------------
@@ -423,6 +430,7 @@ class ShadowRuntimeReader:
         registry_backed = self._registry is not None
         return {
             "reader_id": self._reader_id,
+            "require_trusted_time": self._require_trusted_time,
             "shadow_reader_version": SHADOW_READER_VERSION,
             "prototype_only": True,
             "enabled": self._enabled,
@@ -535,6 +543,11 @@ class ShadowRuntimeReader:
                 "the shadow reader is not disabled; re-enablement is not applicable",
                 rejection_codes=("RE_ENABLE_READER_NOT_DISABLED",),
             )
+        try:
+            read_context = self._authenticated_context(read_context)
+        except TrustedArtifactError as exc:
+            raise ShadowReenablementError("trusted time required for re-enablement",
+                rejection_codes=exc.rejection_codes) from exc
         rejections = self._reenable_rejections(
             read_context=read_context,
             evidence=evidence,
@@ -753,7 +766,7 @@ class ShadowRuntimeReader:
                                     "RE_ENABLE_RECOVERY_STATE_MISMATCH"
                                 )
 
-        verification = verify_runtime_activation_authorization(
+        verification = self._verify_authorization(
             authorization,
             ActivationVerificationContext(
                 dataset_identity=read_context.dataset_identity,
@@ -771,6 +784,7 @@ class ShadowRuntimeReader:
                     self._require_authoritative_governance
                 ),
             ),
+            read_context=read_context,
         )
         if not verification.is_consumable:
             rejections.append("RE_ENABLE_AUTHORIZATION_NOT_CONSUMABLE")
@@ -779,6 +793,25 @@ class ShadowRuntimeReader:
         return sorted(set(rejections))
 
     # -- 缓存键（仅用于可观测性；绝不用于跳过校验） --------------------------
+
+    def _authenticated_context(self, context: ShadowReadContext) -> ShadowReadContext:
+        if not self._require_trusted_time:
+            return context
+        if not isinstance(context, ShadowReadContext):
+            raise TrustedArtifactError("malformed strict read context",
+                rejection_codes=("TRUSTED_TIME_CONTEXT_INVALID",))
+        if not isinstance(self._strict_activation_verifier, StrictActivationVerifier):
+            raise TrustedArtifactError("strict time verifier missing",
+                rejection_codes=("TRUSTED_TIME_VERIFIER_MISSING",))
+        observation = self._strict_activation_verifier.time_verifier.verify(
+            context.trusted_time_evidence, dataset_identity=context.dataset_identity)
+        return replace(context, current_time=observation.effective_time)
+
+    def _verify_authorization(self, authorization, context, *, read_context):
+        if self._require_trusted_time:
+            return self._strict_activation_verifier.verify(authorization, context,
+                time_evidence=read_context.trusted_time_evidence)
+        return verify_runtime_activation_authorization(authorization, context)
 
     def cache_key(
         self,
@@ -848,6 +881,15 @@ class ShadowRuntimeReader:
         """
         if not isinstance(read_context, ShadowReadContext):
             raise ShadowReaderError("read_context must be a ShadowReadContext")
+
+        try:
+            read_context = self._authenticated_context(read_context)
+        except TrustedArtifactError as exc:
+            return self._result(source_key="", canonical_id="",
+                status=ShadowResolutionStatus.REJECTED_SHADOW.value,
+                snapshot_fingerprint="", cache_key="",
+                read_context=replace(read_context, current_time=""),
+                rejection_codes=exc.rejection_codes)
 
         rejections: list[str] = []
         resolved_snapshot = snapshot
@@ -1082,7 +1124,7 @@ class ShadowRuntimeReader:
                     != evidence.authorization.proposal_content_fingerprint
                 ):
                     revalidation_codes.append("GOVERNANCE_CONTENT_MISMATCH")
-            verification = verify_runtime_activation_authorization(
+            verification = self._verify_authorization(
                 evidence.authorization,
                 ActivationVerificationContext(
                     dataset_identity=read_context.dataset_identity,
@@ -1098,6 +1140,7 @@ class ShadowRuntimeReader:
                         self._require_authoritative_governance
                     ),
                 ),
+                read_context=read_context,
             )
             if not verification.is_consumable:
                 revalidation_codes.append("AUTHORIZATION_NOT_CONSUMABLE")

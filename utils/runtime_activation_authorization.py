@@ -67,6 +67,8 @@ from utils.source_identity import (
     canonical_json,
     fingerprint,
 )
+from utils.trusted_time_authority import TrustedTimeVerifier, parse_utc
+from utils.trusted_artifacts import TrustedArtifactError
 
 #: 原型标记。任何「这已经是生产能力」的解读都是错的。
 PROTOTYPE_ONLY = True
@@ -782,6 +784,87 @@ def _rejected_result(
 # =============================================================================
 # 生命周期（影子专用）
 # =============================================================================
+
+@dataclass(frozen=True)
+class StrictAuthorizationVerificationResult(AuthorizationVerificationResult):
+    """Separate signature authenticity from current authorization consumption."""
+
+    signature_valid: bool = False
+    trusted_time_verified: bool = False
+    time_evidence_fingerprint: str = ""
+    lifetime_policy_version: str = "synthetic-activation-lifetime-v1"
+
+    def as_dict(self) -> dict:
+        return {**super().as_dict(), "signature_valid": self.signature_valid,
+                "trusted_time_verified": self.trusted_time_verified,
+                "time_evidence_fingerprint": self.time_evidence_fingerprint,
+                "lifetime_policy_version": self.lifetime_policy_version}
+
+
+@dataclass(frozen=True)
+class StrictActivationVerifier:
+    """Opt-in shadow time wrapper over the single existing authorization engine.
+
+    A construction-time ceiling (at most 24h) is an isolated prototype policy,
+    not a production authorization policy. No per-call time or policy overrides.
+    """
+
+    time_verifier: TrustedTimeVerifier
+    max_lifetime_seconds: int = 86400
+
+    def __post_init__(self):
+        if (type(self.max_lifetime_seconds) is not int
+            or not 0 < self.max_lifetime_seconds <= 86400
+            or not isinstance(self.time_verifier, TrustedTimeVerifier)):
+            raise ValueError("an established trusted-time verifier and bounded lifetime are required")
+
+    def verify(self, authorization, context: ActivationVerificationContext,
+               *, time_evidence=None) -> StrictAuthorizationVerificationResult:
+        codes: list[str] = []
+        verified_time = ""
+        evidence_fingerprint = ""
+        try:
+            observed = self.time_verifier.verify(time_evidence,
+                dataset_identity=context.dataset_identity)
+            verified_time = observed.effective_time
+            evidence_fingerprint = observed.evidence_fingerprint
+        except TrustedArtifactError as exc:
+            codes.extend(exc.rejection_codes)
+        # Empty time on failure is deliberately unusable. Never reuse caller time.
+        result = verify_runtime_activation_authorization(
+            authorization, replace(context, current_time=verified_time,
+                expected_purpose=RUNTIME_ACTIVATION_AUTHORIZATION_PURPOSE,
+                expected_schema_version=RUNTIME_ACTIVATION_AUTHORIZATION_SCHEMA_VERSION))
+        codes.extend(result.rejection_codes)
+        if isinstance(authorization, Mapping):
+            try:
+                authorization = RuntimeActivationAuthorization.from_dict(authorization)
+            except ActivationAuthorizationError:
+                authorization = None
+        if isinstance(authorization, RuntimeActivationAuthorization):
+            try:
+                start = parse_utc(authorization.authorized_at)
+                end = parse_utc(authorization.expires_at)
+            except TrustedArtifactError:
+                codes.append("MALFORMED_TIMESTAMP")
+            else:
+                lifetime = (end - start).total_seconds()
+                if lifetime <= 0:
+                    codes.append("ACTIVATION_LIFETIME_INVALID")
+                elif lifetime > self.max_lifetime_seconds:
+                    codes.append("ACTIVATION_LIFETIME_EXCEEDED")
+        signature_errors = {"MALFORMED_ARTIFACT", "TRUST_ANCHOR_MISSING",
+            "SIGNER_KEY_UNTRUSTED", "SIGNATURE_INVALID", "SIGNATURE_ALGORITHM_UNSUPPORTED"}
+        signature_valid = bool(result.authorization_fingerprint) and not (
+            signature_errors & set(result.rejection_codes))
+        payload = {f.name: getattr(result, f.name) for f in fields(AuthorizationVerificationResult)}
+        payload.update(verification_status="REJECTED" if codes else "VERIFIED",
+                       rejection_codes=tuple(sorted(set(codes))),
+                       verified_scope=result.verified_scope if not codes else "")
+        return StrictAuthorizationVerificationResult(**payload,
+            signature_valid=signature_valid, trusted_time_verified=bool(verified_time),
+            time_evidence_fingerprint=evidence_fingerprint)
+
 
 class ActivationLifecycleState(str, Enum):
     """激活生命周期状态（影子专用）。"""

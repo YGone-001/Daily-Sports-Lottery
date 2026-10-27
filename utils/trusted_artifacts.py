@@ -43,6 +43,7 @@ TRUSTED_ARTIFACT_TYPES: tuple[str, ...] = (
     "SOURCE_OBSERVATION_ATTESTATION",
     "SHADOW_AUDIT_CHAIN_CHECKPOINT",
     "SHADOW_RECOVERY_EVIDENCE",
+    "RUNTIME_ACTIVATION_TIME_ATTESTATION",
 )
 
 #: 签名长度（Ed25519）。
@@ -133,7 +134,9 @@ class SignedTrustedArtifact:
                 "trusted artifact must be an object",
                 rejection_codes=("TRUSTED_ARTIFACT_MALFORMED",),
             )
-        names = {field.name for field in fields(cls)}
+        # The wire format uses payload (JSON data), not the internal payload_json.
+        names = {"payload" if field.name == "payload_json" else field.name
+                 for field in fields(cls)}
         missing = sorted(name for name in names if name not in payload)
         if missing:
             raise TrustedArtifactError(

@@ -27,7 +27,6 @@ from utils.runtime_activation_authorization import (
     ActivationPrototypeError,
     ActivationVerificationContext,
     ShadowActivationSnapshot,
-    verify_runtime_activation_authorization,
 )
 from utils.runtime_mapping_policy import RUNTIME_MAPPING_POLICY_VERSION
 from utils.runtime_mapping_eligibility import RUNTIME_ELIGIBILITY_EVALUATOR_VERSION
@@ -43,6 +42,7 @@ from utils.shadow_runtime_reader import (
     ShadowRuntimeReader,
 )
 from utils.source_identity import fingerprint
+from utils.trusted_artifacts import TrustedArtifactError
 
 #: 模拟层版本。
 #:
@@ -71,6 +71,7 @@ ROLLBACK_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("ROLLBACK_AUTHORIZATION_EVIDENCE_MISSING", "目标快照的授权缺少可复核证据。"),
     ("ROLLBACK_OWNERSHIP_CONFLICT", "目标快照与既有 Canonical 所有权冲突。"),
     ("ROLLBACK_READER_DISABLED", "读取器处于停用状态；回滚不得绕过紧急停用。"),
+    ("ROLLBACK_RECONCILIATION_REQUIRES_DISABLED", "显式停用对账要求读取器保持停用。"),
     ("ROLLBACK_CLOCK_UNAVAILABLE", "未提供可解析的受控时钟。"),
     ("ROLLBACK_AUDIT_PERSISTENCE_FAILED", "审计事件无法持久化；回滚未提交（fail closed）。"),
     ("ROLLBACK_AUDIT_COMMIT_UNVERIFIED", "审计提交结果不确定或收据无法验证；已 fail closed。"),
@@ -461,6 +462,7 @@ class ShadowActivationSimulator:
         actor: str = "shadow-operator",
         reason: str = "deterministic rollback",
         audit_checkpoint: Any = None,
+        reconcile_disabled_reader: bool = False,
     ) -> ShadowRollbackReport:
         """
         **确定性**回滚到显式指定的历史快照。
@@ -477,7 +479,23 @@ class ShadowActivationSimulator:
         一律 fail closed（停用读取器并失效活动指针），绝不留新的可消费快照，
         也绝不改写或截断任何既有审计字节。
         """
+        # reconcile_disabled_reader is a separately requested shadow recovery
+        # action: external checkpoint and current activation evidence are required,
+        # and it cannot enable consumption. Guarded re_enable remains mandatory.
         previous = self._registry.active_snapshot_id
+
+        # An explicit recovery reconciliation may select a currently valid target
+        # while consumption remains disabled. It requires an external checkpoint;
+        # ordinary rollback still rejects disabled readers (legacy contract).
+        try:
+            read_context = self._reader._authenticated_context(read_context)
+        except TrustedArtifactError as exc:
+            return self._rollback_report(status="ROLLBACK_REJECTED",
+                target_snapshot_id=str(target_snapshot_id), previous=previous,
+                effective=previous, rejection_codes=exc.rejection_codes,
+                read_context=read_context, audit_event_types=(), audit_committed=False,
+                reader_disabled=not self._reader.enabled,
+                audit_store_attached=self._audit is not None, commit_outcome="NOT_ATTEMPTED")
 
         if self._audit is None:
             # 没有任何持久审计存储：回滚绝不视为已提交。
@@ -499,7 +517,7 @@ class ShadowActivationSimulator:
                 ),
             )
 
-        if self._require_trusted_audit_checkpoint:
+        if self._require_trusted_audit_checkpoint or reconcile_disabled_reader:
             if (
                 audit_checkpoint is None
                 or not self._audit_checkpoint_trusted_public_key_path
@@ -582,7 +600,8 @@ class ShadowActivationSimulator:
             )
 
         rejection_codes = self._rollback_rejections(
-            target_snapshot_id=str(target_snapshot_id), read_context=read_context
+            target_snapshot_id=str(target_snapshot_id), read_context=read_context,
+            reconcile_disabled_reader=reconcile_disabled_reader,
         )
 
         if rejection_codes:
@@ -715,6 +734,7 @@ class ShadowActivationSimulator:
                 "SHADOW_ROLLBACK_COMPLETED",
             ),
             audit_committed=True,
+            reader_disabled=not self._reader.enabled,
             audit_store_attached=True,
             commit_outcome="COMMITTED",
             completion_event_observed=True,
@@ -864,12 +884,15 @@ class ShadowActivationSimulator:
     # -- 内部 -------------------------------------------------------------
 
     def _rollback_rejections(
-        self, *, target_snapshot_id: str, read_context: ShadowReadContext
+        self, *, target_snapshot_id: str, read_context: ShadowReadContext,
+        reconcile_disabled_reader: bool = False,
     ) -> list[str]:
         rejections: list[str] = []
 
-        if not self._reader.enabled:
+        if not self._reader.enabled and not reconcile_disabled_reader:
             rejections.append("ROLLBACK_READER_DISABLED")
+        if self._reader.enabled and reconcile_disabled_reader:
+            rejections.append("ROLLBACK_RECONCILIATION_REQUIRES_DISABLED")
         if _parse_timestamp(read_context.current_time) is None:
             rejections.append("ROLLBACK_CLOCK_UNAVAILABLE")
 
@@ -895,7 +918,7 @@ class ShadowActivationSimulator:
             if evidence is None:
                 rejections.append("ROLLBACK_AUTHORIZATION_EVIDENCE_MISSING")
                 continue
-            verification = verify_runtime_activation_authorization(
+            verification = self._reader._verify_authorization(
                 evidence.authorization,
                 ActivationVerificationContext(
                     dataset_identity=read_context.dataset_identity,
@@ -908,6 +931,7 @@ class ShadowActivationSimulator:
                     proposal=evidence.proposal,
                     revocation_registry=read_context.revocation_registry,
                 ),
+                read_context=read_context,
             )
             if not verification.is_consumable:
                 rejections.append("ROLLBACK_AUTHORIZATION_NOT_CONSUMABLE")

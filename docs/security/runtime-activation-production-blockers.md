@@ -19,7 +19,11 @@
 | B-04 审计外部信任锚 | **CLOSED（检查点/截断/重写）** | `ShadowActivationAuditStore.verify_external_checkpoint`；严格回滚要求检查点；`test_b04_*`。**残余**：生产审计适配器的信任仍属部署控制，需独立审计服务 |
 | B-05 恢复前置 | **CLOSED（组件）** | `utils/recovery_authority.py`；严格再启用要求 `divergence=NONE` 的签名恢复证据；`test_b05_*` |
 
-**仍未关闭**：B-06（可信时间/最大寿命）、B-07（`approval_fingerprint`）、B-08（空所有权证据）、
+**B-06 隔离组件更新**：已增加签名时间证据、独立 freshness reference、会话连续性、24 小时合成寿命上限，
+并接入 opt-in shadow 读取/再启用；详见 [可信时间验收说明](runtime-activation-trusted-time.md)。
+该实现**没有部署生产时间权威**，不能将其视为生产控制关闭。
+
+**仍未达到生产关闭**：B-06（生产时间权威与持久连续性）、B-07（`approval_fingerprint`）、B-08（空所有权证据）、
 B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产激活、生产读取器或生产审计服务。
 
 关闭 B-01 ~ B-05 的实现均位于**仓库内隔离原型**，密钥只在测试临时目录生成；
@@ -89,12 +93,12 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 - **整改标准**：`re_enable()` 必须要求已验证的恢复证据，并识别事件/指针差异；差异未消解前拒绝再启用。
 - **验收测试**：`test_reenable_requires_recovery_evidence`、`test_event_without_pointer_blocks_reenable`。
 
-### B-06 无可信时间权威，无最大授权寿命（High）
+### B-06 生产可信时间权威与最大授权寿命（High；隔离组件已实现）
 
 - **位置**：`ActivationVerificationContext.current_time`；`_collect_rejections`；`_assert_body_is_signable`（[runtime_activation_authorization.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/runtime_activation_authorization.py)）。
 - **受影响属性**：过期/生效边界、重放窗口。
-- **现状**：时间由调用方提供；无 NTP/单调时钟/偏差检查；仅要求 `expires_at > authorized_at`，无上限。
-- **整改标准**：受控时间源（NTP + 单调时钟 + 最大偏差）、时钟回拨 fail closed、最大寿命策略（建议 ≤24h，高风险 ≤1h）。
+- **现状**：legacy 保留调用方时间。opt-in strict 模式要求 Ed25519 时间证明、单独配置的受信任 freshness reference、会话 challenge 与高水位，并强制版本化合成策略 `0 < lifetime <= 24h`。时间不可信、过期、回拨、旧 generation、丢失会话状态均拒绝。没有生产时间服务或持久高水位。
+- **整改标准**：部署独立认证的生产时间源与持久连续性，审批生产最大寿命策略并独立复评。24 小时仅为当前合成策略；更短风险分层须有单独批准的分类体系。
 - **验收测试**：`test_clock_rollback_fails_closed`、`test_max_authorization_lifetime_enforced`、`test_expiry_boundary_uses_trusted_time`。
 
 ### B-07 激活授权未绑定 `approval_fingerprint`（High）
