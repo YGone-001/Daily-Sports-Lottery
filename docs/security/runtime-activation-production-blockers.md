@@ -1,8 +1,32 @@
 # 运行期激活：生产阻断项登记与整改依赖
 
-**基线**：`7b44e4c36b162c7ef73b07bda016397c28e7acdf`
+**本次集成验收基线**：`3fc6683081560936dc0ea6e7650155e8cb4123ee`
 **决策**：`PRODUCTION_ACTIVATION_NOT_READY` / **NO-GO**
 **说明**：本文件只登记阻断项与整改顺序，不实现生产激活、生产账本读取器或生产审计服务。
+
+---
+
+## 集成验收与生产状态口径
+
+完整合成链路、替换/重放、恢复、提交故障、真实进程崩溃与平台锁验收见
+[集成安全评审](runtime-activation-integrated-security-review.md)。
+十八项生产来源 A–R 和 B-01 至 B-14 的组件/部署分栏见
+[生产就绪矩阵](runtime-activation-production-readiness-matrix.md)。
+
+**SHADOW_READER_IMPLEMENTED / PRODUCTION_READER_NOT_ENABLED**。
+组件的实现、组件测试和跨组件集成通过，均不证明生产信任源存在或已部署。
+下文历史“CLOSED（组件）”仅表示隔离控制已实现；**全部 B-01 至 B-14 的生产控制仍未关闭**。
+未知生产责任人/根来源为 NOT_ESTABLISHED，生产验证状态为 NOT_VERIFIED。
+生产激活 NOT_ENABLED、生产 Reader NOT_ENABLED、生产映射写入 NOT_GRANTED，**NO-GO**。
+
+调用方仍提供部分公钥、数据集/基线、路径、完整状态和独立时钟 callback；
+公钥可验不证明它是正确生产根，签名合成“当前”状态不证明生产全局当前性。
+本次没有部署 KMS、时间/撤销/审计服务或新生产 authority。
+
+集成验收独立复现 D-01：待完成的 `re_enable()` 会覆盖更新的紧急停用。
+最小修正为 Reader 的短状态锁及状态 epoch 比较，旧请求返回 `RE_ENABLE_STATE_CHANGED`；
+不在锁内验证证据或进行控制文件 I/O。精确基线复现器和两项真实线程回归见集成评审 §26。
+该隔离修正不改变生产部署状态或上述 B 项结论。
 
 ---
 
@@ -127,11 +151,13 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 - **整改标准**：隔离组件已实现并验证；生产 owner/view 服务、信任锚分发与全局当前性仍需部署和独立评审，不能标记生产关闭。
 - **验收测试**：`tests/test_runtime_activation_approval_binding.py`，AB-01～AB-34 与附加对抗测试；`tools/shadow_approval_binding_validation.py`。
 
-### B-08 所有权保护在证据为空时被跳过（High）
+### B-08 生产完整所有权来源与强制策略缺失（High）
 
 - **位置**：`ShadowRuntimeReader.read` 第 6 步；`_rollback_rejections`。
 - **受影响属性**：Canonical 所有权完整性。
-- **现状**：`known_canonical_ids` 为空 -> 不检查未知目标；`known_source_bindings` 为空 -> 视为“缺少证据”通过。
+- **现状**：legacy 检视仍可能跳过空调用方集合；strict 签名治理视图要求非空 Canonical 集合，
+  lifecycle 核对当前唯一 owner 与 Canonical 目标，且当前事实来自认证 view。
+  完整合成链路已经执行这些控制；但生产完整所有权源和不可绕过的严格部署策略仍未建立。
 - **整改标准**：生产读取必须要求非空的权威 Canonical 视图；空集合 fail closed。
 - **验收测试**：`test_empty_known_canonical_ids_fails_closed`、`test_empty_known_bindings_fails_closed`。
 
@@ -165,6 +191,9 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 - **验收测试**：`test_concurrent_verify_and_append_never_observes_partial_state`、Windows CI 稳定通过。
 
 ### B-12 设计文档与实现状态漂移（Informational）
+
+- **本次更新**：新的集成安全评审和生产矩阵明确区分 SHADOW_READER_IMPLEMENTED 与
+  PRODUCTION_READER_NOT_ENABLED，逐项列出调用方输入与生产缺口；旧评审的历史状态不作为当前实现结论。
 
 - **位置**：[runtime-activation-architecture.md](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/docs/runtime-activation-architecture.md) 声称授权/读取器 `NOT_IMPLEMENTED`，但隔离影子原型已存在。
 - **受影响属性**：评审与运维认知。

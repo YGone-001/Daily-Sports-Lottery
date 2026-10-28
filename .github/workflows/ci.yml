@@ -90,6 +90,13 @@ jobs:
           python -m tools.shadow_ledger_concurrency_validation | tee "${RUNNER_TEMP:-/tmp}/ledger-concurrency.json"
           python -c 'import json,sys; d=json.load(open(sys.argv[1])); print("::notice title=ledger concurrency::" + json.dumps({"success":d["success"],"platform":d["platform"],"stress":d["process_stress"],"bounded_os":d["bounded_os_lock"]["outcome"],"pinned_baseline_os":d["pinned_baseline_os"]["outcome"],"windows_replace":d["windows_replace_probe"],"abrupt_append":d["abrupt_append"],"root_cause":d["windows_original_root_cause"]},sort_keys=True))' "${RUNNER_TEMP:-/tmp}/ledger-concurrency.json"
 
+      - name: Run integrated isolated shadow trust chain acceptance
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m tools.shadow_trust_chain_validation | tee "${RUNNER_TEMP:-/tmp}/shadow-trust-chain.json"
+          python -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["success"] and d["seven_stores_unchanged"]; print("::notice title=shadow trust chain::" + json.dumps({"success":d["success"],"scenarios":len(d["steps"]),"decision":d["decision"]},sort_keys=True))' "${RUNNER_TEMP:-/tmp}/shadow-trust-chain.json"
+
       - name: Windows NTFS junction regression must execute on Windows
         if: runner.os == 'Windows'
         shell: bash

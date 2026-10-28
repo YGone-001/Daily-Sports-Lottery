@@ -146,6 +146,7 @@ class ShadowReaderError(ActivationPrototypeError):
 #: 再启用拒绝码（停用后的恢复必须重新验证证据）。
 REENABLE_REJECTION_CODES: tuple[tuple[str, str], ...] = (
     ("RE_ENABLE_READER_NOT_DISABLED", "读取器当前未停用；再启用没有意义。"),
+    ("RE_ENABLE_STATE_CHANGED", "再启用校验期间读取器代际已变化；不得覆盖较新的停用。"),
     ("RE_ENABLE_REGISTRY_REQUIRED", "未附加注册表，无法确定被选中的目标快照。"),
     ("RE_ENABLE_NO_SELECTED_SNAPSHOT", "没有显式选择的影子快照，拒绝再启用。"),
     ("RE_ENABLE_SNAPSHOT_FINGERPRINT_MISMATCH", "被选中快照的指纹不可复算。"),
@@ -470,6 +471,11 @@ class ShadowRuntimeReader:
         self._require_trusted_time = bool(require_trusted_time)
         self._strict_activation_verifier = strict_activation_verifier
         self._reader_id = str(reader_id)
+        # Only reader state transitions share this lock. Evidence verification
+        # and controller/file I/O never run under it, preserving lock order and
+        # allowing emergency disable to interrupt a pending re-enablement.
+        self._state_lock = RLock()
+        self._state_epoch = 0
         self._enabled = True
         self._generation = 0
         #: 严格恢复所需的**只读**当前审计状态源（绝不写入）。
@@ -575,9 +581,12 @@ class ShadowRuntimeReader:
         fail-closed：先把状态置为停用，再计算报告 —— 即使报告计算失败，
         有效读取状态也已经是「不可消费」。绝不部分启用。
         """
-        previous_generation = self._generation
-        self._enabled = False
-        self._generation = previous_generation + 1
+        with self._state_lock:
+            previous_generation = self._generation
+            self._enabled = False
+            self._state_epoch += 1
+            self._generation = previous_generation + 1
+            disabled_generation = self._generation
         report = {
             "kind": "SHADOW_RUNTIME_DISABLE_RESULT",
             "prototype_only": True,
@@ -585,7 +594,7 @@ class ShadowRuntimeReader:
             "disabled": True,
             "enabled": self._enabled,
             "previous_generation": previous_generation,
-            "reader_generation": self._generation,
+            "reader_generation": disabled_generation,
             "at": str(at),
             "actor": str(actor),
             "actor_role": "shadow-operator",
@@ -627,11 +636,13 @@ class ShadowRuntimeReader:
 
         绝不签发任何授权、绝不构成生产激活、绝不要求新的生产签名密钥。
         """
-        if self._enabled:
-            raise ShadowReenablementError(
-                "the shadow reader is not disabled; re-enablement is not applicable",
-                rejection_codes=("RE_ENABLE_READER_NOT_DISABLED",),
-            )
+        with self._state_lock:
+            if self._enabled:
+                raise ShadowReenablementError(
+                    "the shadow reader is not disabled; re-enablement is not applicable",
+                    rejection_codes=("RE_ENABLE_READER_NOT_DISABLED",),
+                )
+            expected_epoch = self._state_epoch
         try:
             read_context = self._authenticated_context(read_context)
         except TrustedArtifactError as exc:
@@ -649,9 +660,17 @@ class ShadowRuntimeReader:
             )
 
         active = self._registry.active()  # type: ignore[union-attr]
-        previous_generation = self._generation
-        self._enabled = True
-        self._generation = previous_generation + 1
+        with self._state_lock:
+            if self._enabled or self._state_epoch != expected_epoch:
+                raise ShadowReenablementError(
+                    "reader state changed during re-enablement verification",
+                    rejection_codes=("RE_ENABLE_STATE_CHANGED",),
+                )
+            previous_generation = self._generation
+            self._enabled = True
+            self._state_epoch += 1
+            self._generation = previous_generation + 1
+            enabled_generation = self._generation
         report = {
             "kind": "SHADOW_RUNTIME_REENABLE_RESULT",
             "prototype_only": True,
@@ -659,7 +678,7 @@ class ShadowRuntimeReader:
             "reader_id": self._reader_id,
             "enabled": True,
             "previous_generation": previous_generation,
-            "reader_generation": self._generation,
+            "reader_generation": enabled_generation,
             "at": str(at),
             "reason": str(reason),
             "snapshot_id": active.snapshot_id if active is not None else "",
@@ -958,8 +977,9 @@ class ShadowRuntimeReader:
             raise TrustedArtifactError("revocation state changed during verification",
                 rejection_codes=("REVOCATION_CONCURRENT_STATE_CHANGED",))
         if self._revocation_generation != verified.continuity_generation:
-            self._revocation_generation = verified.continuity_generation
-            self._generation += 1
+            with self._state_lock:
+                self._revocation_generation = verified.continuity_generation
+                self._generation += 1
         if authorization is not None and (
             authorization.activation_id, authorization.fingerprint()
         ) not in verified.authorization_inventory:
@@ -978,9 +998,10 @@ class ShadowRuntimeReader:
 
     def _verify_controlled_selection(self, context, snapshot):
         verified = self._snapshot_controller.verify_current(context, snapshot)
-        if verified.generation != self._controlled_generation:
-            self._controlled_generation = verified.generation
-            self._generation += 1
+        with self._state_lock:
+            if verified.generation != self._controlled_generation:
+                self._controlled_generation = verified.generation
+                self._generation += 1
         return verified
 
     def cache_key(
