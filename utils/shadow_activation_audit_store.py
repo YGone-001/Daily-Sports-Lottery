@@ -258,6 +258,7 @@ class ShadowActivationAuditStore:
         *,
         dataset_identity: str = "",
         filename: str = SHADOW_AUDIT_FILENAME,
+        lock_factory: Any = None,
     ) -> None:
         self._workspace = _validate_workspace(workspace)
         self._filename = str(filename)
@@ -266,6 +267,7 @@ class ShadowActivationAuditStore:
         )
         self._lock_path = self._path + ".lock"
         self.dataset_identity = str(dataset_identity)
+        self._lock_factory = lock_factory or _ledger_lock
 
     # -- 只读视图 ---------------------------------------------------------
 
@@ -488,7 +490,7 @@ class ShadowActivationAuditStore:
                 rejection_codes=("UNSUPPORTED_EVENT_TYPE",),
             )
 
-        with _ledger_lock(self._lock_path):
+        with self._lock_factory(self._lock_path):
             records = self._read_strict()
             # 追加**之前**完整校验既有历史（不重新加锁，避免递归死锁）。
             self._validate_records(records)

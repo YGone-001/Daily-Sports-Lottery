@@ -135,27 +135,30 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 - **整改标准**：生产读取必须要求非空的权威 Canonical 视图；空集合 fail closed。
 - **验收测试**：`test_empty_known_canonical_ids_fails_closed`、`test_empty_known_bindings_fails_closed`。
 
-### B-09 快照发布/选择仅存在于内存，选择本身无授权、无审计（Medium）
+### B-09 快照持久发布与受控选择（Medium；隔离组件已实现）
 
 - **位置**：`ShadowSnapshotRegistry.select`（[shadow_activation_simulation.py](file:///c:/Users/YGone/Desktop/program/Daily-Sports-Lottery/utils/shadow_activation_simulation.py)）。
 - **受影响属性**：发布/切换的可审计性与操作授权。
-- **现状**：`select()` 只改内存指针、无签名、无审计；虽然消费仍要求证据，但生产切换必须可审计且受角色控制。
+- **现状**：legacy `select()` 保留隔离历史兼容；新增持久快照、独立 publisher/selector/checkpoint 签名、append-only 控制日志、精确审计回执与读回、CAS、严格 Reader 和显式恢复。直接 registry 修改无法通过受控读取。
+- **组件状态**：**COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**；真实功能与故障测试见 [快照控制验收](runtime-activation-snapshot-control.md)。独立生产签发方、持久高水位、部署强制控制和 KMS 均未建立，**生产未关闭**。
 - **整改标准**：持久化快照注册表 + 受控选择 API + 选择事件审计 + 角色分离。
-- **验收测试**：`test_snapshot_selection_requires_role_and_is_audited`。
+- **验收测试**：`tests/test_persistent_shadow_snapshot_control.py` 的 PC-01~PC-60 及真实进程崩溃/锁、写入失败、竞争与对账扩展测试。
 
 ### B-10 事件/指针差异的残余（High）
 
 - **位置**：回滚成功事件提交后指针应用失败路径。
 - **受影响属性**：审计与有效状态一致性。
 - **现状**：隔离原型已实现外部签名检查点与恢复证据，严格模式下可检测尾部截断/追加/重写与事件-指针差异；但检查点发布方仍是调用方提供的密钥，生产独立审计服务不存在。未启用严格模式时仍无法检测截断。
+- **组件改进**：新控制面识别孤立意图、审计未匹配控制提交、提交缺失指针、指针未匹配提交，保留原字节，要求签名 RECOVER 与提交后检查点、既有恢复证据才能启用。**不宣称原子多文件事务或生产关闭**。
 - **整改标准**：恢复流程必须识别并消解 `EVENT_WITHOUT_POINTER` / `POINTER_WITHOUT_EVENT`。
 - **验收测试**：`test_recovery_reconciles_event_pointer_divergence`。
 
 ### B-11 并发读一致性与 Windows 锁（Medium）
 
-- **位置**：`verify()` 无锁；`_ledger_lock` 有界等待。
+- **位置**：`verify()` 无共享读锁；旧 `_ledger_lock` 仅 Windows OS 锁重试有截止时间，线程 acquire 与 POSIX flock 尚未统一有界。
 - **受影响属性**：审计读取一致性、跨平台可用性。
 - **现状**：并发追加有锁（`SG-35`）；`verify()` 可能看到撕裂尾并 fail closed；Windows 间歇性锁问题未根因修复。
+- **本次边界**：隔离控制面新增有界线程/OS 锁、固定锁顺序、审计竞争检测与真实子进程验证；未全局替换原 ledger 锁或部署生产共享读快照。**B-11 保持独立待办**。
 - **整改标准**：生产读取使用快照/共享锁；修复 Windows 锁竞争根因。
 - **验收测试**：`test_concurrent_verify_and_append_never_observes_partial_state`、Windows CI 稳定通过。
 

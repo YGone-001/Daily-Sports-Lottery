@@ -248,6 +248,8 @@ class ShadowReadContext:
     lifecycle_evidence: Any = None
     #: 独立撤销权威的原始完整状态与会话检查点。
     revocation_evidence: Any = None
+    #: 独立签名的持久快照控制状态检查点。
+    control_checkpoint: Any = None
 
     def evidence_for(self, activation_id: str) -> ShadowAuthorizationEvidence | None:
         for record in self.evidence:
@@ -403,7 +405,25 @@ class ShadowRuntimeReader:
         supersession_verifier: Any = None,
         require_independent_revocation: bool = False,
         revocation_verifier: Any = None,
+        require_controlled_snapshot_selection: bool = False,
+        snapshot_controller: Any = None,
     ) -> None:
+        if require_controlled_snapshot_selection:
+            from utils.shadow_snapshot_control import PersistentShadowSnapshotController
+            if (not isinstance(snapshot_controller, PersistentShadowSnapshotController)
+                or registry is not snapshot_controller.registry or audit_store is not snapshot_controller.audit
+                or not require_authoritative_governance or not require_authenticated_approval or not require_trusted_time
+                or not require_verified_supersession or not require_independent_revocation
+                or not require_observation_attestation or not require_recovery_evidence_for_reenable
+                or strict_activation_verifier is not snapshot_controller.strict
+                or supersession_verifier is not snapshot_controller.lifecycle
+                or revocation_verifier is not snapshot_controller.revocation):
+                raise ValueError("controlled selection requires coherent persistent control, audit and all strict authorities")
+        elif snapshot_controller is not None:
+            raise ValueError("snapshot controller requires explicit controlled selection mode")
+        self._require_controlled_snapshot_selection = bool(require_controlled_snapshot_selection)
+        self._snapshot_controller = snapshot_controller
+        self._controlled_generation = None
         if require_independent_revocation:
             from utils.activation_revocation_authority import IndependentRevocationVerifier
             from utils.shadow_activation_simulation import ShadowSnapshotRegistry
@@ -463,6 +483,8 @@ class ShadowRuntimeReader:
         self._require_recovery_evidence_for_reenable = bool(
             require_recovery_evidence_for_reenable or require_trusted_time
         )
+        if self._require_controlled_snapshot_selection:
+            self._snapshot_controller.attach_reader(self)
 
     # -- 只读状态 ---------------------------------------------------------
 
@@ -486,12 +508,14 @@ class ShadowRuntimeReader:
             "require_authenticated_approval": self._require_authenticated_approval,
             "require_verified_supersession": self._require_verified_supersession,
             "require_independent_revocation": self._require_independent_revocation,
+            "require_controlled_snapshot_selection": self._require_controlled_snapshot_selection,
             "shadow_reader_version": SHADOW_READER_VERSION,
             "prototype_only": True,
             "enabled": self._enabled,
             "generation": self._generation,
             "registry_attached": registry_backed,
             "snapshot_authority": (
+                "VERIFIED_PERSISTENT_CONTROL" if self._require_controlled_snapshot_selection else
                 "REGISTRY_SELECTED" if registry_backed else "STANDALONE_INSPECTION"
             ),
             "requires_explicit_selection": registry_backed,
@@ -525,6 +549,10 @@ class ShadowRuntimeReader:
         仍然「代际有效」。需要当前授权结论时必须重新执行 ``read()``。
         独立撤销模式额外使已观察到的新撤销状态失效旧句柄；仍不证明全局当前性。
         """
+        if self._require_controlled_snapshot_selection and (
+            self._controlled_generation is None or not self._snapshot_controller.generation_current(self._controlled_generation)
+        ):
+            return False
         if self._require_independent_revocation and (
             not self._revocation_verifier.continuity_healthy
             or self._revocation_generation != self._revocation_verifier.generation
@@ -703,6 +731,12 @@ class ShadowRuntimeReader:
             rejections.append("RE_ENABLE_POLICY_VERSION_MISMATCH")
         if active.evaluator_version != read_context.evaluator_version:
             rejections.append("RE_ENABLE_EVALUATOR_VERSION_MISMATCH")
+
+        if self._require_controlled_snapshot_selection:
+            try:
+                self._verify_controlled_selection(read_context, active)
+            except TrustedArtifactError as exc:
+                rejections.extend(exc.rejection_codes)
 
         if self._require_independent_revocation:
             try:
@@ -934,6 +968,13 @@ class ShadowRuntimeReader:
         return self._supersession_verifier.verify_snapshot(context.lifecycle_evidence,
             read_context=context, snapshot=snapshot)
 
+    def _verify_controlled_selection(self, context, snapshot):
+        verified = self._snapshot_controller.verify_current(context, snapshot)
+        if verified.generation != self._controlled_generation:
+            self._controlled_generation = verified.generation
+            self._generation += 1
+        return verified
+
     def cache_key(
         self,
         *,
@@ -1159,6 +1200,15 @@ class ShadowRuntimeReader:
                 rejection_codes=rejections,
             )
 
+        if self._require_controlled_snapshot_selection:
+            try:
+                self._verify_controlled_selection(read_context, resolved_snapshot)
+            except TrustedArtifactError as exc:
+                return self._result(source_key=source_key, canonical_id="",
+                    status=ShadowResolutionStatus.REJECTED_SHADOW.value,
+                    snapshot_fingerprint=snapshot_fingerprint, cache_key=cache_key,
+                    read_context=read_context, rejection_codes=exc.rejection_codes)
+
         if self._require_independent_revocation:
             try:
                 self._verify_independent_revocations(read_context, snapshot=resolved_snapshot)
@@ -1315,6 +1365,19 @@ class ShadowRuntimeReader:
                 rejection_codes=revalidation_codes,
                 authorization_ids=tuple(b.activation_id for b in matches),
             )
+
+        # A concurrent selection/audit append after the initial proof invalidates
+        # this read's checkpoint. Revalidate at the final consumption boundary.
+        if self._require_controlled_snapshot_selection:
+            try:
+                self._verify_controlled_selection(read_context, resolved_snapshot)
+                if not self._enabled:
+                    raise TrustedArtifactError("reader disabled during read", rejection_codes=("CONTROL_READER_DISABLED",))
+            except TrustedArtifactError as exc:
+                return self._result(source_key=source_key, canonical_id="",
+                    status=ShadowResolutionStatus.REJECTED_SHADOW.value,
+                    snapshot_fingerprint=snapshot_fingerprint, cache_key=cache_key,
+                    read_context=read_context, rejection_codes=exc.rejection_codes)
 
         # 8. 解析成功
         return self._result(

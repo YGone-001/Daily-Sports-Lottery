@@ -435,6 +435,8 @@ class ShadowActivationSimulator:
         - 不做任何 Canonical / 依赖存储写入。
         - 内部失败时有效状态仍为「不可消费」（绝不部分启用）。
         """
+        if self._reader._require_controlled_snapshot_selection:
+            return self._reader._snapshot_controller.disable(at=at, actor=actor, reason=reason)
         report = self._reader.disable(at=at, actor=actor, reason=reason)
         self._registry_invalidate_active()
         self._emit(
@@ -483,6 +485,13 @@ class ShadowActivationSimulator:
         # action: external checkpoint and current activation evidence are required,
         # and it cannot enable consumption. Guarded re_enable remains mandatory.
         previous = self._registry.active_snapshot_id
+
+        if self._reader._require_controlled_snapshot_selection:
+            return self._rollback_report(status="ROLLBACK_REJECTED", target_snapshot_id=str(target_snapshot_id),
+                previous=previous, effective=previous, rejection_codes=("CONTROL_SELECTION_AUTHORIZATION_REQUIRED",),
+                read_context=read_context, audit_event_types=(), audit_committed=False,
+                reader_disabled=not self._reader.enabled, audit_store_attached=self._audit is not None,
+                commit_outcome="NOT_ATTEMPTED")
 
         # An explicit recovery reconciliation may select a currently valid target
         # while consumption remains disabled. It requires an external checkpoint;
