@@ -148,13 +148,15 @@ append/flush/fsync、release、checkpoint、并发选择、持锁进程终止及
 输出动态 JSON，包含实测等待和错误码；不是静态预期表，也不是吞吐基准。
 CI 两平台运行同一功能入口，并将真实 pytest 数量及实测诊断写入 notice，便于独立核对最终 SHA。
 
-本地 Windows / Python 3.12.10 最终专项：**58 passed、2 skipped、0 failed（200.28 秒）**。
+本地 Windows / Python 3.12.10 最终专项：**59 passed、2 skipped、0 failed（155.14 秒）**。
 两项跳过仅为 LC-04 / LC-26 的 POSIX 专用路径；Windows msvcrt、字节范围与 deny-delete 实验均实际执行。
-17 个指定聚焦文件合计 **838 passed、2 skipped**；另补跑原审计/回滚修正测试 **50 passed**，
-总聚焦为 **888 passed、2 skipped**。完整功能入口最终 success=true，四组进程压力场景全部通过，
+17 个指定聚焦文件合计 **839 passed、2 skipped**；另补跑原审计/回滚修正测试 **50 passed**，
+总聚焦为 **889 passed、2 skipped**。完整功能入口最终 success=true，四组进程压力场景全部通过，
 七个实际生产 JSON 与实现前 SHA-256 一致。
 完整本地与最终 SHA 两平台 CI 数量在最终验收报告核验；不将本机数字推算为远程统计。
-完整本地执行 `python -m pytest -q`：**2058 passed、2 skipped、0 failed（830.68 秒）**。
+最终完整本地执行 `python -m pytest -q`：**2059 passed、2 skipped、0 failed（746.78 秒）**。
+验证器另有一项负向用例：只有 LEDGER_LOCK_TIMEOUT 才可作为争用超时证据，
+非预期 I/O 错误必须使验收失败。运行期锁的错误分类保持不变；修正以前向提交完成，不改写历史。
 完整平台对照由最终 SHA 的远程实际 notice 核验，需同时说明相反平台专用用例的跳过原因。
 平台专用用例只允许在相反平台跳过，并由对应平台 CI 实际执行。
 

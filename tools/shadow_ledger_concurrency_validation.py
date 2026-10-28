@@ -156,6 +156,8 @@ def process_lock_probe(workspace, *, abrupt=False, legacy=False, byte_offset=Non
                 with BoundedLedgerLock(path, timeout=0.12, poll_interval=0.01) as lock:
                     outcome = dict(status="ACQUIRED", diagnostics=lock.diagnostics)
             except LedgerLockError as exc:
+                require(exc.rejection_codes == ("LEDGER_LOCK_TIMEOUT",),
+                    "unexpected OS error is not a contention timeout")
                 outcome = dict(status="TIMEOUT", codes=exc.rejection_codes, diagnostics=exc.diagnostics)
             if byte_offset == 1:
                 require(outcome["status"] == "ACQUIRED", "unrelated byte blocked")

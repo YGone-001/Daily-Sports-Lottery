@@ -609,3 +609,12 @@ def test_real_process_termination_during_partial_append_rejects_on_restart(tmp_p
     from tools.shadow_ledger_concurrency_validation import abrupt_append_probe
     result=abrupt_append_probe(tmp_path / "append-crash")
     assert result["lock_reacquired"] and result["restart_rejected"] and result["history_preserved"]
+
+
+@bounded_case
+def test_validation_probe_rejects_unexpected_os_errors(tmp_path):
+    # The holder is a fresh spawn process; only the parent contender gets EIO.
+    with patch.object(BoundedLedgerLock,"_try_os_lock",side_effect=OSError(errno.EIO,"unexpected I/O")):
+        with pytest.raises(RuntimeError,match="unexpected OS error"):
+            process_lock_probe(tmp_path)
+    with BoundedLedgerLock(tmp_path / "process.lock",timeout=.5): pass
