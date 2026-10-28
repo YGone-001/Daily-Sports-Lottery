@@ -35,6 +35,12 @@
 **COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**；
 生产生命周期注册表、持久检查点与全局当前性未部署，不能标记生产关闭。B-14 保持单独待办。
 
+**B-14 隔离组件更新**：已增加独立 Ed25519 撤销角色、不可变事件、完整当前状态、独立会话检查点、
+有界新鲜度与单调连续性，并强制用于 opt-in shadow 读取、再启用和回滚；详见
+[独立撤销权威说明](runtime-activation-revocation-authority.md)。状态为
+**COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**。
+没有生产撤销服务器、生产持久高水位、密钥轮换或全局当前性证明，B-14 **生产控制仍待办**。
+
 **仍未达到生产关闭**：B-06（生产时间权威与持久连续性）、B-07（生产批准权威）、B-08（空所有权证据）、
 B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产激活、生产读取器或生产审计服务。
 
@@ -171,9 +177,10 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 ### B-14 撤销权威缺失（High）
 
 - **位置**：`revocation_registry` 由调用方传入。
-- **现状**：legacy 依赖调用方登记；strict shadow 使用既有签名治理撤销事实，调用方空表不能覆盖，supersession 不能擦除已观察撤销。但没有生产独立撤销服务、全局新鲜性或密钥管理后端，无法将隔离签名视图视为生产撤销权威。
-- **整改标准**：独立撤销权威（签名撤销记录 + 当前状态视图）。
-- **验收测试**：`test_unregistered_revocation_is_detected_from_authority`。
+- **现状**：新增 `require_independent_revocation=True` 的隔离模式：独立角色签名事件、完整状态和独立检查点绑定特定授权指纹、当前生命周期、dataset 与 baseline；每次消费重新认证，旧状态、删减清单和检查点重放均拒绝。既有签名治理撤销继续保守合并，caller 空表不能覆盖认证撤销，supersession 不会恢复撤销授权。
+- **组件状态**：**COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**。
+- **生产整改标准**：部署独立撤销签发者持久化、可信检查点权威、密钥分发/轮换、可达性与独立审计，并单独评审全局当前性。新 challenge 或对旧状态重新签名都不能替代这些控制。
+- **验收测试**：`tests/test_activation_revocation_authority.py`（VR-01～VR-50 及附加测试）、`tools/shadow_revocation_authority_validation.py`；见 [独立撤销权威说明](runtime-activation-revocation-authority.md)。
 
 ---
 

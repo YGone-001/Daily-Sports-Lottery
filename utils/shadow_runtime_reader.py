@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any, Mapping, Sequence
 
 from utils.mapping_governance import ACTIVE_STATES, MappingProposal
@@ -245,6 +246,8 @@ class ShadowReadContext:
     trusted_time_evidence: SignedTrustedArtifact | Mapping[str, Any] | None = None
     #: 原始签名生命周期证据；派生的只读结果不能替代它。
     lifecycle_evidence: Any = None
+    #: 独立撤销权威的原始完整状态与会话检查点。
+    revocation_evidence: Any = None
 
     def evidence_for(self, activation_id: str) -> ShadowAuthorizationEvidence | None:
         for record in self.evidence:
@@ -398,7 +401,23 @@ class ShadowRuntimeReader:
         require_authenticated_approval: bool = False,
         require_verified_supersession: bool = False,
         supersession_verifier: Any = None,
+        require_independent_revocation: bool = False,
+        revocation_verifier: Any = None,
     ) -> None:
+        if require_independent_revocation:
+            from utils.activation_revocation_authority import IndependentRevocationVerifier
+            from utils.shadow_activation_simulation import ShadowSnapshotRegistry
+            if (not isinstance(registry, ShadowSnapshotRegistry) or not require_authoritative_governance
+                or not require_authenticated_approval or not require_trusted_time
+                or not isinstance(revocation_verifier, IndependentRevocationVerifier)
+                or revocation_verifier.strict_activation_verifier is not strict_activation_verifier):
+                raise ValueError("independent revocation requires registry, governance, approval and the same strict time verifier")
+        elif revocation_verifier is not None:
+            raise ValueError("revocation verifier requires explicit independent revocation mode")
+        self._require_independent_revocation = bool(require_independent_revocation)
+        self._revocation_verifier = revocation_verifier
+        self._revocation_generation = None
+        self._revocation_lock = RLock()
         if require_verified_supersession:
             from utils.activation_supersession import ActivationSupersessionVerifier
             from utils.shadow_activation_simulation import ShadowSnapshotRegistry
@@ -411,6 +430,12 @@ class ShadowRuntimeReader:
             raise ValueError("supersession verifier requires explicit strict supersession mode")
         self._require_verified_supersession = bool(require_verified_supersession)
         self._supersession_verifier = supersession_verifier
+        if require_independent_revocation and require_verified_supersession and (
+            revocation_verifier._keys[3] != supersession_verifier._keys[0]
+            or revocation_verifier._keys[2] != supersession_verifier._keys[2]
+            or revocation_verifier.dataset_identity != supersession_verifier.dataset_identity
+        ):
+            raise ValueError("revocation and lifecycle must agree on dataset, activation and lifecycle trust roots")
         if require_authenticated_approval and (
             registry is None or not require_trusted_time or not require_authoritative_governance
             or not isinstance(strict_activation_verifier, StrictActivationVerifier)
@@ -460,6 +485,7 @@ class ShadowRuntimeReader:
             "require_trusted_time": self._require_trusted_time,
             "require_authenticated_approval": self._require_authenticated_approval,
             "require_verified_supersession": self._require_verified_supersession,
+            "require_independent_revocation": self._require_independent_revocation,
             "shadow_reader_version": SHADOW_READER_VERSION,
             "prototype_only": True,
             "enabled": self._enabled,
@@ -497,7 +523,13 @@ class ShadowRuntimeReader:
 
         因此它**不是**当前授权有效性的证明：治理状态可能已经变化，而旧结果
         仍然「代际有效」。需要当前授权结论时必须重新执行 ``read()``。
+        独立撤销模式额外使已观察到的新撤销状态失效旧句柄；仍不证明全局当前性。
         """
+        if self._require_independent_revocation and (
+            not self._revocation_verifier.continuity_healthy
+            or self._revocation_generation != self._revocation_verifier.generation
+        ):
+            return False
         return self._enabled and result.reader_generation == self._generation
 
     # -- 紧急停用 ---------------------------------------------------------
@@ -671,6 +703,12 @@ class ShadowRuntimeReader:
             rejections.append("RE_ENABLE_POLICY_VERSION_MISMATCH")
         if active.evaluator_version != read_context.evaluator_version:
             rejections.append("RE_ENABLE_EVALUATOR_VERSION_MISMATCH")
+
+        if self._require_independent_revocation:
+            try:
+                self._verify_independent_revocations(read_context, snapshot=active, authorization=authorization)
+            except TrustedArtifactError as exc:
+                rejections.extend(exc.rejection_codes)
 
         if self._require_verified_supersession:
             try:
@@ -855,10 +893,42 @@ class ShadowRuntimeReader:
         if self._require_trusted_time:
             context = replace(context, require_verified_governance=(
                 context.require_verified_governance or self._require_authenticated_approval))
-            return self._strict_activation_verifier.verify(authorization, context,
+            result = self._strict_activation_verifier.verify(authorization, context,
                 time_evidence=read_context.trusted_time_evidence,
                 governance_view=read_context.authoritative_view)
-        return verify_runtime_activation_authorization(authorization, context)
+        else:
+            result = verify_runtime_activation_authorization(authorization, context)
+        if self._require_independent_revocation:
+            try:
+                self._verify_independent_revocations(read_context, authorization=authorization)
+            except TrustedArtifactError as exc:
+                return replace(result, verification_status="REJECTED", verified_scope="",
+                    rejection_codes=tuple(sorted(set(result.rejection_codes) | set(exc.rejection_codes))))
+        return result
+
+    def _verify_independent_revocations(self, context, *, snapshot=None, authorization=None):
+        with self._revocation_lock:
+            return self._check_independent_revocations(context, snapshot=snapshot, authorization=authorization)
+
+    def _check_independent_revocations(self, context, *, snapshot=None, authorization=None):
+        verified = self._revocation_verifier.verify(context.revocation_evidence, read_context=context)
+        if verified.continuity_generation != self._revocation_verifier.generation:
+            raise TrustedArtifactError("revocation state changed during verification",
+                rejection_codes=("REVOCATION_CONCURRENT_STATE_CHANGED",))
+        if self._revocation_generation != verified.continuity_generation:
+            self._revocation_generation = verified.continuity_generation
+            self._generation += 1
+        if authorization is not None and (
+            authorization.activation_id, authorization.fingerprint()
+        ) not in verified.authorization_inventory:
+            raise TrustedArtifactError("authorization differs from complete authenticated revocation scope",
+                rejection_codes=("REVOCATION_ACTIVATION_ID_CONFLICT",))
+        revoked_ids = {aid for aid, _ in verified.revoked_authorizations}
+        if ((snapshot is not None and any(b.activation_id in revoked_ids for b in snapshot.bindings))
+            or (authorization is not None and verified.is_revoked(authorization))):
+            raise TrustedArtifactError("independently authenticated activation revocation",
+                rejection_codes=("ACTIVATION_AUTHORIZATION_REVOKED",))
+        return verified
 
     def _verify_current_lifecycle(self, context, snapshot):
         return self._supersession_verifier.verify_snapshot(context.lifecycle_evidence,
@@ -1088,6 +1158,19 @@ class ShadowRuntimeReader:
                 read_context=read_context,
                 rejection_codes=rejections,
             )
+
+        if self._require_independent_revocation:
+            try:
+                self._verify_independent_revocations(read_context, snapshot=resolved_snapshot)
+            except TrustedArtifactError as exc:
+                cache_key = self.cache_key(snapshot=resolved_snapshot, read_context=read_context,
+                    source_identity_key=source_key)
+                return self._result(source_key=source_key, canonical_id="",
+                    status=ShadowResolutionStatus.REJECTED_SHADOW.value,
+                    snapshot_fingerprint=snapshot_fingerprint, cache_key=cache_key,
+                    read_context=read_context, rejection_codes=exc.rejection_codes)
+            cache_key = self.cache_key(snapshot=resolved_snapshot, read_context=read_context,
+                source_identity_key=source_key)
 
         # Strict lifecycle is checked even for an unknown observation. Governance
         # ambiguity must never be downgraded to NOT_FOUND by an empty match set.

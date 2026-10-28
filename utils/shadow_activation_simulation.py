@@ -912,6 +912,12 @@ class ShadowActivationSimulator:
         if target.evaluator_version != read_context.evaluator_version:
             rejections.append("ROLLBACK_EVALUATOR_VERSION_MISMATCH")
 
+        if self._reader._require_independent_revocation:
+            try:
+                self._reader._verify_independent_revocations(read_context, snapshot=target)
+            except TrustedArtifactError as exc:
+                rejections.extend(exc.rejection_codes)
+
         if self._reader._require_verified_supersession:
             try:
                 self._reader._verify_current_lifecycle(read_context, target)
