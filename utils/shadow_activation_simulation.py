@@ -912,6 +912,12 @@ class ShadowActivationSimulator:
         if target.evaluator_version != read_context.evaluator_version:
             rejections.append("ROLLBACK_EVALUATOR_VERSION_MISMATCH")
 
+        if self._reader._require_verified_supersession:
+            try:
+                self._reader._verify_current_lifecycle(read_context, target)
+            except TrustedArtifactError as exc:
+                rejections.extend(exc.rejection_codes)
+
         known_ids = read_context.canonical_id_set()
         for binding in target.bindings:
             evidence = read_context.evidence_for(binding.activation_id)

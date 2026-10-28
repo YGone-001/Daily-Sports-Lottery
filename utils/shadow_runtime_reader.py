@@ -243,6 +243,8 @@ class ShadowReadContext:
     recovery_max_age_seconds: float = 3600.0
     #: Strict shadow time evidence; trust roots and policy belong to the reader.
     trusted_time_evidence: SignedTrustedArtifact | Mapping[str, Any] | None = None
+    #: 原始签名生命周期证据；派生的只读结果不能替代它。
+    lifecycle_evidence: Any = None
 
     def evidence_for(self, activation_id: str) -> ShadowAuthorizationEvidence | None:
         for record in self.evidence:
@@ -394,7 +396,21 @@ class ShadowRuntimeReader:
         require_trusted_time: bool = False,
         strict_activation_verifier: StrictActivationVerifier | None = None,
         require_authenticated_approval: bool = False,
+        require_verified_supersession: bool = False,
+        supersession_verifier: Any = None,
     ) -> None:
+        if require_verified_supersession:
+            from utils.activation_supersession import ActivationSupersessionVerifier
+            from utils.shadow_activation_simulation import ShadowSnapshotRegistry
+            if (not isinstance(registry, ShadowSnapshotRegistry) or not require_authoritative_governance
+                or not require_authenticated_approval or not require_trusted_time
+                or not isinstance(supersession_verifier, ActivationSupersessionVerifier)
+                or supersession_verifier.strict_activation_verifier is not strict_activation_verifier):
+                raise ValueError("strict supersession requires registry, governance, approval, time and the same verifier")
+        elif supersession_verifier is not None:
+            raise ValueError("supersession verifier requires explicit strict supersession mode")
+        self._require_verified_supersession = bool(require_verified_supersession)
+        self._supersession_verifier = supersession_verifier
         if require_authenticated_approval and (
             registry is None or not require_trusted_time or not require_authoritative_governance
             or not isinstance(strict_activation_verifier, StrictActivationVerifier)
@@ -443,6 +459,7 @@ class ShadowRuntimeReader:
             "reader_id": self._reader_id,
             "require_trusted_time": self._require_trusted_time,
             "require_authenticated_approval": self._require_authenticated_approval,
+            "require_verified_supersession": self._require_verified_supersession,
             "shadow_reader_version": SHADOW_READER_VERSION,
             "prototype_only": True,
             "enabled": self._enabled,
@@ -655,6 +672,16 @@ class ShadowRuntimeReader:
         if active.evaluator_version != read_context.evaluator_version:
             rejections.append("RE_ENABLE_EVALUATOR_VERSION_MISMATCH")
 
+        if self._require_verified_supersession:
+            try:
+                lifecycle = self._verify_current_lifecycle(read_context, active)
+                current = lifecycle.current_for(authorization.scoped_source_identity_key)
+                if (current is None or current.activation_id != authorization.activation_id
+                    or current.authorization_fingerprint != authorization.fingerprint()):
+                    rejections.append("LIFECYCLE_ACTIVATION_NOT_CURRENT")
+            except TrustedArtifactError as exc:
+                rejections.extend(exc.rejection_codes)
+
         matching = tuple(
             binding
             for binding in active.bindings
@@ -832,6 +859,10 @@ class ShadowRuntimeReader:
                 time_evidence=read_context.trusted_time_evidence,
                 governance_view=read_context.authoritative_view)
         return verify_runtime_activation_authorization(authorization, context)
+
+    def _verify_current_lifecycle(self, context, snapshot):
+        return self._supersession_verifier.verify_snapshot(context.lifecycle_evidence,
+            read_context=context, snapshot=snapshot)
 
     def cache_key(
         self,
@@ -1057,6 +1088,17 @@ class ShadowRuntimeReader:
                 read_context=read_context,
                 rejection_codes=rejections,
             )
+
+        # Strict lifecycle is checked even for an unknown observation. Governance
+        # ambiguity must never be downgraded to NOT_FOUND by an empty match set.
+        if self._require_verified_supersession:
+            try:
+                self._verify_current_lifecycle(read_context, resolved_snapshot)
+            except TrustedArtifactError as exc:
+                return self._result(source_key=source_key, canonical_id="",
+                    status=ShadowResolutionStatus.REJECTED_SHADOW.value,
+                    snapshot_fingerprint=snapshot_fingerprint, cache_key=cache_key,
+                    read_context=read_context, rejection_codes=exc.rejection_codes)
 
         # 5. 绑定
         matches = resolved_snapshot.bindings_for(source_key)

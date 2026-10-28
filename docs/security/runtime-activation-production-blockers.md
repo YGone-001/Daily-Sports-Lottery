@@ -27,7 +27,13 @@
 资格/激活批准指纹一致性及 strict shadow 读取/恢复/回滚保护，详见
 [已认证批准绑定验收说明](runtime-activation-approval-binding.md)。
 状态为 **COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**；
-不表示已部署生产批准服务。B-13 完整 supersession 和 B-14 生产撤销权威仍是独立待办。
+不表示已部署生产批准服务。B-13 生产 supersession 权威和 B-14 生产撤销权威仍是独立待办。
+
+**B-13 隔离组件更新**：已实现专用域签名替代事件、签名当前 inventory、独立会话检查点、
+单调历史连续性、唯一 CURRENT 与 strict shadow 读取/再启用/回滚检查；详见
+[显式授权替代说明](runtime-activation-supersession.md)。状态为
+**COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**；
+生产生命周期注册表、持久检查点与全局当前性未部署，不能标记生产关闭。B-14 保持单独待办。
 
 **仍未达到生产关闭**：B-06（生产时间权威与持久连续性）、B-07（生产批准权威）、B-08（空所有权证据）、
 B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产激活、生产读取器或生产审计服务。
@@ -157,14 +163,15 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 ### B-13 多授权/替代语义不完整（Medium）
 
 - **位置**：`ShadowActivationSnapshot.bindings_for` + 读取器“全部匹配绑定必须可消费”。
-- **现状**：同一源键的旧授权若过期/撤销，会阻断新授权的解析；无显式 supersede 规则。
-- **整改标准**：定义并实现 supersession/最新有效授权选择规则（不得按时间臆测，需显式状态）。
-- **验收测试**：`test_superseded_authorization_does_not_block_current_one`、`test_revoked_old_authorization_cannot_be_reused`。
+- **现状**：legacy 检视仍保留旧行为。隔离 strict 模式通过独立生命周期签名 A→B、签名 CURRENT 状态与独立检查点确定唯一有效授权；历史 A 保留并独立验签，其过期/撤销不再阻断有效 B。双 CURRENT、环、分叉、缺失/伪造证据、旧状态及旧快照恢复一律拒绝。
+- **组件状态**：**COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**。
+- **生产整改标准**：部署独立生命周期权威、可信当前检查点、持久连续性及快照发布/选择控制并独立复评。不得按签发时间、approval recency、快照新旧、词法 ID 或插入顺序推断当前授权。
+- **验收测试**：`tests/test_activation_supersession.py`（SS-01～SS-44 及附加对抗测试）、`tools/shadow_activation_supersession_validation.py`；实现与限制见 [显式授权替代说明](runtime-activation-supersession.md)。
 
 ### B-14 撤销权威缺失（High）
 
 - **位置**：`revocation_registry` 由调用方传入。
-- **现状**：读取器/再启用只按调用方登记判断撤销；无法发现未登记的真实撤销。
+- **现状**：legacy 依赖调用方登记；strict shadow 使用既有签名治理撤销事实，调用方空表不能覆盖，supersession 不能擦除已观察撤销。但没有生产独立撤销服务、全局新鲜性或密钥管理后端，无法将隔离签名视图视为生产撤销权威。
 - **整改标准**：独立撤销权威（签名撤销记录 + 当前状态视图）。
 - **验收测试**：`test_unregistered_revocation_is_detected_from_authority`。
 

@@ -821,7 +821,10 @@ def test_aa_12_shadow_snapshot_is_immutable(env):
     with pytest.raises(ShadowActivationSnapshotError) as exc3:
         build_shadow_activation_snapshot(
             authorizations=[
-                dataclasses.replace(env.authorization, signature="A" + env.authorization.signature[1:])
+                dataclasses.replace(env.authorization, signature=(
+                    ("B" if env.authorization.signature[0] == "A" else "A")
+                    + env.authorization.signature[1:]
+                ))
             ],
             verification_context=_vctx(env),
             observations=[env.observation],
