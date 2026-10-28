@@ -153,12 +153,14 @@ B-09 ~ B-14。因此生产决策仍为 **NO-GO**，且本次**未**启用生产�
 - **整改标准**：恢复流程必须识别并消解 `EVENT_WITHOUT_POINTER` / `POINTER_WITHOUT_EVENT`。
 - **验收测试**：`test_recovery_reconciles_event_pointer_divergence`。
 
-### B-11 并发读一致性与 Windows 锁（Medium）
+### B-11 并发读一致性与 Windows 锁（Medium；组件硬化）
 
-- **位置**：`verify()` 无共享读锁；旧 `_ledger_lock` 仅 Windows OS 锁重试有截止时间，线程 acquire 与 POSIX flock 尚未统一有界。
+- **位置**：`utils/ledger_lock.py`，治理/审计/控制日志及持久快照的同步读取与追加调用方。
 - **受影响属性**：审计读取一致性、跨平台可用性。
-- **现状**：并发追加有锁（`SG-35`）；`verify()` 可能看到撕裂尾并 fail closed；Windows 间歇性锁问题未根因修复。
-- **本次边界**：隔离控制面新增有界线程/OS 锁、固定锁顺序、审计竞争检测与真实子进程验证；未全局替换原 ledger 锁或部署生产共享读快照。**B-11 保持独立待办**。
+- **现状**：已统一有界线程、Windows/POSIX OS 获取与明确释放所有权；公共读取使用 writer 的锁身份，报告与检查点从一次捕获的已提交前缀派生；append 使用私有辅助避免递归。既有签名、控制检查点和 UNCERTAIN 保护保持。
+- **组件状态**：**COMPONENT_IMPLEMENTED / COMPONENT_VERIFIED / ISOLATED_PROTOTYPE_ONLY / PRODUCTION_CONTROL_NOT_READY**；见 [账本并发验收](runtime-activation-ledger-concurrency.md)。组件验证依赖真实本地与两平台 CI，不等于生产部署验证。
+- **Windows 调查**：**ROOT_CAUSE_NOT_REPRODUCED**。实测区分 msvcrt errno 13 的锁竞争与受控 deny-delete 句柄下 WinError 5 的替换失败；不将它们宣称为原间歇问题或杀软根因。
+- **生产残余**：合作目录信任、非合作 writer、网络文件系统、敌对目录替换、独立检查点签发、持久高水位、实际断电与部署服务仍未验证。B-10 也未生产关闭。
 - **整改标准**：生产读取使用快照/共享锁；修复 Windows 锁竞争根因。
 - **验收测试**：`test_concurrent_verify_and_append_never_observes_partial_state`、Windows CI 稳定通过。
 

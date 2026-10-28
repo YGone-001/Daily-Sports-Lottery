@@ -31,6 +31,7 @@ from dataclasses import dataclass, fields
 from typing import Any, Mapping, Sequence
 
 from utils.mapping_governance import _ledger_lock
+from utils.ledger_lock import VerifiedLedgerSnapshot
 from utils.runtime_activation_authorization import ActivationPrototypeError
 from utils.source_identity import canonical_json, fingerprint
 from utils.trusted_artifacts import (
@@ -318,21 +319,21 @@ class ShadowActivationAuditStore:
 
     def records(self) -> tuple[ShadowAuditRecord, ...]:
         """读取全部事件（只读；不完整即抛错，绝不静默截断）。"""
-        return tuple(self._read_strict())
+        with self._lock_factory(self._lock_path):
+            return tuple(self._read_strict())
 
     def event_types(self) -> tuple[str, ...]:
-        return tuple(record.event_type for record in self._read_strict())
+        return tuple(record.event_type for record in self.verified_snapshot().records)
 
     def chain_tip(self) -> str:
-        records = self._read_strict()
-        return records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
+        return self.verified_snapshot().report["chain_tip"]
 
     # -- 外部签名检查点 ---------------------------------------------------
 
     def checkpoint_payload(self, *, issued_at: str) -> dict:
         """当前完整链的检查点载荷（链尖 + 长度 + 存储身份 + 时间）。"""
-        records = self._read_strict()
-        self._validate_records(records)
+        snapshot = self.verified_snapshot()
+        records = snapshot.records
         return {
             "subject_identity": self.store_identity(),
             "dataset_identity": self.dataset_identity,
@@ -371,6 +372,13 @@ class ShadowActivationAuditStore:
         检查点长度/链尖必须精确匹配当前历史：任何尾部截断、尾部追加或全链重写
         都会导致不匹配并 fail closed。
         """
+        payload, _ = self.verify_external_checkpoint_snapshot(checkpoint,
+            trusted_public_key_path=trusted_public_key_path, current_time=current_time, max_age_seconds=max_age_seconds)
+        return payload
+
+    def verify_external_checkpoint_snapshot(self, checkpoint, *, trusted_public_key_path,
+                                           current_time, max_age_seconds):
+        snapshot = self.verified_snapshot()
         try:
             payload = verify_trusted_artifact(
                 checkpoint,
@@ -394,8 +402,7 @@ class ShadowActivationAuditStore:
                 "external audit checkpoint dataset identity mismatch",
                 rejection_codes=("CHECKPOINT_MISMATCH",),
             )
-        records = self._read_strict()
-        self._validate_records(records)
+        records = snapshot.records
         expected_tip = records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
         if (
             int(payload.get("entry_count", -1)) != len(records)
@@ -406,7 +413,7 @@ class ShadowActivationAuditStore:
                 "(truncation, append or rewrite detected)",
                 rejection_codes=("CHECKPOINT_MISMATCH",),
             )
-        return payload
+        return payload, snapshot
 
     def verify(self) -> dict:
         """
@@ -415,8 +422,14 @@ class ShadowActivationAuditStore:
 
         任何不一致都抛 ``ShadowAuditIntegrityError``（fail closed，绝不修复）。
         """
-        records = self._read_strict()
+        return self.verified_snapshot().report
+
+    def verified_snapshot(self) -> VerifiedLedgerSnapshot:
+        records = self.records()
         self._validate_records(records)
+        return VerifiedLedgerSnapshot(tuple(records), canonical_json(self._verification_report(records)))
+
+    def _verification_report(self, records):
         previous = records[-1].entry_hash if records else GENESIS_PREVIOUS_HASH
 
         return {

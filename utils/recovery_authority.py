@@ -92,7 +92,10 @@ def build_recovery_evidence(
             rejection_codes=("RECOVERY_EVIDENCE_MISSING",),
         )
     try:
-        audit_store.verify_external_checkpoint(
+        from utils.shadow_activation_audit_store import ShadowActivationAuditStore
+        method = (audit_store.verify_external_checkpoint_snapshot if isinstance(audit_store, ShadowActivationAuditStore)
+            else audit_store.verify_external_checkpoint)
+        checked = method(
             audit_checkpoint,
             trusted_public_key_path=checkpoint_trusted_public_key_path,
             current_time=current_time,
@@ -103,7 +106,15 @@ def build_recovery_evidence(
             f"audit chain checkpoint verification failed: {exc}",
             rejection_codes=("RECOVERY_EVIDENCE_INVALID",),
         ) from exc
-    records = audit_store.records()
+    if isinstance(audit_store, ShadowActivationAuditStore):
+        _, snapshot = checked
+        records = snapshot.records
+    else:
+        records = audit_store.records()
+        if (not isinstance(checked, dict) or checked.get("entry_count") != len(records)
+            or checked.get("chain_tip") != (records[-1].entry_hash if records else "0" * 64)):
+            raise RecoveryEvidenceError("checkpoint and records are not one snapshot",
+                rejection_codes=("RECOVERY_EVIDENCE_INVALID",))
     completion = records[-1] if records else None
     completion_present = bool(
         completion is not None

@@ -31,6 +31,7 @@ from utils.runtime_activation_authorization import (
 from utils.runtime_mapping_policy import RUNTIME_MAPPING_POLICY_VERSION
 from utils.runtime_mapping_eligibility import RUNTIME_ELIGIBILITY_EVALUATOR_VERSION
 from utils.shadow_activation_audit_store import (
+    ShadowActivationAuditStore,
     ShadowAuditCommitReceipt,
     ShadowAuditRecord,
 )
@@ -840,8 +841,14 @@ class ShadowActivationSimulator:
     def _read_back(self):
         """回读并校验整个审计链；任何失败都返回 ``(None, None)``。"""
         try:
-            records = self._audit.records()
-            self._audit.verify()
+            if isinstance(self._audit, ShadowActivationAuditStore):
+                records = self._audit.verified_snapshot().records
+            else:
+                records = self._audit.records()
+                report = self._audit.verify()
+                if (report["entry_count"] != len(records)
+                    or report["chain_tip"] != (records[-1].entry_hash if records else "0" * 64)):
+                    return None, None
             identity = self._audit.store_identity()
         except Exception:  # noqa: BLE001  (读取 / 校验失败即视为不可判定)
             return None, None

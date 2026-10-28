@@ -7,8 +7,7 @@ import os
 from pathlib import Path
 import re
 import stat
-import threading
-import time
+from utils.ledger_lock import BoundedLedgerLock, LedgerLockError
 from uuid import uuid4
 
 from utils.mapping_governance import load_trusted_public_key, reconstruct_proposal_from_evidence
@@ -70,63 +69,35 @@ def safe_path(root, path):
     return Path(_validate_audit_file(str(path), str(root)))
 
 
-class BoundedShadowLock:
-    """固定顺序调用的合作进程锁；线程和 POSIX/Windows OS 等待都有限。"""
-    _guards = {}
-    _guard_lock = threading.Lock()
+class BoundedShadowLock(BoundedLedgerLock):
+    """保留隔离控制面 5 秒预算与拒绝码；与治理/审计共用锁身份注册表。"""
 
     def __init__(self, path, timeout=5.0):
-        self.path = str(safe_path(Path(path).parent, Path(path)))
-        self.timeout = timeout
-        self.fd = None
-        self.guard = None
+        root = Path(path).parent
+        super().__init__(safe_path(root, Path(path)), timeout=timeout, poll_interval=0.01)
+
+    def _translated(self, exc):
+        code = "CONTROL_LOCK_TIMEOUT" if exc.rejection_codes == ("LEDGER_LOCK_TIMEOUT",) else exc.rejection_codes[0].replace("LEDGER_", "CONTROL_")
+        translated = ShadowControlError(code, rejection_codes=(code,))
+        translated.diagnostics = exc.diagnostics
+        return translated
 
     def __enter__(self):
-        with self._guard_lock:
-            self.guard = self._guards.setdefault(self.path, threading.Lock())
-        if not self.guard.acquire(timeout=self.timeout):
-            reject("CONTROL_LOCK_TIMEOUT")
         try:
-            safe_path(Path(self.path).parent, Path(self.path))
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            if os.fstat(self.fd).st_nlink != 1:
-                reject("CONTROL_PATH_ALIAS")
-            if os.fstat(self.fd).st_size == 0:
-                os.write(self.fd, b"0")
-            deadline = time.monotonic() + self.timeout
-            while True:
-                try:
-                    if os.name == "nt":
-                        import msvcrt
-                        os.lseek(self.fd, 0, os.SEEK_SET)
-                        msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        reject("CONTROL_LOCK_TIMEOUT")
-                    time.sleep(0.01)
-            return self
-        except BaseException:
-            if self.fd is not None:
-                os.close(self.fd)
-            self.guard.release()
-            raise
+            return super().__enter__()
+        except LedgerLockError as exc:
+            if exc.diagnostics["phase"] == "open" and isinstance(exc.__cause__, PermissionError):
+                original = exc.__cause__
+                original.rejection_codes = ("CONTROL_LOCK_OS_ERROR",)
+                original.diagnostics = exc.diagnostics
+                raise original from exc
+            raise self._translated(exc) from exc
 
     def __exit__(self, *args):
         try:
-            if os.name == "nt":
-                import msvcrt
-                os.lseek(self.fd, 0, os.SEEK_SET)
-                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-        finally:
-            os.close(self.fd)
-            self.guard.release()
+            return super().__exit__(*args)
+        except LedgerLockError as exc:
+            raise self._translated(exc) from exc
 
 
 def sync_directory(path):
@@ -225,6 +196,10 @@ class PersistentShadowSnapshotStore:
         return safe_path(self.workspace, self.directory / (snapshot_id + ".json"))
 
     def verify_snapshot(self, snapshot_id):
+        with BoundedShadowLock(self.lock_path):
+            return self._verify_snapshot_unlocked(snapshot_id)
+
+    def _verify_snapshot_unlocked(self, snapshot_id):
         envelope = strict_json_file(self.workspace, self._path(snapshot_id))
         return self._validate_envelope(envelope, snapshot_id)
 
@@ -299,9 +274,17 @@ class PersistentShadowSnapshotStore:
         return envelope
 
     def get(self, snapshot_id):
-        return decode_snapshot(self.verify_snapshot(snapshot_id)["snapshot"])
+        with BoundedShadowLock(self.lock_path):
+            return self._get_unlocked(snapshot_id)
+
+    def _get_unlocked(self, snapshot_id):
+        return decode_snapshot(self._verify_snapshot_unlocked(snapshot_id)["snapshot"])
 
     def list_snapshot_ids(self):
+        with BoundedShadowLock(self.lock_path):
+            return self._list_snapshot_ids_unlocked()
+
+    def _list_snapshot_ids_unlocked(self):
         safe_path(self.workspace, self.directory)
         ids = []
         for path in self.directory.iterdir():
@@ -312,7 +295,8 @@ class PersistentShadowSnapshotStore:
         return tuple(sorted(ids))
 
     def verify_store(self):
-        return tuple((sid, fingerprint(self.verify_snapshot(sid))) for sid in self.list_snapshot_ids())
+        with BoundedShadowLock(self.lock_path):
+            return tuple((sid, fingerprint(self._verify_snapshot_unlocked(sid))) for sid in self._list_snapshot_ids_unlocked())
 
     def recover_read_only(self):
         return dict(status="RECOVERED_READ_ONLY", inventory=self.verify_store(), consumption_enabled=False)
@@ -329,9 +313,9 @@ class PersistentShadowSnapshotStore:
                 evidence=evidence, published_at=published_at)
             self._validate_envelope(envelope, snapshot.snapshot_id)
             if target.exists():
-                if self.get(snapshot.snapshot_id) != snapshot:
+                if self._get_unlocked(snapshot.snapshot_id) != snapshot:
                     reject("PERSISTENT_SNAPSHOT_ID_CONFLICT")
                 return dict(idempotent=True, snapshot_id=snapshot.snapshot_id)
             atomic_json(self.workspace, target, envelope, immutable=True)
-            self.verify_snapshot(snapshot.snapshot_id)
+            self._verify_snapshot_unlocked(snapshot.snapshot_id)
             return dict(idempotent=False, snapshot_id=snapshot.snapshot_id)

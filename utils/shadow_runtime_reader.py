@@ -843,10 +843,18 @@ class ShadowRuntimeReader:
                     )
                 else:
                     try:
-                        records = tuple(self._audit_store.records())
-                        self._audit_store.verify()
+                        from utils.shadow_activation_audit_store import ShadowActivationAuditStore
+                        if isinstance(self._audit_store, ShadowActivationAuditStore):
+                            audit_snapshot = self._audit_store.verified_snapshot()
+                            records, audit_report = audit_snapshot.records, audit_snapshot.report
+                        else:
+                            records = tuple(self._audit_store.records())
+                            audit_report = self._audit_store.verify()
+                            if (audit_report["entry_count"] != len(records)
+                                or audit_report["chain_tip"] != (records[-1].entry_hash if records else "0" * 64)):
+                                raise ValueError("audit source changed during verification")
                         store_identity = str(self._audit_store.store_identity())
-                        chain_tip = str(self._audit_store.chain_tip())
+                        chain_tip = audit_report["chain_tip"]
                         entry_count = len(records)
                     except Exception:  # noqa: BLE001
                         rejections.append("RE_ENABLE_RECOVERY_STATE_INVALID")

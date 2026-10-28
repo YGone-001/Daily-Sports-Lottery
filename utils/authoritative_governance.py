@@ -306,8 +306,8 @@ def build_authoritative_governance_view(
             "the authoritative governance ledger does not exist",
             rejection_codes=("TRUSTED_ARTIFACT_MALFORMED",),
         )
-    entries = ledger.entries()
-    structural = ledger.verify()
+    snapshot = ledger.verified_snapshot()
+    entries, structural = snapshot.entries, snapshot.report
 
     checkpoint_payload = verify_trusted_artifact(
         ledger_checkpoint,
@@ -338,11 +338,13 @@ def build_authoritative_governance_view(
         )
 
     audit = audit_historical_approvals(
-        ledger,
+        ledger._captured_read_source(snapshot),
         trusted_public_key_path=trusted_owner_public_key_path,
         dataset_identity=dataset_identity,
     )
     approved_records = _derive_approved_records(entries, audit, dataset_identity)
+    # A second observation is only a currentness fence: it can reject an
+    # advance, never contribute fields to the captured authenticated view.
     if ledger.entries() != entries:
         _approval_error("governance history changed during approval authentication")
 

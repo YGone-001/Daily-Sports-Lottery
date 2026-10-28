@@ -33,6 +33,10 @@ class ShadowSnapshotControlJournal:
         return fingerprint(dict(schema=JOURNAL_SCHEMA, path=str(self.path), dataset=self.dataset_identity))
 
     def records(self):
+        with BoundedShadowLock(self.lock_path):
+            return self._records_unlocked()
+
+    def _records_unlocked(self):
         safe_path(self.workspace, self.path)
         if not self.path.exists():
             return ()
@@ -69,7 +73,7 @@ class ShadowSnapshotControlJournal:
         if event_type not in EVENT_TYPES:
             reject("CONTROL_JOURNAL_EVENT_UNSUPPORTED")
         with BoundedShadowLock(self.lock_path):
-            records = self.records()
+            records = self._records_unlocked()
             request_id = command.payload()["request_id"] if command is not None else ""
             record = dict(schema_version=JOURNAL_SCHEMA, sequence=len(records),
                 previous_hash=records[-1]["entry_hash"] if records else GENESIS, event_type=event_type,
@@ -87,6 +91,6 @@ class ShadowSnapshotControlJournal:
                 handle.flush()
                 os.fsync(handle.fileno())
             sync_directory(self.workspace)
-            if self.records()[-1] != record:
+            if self._records_unlocked()[-1] != record:
                 reject("CONTROL_JOURNAL_READBACK_MISMATCH")
             return record

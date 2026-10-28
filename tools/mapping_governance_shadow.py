@@ -54,6 +54,8 @@ from utils.mapping_governance import (
     MappingState,
     ProposalAction,
     audit_historical_approvals,
+    _audit_historical_snapshot,
+    _mapping_eligibility_entries,
     build_approval_body,
     build_proposal,
     governance_rule_for,
@@ -374,17 +376,18 @@ def shadow_validate(
                     }
                 )
 
-    ledger_state = ledger.proposal_states() if write_ledger else {}
-    active = ledger.active_bindings() if write_ledger else {}
-    legacy_active = ledger.legacy_active_bindings() if write_ledger else ()
+    snapshot = ledger.verified_snapshot() if ledger.exists() else None
+    ledger_state = ledger._proposal_states(snapshot.entries) if write_ledger and snapshot else {}
+    active = ledger._active_bindings(snapshot.entries) if write_ledger and snapshot else {}
+    legacy_active = ledger._legacy_active_bindings(snapshot.entries) if write_ledger and snapshot else ()
 
     # 4) 独立的历史批准审计（仅在提供可信公钥时；缺失时绝不退化为信任内嵌公钥）
     audit: dict | None = None
     eligibility: dict | None = None
     if write_ledger and ledger.exists():
         if trusted_public_key_path:
-            audit = audit_historical_approvals(
-                ledger,
+            audit = _audit_historical_snapshot(
+                ledger, snapshot,
                 trusted_public_key_path=trusted_public_key_path,
                 dataset_identity=dataset_identity,
             )
@@ -398,8 +401,8 @@ def shadow_validate(
                     "approval verification is claimed"
                 ),
             }
-        eligibility = mapping_eligibility(
-            ledger, current_baseline_fingerprint=baseline
+        eligibility = _mapping_eligibility_entries(
+            snapshot.entries, current_baseline_fingerprint=baseline
         )
 
     return {
@@ -422,7 +425,7 @@ def shadow_validate(
         "legacy_active_bindings": list(legacy_active),
         "authenticated_approval_audit": audit,
         "current_mapping_eligibility": eligibility,
-        "ledger_verification": ledger.verify() if ledger.exists() else None,
+        "ledger_verification": snapshot.report if snapshot else None,
         "governance_status": governance_status(),
         "production_mapping_write_authorization": PRODUCTION_MAPPING_WRITE_AUTHORIZATION,
         "runtime_ledger_enforcement": RUNTIME_LEDGER_ENFORCEMENT,
@@ -659,18 +662,19 @@ def build_isolated_governance_snapshot(
     bindings: tuple[tuple[str, str, str], ...] = ()
 
     if ledger_exists:
-        report = ledger.verify()
+        snapshot = ledger.verified_snapshot()
+        report, entries = snapshot.report, snapshot.entries
         structural_integrity = str(report["integrity"])
         limitations.append(
             "Structural ledger validation was performed; it proves internal "
             "consistency only and cannot detect tail truncation."
         )
-        states = tuple(sorted(ledger.proposal_states().items()))
+        states = tuple(sorted(ledger._proposal_states(entries).items()))
         fingerprints = tuple(
-            sorted({(e.proposal_id, e.proposal_fingerprint) for e in ledger.entries()})
+            sorted({(e.proposal_id, e.proposal_fingerprint) for e in entries})
         )
         try:
-            active = ledger.active_bindings()
+            active = ledger._active_bindings(entries)
         except GovernanceError as exc:  # noqa: BLE001
             limitations.append(
                 f"Active bindings could not be read under the current key contract: {exc}"
@@ -689,8 +693,8 @@ def build_isolated_governance_snapshot(
         )
 
     if trusted_public_key_path and ledger_exists:
-        audit = audit_historical_approvals(
-            ledger,
+        audit = _audit_historical_snapshot(
+            ledger, snapshot,
             trusted_public_key_path=trusted_public_key_path,
             dataset_identity=dataset_identity,
         )

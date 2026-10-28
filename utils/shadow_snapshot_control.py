@@ -177,10 +177,7 @@ class PersistentShadowSnapshotController:
     def _inspect(self):
         inventory = self.store.verify_store()
         records = self.journal.records()
-        audit_records = tuple(self.audit.records())
-        self.audit.verify()
-        if tuple(self.audit.records()) != audit_records:
-            reject("CONTROL_AUDIT_CONCURRENT_CHANGE")
+        audit_records = self.audit.verified_snapshot().records
         requests, pending, published = {}, set(), {}
         selected, generation, selection_sequence, last_commit, selection_command = "", 0, 0, None, ""
         bound_audit_ids, reconciled = set(), set()
@@ -383,8 +380,7 @@ class PersistentShadowSnapshotController:
         if not isinstance(record, ShadowAuditRecord):
             reject("CONTROL_AUDIT_RECEIPT_INVALID")
         receipt = self.audit.receipt_for(record)
-        self.audit.verify()
-        readback = tuple(self.audit.records())
+        readback = self.audit.verified_snapshot().records
         self._audit_record(record, receipt, command, sid, previous, event_type=event_type)
         if event_type in ("SHADOW_SNAPSHOT_SELECTED", "SHADOW_SNAPSHOT_SWITCHED") and (
             record.previous_entry_hash != p["expected_audit_tip"] or record.sequence != p["expected_audit_count"]
@@ -476,7 +472,8 @@ class PersistentShadowSnapshotController:
                 self._fail_closed(now, "control commitment not independently verified")
                 outcome = "UNCERTAIN"
                 try:
-                    if (self.audit.chain_tip(), len(self.audit.records())) == before_audit and not control_committed:
+                    audit_view = self.audit.verified_snapshot().report
+                    if (audit_view["chain_tip"], audit_view["entry_count"]) == before_audit and not control_committed:
                         outcome = "NOT_COMMITTED"
                 except Exception:
                     pass

@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
+from utils.ledger_lock import BoundedLedgerLock, VerifiedLedgerSnapshot
 
 from utils.source_identity import (
     IDENTITY_KEY_SCHEMA_VERSION,
@@ -1221,6 +1222,17 @@ def _entry_hash(payload: Mapping[str, Any]) -> str:
     return fingerprint(body)
 
 
+@dataclass(frozen=True)
+class _CapturedGovernanceReadSource:
+    """批准审计的显式只读来源；不持有锁，不提供任何写入或签名能力。"""
+    path: str
+    dataset_identity: str
+    snapshot: VerifiedLedgerSnapshot
+
+    def verified_snapshot(self):
+        return self.snapshot
+
+
 class GovernanceLedger:
     """
     隔离的 append-only 治理账本。
@@ -1252,6 +1264,10 @@ class GovernanceLedger:
         return os.path.exists(self.path)
 
     def raw_lines(self) -> tuple[str, ...]:
+        with _ledger_lock(self._lock_path):
+            return self._raw_lines_unlocked()
+
+    def _raw_lines_unlocked(self) -> tuple[str, ...]:
         if not self.exists():
             return ()
         with open(self.path, "r", encoding="utf-8") as handle:
@@ -1259,8 +1275,12 @@ class GovernanceLedger:
 
     def entries(self) -> tuple[LedgerEntry, ...]:
         """读取全部条目（只读；不做完整性判定）。"""
+        with _ledger_lock(self._lock_path):
+            return self._entries_unlocked()
+
+    def _entries_unlocked(self) -> tuple[LedgerEntry, ...]:
         out: list[LedgerEntry] = []
-        for index, line in enumerate(self.raw_lines()):
+        for index, line in enumerate(self._raw_lines_unlocked()):
             try:
                 payload = json.loads(line)
             except Exception as exc:  # noqa: BLE001
@@ -1283,7 +1303,18 @@ class GovernanceLedger:
 
         返回确定性报告；任何不一致都抛 ``LedgerIntegrityError``。
         """
+        return self.verified_snapshot().report
+
+    def verified_snapshot(self) -> VerifiedLedgerSnapshot:
+        # entries() copies one committed byte sequence under the writer lock.
+        # All subsequent validation/derivation is pure over that captured tuple.
         entries = self.entries()
+        return VerifiedLedgerSnapshot(entries, canonical_json(self._verify_entries(entries)))
+
+    def _captured_read_source(self, snapshot):
+        return _CapturedGovernanceReadSource(self.path, self.dataset_identity, snapshot)
+
+    def _verify_entries(self, entries) -> dict:
         previous = GENESIS_PREVIOUS_HASH
         seen_transitions: dict[str, str] = {}
         seen_replay_keys: dict[str, str] = {}
@@ -1337,8 +1368,8 @@ class GovernanceLedger:
             "entry_count": len(entries),
             "chain_tip": previous,
             "integrity": "OK",
-            "binding_key_contracts": self.binding_key_contracts(),
-            "incomplete_approved_entries": list(self.incomplete_approved_entries()),
+            "binding_key_contracts": self._binding_key_contracts(entries),
+            "incomplete_approved_entries": list(self._incomplete_approved_entries(entries)),
             "trust_anchor": LEDGER_TRUST_ANCHOR_STATEMENT,
         }
 
@@ -1346,8 +1377,12 @@ class GovernanceLedger:
 
     def proposal_states(self) -> dict[str, str]:
         """每个提案的当前状态（由最后一条迁移推导；只读）。"""
+        return self._proposal_states(self.entries())
+
+    @staticmethod
+    def _proposal_states(entries) -> dict[str, str]:
         states: dict[str, str] = {}
-        for entry in self.entries():
+        for entry in entries:
             states[entry.proposal_id] = entry.to_state
         return states
 
@@ -1369,12 +1404,15 @@ class GovernanceLedger:
         含义，也不得据以主张活动授权。设为 ``False`` 时只返回当前契约的绑定，
         旧键另行通过 ``legacy_active_bindings()`` 只读检视（历史可审计）。
         """
-        states = self.proposal_states()
+        return self._active_bindings(self.entries(), require_current_keys=require_current_keys)
+
+    def _active_bindings(self, entries, *, require_current_keys=True):
+        states = self._proposal_states(entries)
         bindings: dict[str, dict[str, str]] = {}
         for proposal_id, state in sorted(states.items()):
             if state not in ACTIVE_STATES:
                 continue
-            record = self._binding_record_for(proposal_id)
+            record = self._binding_record_for(proposal_id, entries)
             if record is None:
                 continue
             key, canonical_id, contract = record
@@ -1394,12 +1432,15 @@ class GovernanceLedger:
         """
         只读检视：由**旧契约**绑定键支撑的活动绑定（历史审计，不构成授权）。
         """
-        states = self.proposal_states()
+        return self._legacy_active_bindings(self.entries())
+
+    def _legacy_active_bindings(self, entries):
+        states = self._proposal_states(entries)
         legacy: list[dict[str, str]] = []
         for proposal_id, state in sorted(states.items()):
             if state not in ACTIVE_STATES:
                 continue
-            record = self._binding_record_for(proposal_id)
+            record = self._binding_record_for(proposal_id, entries)
             if record is None:
                 continue
             key, canonical_id, contract = record
@@ -1417,8 +1458,12 @@ class GovernanceLedger:
 
     def binding_key_contracts(self) -> dict[str, int]:
         """只读：账本中出现的绑定键契约分布。"""
+        return self._binding_key_contracts(self.entries())
+
+    @staticmethod
+    def _binding_key_contracts(entries) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for entry in self.entries():
+        for entry in entries:
             key = entry.binding_source_key
             if not key:
                 continue
@@ -1432,16 +1477,20 @@ class GovernanceLedger:
 
         新增记录永不缺证据；该视图用于检出旧记录并驱动 fail-closed 审计。
         """
+        return self._incomplete_approved_entries(self.entries())
+
+    @staticmethod
+    def _incomplete_approved_entries(entries):
         return tuple(
             entry.sequence
-            for entry in self.entries()
+            for entry in entries
             if entry.to_state in ACTIVE_STATES
             and (not entry.approval_artifact or not entry.proposal_evidence)
         )
 
-    def _binding_record_for(self, proposal_id: str) -> tuple[str, str, str] | None:
+    def _binding_record_for(self, proposal_id: str, entries=None) -> tuple[str, str, str] | None:
         """从账本中恢复某提案的绑定记录（身份键 + 目标 Canonical ID + 契约分类）。"""
-        for entry in self.entries():
+        for entry in self.entries() if entries is None else entries:
             if entry.proposal_id != proposal_id:
                 continue
             key = entry.binding_source_key
@@ -1479,9 +1528,9 @@ class GovernanceLedger:
         validate_proposal(proposal)
 
         with _ledger_lock(self._lock_path):
-            entries = self.entries()
+            entries = self._entries_unlocked()
             if entries:
-                self.verify()
+                self._verify_entries(entries)
 
             previous = entries[-1].entry_hash if entries else GENESIS_PREVIOUS_HASH
 
@@ -1596,7 +1645,7 @@ class GovernanceLedger:
                         f"evidence; identity_kind='{proposal.identity_key_kind}' is not "
                         "sufficient"
                     )
-                existing = self.active_bindings().get(proposal.source_key)
+                existing = self._active_bindings(entries).get(proposal.source_key)
                 if existing and existing["canonical_id"] != proposal.candidate_canonical_id:
                     raise ConflictingBindingError(
                         "Source identity is already actively bound to Canonical ID "
@@ -1646,94 +1695,12 @@ LEDGER_LOCK_TIMEOUT_SECONDS = 120.0
 LEDGER_LOCK_POLL_SECONDS = 0.05
 
 
-class _ledger_lock:
-    """
-    账本专用的跨进程 + 跨线程互斥锁。
+class _ledger_lock(BoundedLedgerLock):
+    """保留 120 秒默认值；统一线程与 Windows/POSIX 的总获取截止时间。"""
 
-    刻意**不复用** ``utils/concurrency.acquire_refresh_lock``：后者绑定
-    ``config.DATA_DIR`` 且属于刷新锁语义，二者不得相互影响。
-    """
-
-    _thread_guards: dict[str, Any] = {}
-    _thread_guards_lock = None
-
-    def __init__(self, lock_path: str) -> None:
-        self._lock_path = lock_path
-        self._fd: int | None = None
-        self._guard = None
-
-    def __enter__(self):
-        import threading
-
-        if _ledger_lock._thread_guards_lock is None:
-            _ledger_lock._thread_guards_lock = threading.Lock()
-        with _ledger_lock._thread_guards_lock:
-            guard = _ledger_lock._thread_guards.get(self._lock_path)
-            if guard is None:
-                guard = threading.Lock()
-                _ledger_lock._thread_guards[self._lock_path] = guard
-        self._guard = guard
-        self._guard.acquire()
-
-        directory = os.path.dirname(self._lock_path) or "."
-        os.makedirs(directory, exist_ok=True)
-        self._fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        st = os.fstat(self._fd)
-        if st.st_size == 0:
-            os.write(self._fd, b"0")
-        os.lseek(self._fd, 0, os.SEEK_SET)
-
-        try:
-            self._acquire_os_lock()
-        except BaseException:
-            os.close(self._fd)
-            self._fd = None
-            self._guard.release()
-            raise
-        return self
-
-    def _acquire_os_lock(self) -> None:
-        """获取 OS 级排他锁；以截止时间为界重试，超时才放弃。"""
-        if os.name == "nt":
-            import msvcrt
-
-            deadline = time.monotonic() + LEDGER_LOCK_TIMEOUT_SECONDS
-            while True:
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                try:
-                    msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
-                    return
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise
-                    time.sleep(LEDGER_LOCK_POLL_SECONDS)
-        else:
-            import fcntl
-
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            if self._fd is not None:
-                try:
-                    if os.name == "nt":
-                        import msvcrt
-
-                        os.lseek(self._fd, 0, os.SEEK_SET)
-                        msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(self._fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                finally:
-                    os.close(self._fd)
-                    self._fd = None
-        finally:
-            if self._guard is not None:
-                self._guard.release()
-        return False
+    def __init__(self, lock_path, timeout=None):
+        super().__init__(lock_path, timeout=LEDGER_LOCK_TIMEOUT_SECONDS if timeout is None else timeout,
+            poll_interval=LEDGER_LOCK_POLL_SECONDS)
 
 
 # =============================================================================
@@ -1830,8 +1797,13 @@ def audit_historical_approvals(
             "audit; an embedded public key is never accepted as the trust anchor"
         )
 
-    structural = ledger.verify()
-    entries = ledger.entries()
+    return _audit_historical_snapshot(ledger, ledger.verified_snapshot(),
+        trusted_public_key_path=trusted_public_key_path, dataset_identity=dataset_identity)
+
+
+def _audit_historical_snapshot(ledger, snapshot, *, trusted_public_key_path, dataset_identity=None):
+    """复用同一已读副本的原批准验证算法；不增加任何签名权威。"""
+    structural, entries = snapshot.report, snapshot.entries
     verified: list[dict] = []
     failures: list[dict] = []
 
@@ -1940,11 +1912,15 @@ def mapping_eligibility(
     已经变化而**不再可执行**。二者必须分开报告：一份有效的旧签名**绝不**自动
     授权对新基线采取行动。
     """
-    states = ledger.proposal_states()
+    return _mapping_eligibility_entries(ledger.entries(), current_baseline_fingerprint=current_baseline_fingerprint)
+
+
+def _mapping_eligibility_entries(entries, *, current_baseline_fingerprint):
+    states = GovernanceLedger._proposal_states(entries)
     eligible: list[dict] = []
     stale: list[dict] = []
 
-    for entry in ledger.entries():
+    for entry in entries:
         if entry.to_state not in ACTIVE_STATES:
             continue
         if states.get(entry.proposal_id) not in ACTIVE_STATES:
