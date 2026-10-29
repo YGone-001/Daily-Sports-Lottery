@@ -5,8 +5,9 @@
 仓库：`https://github.com/YGone-001/Daily-Sports-Lottery.git`；分支 **develop**。
 验收起点：`3fc6683081560936dc0ea6e7650155e8cb4123ee`。
 保留的 main：`bb8bbe542449ceca3964bae42ad6f132b33b9af2`。
-最终提交的 SHA、远程工作流与四个作业结论由提交后的最终交付回复提供，
-**本文件不预先宣称尚未发生的最终 CI 成功**。
+安全实现及测试验收提交：`a6b17053c6c7eaae616993bc2f6727d913e9eef1`。
+本报告随后以前向文档提交回填已经完成的远程证据；该文档提交不改变任何安全实现或测试。
+包含本报告的最终仓库 HEAD 与其独立 CI 核验结果列于最终交付回复，避免在提交内容中自引用尚未生成的 SHA。
 
 ## 2. 预检与 Git 完整性
 
@@ -457,10 +458,27 @@ data/*.json 未加入变更，六个非 Canonical 文件与 Canonical 文件均�
 
 ## 24. 远程 CI 与最终 SHA
 
-CI 保留 Ubuntu/Windows × Python 3.12 的两个 full-suite 作业和两个 Canonical lifecycle 作业；
-两个 full-suite 作业新增执行真实集成演示，错误或七库变化直接失败。
-最终 SHA、四个 job ID、实际 pytest totals 和 workflow conclusion 在推送完成后核实，列于最终交付回复。
-提交前本地证据不能替代远程证据；**没有预先宣称最终 workflow success**。
+实现验收 SHA：`a6b17053c6c7eaae616993bc2f6727d913e9eef1`。
+[CI 40722550356](https://github.com/YGone-001/Daily-Sports-Lottery/actions/runs/40722550356)
+经 GitHub API 核实 **completed/success**，head_sha 精确匹配。
+
+| 作业 | job ID / 日志 | 真实结果 |
+| :--- | :--- | :--- |
+| Windows full pytest | [122937045857](https://github.com/YGone-001/Daily-Sports-Lottery/actions/runs/40722550356/job/122937045857) | **2137 passed, 2 skipped in 363.23s** |
+| Ubuntu full pytest | [122937046168](https://github.com/YGone-001/Daily-Sports-Lottery/actions/runs/40722550356/job/122937046168) | **2132 passed, 7 skipped in 155.31s** |
+| Windows Canonical lifecycle | [122937046293](https://github.com/YGone-001/Daily-Sports-Lottery/actions/runs/40722550356/job/122937046293) | **23 passed in 7.36s** |
+| Ubuntu Canonical lifecycle | [122937046598](https://github.com/YGone-001/Daily-Sports-Lottery/actions/runs/40722550356/job/122937046598) | **23 passed in 0.64s** |
+
+四个作业均 completed/success。两个 full-suite 作业中的集成演示步骤均成功，日志实际输出
+`success=true / scenarios=32 / decision=NO-GO`；工具内部同时执行 8 个提交故障不变量。
+Ubuntu 的 7 个 skip 均为既有 Windows msvcrt/byte-range/deny-delete/NTFS junction 路径；
+Windows 的 2 个 skip 为既有 POSIX 专属路径。新集成测试在两个平台均不 skip。
+Windows 单独强制 junction 回归实际 **1 passed / 90 deselected**，没有跳过。
+
+推送后 fetch 已核实 HEAD=origin/develop=上述实现 SHA，origin/main 保持
+`bb8bbe542449ceca3964bae42ad6f132b33b9af2`，工作区干净。作者/提交者均符合 AGENTS.md；
+提交单行、空 body、无禁止字眼，无历史改写。
+本次仅回填文档；最终文档提交仍触发相同四个 CI 作业，最终交付回复再核实其精确 SHA 与结论。
 
 ## 25. Gates A–AC
 
@@ -486,14 +504,14 @@ CI 保留 Ubuntu/Windows × Python 3.12 的两个 full-suite 作业和两个 Can
 | R | Replay and State Rollback Protection | **PASS（会话内）** | §14；不声称生产持久或全局当前性 |
 | S | Crash/Restart Safety | **PASS（进程崩溃）** | 5 个真实进程退出边界与公钥只读重启 |
 | T | Cross-Process Consistency | **PASS（本机合作进程）** | IT-31/32 + 既有 LC 真实进程套件 |
-| U | Windows/POSIX Lock Safety | **WINDOWS_PASS / POSIX_PENDING_CI** | Windows 实际 OS 锁；最终双平台 CI 补全 |
+| U | Windows/POSIX Lock Safety | **PASS（Windows/POSIX）** | 双平台完整 CI 成功；实际 OS contention、释放和跨进程验证 |
 | V | Production Entry-Point Isolation | **PASS** | AST 22 模块 import closure、routes、frontend、startup、repair audit |
 | W | Production Trust-Source Gap Register | **PASS** | A–R / B-01–14；责任/根未知不猜测 |
 | X | Functional Integration Demonstration | **PASS** | 32 场景 + 8 故障；普通/优化 JSON 完全一致 |
 | Y | Seven-Store Byte Integrity | **PASS** | §23；七个实际本机 JSON SHA-256 完全一致 |
 | Z | Complete Local Regression | **PASS** | 2137 passed / 2 skipped；定向876 passed / 2 skipped |
-| AA | Four Remote CI Jobs and Workflow | **PENDING_FINAL_COMMIT_CI** | 最终提交后核实，禁止提前宣称成功 |
-| AB | Forward-Only Git Integrity | **PENDING_COMMIT_AND_PUSH** | 提交/推送后核对 HEAD、origin/develop、main 与空工作区 |
+| AA | Four Remote CI Jobs and Workflow | **PASS（实现验收 SHA）** | §24：精确 a6b1705 四个作业及整体 workflow success；最终文档提交另核实 |
+| AB | Forward-Only Git Integrity | **PASS（前向提交）** | §24：HEAD=origin/develop，main 不变、工作区干净；最终文档提交另核实 |
 | AC | Explicit Production NO-GO | **PASS** | 三标志关闭；PRODUCTION_ACTIVATION_READY=NO / NO-GO |
 
 PASS 只用于可复核实际证据；完整链路门不因单个组件测试通过而通过。
@@ -560,5 +578,6 @@ PRODUCTION_ACTIVATION_READY = NO
 DECISION = NO-GO
 ```
 
-最终任务状态依 Gates 与最终远程证据报告为 PHASE 2-P COMPLETED 或 PHASE 2-P BLOCKED。
+**实现验收状态：PHASE 2-P COMPLETED。** Gates A–AC 已有上述实际证据，保证范围仍仅限隔离合成验收。
+最终文档提交的 SHA、远程复验和空工作区由最终交付回复给出；不从已有实现工作流推测新提交的 CI 结论。
 停止于验收、文档、回归、前向提交、推送及 CI 核验；不接生产刷新、不部署安全服务、不自动开始后续工作。
