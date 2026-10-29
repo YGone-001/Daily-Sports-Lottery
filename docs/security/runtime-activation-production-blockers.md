@@ -270,3 +270,39 @@ DECISION                       = NO-GO
 4. 观测来源认证的验证报告。
 5. 恢复证据与差异对账的验证报告。
 6. 权威 Canonical 所有权视图的验证报告。
+
+## 5. 生产信任根与部署契约的横向阻断
+
+本次仅建立 DESIGNED 契约，不部署服务，不将既有组件/合成验收当作生产整改完成。
+B-01–14 的生产结论保持；下表新增横向 blocker，详细 authority 和可度量负向验收以
+[结构化验收登记](runtime-activation-production-acceptance-gates.md)为准。
+
+| ID | 严重度 | 未建立的控制 | 必须取得的未来验收 |
+| --- | --- | --- | --- |
+| BT-ROOT | Critical | 带外初始根、独立双批准、固定分发、最低版本和应急吊销 | PA-O/PA-R；根整组替换、降级、失陷恢复均 fail closed |
+| BT-OWNER | Critical | 十八类实际职责接受、安全批准、实施/可用性/恢复责任 | PA-A–R；逐类实名职责证据与签发/验证分离 |
+| BT-CONTINUITY | Critical | 时间、治理、lifecycle、撤销和 checkpoint 持久高水位 | PA-G/H/I/L/M；备份回滚/重启/旧状态重签拒绝 |
+| BT-DURABILITY | High | 目标平台耐久性、独立备份恢复与敌对目录边界 | PA-P；实际断电/确认丢失不静默成功 |
+| BT-POLICY | High | drift、寿命、freshness、撤销可见性、保留与升级预算 | PA-F/G/I/Q；审批数值政策及边界/断服务实测 |
+| BT-DEPLOYMENT | Critical | 生产非可选严格构造、固定来源和所有入口封闭 | PA-R、SD-01–15；全部降级与 legacy 入口拒绝 |
+| BT-REVIEW | High | 真实等效环境完整链路和独立安全复评 | PA-A–R/TH-01–20；独立原始部署证据和单独生产决策 |
+
+所有 blocker 仍 OPEN、deployment_verified=false。未知 owner/root 不可用概念角色或 caller 公钥替代。
+恢复 authority 必须有 operational recovery owner 与独立 security approver，缺失时拒绝恢复写入和再启用。
+旧的组件整改顺序只描述历史分解；后续基础设施依赖以新部署契约 W01–W14 为准，均 BLOCKED。
+根/时间/撤销/检查点缺失、当前 ownership 无法确立、UNCERTAIN 或 continuity 丢失任一项均足以 NO-GO。
+**PRODUCTION_ACTIVATION_READY = NO；DECISION = NO-GO。**
+
+## 6. 阻断关闭的状态分层
+
+| 状态 | 本次含义与证据 |
+| --- | --- |
+| DESIGNED | YES；已规定生产信任、部署和未来验收契约 |
+| OWNER_ASSIGNED | NO；无实际职责接受，不得用概念角色替代 |
+| APPROVED | NO；无真实根、平台和数值政策批准 |
+| IMPLEMENTED | NO（生产）；隔离组件实现不能关闭 blocker |
+| VERIFIED_IN_TEST | NO（生产控制）；离线表检查和合成回归仅证明各自范围 |
+| VERIFIED_IN_DEPLOYMENT | NO；没有实际部署故障/连续性验证 |
+| PRODUCTION_AUTHORIZED | NO；所有 blocker 保持 OPEN，生产 NO-GO |
+
+任何设计或测试 gate PASS 都不将后续状态自动置为 YES。

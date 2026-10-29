@@ -84,3 +84,27 @@
 5. 建立监控/事件响应和不可绕过的严格部署政策，执行真实环境故障及跨平台验收，再独立安全复评。
 
 本次仅登记依赖，**没有执行上述生产部署，也没有授权实施下一项工作**。
+
+## 6. 生产信任引导契约更新
+
+本次基线 `7c8e28f395cfb0edacd7e1e7055e254d14dbd43b`；前文保留前次评审历史基线。
+十八类 A–R 的生产设计现为 DESIGNED，实际 operational/security/implementation/availability owner
+全部 NOT_ESTABLISHED；生产根来源、平台、存储、checkpoint publisher 和恢复责任也未建立。
+**设计完成不关闭任何生产阻断项**。
+
+| 证据级别 | 本次状态 |
+| --- | --- |
+| DESIGNED | 所有权、根引导、部署、威胁模型、依赖和验收契约已记录 |
+| OWNER_ASSIGNED | NO；无真实职责接受记录 |
+| APPROVED | NO；根、数值政策和部署无实际批准 |
+| IMPLEMENTED | NO（生产）；既有隔离 shadow 代码保持原状 |
+| VERIFIED_IN_TEST | NO（生产）；本次只运行离线契约与既有合成回归 |
+| VERIFIED_IN_DEPLOYMENT | NO；没有部署或现场验证 |
+| PRODUCTION_AUTHORIZED | NO；测试/门禁不得自动晋级 |
+
+权威字段和 signer/root 关联以[所有权登记](runtime-activation-production-authority-ownership.md)为准；
+初始根、配置分发、轮换/吊销和来源完整性见[根引导](runtime-activation-production-trust-bootstrap.md)；
+持久高水位、多存储差异、严格模式和依赖 DAG 见[部署契约](runtime-activation-production-deployment-contract.md)；
+B-01–14 与 BT-* 的未来验收及 A–X 证据口径见[验收门禁](runtime-activation-production-acceptance-gates.md)。
+所有十八类真实部署验收均 NOT_EXECUTED，数值生产政策均 POLICY_NOT_APPROVED。
+**PRODUCTION_ACTIVATION_READY = NO；DECISION = NO-GO。**
