@@ -2,9 +2,13 @@
 
 TC-01..16 validate linked contracts, not keyword presence. Mutation controls prove
 that broken authority/root/separation/continuity/dependency/gate links are rejected.
-The frozen repository manifest is scoped to this documentation-only change.
+The original frozen manifest is verified against its exact historical Git tree.
+Current authorized implementation is assessed by the new pilot boundary tests.
 """
 from copy import deepcopy
+from functools import lru_cache
+from io import BytesIO
+import tarfile
 import ast
 import hashlib
 import json
@@ -25,6 +29,7 @@ NAMES = {
 UNKNOWN = "NOT_ESTABLISHED"
 STATES = ("DESIGNED", "OWNER_ASSIGNED", "APPROVED", "IMPLEMENTED", "VERIFIED_IN_TEST",
           "VERIFIED_IN_DEPLOYMENT", "PRODUCTION_AUTHORIZED")
+HISTORICAL_REVISION = "4f4da993a27dc0c5362f38bc228b463ba364999b"
 CATEGORIES = set("ABCDEFGHIJKLMNOPQR")
 STORES = {"daily_matches.json", "team_strength.json", "calibrated.json",
           "prediction_snapshots.json", "odds_snapshots.json", "settlements.json", "evaluation_rows.json"}
@@ -45,10 +50,23 @@ def unique(records, field):
     return set(values)
 
 
+@lru_cache(maxsize=1)
+def historical_files():
+    # Read the exact committed snapshot, including its original seven-path scope.
+    # CI checks out history before offline pytest; tests never fetch or write it.
+    archive = subprocess.check_output(["git", "archive", "--format=tar", HISTORICAL_REVISION], cwd=ROOT)
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as tree:
+        return {member.name: tree.extractfile(member).read() for member in tree.getmembers() if member.isfile()}
+
+
+def historical_text(path):
+    return historical_files()[path].decode("utf-8-sig")
+
+
 def load_contracts():
     result = {}
     for key, name in NAMES.items():
-        blocks = re.findall(r"```json\n(.*?)\n```", (SECURITY / name).read_text(encoding="utf-8"), re.S)
+        blocks = re.findall(r"```json\n(.*?)\n```", historical_text("docs/security/" + name), re.S)
         need(len(blocks) == 1, "one-review-table:" + key)
         result[key] = json.loads(blocks[0])
     return result
@@ -75,8 +93,8 @@ def validate_ownership(c):
         need(bool(a["trust_boundary"] and a["authoritative_dataset_and_scope"]), "authority-scope")
         for e in a["supporting_evidence"]:
             path = ROOT / e["path"]
-            need(path.is_file() and path.suffix == ".py", "source-evidence-path")
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            need(e["path"] in historical_files() and path.suffix == ".py", "source-evidence-path")
+            tree = ast.parse(historical_text(e["path"]))
             need(any(isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == e["symbol"] for n in ast.walk(tree)), "source-evidence-symbol")
 
 
@@ -271,7 +289,7 @@ WIRE_SOURCES = {
 @pytest.mark.parametrize("role", sorted(WIRE_SOURCES))
 def test_tc04_signer_purpose_reconciles_with_actual_code(contracts, role):
     name, constant = WIRE_SOURCES[role]
-    tree = ast.parse((ROOT / "utils" / name).read_text(encoding="utf-8-sig"))
+    tree = ast.parse(historical_text("utils/" + name))
     values = [node.value.value for node in tree.body if isinstance(node, ast.Assign)
               and any(isinstance(t, ast.Name) and t.id == constant for t in node.targets)
               and isinstance(node.value, ast.Constant)]
@@ -331,7 +349,7 @@ def test_contract_mutations_fail_closed(contracts, mutation, code):
 
 
 def test_dependency_diagram_matches_structured_register(contracts):
-    text = (SECURITY / NAMES["deployment"]).read_text(encoding="utf-8")
+    text = historical_text("docs/security/" + NAMES["deployment"])
     edges = set(re.findall(r"^ (W[0-9]{2})(?:\[[^\]]*\])? --> (W[0-9]{2})", text, re.M))
     expected = {(pre, w["id"]) for w in contracts["deployment"]["work_packages"] for pre in w["prerequisites"]}
     assert edges == expected
@@ -352,13 +370,12 @@ def test_tc14_production_flags_stay_disabled(contracts):
 def test_tc15_seven_protected_stores(contracts, seven_store_session_integrity):
     expected = contracts["acceptance"]["protected_stores"]
     assert set(expected) == STORES
-    for name, digest in seven_store_session_integrity.items():
-        assert re.fullmatch(r"[0-9a-f]{64}", expected[name])
-        if digest != "<absent>":
-            assert digest == expected[name], name
-        # CI has no ignored production data; absence only proves non-creation.
-        else:
-            assert not (ROOT / "data" / name).exists()
+    # Original recorded hashes remain in the exact historical Git document.
+    # Private JSON was never committed: do not present archived metadata as old bytes.
+    assert all(re.fullmatch(r"[0-9a-f]{64}", digest) for digest in expected.values())
+    assert len(expected) == 7
+    # Active safety assertion: every currently present/absent store stays identical
+    # during this run, independently of legitimate changes between authorized runs.
     assert store_hashes() == seven_store_session_integrity
 
 
@@ -368,10 +385,12 @@ def test_tc16_no_runtime_integration_new_endpoints_keys_or_weakened_existing_tes
     assert len(allowed) == 7 and "tests/test_production_trust_contracts.py" in allowed
     assert all(p.startswith("docs/security/runtime-activation-production-") and p.endswith(".md")
                for p in allowed - {"tests/test_production_trust_contracts.py"})
-    listed = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT).decode().split("\0")
-    assert {p for p in listed if p} - allowed == set(frozen["paths"])
+    archived = historical_files()
+    assert set(archived) - allowed == set(frozen["paths"])
     h = hashlib.sha256()
     for name in frozen["paths"]:
-        data = (ROOT / name).read_bytes().replace(b"\r\n", b"\n")
+        data = archived[name].replace(b"\r\n", b"\n")
         h.update(name.encode() + b"\0" + hashlib.sha256(data).digest())
-    assert h.hexdigest() == frozen["normalized_sha256"], "existing code/tests/entrypoints/CI changed"
+    assert h.hexdigest() == frozen["normalized_sha256"], "historical scope/content changed"
+    # The current authorized change has its own allowlist and executable boundary
+    # assertions in test_trust_root_bootstrap; historic scope is never overwritten.

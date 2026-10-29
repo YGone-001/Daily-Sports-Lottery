@@ -39,6 +39,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Pinned historical trust-contract evidence; pytest remains offline.
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -137,6 +139,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Pinned historical trust-contract evidence; pytest remains offline.
 
       - name: Set up Python
         uses: actions/setup-python@v5

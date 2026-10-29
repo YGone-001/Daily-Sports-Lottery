@@ -108,3 +108,23 @@
 B-01–14 与 BT-* 的未来验收及 A–X 证据口径见[验收门禁](runtime-activation-production-acceptance-gates.md)。
 所有十八类真实部署验收均 NOT_EXECUTED，数值生产政策均 POLICY_NOT_APPROVED。
 **PRODUCTION_ACTIVATION_READY = NO；DECISION = NO-GO。**
+
+## 7. 离线根引导功能试验
+
+基线 `4f4da993a27dc0c5362f38bc228b463ba364999b`。新增
+[离线根引导与固定权威试验](runtime-activation-offline-trust-bootstrap.md)：独立 harness pin、
+真实签名 bundle、独立批准的 transition、角色/用途/范围核验、会话防回退和固定 Shadow 适配器。
+这是 **隔离组件实现与测试证据**，不建立生产根来源或真实运营轮换。
+
+| 状态 | 当前边界 |
+| --- | --- |
+| DESIGNED / IMPLEMENTED | 离线试验已有功能；生产基础设施未实施 |
+| VERIFIED_IN_TEST | 以本次实际执行结果为准；精确计数及最终 CI 在交付报告 |
+| OWNER_ASSIGNED / APPROVED | 生产仍 NOT_ESTABLISHED；不以合成 actor/批准替代 |
+| VERIFIED_IN_DEPLOYMENT | NO；没有生产现场证据 |
+| PRODUCTION_AUTHORIZED | NO；不得由试验或 CI 自动晋级 |
+
+旧四份生产契约及原冻结范围保持历史可审计；旧测试改为核验固定 Git 历史树，
+本次改动用单独版本的活跃范围与七库运行前后字节检查保护。
+生产 root、持久 continuity、全局 currentness、真实 owner、独立服务与部署策略仍是阻断项。
+**PRODUCTION_ACTIVATION_READY = NO；DECISION = NO-GO。**
