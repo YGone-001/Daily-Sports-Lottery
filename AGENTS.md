@@ -150,6 +150,9 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   `git rev-parse --git-path info/exclude` 定位文件（兼容 `.git` 为文件的 worktree），
   并**幂等**追加 `/reports/`；不得用 `.gitignore` 代替。
 - **不得** `git add -f reports/`；报告不得进入任何提交或推送。
+- 该规则属于**本机 Git 元数据**，因此**不会**出现在全新克隆（包括 CI checkout）中；
+  CI 不需要也不得创建它。本地校验命令如下（在未配置该规则的全新克隆上会输出为空，
+  这属于预期环境差异，不代表规则缺失）。
 - 验证：`git check-ignore -v reports/<文件>` 必须命中；`git ls-files -- reports/` 必须为空。
 
 ### 5.2 远程 CI 必须先于最终报告完成
