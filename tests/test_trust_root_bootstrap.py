@@ -24,7 +24,7 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v2-real-sports-identity-audit"
+SCOPE_VERSION = "offline-root-pilot-v3-strong-number-scoping"
 ALLOWED_PATHS = frozenset((
     # trust-root pilot scope (unchanged)
     "utils/trust_root_bootstrap.py",
@@ -39,7 +39,12 @@ ALLOWED_PATHS = frozenset((
     "tools/real_sports_identity_audit.py",
     "tests/test_real_sports_identity_audit.py",
     "docs/analysis/real-sports-identity-mapping-evidence.md",
-    "docs/analysis/real-sports-mapping-business-value.md"))
+    "docs/analysis/real-sports-mapping-business-value.md",
+    # strong-number conflict identity scoping
+    "AGENTS.md",
+    "utils/source_identity.py",
+    "tests/test_strong_number_conflict_scoping.py",
+    "docs/source-identity-provenance.md"))
 
 
 @pytest.fixture(scope="session", autouse=True)

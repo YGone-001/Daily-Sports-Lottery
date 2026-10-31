@@ -256,6 +256,37 @@ sole ownership proof.
 `detect_all_conflicts` also classifies `STRONG_NUMBER_CONFLICT` (severity `REJECT`) and
 `CANONICAL_OWNER_CONFLICT` (severity `AMBIGUOUS`, never auto-resolved to the latest claim).
 
+#### 6.3.1 `STRONG_NUMBER_CONFLICT` is scoped to one source event identity
+
+A stability scope is a **domain**, not an identity: every market row of one day shares
+`(adapter, sport, event_date, namespace, raw_identifier_type)`. Grouping by that key therefore
+cannot distinguish "one source identity contradicts itself" from "two independent matches
+happen to be listed on the same day".
+
+The grouping key is `strong_number_identity_key()`:
+
+| Dimension | Why it is part of the key |
+| :--- | :--- |
+| `adapter` | the same literal value under a different parser is a different declaration |
+| `sport` | football and basketball number spaces are independent; cross-sport reuse of a literal string is governed separately by `CROSS_SPORT_SHARED_NAMESPACE` |
+| `event_date` | the scoped identity is `(sport, date, number)`; re-use across dates is the cross-scope detector's job |
+| `derived_source_id` | identifies **that one** source event — the central element |
+
+Two dimensions are deliberately **excluded**:
+
+- `stability_scope.as_key()` — a domain shared by unrelated matches. Grouping by it produced
+  **52 scope-wide `REJECT` alerts on real data, of which 0 were per-identity contradictions**
+  (each alert covered 2–31 distinct source identities).
+- `raw_identifier_type` — it depends on "does the ID suffix happen to equal the competition
+  number", i.e. on how the row was classified. Including it split two observations of the
+  *same* source ID into different groups and **missed** a genuine contradiction.
+
+Missing `derived_source_id` yields `None`: a missing source identity is never completed or
+upgraded into a verified one, and no collision is invented for it.
+
+The severity contract is unchanged: a real per-identity contradiction stays `REJECT`, and
+`CONFLICT_GOVERNANCE_RULES` still maps it to `REJECTED` / `REJECT_IDENTITY_CLAIM`.
+
 ---
 
 ## 7. Evidence integrity

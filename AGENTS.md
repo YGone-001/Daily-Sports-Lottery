@@ -98,8 +98,83 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
-## 四、验收
+## 四、身份语义与冲突口径
+
+### 4.1 稳定性作用域 ≠ 唯一源事件身份
+
+| 概念 | 取值 | 语义 |
+| --- | --- | --- |
+| 稳定性作用域（`SourceIdentityScope` / `stability_scope`） | adapter × sport × event_date × provider_namespace × raw_identifier_type | 一个源**域**；同一天、同命名空间下的**多场不同比赛共享它** |
+| 源事件身份键（`strong_number_identity_key`） | adapter × sport × event_date × `derived_source_id` | 标识**具体的那一个源事件**声明 |
+
+> 冲突结论必须绑定到「**源事件身份**」，不能绑定到「域」。
+> 同一域内的独立比赛各自拥有不同编号，**不构成**身份互斥。
+
+### 4.2 强编号冲突必须按源事件身份判定
+
+`utils/source_identity.detect_strong_number_conflict` 的分组契约：
+
+- 分组键**必须**是 `strong_number_identity_key()`（含 `derived_source_id`）；
+- **不得**退回 `stability_scope.as_key()`：它描述域，会把独立比赛误判为互斥（真实数据上
+  曾产生 100% 假告警）；
+- **不得**把 `raw_identifier_type` 纳入分组：它取决于「id 尾段是否恰等于竞彩编号」这一观测
+  形态，纳入后会**漏检**同一源 ID 的真实矛盾；
+- **不得**只按 `competition_number_normalized` 分组：目标是「一个源身份是否自相矛盾」，
+  不是「哪些比赛共用编号」；
+- 缺少 `derived_source_id` 时返回 `None`，**绝不**为缺失的源身份补全或升级证据。
+
+### 4.3 真实的身份矛盾必须 fail closed
+
+- 同一条派生源 ID 在同一作用域内声明两个及以上互斥强编号 → `STRONG_NUMBER_CONFLICT`，
+  严重度保持 `REJECT`。
+- **不得**为了让告警消失而把 `REJECT` 降级为 `AMBIGUOUS`，也不得整体屏蔽该类别。
+- 跨运动共享命名空间、行位置复用、Canonical 归属冲突三类检测**彼此独立**，
+  修正强编号分组时不得改变它们的语义。
+
+### 4.4 真实数据只读，结论不得外推
+
+- 不得自动合并重复 Canonical 归属、不得自动批准歧义对、不得改写 `calibrated.json`、
+  不得修改结算/评估引用、不得引入自动队名别名策略。
+- 无独立人工复核标签时，**不得**声称精度 / 召回提升。
+- 真实数据结论只在**本机真实数据**上成立；CI 无该私有数据集时，只能报告合成测试结果，
+  不得用合成结果冒充真实数据验收。
+
+---
+
+## 五、本地报告与交付顺序
+
+### 5.1 报告只存在于本机，绝不进入远程
+
+- 最终报告写入 `<仓库根>/reports/`，该目录**只属于本地检出**。
+- 排除规则通过 Git 本地元数据建立，使用
+  `git rev-parse --git-path info/exclude` 定位文件（兼容 `.git` 为文件的 worktree），
+  并**幂等**追加 `/reports/`；不得用 `.gitignore` 代替。
+- **不得** `git add -f reports/`；报告不得进入任何提交或推送。
+- 验证：`git check-ignore -v reports/<文件>` 必须命中；`git ls-files -- reports/` 必须为空。
+
+### 5.2 远程 CI 必须先于最终报告完成
+
+固定顺序：**提交 → 推送 → 定位最终 SHA 的 CI → 等待终态 → 核对每个 job → 才写报告**。
+
+- 不得用旧 SHA 的 CI 结果作为验收证据；
+- 不得以「各个 job 成功」推断「workflow 成功」，必须以 workflow 终态为准；
+- 终态为失败 / 取消时，记录真实结果并前向修复后重新验证，**不得**放弃 CI 直接写成功报告；
+- 未取得可验证终态前，**不得**生成最终报告，也不得写占位报告。
+
+### 5.3 精确 SHA 的 CI 校验
+
+- 以命令定位：`gh run list --commit <FINAL_SHA>`、`gh run view <RUN_ID> --json
+  databaseId,headSha,status,conclusion,jobs,url`，必要时 `gh run watch <RUN_ID> --exit-status`。
+- 记录 run id、URL、`headSha`、`status`、`conclusion` 与每个必需 job 的名称与结论。
+- 仓库 CI 为 `.github/workflows/ci.yml`，`develop` 触发，四个 job：
+  `offline-tests`（ubuntu / windows）与 `staging-validation`（ubuntu / windows）。
+
+---
+
+## 六、验收
 
 - 提交前运行 `python -m pytest -q`，并在回复中报告**真实执行结果**。
+- 必须分别标注三类结论：`SYNTHETIC_TEST_VERIFIED`、`REAL_DATA_MEASURED`、
+  `REAL_DATA_NOT_AVAILABLE`，不得混同。
 - CI：`.github/workflows/ci.yml`，push / PR 到 `develop` 触发，
-  矩阵 `ubuntu-latest` + `windows-latest` × Python 3.12。
+  矩阵 `ubuntu-latest` + `windows-latest` × Python 3.12；最终 SHA 上四个 job 必须全部成功。

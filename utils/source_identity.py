@@ -1359,21 +1359,61 @@ def detect_row_position_reuse(
     return tuple(conflicts)
 
 
+def strong_number_identity_key(
+    observation: SourceObservation,
+) -> tuple[str, str, str, str] | None:
+    """
+    返回一条观测所断言的**源事件身份**键（只读纯函数）。
+
+    键为 ``(adapter, sport, event_date, derived_source_id)``。缺少
+    ``derived_source_id`` 时返回 ``None``：缺失的源身份既不被补全，也不被升级为
+    已验证身份。
+    """
+    if not observation.derived_source_id:
+        return None
+    return (
+        observation.adapter,
+        observation.sport or MISSING,
+        observation.event_date or MISSING,
+        observation.derived_source_id,
+    )
+
+
 def detect_strong_number_conflict(
     observations: Sequence[SourceObservation],
 ) -> tuple[IdentityConflict, ...]:
     """
-    检测**同一源身份试图代表两个强编号互斥的事件**（§12）。
+    检测**同一源事件身份**是否同时声明了互斥的强竞彩编号（§12）。
 
-    结论级别为 REJECTED。
+    判定按 :func:`strong_number_identity_key` 分组，即
+    ``(adapter, sport, event_date, derived_source_id)``：
+
+    - ``derived_source_id`` 是本函数的中心要素，用来锁定**具体的那一个源事件**；
+    - ``sport`` / ``event_date`` 保留既有作用域语义（足球与篮球、不同日期是不同的
+      作用域身份；跨作用域复用由 :func:`detect_cross_sport_namespace_collision` 单独治理）；
+    - ``adapter`` 区分同一原始值在不同解析器下的声明。
+
+    该键**刻意不使用** ``stability_scope.as_key()``：``stability_scope`` 描述的是一个
+    源**域**（adapter × sport × date × namespace × raw_identifier_type），同一域内的
+    多场**独立比赛**共享它，因此按域分组会把「各自拥有不同编号的不同比赛」误判为
+    「同一源身份携带互斥编号」——这是已被真实数据证实的缺陷口径。
+
+    该键**同时刻意排除** ``raw_identifier_type``：它取决于「该行 id 尾段是否恰好等于
+    竞彩编号」这一**观测形态**，而不是源身份本身。一旦参与分组，指向同一源 ID 的两条
+    观测会落入不同的域，从而**漏检**真实的强编号矛盾（已在基线复现中观测到）。
+
+    因此判定条件严格是：**同一条派生源 ID** 在该作用域下携带两个及以上不同的规范化
+    竞彩编号。结论级别仍为 ``REJECT``：真实的身份矛盾一律 fail closed，绝不为了消除
+    假告警而降级为 ``AMBIGUOUS``。
     """
-    groups: dict[tuple, list[SourceObservation]] = {}
-    for obs in observations:
-        if obs.derived_source_id:
-            groups.setdefault(obs.stability_scope.as_key(), []).append(obs)
+    groups: dict[tuple[str, str, str, str], list[SourceObservation]] = {}
+    for observation in observations:
+        key = strong_number_identity_key(observation)
+        if key is not None:
+            groups.setdefault(key, []).append(observation)
 
     conflicts: list[IdentityConflict] = []
-    for key in sorted(groups, key=lambda k: tuple(str(x) for x in k)):
+    for key in sorted(groups):
         members = groups[key]
         numbers = {
             o.competition_number_normalized
@@ -1382,17 +1422,25 @@ def detect_strong_number_conflict(
         }
         if len(numbers) < 2:
             continue
+        observation_ids = tuple(sorted({o.observation_id for o in members}))
         conflicts.append(
             IdentityConflict(
                 category=CONFLICT_STRONG_NUMBER_CONFLICT,
-                subject="|".join(str(part) for part in key),
+                subject=key[3],
                 severity=SEVERITY_REJECT,
                 detail=(
-                    "同一作用域内的源记录携带互斥的强竞彩编号；"
-                    "强编号冲突绝不退化为队名匹配。"
+                    "同一源身份（同一 adapter / sport / date / 派生源 ID）携带互斥的"
+                    "强竞彩编号；强编号冲突绝不退化为队名匹配。"
                 ),
-                observation_ids=tuple(sorted(o.observation_id for o in members)),
-                evidence=tuple(sorted((n, n) for n in numbers)),
+                observation_ids=observation_ids,
+                evidence=(
+                    ("adapter", key[0]),
+                    ("sport", key[1]),
+                    ("event_date", key[2]),
+                    ("derived_source_id", key[3]),
+                    ("competition_numbers", ",".join(sorted(numbers))),
+                    ("observation_count", str(len(observation_ids))),
+                ),
             )
         )
     return tuple(conflicts)
