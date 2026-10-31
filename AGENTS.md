@@ -139,6 +139,33 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - 真实数据结论只在**本机真实数据**上成立；CI 无该私有数据集时，只能报告合成测试结果，
   不得用合成结果冒充真实数据验收。
 
+### 4.5 候选证据 ≠ 人工评审结论
+
+- 重复候选的分类（`HIGH_EVIDENCE_DUPLICATE_CANDIDATE` / `AMBIGUOUS_NAME_CANDIDATE` /
+  `INSUFFICIENT_SOURCE_IDENTITY` / `NEGATIVE_CONTROL_CANDIDATE`）是**诊断标签**，
+  永远不是裁决。未记录人工决定时，状态保持 `UNREVIEWED`。
+- 评审记录的 `label_provenance` **必须**是 `HUMAN_REVIEWED`；`AUTOMATED` /
+  `MODEL_GENERATED` / `DERIVED` / `PROXY` 一律拒绝（`AUTOMATED_LABEL_REJECTED`）。
+- 评审记录必须绑定 `dataset_fingerprint` + `candidate_fingerprint` + `canonical_ids`；
+  任一不匹配即拒绝（`DATASET_FINGERPRINT_MISMATCH` / `STALE_CANDIDATE_FINGERPRINT` /
+  `CANONICAL_IDS_MISMATCH`），不得重新解释。
+- 同一候选的**矛盾决定**必须拒绝（`CONFLICTING_LABEL`），不得按"最新一条"取胜。
+- 评审文件不得携带生产授权或变更语义字段（`approved` / `signature` / `apply` /
+  `merge` / `delete` / `surviving_canonical_id` 等），命中即拒。
+- 自述的 reviewer 只是**审计元数据**，**不**等同 Ed25519 所有者批准，
+  **不**替代既有签名治理。
+
+### 4.6 Canonical 归并对账只允许预览
+
+- `tools/real_sports_duplicate_review.preview` 只做**影响分析**：不得选择存活 Canonical ID
+  （禁止按字典序、源层级或"缺编号"来选），不得删除较弱记录、不得生成可执行修复清单。
+- 预览输出必须显式声明 `executable=false`、`apply_available=false`、
+  `production_write_authorization=false`、`surviving_canonical_id=null`。
+- 缺少强编号的身份**不得**单独确立 Canonical 归属；派生 provider 后缀不得升级为已验证身份；
+  截断队名不得单独作为同一赛事证据。
+- 历史 `snapshot_id` / `settlement_id` / `evaluation_id` **不可变**：
+  对未来归并的影响只做说明，绝不重写既有快照、结算或评估标识符。
+
 ---
 
 ## 五、本地报告与交付顺序
@@ -153,6 +180,8 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - 该规则属于**本机 Git 元数据**，因此**不会**出现在全新克隆（包括 CI checkout）中；
   CI 不需要也不得创建它。本地校验命令如下（在未配置该规则的全新克隆上会输出为空，
   这属于预期环境差异，不代表规则缺失）。
+- 评审工作流产出的候选队列、评审记录、预览文件同样属于本机工件：
+  默认写入 `reports/` 或仓库之外的临时目录，**不得**写入 `data/`，也不得提交。
 - 验证：`git check-ignore -v reports/<文件>` 必须命中；`git ls-files -- reports/` 必须为空。
 
 ### 5.2 远程 CI 必须先于最终报告完成
@@ -179,5 +208,10 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - 提交前运行 `python -m pytest -q`，并在回复中报告**真实执行结果**。
 - 必须分别标注三类结论：`SYNTHETIC_TEST_VERIFIED`、`REAL_DATA_MEASURED`、
   `REAL_DATA_NOT_AVAILABLE`，不得混同。
+- 重复评审工作流必须**真实执行**一次 `generate` / `validate` / `preview`
+  （本机有真实数据时对真实数据执行，否则对隔离夹具执行），并如实报告：
+  候选数、已评审数、待评审数、被拒绝记录数与预览结论。
+- 依赖人工标签的精度 / 召回指标，只有在**独立评审决定存在**时才能报告，
+  且必须注明其来源为自述本地评审（非签名组织批准）；否则记 `N/A`。
 - CI：`.github/workflows/ci.yml`，push / PR 到 `develop` 触发，
   矩阵 `ubuntu-latest` + `windows-latest` × Python 3.12；最终 SHA 上四个 job 必须全部成功。

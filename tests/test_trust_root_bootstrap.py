@@ -24,7 +24,7 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v3-strong-number-scoping"
+SCOPE_VERSION = "offline-root-pilot-v4-duplicate-review"
 ALLOWED_PATHS = frozenset((
     # trust-root pilot scope (unchanged)
     "utils/trust_root_bootstrap.py",
@@ -44,7 +44,11 @@ ALLOWED_PATHS = frozenset((
     "AGENTS.md",
     "utils/source_identity.py",
     "tests/test_strong_number_conflict_scoping.py",
-    "docs/source-identity-provenance.md"))
+    "docs/source-identity-provenance.md",
+    # offline duplicate review and reconciliation preview
+    "tools/real_sports_duplicate_review.py",
+    "tests/test_real_sports_duplicate_review.py",
+    "docs/duplicate-review-workflow.md"))
 
 
 @pytest.fixture(scope="session", autouse=True)
