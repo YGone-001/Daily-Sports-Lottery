@@ -24,12 +24,22 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v1"
-ALLOWED_PATHS = frozenset(("utils/trust_root_bootstrap.py", "utils/trusted_artifacts.py",
-    "tools/trust_root_bootstrap_validation.py", "tests/test_trust_root_bootstrap.py",
-    "tests/test_production_trust_contracts.py", ".github/workflows/ci.yml",
+SCOPE_VERSION = "offline-root-pilot-v2-real-sports-identity-audit"
+ALLOWED_PATHS = frozenset((
+    # trust-root pilot scope (unchanged)
+    "utils/trust_root_bootstrap.py",
+    "utils/trusted_artifacts.py",
+    "tools/trust_root_bootstrap_validation.py",
+    "tests/test_trust_root_bootstrap.py",
+    "tests/test_production_trust_contracts.py",
+    ".github/workflows/ci.yml",
     "docs/security/runtime-activation-offline-trust-bootstrap.md",
-    "docs/security/runtime-activation-production-readiness-matrix.md"))
+    "docs/security/runtime-activation-production-readiness-matrix.md",
+    # read-only real sports identity audit scope
+    "tools/real_sports_identity_audit.py",
+    "tests/test_real_sports_identity_audit.py",
+    "docs/analysis/real-sports-identity-mapping-evidence.md",
+    "docs/analysis/real-sports-mapping-business-value.md"))
 
 
 @pytest.fixture(scope="session", autouse=True)
