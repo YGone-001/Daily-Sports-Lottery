@@ -70,20 +70,57 @@ def _match_key(match: dict) -> str:
     )
 
 
+#: 赔率价格键：必须是严格大于 1.0 的有限数值才算有效。
+_PRICE_ODDS_KEYS = frozenset(
+    {"home_win", "away_win", "draw", "over", "under", "over_2_5", "under_2_5"}
+)
+
+#: 盘口线键：只要求有限数值（不要求 > 1.0）。
+_LINE_ODDS_KEYS = frozenset({"total_line"})
+
+
+def _odds_value_acceptable(key: str, value: object) -> bool:
+    """
+    某个键的取值是否**已经可用**。
+
+    - 价格键：`is_valid_price`（0 / 1.0 / NaN / inf / 字符串一律不算）；
+    - 盘口线键：`is_finite_number`；
+    - 其它元数据键（如 `matchnum`）：非 None 即可。
+
+    这样「已有的无效值」不会阻止一个独立验证过的有效值入册，
+    而「已有的有效值」仍然不会被覆盖。
+    """
+    from utils.market_coverage import is_finite_number, is_valid_price
+
+    if key in _PRICE_ODDS_KEYS:
+        return is_valid_price(value)
+    if key in _LINE_ODDS_KEYS:
+        return is_finite_number(value)
+    return value is not None
+
+
 def _fill_missing_odds(target: dict, source: dict) -> bool:
     """
-    把 ``source`` 中**缺失**的盘口键补进 ``target``，绝不覆盖已有值。
+    把 ``source`` 中**可用**的盘口键补进 ``target``。
+
+    规则：
+    - 新值本身无效（None / 空串 / 非法价格 / 非法盘口线）→ 不写入；
+    - 目标已有**有效**值 → 绝不覆盖（不为了让价格"标准化"而改写）；
+    - 目标缺失或只有**无效**值（0、1.0、NaN、inf、非数值字符串）→ 用有效新值替换。
 
     直播源与竞彩 XML 是两类互补市场（直播给胜负，XML 的 sf 给胜负、dxf 给大小分）。
     既有实现只要目标已有任意盘口就整行跳过，导致直播行永远拿不到 dxf 大小分。
     """
     changed = False
     for key, value in source.items():
-        if value is None:
+        if value is None or value == "":
             continue
-        if target.get(key) is None:
-            target[key] = value
-            changed = True
+        if not _odds_value_acceptable(key, value):
+            continue
+        if _odds_value_acceptable(key, target.get(key)):
+            continue
+        target[key] = value
+        changed = True
     return changed
 
 
