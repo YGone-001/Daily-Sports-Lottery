@@ -112,6 +112,14 @@ STATUS_SOURCE_REFERENCE_REVIEWED = "SOURCE_REFERENCE_REVIEWED"
 STATUS_INDEPENDENTLY_SUPPORTED = "ORIENTATION_INDEPENDENTLY_SUPPORTED"
 STATUS_CONTRADICTED = "ORIENTATION_CONTRADICTED"
 STATUS_UNVERIFIED = "ORIENTATION_UNVERIFIED"
+#: 外部记录只与**某一侧** provider 队对一致：方向可参考，但跨源同一性未建立。
+STATUS_SOURCE_SIDE_MATCHED = "SOURCE_SIDE_MATCHED"
+#: 跨源同一性未建立的显式标记（用于 `cross_source_identity` 字段）。
+STATUS_CROSS_SOURCE_UNVERIFIED = "CROSS_SOURCE_IDENTITY_UNVERIFIED"
+
+#: 证据校验退出码（沿用既有 `EXIT_REVIEW_REJECTED = 4`，仅新增后两者）。
+EXIT_EVIDENCE_REJECTED = 5
+EXIT_MULTIPLE_REJECTIONS = 6
 EVIDENCE_STATUS_VALUES = (
     STATUS_SOURCE_REFERENCE_SUPPLIED,
     STATUS_SOURCE_REFERENCE_REVIEWED,
@@ -260,6 +268,12 @@ def build_queue_entry(candidate: Mapping[str, Any], *, review_status: str, orien
         "final_scores": dict(candidate["final_scores"]),
         "human_review_status": review_status,
         "orientation_evidence_status": orientation.get("status", STATUS_UNVERIFIED),
+        "cross_source_identity": orientation.get("cross_source_identity", STATUS_CROSS_SOURCE_UNVERIFIED),
+        "orientation_matched_source_sides": list(orientation.get("matched_source_sides", [])),
+        "orientation_unresolved_sides": list(orientation.get("unresolved_sides", [])),
+        "orientation_supporting_evidence_ids": list(orientation.get("supporting_evidence_ids", [])),
+        "orientation_contradictory_references": list(orientation.get("contradictory_references", [])),
+        "orientation_fixture_identifiers": list(orientation.get("fixture_identifiers", [])),
         "orientation_evidence": dict(orientation),
         "authoritative": False,
         "is_approval": False,
@@ -352,6 +366,27 @@ def load_evidence(path: str | None) -> dict[str, Any]:
                 }
             )
             continue
+        correspondence = record.get("team_name_correspondence")
+        if correspondence is not None:
+            if not isinstance(correspondence, list) or not all(
+                isinstance(entry, Mapping)
+                and entry.get("provider_team")
+                and entry.get("source_team")
+                and entry.get("verification_status") in EVIDENCE_STATUS_VALUES
+                for entry in correspondence
+            ):
+                rejected.append(
+                    {
+                        "index": index,
+                        "evidence_id": record.get("evidence_id"),
+                        "reason_code": "INVALID_TEAM_NAME_CORRESPONDENCE",
+                        "detail": (
+                            "team_name_correspondence must be a list of "
+                            "{provider_team, source_team, verification_status} objects"
+                        ),
+                    }
+                )
+                continue
         accepted.append(record)
     return {
         "schema_version": WORKBENCH_SCHEMA_VERSION,
@@ -365,12 +400,53 @@ def _norm(value: Any) -> str:
     return "".join(ch for ch in str(value or "") if not ch.isspace()).lower()
 
 
-def _pair_matches(evidence: Mapping[str, Any], teams: Mapping[str, Any]) -> bool:
-    pair = {_norm(evidence.get("home_team")), _norm(evidence.get("away_team"))}
-    wanted = {_norm(value.get("home")) for value in teams.values()} | {
-        _norm(value.get("away")) for value in teams.values()
-    }
-    return len(pair) == 2 and pair == wanted
+def _side_name_sets(candidate: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+    """Per-provider-side ``(home, away)`` name sets, kept separate on purpose."""
+    sides: dict[str, tuple[str, str]] = {}
+    for mid, teams in (candidate.get("team_names") or {}).items():
+        home, away = _norm(teams.get("home")), _norm(teams.get("away"))
+        if home and away and home != away:
+            sides[str(mid)] = (home, away)
+    return sides
+
+
+def _evidence_pair(item: Mapping[str, Any]) -> tuple[str, str] | None:
+    home, away = _norm(item.get("home_team")), _norm(item.get("away_team"))
+    if not home or not away or home == away:
+        return None
+    return (home, away)
+
+
+def _reviewed_correspondences(item: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    """
+    Reviewed name correspondences supplied **with** the evidence item.
+
+    A transliteration alias becomes usable only when the operator files a
+    ``SOURCE_REFERENCE_REVIEWED`` entry for it; nothing is inferred from spelling.
+    """
+    out: list[tuple[str, str, str]] = []
+    for entry in item.get("team_name_correspondence") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        if entry.get("verification_status") != STATUS_SOURCE_REFERENCE_REVIEWED:
+            continue
+        provider = _norm(entry.get("provider_team"))
+        source = _norm(entry.get("source_team"))
+        if provider and source:
+            out.append((provider, source, str(entry.get("evidence_reference") or "")))
+    return out
+
+
+def _maps_onto_side(
+    side: tuple[str, str], pair: tuple[str, str], correspondences: Sequence[tuple[str, str, str]]
+) -> bool:
+    """Can the reviewed correspondences reconcile this provider side with the source pair?"""
+    mapped = set(side)
+    for provider, source, _reference in correspondences:
+        if provider in mapped:
+            mapped.discard(provider)
+            mapped.add(source)
+    return set(pair) == mapped
 
 
 def resolve_orientation(
@@ -379,8 +455,13 @@ def resolve_orientation(
     """
     Resolve orientation evidence for one candidate.
 
-    Only ``SOURCE_REFERENCE_REVIEWED`` items whose event date and team pair match the
-    candidate can support or contradict orientation. A URL alone stays unverified.
+    Matching is **per provider side**: an external record that equals only one side's
+    team pair is reported as ``SOURCE_SIDE_MATCHED`` and never promoted to a verified
+    cross-source identity. Name variants need an operator-filed reviewed correspondence.
+
+    A candidate is only ``ORIENTATION_INDEPENDENTLY_SUPPORTED`` when every provider side
+    is covered, no reviewed item carries unresolved contradictions, the reviewed items
+    agree on the home team, and their fixture identifiers do not clash.
     """
     items = [
         item
@@ -389,70 +470,123 @@ def resolve_orientation(
     ]
     supplied = [item for item in items if item["verification_status"] == STATUS_SOURCE_REFERENCE_SUPPLIED]
     reviewed = [item for item in items if item["verification_status"] == STATUS_SOURCE_REFERENCE_REVIEWED]
+    sides = _side_name_sets(candidate)
 
-    matched: list[dict[str, Any]] = []
     unmatched: list[str] = []
-    for item in reviewed:
-        if str(item.get("actual_event_date")) != str(candidate.get("event_date")):
-            unmatched.append(f"{item['evidence_id']}: event date mismatch")
-            continue
-        if not _pair_matches(item, candidate.get("team_names", {})):
-            unmatched.append(f"{item['evidence_id']}: team pair mismatch")
-            continue
-        matched.append(item)
+    matched: list[dict[str, Any]] = []
+    covered_sides: dict[str, set[str]] = {}
+    corroborated_ids: set[str] = set()
 
-    if not matched:
-        return {
-            "status": STATUS_UNVERIFIED,
-            "reason": (
-                "no reviewed external evidence with a matching event date and team pair"
-                if not reviewed
-                else "supplied evidence was not reviewed, or does not match the candidate"
-            ),
+    def base(**kwargs: Any) -> dict[str, Any]:
+        payload = {
             "supplied_count": len(supplied),
             "reviewed_count": len(reviewed),
-            "matched_count": 0,
             "unmatched": unmatched,
             "home_team_claims": {},
             "contradictory_references": [],
             "supporting_evidence_ids": [],
+            "fixture_identifiers": [],
+            "matched_source_sides": [],
+            "unresolved_sides": sorted(sides),
+            "corroborated_evidence_ids": [],
+            "cross_source_identity": STATUS_CROSS_SOURCE_UNVERIFIED,
             "authoritative": False,
         }
+        payload.update(kwargs)
+        return payload
+
+    for item in reviewed:
+        if str(item.get("actual_event_date")) != str(candidate.get("event_date")):
+            unmatched.append(f"{item['evidence_id']}: event date mismatch")
+            continue
+        pair = _evidence_pair(item)
+        if pair is None:
+            unmatched.append(f"{item['evidence_id']}: team names missing")
+            continue
+        correspondences = _reviewed_correspondences(item)
+        exact = [mid for mid, side in sides.items() if set(side) == set(pair)]
+        reconciled = [
+            mid for mid, side in sides.items()
+            if mid not in exact and _maps_onto_side(side, pair, correspondences)
+        ]
+        if not exact and not reconciled:
+            unmatched.append(f"{item['evidence_id']}: team pair mismatch")
+            continue
+        matched.append(dict(item))
+        covered_sides[str(item["evidence_id"])] = set(exact) | set(reconciled)
+        if reconciled:
+            corroborated_ids.add(str(item["evidence_id"]))
+
+    if not matched:
+        return base(
+            status=STATUS_UNVERIFIED,
+            reason=(
+                "no reviewed external evidence for this candidate"
+                if not reviewed
+                else "supplied evidence was not reviewed, or does not match any provider side"
+            ),
+            matched_count=0,
+        )
 
     claims: dict[str, list[str]] = defaultdict(list)
     for item in matched:
         claims[str(item["home_team"])].append(str(item["evidence_id"]))
+    supporting_ids = sorted(item["evidence_id"] for item in matched)
+    contradictions = sorted(
+        {str(ref) for item in matched for ref in item.get("contradictory_references") or []}
+    )
+    fixture_ids = sorted({str(item.get("event_identifier")) for item in matched if item.get("event_identifier")})
+    union_covered = set().union(*covered_sides.values()) if covered_sides else set()
+    unresolved_sides = sorted(set(sides) - union_covered)
+    all_sides_covered = bool(sides) and not unresolved_sides
+
+    common = dict(
+        matched_count=len(matched),
+        home_team_claims={home: sorted(ids) for home, ids in sorted(claims.items())},
+        contradictory_references=contradictions,
+        supporting_evidence_ids=supporting_ids,
+        fixture_identifiers=fixture_ids,
+        matched_source_sides=sorted(union_covered),
+        unresolved_sides=unresolved_sides,
+        corroborated_evidence_ids=sorted(corroborated_ids),
+    )
+
     if len(claims) > 1:
-        return {
-            "status": STATUS_CONTRADICTED,
-            "reason": "reviewed external evidence disagrees about the home team",
-            "supplied_count": len(supplied),
-            "reviewed_count": len(reviewed),
-            "matched_count": len(matched),
-            "unmatched": unmatched,
-            "home_team_claims": {home: sorted(ids) for home, ids in sorted(claims.items())},
-            "contradictory_references": sorted(
-                {ref for item in matched for ref in item.get("contradictory_references", [])}
+        return base(
+            status=STATUS_CONTRADICTED,
+            reason="reviewed external evidence disagrees about the home team",
+            **common,
+        )
+    if contradictions:
+        return base(
+            status=STATUS_CONTRADICTED,
+            reason="reviewed external evidence still carries unresolved contradictory references",
+            **common,
+        )
+    if len(fixture_ids) > 1:
+        return base(
+            status=STATUS_CONTRADICTED,
+            reason="reviewed external evidence reports competing fixture identifiers",
+            **common,
+        )
+    if not all_sides_covered:
+        return base(
+            status=STATUS_SOURCE_SIDE_MATCHED,
+            reason=(
+                "external record matches only the listed provider side(s); cross-source "
+                "identity is not established without reviewed name correspondence for the "
+                "remaining side"
             ),
-            "supporting_evidence_ids": sorted(item["evidence_id"] for item in matched),
-            "authoritative": False,
-        }
+            **common,
+        )
 
     home = next(iter(claims))
-    return {
-        "status": STATUS_INDEPENDENTLY_SUPPORTED,
-        "reason": "reviewed external evidence matches the event date and team pair",
-        "supplied_count": len(supplied),
-        "reviewed_count": len(reviewed),
-        "matched_count": len(matched),
-        "unmatched": unmatched,
-        "home_team_claims": {home: sorted(claims[home])},
-        "contradictory_references": sorted(
-            {ref for item in matched for ref in item.get("contradictory_references", [])}
-        ),
-        "supporting_evidence_ids": sorted(item["evidence_id"] for item in matched),
-        "authoritative": False,
-    }
+    return base(
+        status=STATUS_INDEPENDENTLY_SUPPORTED,
+        reason="reviewed external evidence covers every provider side with no contradiction",
+        cross_source_identity=STATUS_INDEPENDENTLY_SUPPORTED,
+        **{**common, "home_team_claims": {home: sorted(claims[home])}},
+    )
 
 
 # =============================================================================
@@ -819,7 +953,14 @@ def review_template(queue: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def orientation_evidence_template(queue: Mapping[str, Any]) -> dict[str, Any]:
-    """Blank independent-orientation evidence template (operator fills, nobody fetches)."""
+    """
+    Blank independent-orientation evidence template (operator fills, nobody fetches).
+
+    The example deliberately demonstrates an **unverified** record: ``checked_by`` is
+    empty and ``verification_status`` is ``SOURCE_REFERENCE_SUPPLIED``. Promoting a
+    record to ``SOURCE_REFERENCE_REVIEWED`` is an operator action taken **after** the
+    source content was actually inspected by a human.
+    """
     return {
         "kind": EVIDENCE_KIND,
         "schema_version": WORKBENCH_SCHEMA_VERSION,
@@ -827,14 +968,37 @@ def orientation_evidence_template(queue: Mapping[str, Any]) -> dict[str, Any]:
         "instructions": [
             "Add one object per independently checked event record (box score, fixture page, document).",
             "verification_status must be SOURCE_REFERENCE_SUPPLIED or SOURCE_REFERENCE_REVIEWED.",
-            "Only SOURCE_REFERENCE_REVIEWED items with matching date and team pair can support orientation.",
+            "Start at SOURCE_REFERENCE_SUPPLIED. Only after a human actually opened and checked the",
+            "source content may that human change the status to SOURCE_REFERENCE_REVIEWED and fill checked_by.",
+            "Only SOURCE_REFERENCE_REVIEWED items covering every provider side can support orientation.",
+            "A team-spelling variant needs its own reviewed team_name_correspondence entry.",
             "A URL alone is never proof; automation or approval fields are rejected.",
             "The workbench never fetches the network.",
         ],
         "required_keys": sorted(EVIDENCE_REQUIRED_KEYS),
+        "optional_keys": ["team_name_correspondence"],
         "allowed_statuses": list(EVIDENCE_STATUS_VALUES),
+        "status_promotion": {
+            "from": STATUS_SOURCE_REFERENCE_SUPPLIED,
+            "to": STATUS_SOURCE_REFERENCE_REVIEWED,
+            "who": "a human operator, after inspecting the source content",
+            "not_allowed": [
+                "automation or a model setting REVIEWED on a human's behalf",
+                "promotion without filling checked_by",
+                "promotion while contradictory_references is non-empty",
+            ],
+        },
+        "team_name_correspondence_example": [
+            {
+                "provider_team": "provider spelling",
+                "source_team": "source spelling",
+                "verification_status": STATUS_SOURCE_REFERENCE_SUPPLIED,
+                "evidence_reference": "where the equivalence was read",
+            }
+        ],
+        "example_allows_illegal_status": False,
         "example": {
-            "evidence_id": "EV-0001",
+            "evidence_id": "EV-EXAMPLE-NOT-REVIEWED",
             "candidate_id": queue["entries"][0]["candidate_id"] if queue["entries"] else "NXD-…",
             "reference_identifier": "operator reference",
             "publisher": "publisher",
@@ -845,10 +1009,14 @@ def orientation_evidence_template(queue: Mapping[str, Any]) -> dict[str, Any]:
             "home_team": "home team as printed by the source",
             "event_identifier": "provider fixture id",
             "excerpt": "verbatim excerpt",
-            "checked_by": "reviewer identity",
-            "verification_status": STATUS_SOURCE_REFERENCE_REVIEWED,
+            "checked_by": "",
+            "verification_status": STATUS_SOURCE_REFERENCE_SUPPLIED,
             "contradictory_references": [],
         },
+        "example_note": (
+            "The example above is a blank, unreviewed placeholder. It is not human-verified "
+            "and must not be copied with REVIEWED status."
+        ),
         "evidence": [],
     }
 
@@ -1013,6 +1181,27 @@ def command_show(data_dir: str | None, candidate_id: str, *, evidence_path: str 
     }
 
 
+def _validation_status(review_rejected: int, evidence_rejected: int) -> str:
+    """Validation outcome covering **both** rejection categories."""
+    if review_rejected and evidence_rejected:
+        return "MULTIPLE_REJECTIONS"
+    if review_rejected:
+        return "REVIEW_REJECTED"
+    if evidence_rejected:
+        return "EVIDENCE_REJECTED"
+    return "SUCCESS"
+
+
+def _validation_exit_code(review_rejected: int, evidence_rejected: int) -> int:
+    if review_rejected and evidence_rejected:
+        return EXIT_MULTIPLE_REJECTIONS
+    if review_rejected:
+        return EXIT_REVIEW_REJECTED
+    if evidence_rejected:
+        return EXIT_EVIDENCE_REJECTED
+    return EXIT_OK
+
+
 def command_validate(data_dir: str | None, reviews_path: str | None, *, evidence_path: str | None = None) -> dict[str, Any]:
     """Validate an imported review file against the current NBA queue."""
     try:
@@ -1046,6 +1235,12 @@ def command_validate(data_dir: str | None, reviews_path: str | None, *, evidence
         "reviewed_count": validation["reviewed_count"],
         "pending_count": validation["pending_count"],
         "rejected_count": validation["rejected_count"],
+        "review_rejected_count": validation["rejected_count"],
+        "evidence_rejected_count": len(evidence_document.get("rejected", [])),
+        "total_rejected_count": validation["rejected_count"] + len(evidence_document.get("rejected", [])),
+        "validation_status": _validation_status(
+            validation["rejected_count"], len(evidence_document.get("rejected", []))
+        ),
         "rejected": validation["rejected"],
         "accepted": validation["accepted"],
         "decisions_by_class": validation["decisions_by_class"],
@@ -1143,6 +1338,329 @@ def command_summary(data_dir: str | None, *, reviews_path: str | None = None,
 
 
 # =============================================================================
+# First real evidence pilot packet
+# =============================================================================
+
+PILOT_KIND = "NBA_EVIDENCE_PILOT_PACKET"
+RETRIEVAL_NOT_RETRIEVED = "EXTERNAL_EVIDENCE_NOT_RETRIEVED"
+DEFAULT_PILOT_LIMIT = 5
+
+
+def select_pilot_candidates(queue: Mapping[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    """Deterministic P0-first selection for the first evidence session."""
+    selected: list[dict[str, Any]] = []
+    for priority in (PRIORITY_P0, PRIORITY_P1, PRIORITY_P2, PRIORITY_P3):
+        for entry in queue["entries"]:
+            if len(selected) >= limit:
+                break
+            if entry["priority"] == priority:
+                selected.append(entry)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _pilot_proposal(entry: Mapping[str, Any]) -> dict[str, Any]:
+    teams = entry["original_teams"]
+    ids = entry["canonical_ids"]
+    return {
+        "candidate_id": entry["candidate_id"],
+        "candidate_fingerprint": entry["candidate_fingerprint"],
+        "dataset_fingerprint": entry["dataset_fingerprint"],
+        "priority": entry["priority"],
+        "canonical_ids": list(ids),
+        "original_number_strings": dict(entry["original_number_strings"]),
+        "event_date": entry["event_date"],
+        "kickoff_metadata": dict(entry["kickoff_metadata"]),
+        "original_team_positions": {
+            mid: {"home": teams[mid].get("home"), "away": teams[mid].get("away")} for mid in ids
+        },
+        "orientation": entry["orientation"],
+        "reference_source": None,
+        "publisher": None,
+        "fixture_identifier": None,
+        "retrieval_status": RETRIEVAL_NOT_RETRIEVED,
+        "retrieved_at": None,
+        "search_channels": [
+            "official league schedule / results page",
+            "club or competition record",
+            "archival box score with explicit home/away designation",
+        ],
+        "proposed_verification_actions": [
+            "open a primary record that prints an explicit home/away designation",
+            "record the publisher, location and retrieval timestamp",
+            "record the provider fixture identifier if the source publishes one",
+            "file team_name_correspondence for any spelling variant separately",
+            "note any contradicting record verbatim in contradictory_references",
+        ],
+        "contradicting_information": list(entry["contradictory_evidence"]),
+        "evidence_status": RETRIEVAL_NOT_RETRIEVED,
+        "human_verified": False,
+        "provenance": "NONE",
+    }
+
+
+def _pilot_supplement(queue: Mapping[str, Any], entry: Mapping[str, Any]) -> str:
+    dossier = render_dossier(queue, entry)
+    ids = entry["canonical_ids"]
+    teams = entry["original_teams"]
+    lines = [
+        dossier,
+        "",
+        "---",
+        "",
+        "## Pilot supplement (Phase 2-Z)",
+        "",
+        f"- candidate: `{entry['candidate_id']}` (priority `{entry['priority']}`)",
+        f"- candidate fingerprint: `{entry['candidate_fingerprint']}`",
+        f"- dataset fingerprint: `{entry['dataset_fingerprint']}`",
+        "",
+        "### Original records (verbatim, never rewritten)",
+        "",
+        "| canonical id | home (as printed) | away (as printed) | number (as printed) | kickoff |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for mid in ids:
+        kickoff = entry["kickoff_metadata"].get(mid, {})
+        lines.append(
+            f"| `{mid}` | {teams[mid].get('home')} | {teams[mid].get('away')} | "
+            f"{entry['original_number_strings'].get(mid)} | "
+            f"{kickoff.get('value') or 'unknown'} |"
+        )
+    lines += [
+        "",
+        "### Source-side status",
+        "",
+        f"- orientation evidence status: `{entry['orientation_evidence_status']}`",
+        f"- cross-source identity: `{entry['cross_source_identity']}`",
+        f"- matched provider sides: {entry['orientation_matched_source_sides'] or 'none'}",
+        f"- unresolved provider sides: {entry['orientation_unresolved_sides'] or 'none'}",
+        "",
+        "### External evidence",
+        "",
+        f"- retrieval status: `{RETRIEVAL_NOT_RETRIEVED}`",
+        "- no external record has been opened by a human in this pilot",
+        "- a URL alone would not constitute verification",
+        "",
+        "### What the operator has to do",
+        "",
+        "1. Open a primary record with an explicit home/away designation.",
+        "2. Record publisher, location and retrieval time.",
+        "3. File the evidence as `SOURCE_REFERENCE_SUPPLIED` first.",
+        "4. Promote to `SOURCE_REFERENCE_REVIEWED` only after actually reading it.",
+        "5. Record contradicting records verbatim; do not resolve them by guessing.",
+        "",
+        "```text",
+        "executable = false",
+        "apply_available = false",
+        "production_write_authorization = false",
+        "surviving_canonical_id = null",
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def command_pilot(data_dir: str | None, output_dir: str | None, *, limit: int = DEFAULT_PILOT_LIMIT) -> dict[str, Any]:
+    """Build the first offline evidence packet (no network, no invented references)."""
+    try:
+        dataset = _load_dataset_or_error(data_dir)
+    except AuditInputError as exc:
+        return {
+            "kind": PILOT_KIND,
+            "real_data_available": False,
+            "status": "NOT_AVAILABLE",
+            "reason": str(exc),
+            "candidate_count": 0,
+            "evidence_status": RETRIEVAL_NOT_RETRIEVED,
+            "human_reviewed_count": 0,
+            "decision": "NO-GO",
+        }
+    queue = build_review_queue(dataset)
+    selected = select_pilot_candidates(queue, limit=limit)
+    proposals = [_pilot_proposal(entry) for entry in selected]
+    impact = unique_impact(dataset, [c for c in queue["candidates"] if c["candidate_id"] in {e["candidate_id"] for e in selected}])
+
+    validation = {
+        "kind": "NBA_EVIDENCE_PILOT_VALIDATION",
+        "dataset_fingerprint": queue["dataset_fingerprint"],
+        "evidence_records": 0,
+        "review_records": 0,
+        "review_rejected_count": 0,
+        "evidence_rejected_count": 0,
+        "total_rejected_count": 0,
+        "validation_status": "SUCCESS",
+        "note": "no evidence or review records exist yet; nothing was invented",
+        "executable": False,
+        "apply_available": False,
+        "production_write_authorization": False,
+        "surviving_canonical_id": None,
+    }
+
+    document = {
+        "kind": PILOT_KIND,
+        "schema_version": WORKBENCH_SCHEMA_VERSION,
+        "real_data_available": True,
+        "dataset_fingerprint": queue["dataset_fingerprint"],
+        "candidate_count": len(selected),
+        "priority_counts": dict(sorted(Counter(entry["priority"] for entry in selected).items())),
+        "candidate_ids": [entry["candidate_id"] for entry in selected],
+        "proposals": proposals,
+        "evidence_status": RETRIEVAL_NOT_RETRIEVED,
+        "retrieved_reference_count": 0,
+        "human_reviewed_count": queue["reviewed_count"],
+        "unique_impact": impact,
+        "executable": False,
+        "apply_available": False,
+        "production_write_authorization": False,
+        "surviving_canonical_id": None,
+        "no_mutation_performed": True,
+        "decision": "NO-GO",
+    }
+
+    if output_dir:
+        validate_output_path(os.path.join(output_dir, "prioritized-five.json"))
+        os.makedirs(output_dir, exist_ok=True)
+        write_json(os.path.join(output_dir, "prioritized-five.json"), {
+            "kind": PILOT_KIND,
+            "dataset_fingerprint": queue["dataset_fingerprint"],
+            "candidate_count": len(selected),
+            "candidates": [dict(entry) for entry in selected],
+        })
+        write_json(os.path.join(output_dir, "source-reference-inventory.json"), {
+            "kind": "NBA_SOURCE_REFERENCE_INVENTORY",
+            "dataset_fingerprint": queue["dataset_fingerprint"],
+            "retrieval_status": RETRIEVAL_NOT_RETRIEVED,
+            "retrieved_reference_count": 0,
+            "note": "no external record was opened in this pilot; no URL is invented",
+            "candidates": [
+                {
+                    "candidate_id": entry["candidate_id"],
+                    "event_date": entry["event_date"],
+                    "original_number_strings": dict(entry["original_number_strings"]),
+                    "original_team_positions": {
+                        mid: entry["original_teams"][mid] for mid in entry["canonical_ids"]
+                    },
+                    "kickoff_metadata": dict(entry["kickoff_metadata"]),
+                    "orientation": entry["orientation"],
+                    "references": [],
+                }
+                for entry in selected
+            ],
+        })
+        write_json(os.path.join(output_dir, "evidence-proposals.json"), {
+            "kind": "NBA_EVIDENCE_PROPOSALS",
+            "dataset_fingerprint": queue["dataset_fingerprint"],
+            "proposal_count": len(proposals),
+            "reviewed_proposal_count": 0,
+            "evidence": [],
+            "proposals": proposals,
+            "note": "proposals are empty of retrieved references; every item stays unreviewed",
+        })
+        write_json(os.path.join(output_dir, "evidence-validation.json"), validation)
+        supplement_dir = os.path.join(output_dir, "candidate-dossier-supplements")
+        os.makedirs(supplement_dir, exist_ok=True)
+        for entry in selected:
+            write_text(
+                os.path.join(supplement_dir, f"{entry['candidate_id']}.md"),
+                _pilot_supplement(queue, entry),
+            )
+        write_text(os.path.join(output_dir, "first-review-instructions.md"), render_first_review_instructions(selected))
+        write_text(os.path.join(output_dir, "unresolved-evidence-register.md"), render_unresolved_register(queue, selected))
+        write_text(os.path.join(output_dir, "pilot-summary.md"), render_pilot_summary(queue, document))
+    return document
+
+
+def render_first_review_instructions(selected: Sequence[Mapping[str, Any]]) -> str:
+    lines = [
+        "# 首批 NBA 证据复核操作说明",
+        "",
+        f"本批次共 **{len(selected)}** 个候选，全部处于 `UNREVIEWED`。",
+        "",
+        "## 步骤",
+        "",
+        "1. 打开 `prioritized-five.json`，按 `priority` 顺序处理（P0 优先）。",
+        "2. 对每个候选打开一份**主记录**（联赛/俱乐部/赛事官方页或存档技术统计），",
+        "   确认它显式写出主队与客队。",
+        "3. 填 `evidence-proposals.json` 中对应条目的 `reference_source` / `publisher` /",
+        "   `retrieved_at` / `fixture_identifier`，`verification_status` 先填 `SOURCE_REFERENCE_SUPPLIED`。",
+        "4. 真正打开并核对内容之后，**由人**把它改为 `SOURCE_REFERENCE_REVIEWED` 并填写 `checked_by`。",
+        "5. 队名拼写不同（如 休斯敦/休斯顿）时，另填一条 `team_name_correspondence`，",
+        "   同样先 `SUPPLIED`，核实后才可 `REVIEWED`。",
+        "6. 发现相反记录时，把它的位置写进 `contradictory_references`，不要猜。",
+        "7. 运行 `python -m tools.nba_human_review_workbench validate --evidence <file>`。",
+        "   退出码：0 成功 / 4 评审被拒 / 5 证据被拒 / 6 两者都被拒。",
+        "",
+        "## 边界",
+        "",
+        "- 只有 `ORIENTATION_INDEPENDENTLY_SUPPORTED` 才表示两源同一性与方向都被核实。",
+        "- `SOURCE_SIDE_MATCHED` 只说明外部记录匹配**某一侧**，不构成跨源同一性。",
+        "- 人工决定仍是复核证据，不是签名治理授权；不得据此合并 Canonical 记录。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_unresolved_register(queue: Mapping[str, Any], selected: Sequence[Mapping[str, Any]]) -> str:
+    lines = [
+        "# 未决证据登记",
+        "",
+        f"- 数据集指纹：`{queue['dataset_fingerprint']}`",
+        f"- 本批次候选：{len(selected)}",
+        "",
+        "| candidate | priority | orientation | evidence status | 未决原因 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for entry in selected:
+        lines.append(
+            f"| `{entry['candidate_id']}` | `{entry['priority']}` | `{entry['orientation']}` | "
+            f"`{entry['orientation_evidence_status']}` | "
+            f"{', '.join(entry['missing_required_evidence'])} |"
+        )
+    lines += [
+        "",
+        "> 全部条目等待真实人工核对；`EXTERNAL_EVIDENCE_NOT_RETRIEVED` 表示本阶段"
+        "未联网、未取得外部记录，不代表外部记录不存在。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_pilot_summary(queue: Mapping[str, Any], document: Mapping[str, Any]) -> str:
+    impact = document["unique_impact"]
+    lines = [
+        "# 首批 NBA 证据试点摘要",
+        "",
+        f"- 数据集指纹：`{document['dataset_fingerprint']}`",
+        f"- 候选：{document['candidate_count']}（{document['priority_counts']}）",
+        f"- 外部参考已获取：**0**（`{RETRIEVAL_NOT_RETRIEVED}`）",
+        f"- 已人工复核：**{document['human_reviewed_count']}**",
+        "- 已核验方向证据：**0**",
+        "",
+        "## 历史影响（去重）",
+        "",
+        "| 阶段 | 逐对合计 | 去重 |",
+        "| --- | --- | --- |",
+    ]
+    for stage in ("prediction", "odds", "settlement", "evaluation"):
+        lines.append(
+            f"| {stage} | {impact['summed_reference_totals'].get(stage, 0)} | "
+            f"{impact['distinct_record_counts'].get(stage, 0)} |"
+        )
+    lines += [
+        "",
+        "```text",
+        "executable = false",
+        "apply_available = false",
+        "production_write_authorization = false",
+        "surviving_canonical_id = null",
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1172,6 +1690,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     validate.add_argument("--reviews", default=None)
     validate.add_argument("--evidence", default=None)
     validate.add_argument("--output", default=None)
+
+    pilot = subparsers.add_parser("pilot", help="first evidence packet (offline)")
+    pilot.add_argument("--data-dir", default=None)
+    pilot.add_argument("--output-dir", default=None)
+    pilot.add_argument("--limit", type=int, default=DEFAULT_PILOT_LIMIT)
+    pilot.add_argument("--output", default=None)
 
     summary = subparsers.add_parser("summary", help="coverage dashboard and register")
     summary.add_argument("--data-dir", default=None)
@@ -1267,13 +1791,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "candidate_count": document.get("candidate_count"),
                     "reviewed_count": document.get("reviewed_count"),
                     "pending_count": document.get("pending_count"),
-                    "rejected_count": document.get("rejected_count"),
+                    "rejected_count": document.get("total_rejected_count"),
+                    "review_rejected_count": document.get("review_rejected_count"),
+                    "evidence_rejected_count": document.get("evidence_rejected_count"),
+                    "validation_status": document.get("validation_status"),
                     "label_status": document.get("label_status"),
                     "executable": document.get("executable"),
                 },
                 ensure_ascii=False, sort_keys=True,
             ))
-            return EXIT_OK if not document.get("rejected_count") else EXIT_REVIEW_REJECTED
+            return _validation_exit_code(
+                int(document.get("review_rejected_count") or 0),
+                int(document.get("evidence_rejected_count") or 0),
+            )
+        if args.command == "pilot":
+            document = command_pilot(args.data_dir, args.output_dir, limit=args.limit)
+            if args.output:
+                write_json(args.output, document)
+            print(json.dumps(
+                {
+                    "candidate_count": document.get("candidate_count"),
+                    "priority_counts": document.get("priority_counts"),
+                    "evidence_status": document.get("evidence_status"),
+                    "human_reviewed_count": document.get("human_reviewed_count"),
+                },
+                ensure_ascii=False, sort_keys=True,
+            ))
+            return EXIT_OK
         if args.command == "summary":
             document = command_summary(
                 args.data_dir, reviews_path=args.reviews, evidence_path=args.evidence

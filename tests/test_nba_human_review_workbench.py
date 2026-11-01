@@ -18,25 +18,32 @@ import pytest
 
 from tools.nba_human_review_workbench import (
     EVIDENCE_STATUS_VALUES,
+    EXIT_EVIDENCE_REJECTED,
+    EXIT_MULTIPLE_REJECTIONS,
     PRIORITY_ORDER,
     PRIORITY_P0,
     PRIORITY_P1,
     PRIORITY_P2,
     QUEUE_KIND,
     STATUS_CONTRADICTED,
+    STATUS_CROSS_SOURCE_UNVERIFIED,
     STATUS_INDEPENDENTLY_SUPPORTED,
     STATUS_SOURCE_REFERENCE_REVIEWED,
     STATUS_SOURCE_REFERENCE_SUPPLIED,
+    STATUS_SOURCE_SIDE_MATCHED,
     STATUS_UNVERIFIED,
     build_review_queue,
+    command_pilot,
     command_prepare,
     command_show,
     command_summary,
     command_validate,
     load_evidence,
     main,
+    orientation_evidence_template,
     queue_for_reviews,
     render_dossier,
+    resolve_orientation,
     review_priority,
     unique_impact,
 )
@@ -809,3 +816,413 @@ def test_hr_aux_cli_prepare_show_summary_wiring(tmp_path):
 
     template = json.loads((out / "review-template.json").read_text(encoding="utf-8"))
     assert all(item["skeleton"]["decision"] is None for item in template["candidates"])
+
+# =============================================================================
+# Phase 2-Z: source-side matching, contradictory evidence, exit status, templates
+# =============================================================================
+
+def variant_fixture(root):
+    """
+    Houston / Oklahoma City transliteration variant pair.
+
+    Both sources describe the same fixture with different spellings, the numbers
+    correspond, so the pair is contradictory-evidence priority ``P0``.
+    """
+    return write_dataset(
+        root,
+        [
+            basketball("500lq-2030-05-01-周六316", home="俄克拉荷马雷霆",
+                       away="休斯顿火箭", jczq_no="周六316"),
+            lottery("500j-2030-05-01-6316", "6316", home="休斯敦火箭",
+                    away="俄克拉荷马城雷霆"),
+        ],
+    )
+
+
+def candidate_of(root, priority=None, **match):
+    dataset = load_dataset(str(root))
+    queue = build_review_queue(dataset)
+    entry = entry_for(queue, priority, **match)
+    return dataset, entry, next(
+        item for item in build_candidates(dataset) if item["candidate_id"] == entry["candidate_id"]
+    )
+
+
+def item_for(candidate, **overrides):
+    base = {
+        "evidence_id": "EV-1",
+        "candidate_id": candidate["candidate_id"],
+        "reference_identifier": "ref",
+        "publisher": "publisher",
+        "source_reference": "https://example.invalid/boxscore",
+        "retrieved_at": "2030-05-02T00:00:00Z",
+        "actual_event_date": candidate["event_date"],
+        "away_team": "away",
+        "home_team": "home",
+        "event_identifier": "FX-1",
+        "excerpt": "excerpt",
+        "checked_by": REVIEWER,
+        "verification_status": STATUS_SOURCE_REFERENCE_REVIEWED,
+        "contradictory_references": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def evidence_of(*items):
+    return {"schema_version": "1.0.0", "evidence": list(items), "rejected": []}
+
+
+def test_z_01_exact_team_pair_still_matches(tmp_path):
+    dataset, entry, candidate = candidate_of(workbench_fixture(tmp_path), PRIORITY_P1)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六308"]
+    result = resolve_orientation(candidate, evidence_of(item_for(candidate, home_team=live["home"], away_team=live["away"])))
+    assert result["status"] == STATUS_INDEPENDENTLY_SUPPORTED
+    assert sorted(result["matched_source_sides"]) == sorted(candidate["canonical_ids"])
+    assert result["unresolved_sides"] == []
+
+
+def test_z_02_reversed_exact_pair_still_supported(tmp_path):
+    dataset, entry, candidate = candidate_of(workbench_fixture(tmp_path), PRIORITY_P1)
+    assert entry["orientation"] == ORIENTATION_REVERSED
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六308"]
+    result = resolve_orientation(candidate, evidence_of(item_for(candidate, home_team=live["home"], away_team=live["away"])))
+    assert result["status"] == STATUS_INDEPENDENTLY_SUPPORTED
+    assert result["home_team_claims"] == {live["home"]: ["EV-1"]}
+
+
+def test_z_03_variant_names_are_not_treated_as_mismatch(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六316"]
+    result = resolve_orientation(candidate, evidence_of(item_for(candidate, home_team=live["home"], away_team=live["away"])))
+    assert result["status"] == STATUS_SOURCE_SIDE_MATCHED
+    assert result["status"] not in (STATUS_UNVERIFIED, STATUS_INDEPENDENTLY_SUPPORTED)
+    assert result["unmatched"] == []
+    assert result["matched_count"] == 1
+
+
+def test_z_04_one_side_evidence_does_not_authorize_identity(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六316"]
+    result = resolve_orientation(candidate, evidence_of(item_for(candidate, home_team=live["home"], away_team=live["away"])))
+    assert result["cross_source_identity"] == STATUS_CROSS_SOURCE_UNVERIFIED
+    assert result["status"] != STATUS_INDEPENDENTLY_SUPPORTED
+    assert result["unresolved_sides"] == ["500j-2030-05-01-6316"]
+    assert result["authoritative"] is False
+
+
+def test_z_05_unverified_alias_cannot_establish_equivalence(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六316"]
+    supplied_alias = [
+        {"provider_team": "休斯敦火箭", "source_team": "休斯顿火箭",
+         "verification_status": STATUS_SOURCE_REFERENCE_SUPPLIED, "evidence_reference": "guess"},
+        {"provider_team": "俄克拉荷马城雷霆", "source_team": "俄克拉荷马雷霆",
+         "verification_status": STATUS_SOURCE_REFERENCE_SUPPLIED, "evidence_reference": "guess"},
+    ]
+    result = resolve_orientation(
+        candidate,
+        evidence_of(item_for(candidate, home_team=live["home"], away_team=live["away"],
+                             team_name_correspondence=supplied_alias)),
+    )
+    assert result["status"] == STATUS_SOURCE_SIDE_MATCHED
+    assert result["corroborated_evidence_ids"] == []
+
+
+def test_z_06_reviewed_identifiers_can_corroborate(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六316"]
+    reviewed_alias = [
+        {"provider_team": "休斯敦火箭", "source_team": "休斯顿火箭",
+         "verification_status": STATUS_SOURCE_REFERENCE_REVIEWED, "evidence_reference": "roster"},
+        {"provider_team": "俄克拉荷马城雷霆", "source_team": "俄克拉荷马雷霆",
+         "verification_status": STATUS_SOURCE_REFERENCE_REVIEWED, "evidence_reference": "roster"},
+    ]
+    result = resolve_orientation(
+        candidate,
+        evidence_of(item_for(candidate, home_team=live["home"], away_team=live["away"],
+                             team_name_correspondence=reviewed_alias)),
+    )
+    assert result["status"] == STATUS_INDEPENDENTLY_SUPPORTED
+    assert result["corroborated_evidence_ids"] == ["EV-1"]
+    assert sorted(result["matched_source_sides"]) == sorted(candidate["canonical_ids"])
+
+
+def test_z_07_conflicting_fixture_identifiers_stay_unresolved(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六316"]
+    first = item_for(candidate, evidence_id="EV-1", home_team=live["home"], away_team=live["away"],
+                     event_identifier="FX-A")
+    second = item_for(candidate, evidence_id="EV-2", home_team=live["home"], away_team=live["away"],
+                      event_identifier="FX-B")
+    result = resolve_orientation(candidate, evidence_of(first, second))
+    assert result["status"] == STATUS_CONTRADICTED
+    assert result["fixture_identifiers"] == ["FX-A", "FX-B"]
+
+
+def test_z_08_unresolved_contradictory_references_block(tmp_path):
+    dataset, entry, candidate = candidate_of(workbench_fixture(tmp_path), PRIORITY_P1)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六308"]
+    result = resolve_orientation(candidate, evidence_of(item_for(
+        candidate, home_team=live["home"], away_team=live["away"],
+        contradictory_references=["https://example.invalid/other-fixture"],
+    )))
+    assert result["status"] == STATUS_CONTRADICTED
+    assert result["contradictory_references"] == ["https://example.invalid/other-fixture"]
+    assert result["status"] != STATUS_INDEPENDENTLY_SUPPORTED
+
+
+def test_z_09_conflicting_home_claims_rejected(tmp_path):
+    dataset, entry, candidate = candidate_of(workbench_fixture(tmp_path), PRIORITY_P1)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六308"]
+    first = item_for(candidate, evidence_id="EV-1", home_team=live["home"], away_team=live["away"])
+    second = item_for(candidate, evidence_id="EV-2", home_team=live["away"], away_team=live["home"])
+    result = resolve_orientation(candidate, evidence_of(first, second))
+    assert result["status"] == STATUS_CONTRADICTED
+    assert len(result["home_team_claims"]) == 2
+
+
+def test_z_10_unreviewed_url_stays_unverified(tmp_path):
+    dataset, entry, candidate = candidate_of(workbench_fixture(tmp_path), PRIORITY_P1)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六308"]
+    result = resolve_orientation(candidate, evidence_of(item_for(
+        candidate, home_team=live["home"], away_team=live["away"],
+        verification_status=STATUS_SOURCE_REFERENCE_SUPPLIED,
+    )))
+    assert result["status"] == STATUS_UNVERIFIED
+    assert result["supplied_count"] == 1
+
+
+def test_z_11_rejected_evidence_is_non_success(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    _, entry, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+    bad = write_json(tmp_path, "ev.json", {"schema_version": "1.0.0", "evidence": [
+        item_for(candidate, home_team=live["home"], away_team=live["away"],
+                 verification_status="VERIFIED_BY_MODEL")]})
+    assert main(["validate", "--data-dir", root, "--evidence", bad,
+                 "--output", str(tmp_path / "v.json")]) == EXIT_EVIDENCE_REJECTED
+    document = json.loads((tmp_path / "v.json").read_text(encoding="utf-8"))
+    assert document["validation_status"] == "EVIDENCE_REJECTED"
+    assert document["evidence_rejected_count"] == 1
+    assert document["review_rejected_count"] == 0
+
+
+def test_z_12_rejected_review_is_non_success(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    queue = queue_for(root)
+    entry = entry_for(queue, PRIORITY_P1)
+    reviews = write_json(tmp_path, "r.json", review_document(
+        queue, [review_record(entry, label_provenance="AUTOMATED")]))
+    assert main(["validate", "--data-dir", root, "--reviews", reviews]) == 4  # EXIT_REVIEW_REJECTED
+
+
+def test_z_13_both_categories_reported(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    queue = queue_for(root)
+    entry = entry_for(queue, PRIORITY_P1)
+    _, _, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+    reviews = write_json(tmp_path, "r.json", review_document(
+        queue, [review_record(entry, label_provenance="AUTOMATED")]))
+    evidence = write_json(tmp_path, "ev.json", {"schema_version": "1.0.0", "evidence": [
+        item_for(candidate, home_team=live["home"], away_team=live["away"],
+                 verification_status="VERIFIED_BY_MODEL")]})
+    code = main(["validate", "--data-dir", root, "--reviews", reviews, "--evidence", evidence,
+                 "--output", str(tmp_path / "v.json")])
+    assert code == EXIT_MULTIPLE_REJECTIONS
+    document = json.loads((tmp_path / "v.json").read_text(encoding="utf-8"))
+    assert document["validation_status"] == "MULTIPLE_REJECTIONS"
+    assert document["review_rejected_count"] == 1
+    assert document["evidence_rejected_count"] == 1
+    assert document["total_rejected_count"] == 2
+
+
+def test_z_14_valid_unresolved_evidence_is_not_malformed(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    _, _, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+    path = write_json(tmp_path, "ev.json", {"schema_version": "1.0.0", "evidence": [
+        item_for(candidate, home_team=live["home"], away_team=live["away"],
+                 verification_status=STATUS_SOURCE_REFERENCE_SUPPLIED)]})
+    document = load_evidence(path)
+    assert document["rejected"] == []
+    assert document["evidence"][0]["verification_status"] == STATUS_SOURCE_REFERENCE_SUPPLIED
+    assert main(["validate", "--data-dir", root, "--evidence", path]) == 0
+
+
+def test_z_15_blank_template_is_not_reviewed(tmp_path):
+    queue = queue_for(workbench_fixture(tmp_path))
+    template = orientation_evidence_template(queue)
+    example = template["example"]
+    assert example["verification_status"] == STATUS_SOURCE_REFERENCE_SUPPLIED
+    assert example["checked_by"] == ""
+    assert template["example_allows_illegal_status"] is False
+    assert template["status_promotion"]["from"] == STATUS_SOURCE_REFERENCE_SUPPLIED
+    assert template["status_promotion"]["to"] == STATUS_SOURCE_REFERENCE_REVIEWED
+    assert "must not be copied with REVIEWED status" in template["example_note"]
+    assert all(entry["skeleton"].get("label_provenance") == "HUMAN_REVIEWED"
+               for entry in review_template(queue)["candidates"])
+
+
+def review_template(queue):
+    from tools.nba_human_review_workbench import review_template as builder
+
+    return builder(queue)
+
+
+def test_z_16_no_invented_human_decisions(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    document = command_prepare(root, str(tmp_path / "out"))
+    assert document["reviewed_count"] == 0
+    assert document["pending_count"] == document["candidate_count"]
+    template = json.loads((tmp_path / "out" / "review-template.json").read_text(encoding="utf-8"))
+    for candidate in template["candidates"]:
+        skeleton = candidate["skeleton"]
+        assert skeleton["decision"] is None
+        assert skeleton["reviewer"] == ""
+        assert skeleton["decided_at"] == ""
+
+
+def test_z_17_existing_candidate_ids_preserved(tmp_path):
+    dataset = load_dataset(workbench_fixture(tmp_path))
+    scan_ids = {c["candidate_id"] for c in build_candidates(dataset) if c["nba_scope"]}
+    queue_ids = {entry["candidate_id"] for entry in build_review_queue(dataset)["entries"]}
+    assert scan_ids == queue_ids
+    assert all(item.startswith("NXD-") for item in queue_ids)
+
+
+def test_z_18_candidate_fingerprints_compatible(tmp_path):
+    dataset = load_dataset(workbench_fixture(tmp_path))
+    scan = build_scan(dataset)
+    queue = build_review_queue(dataset)
+    by_id = {item["candidate_id"]: item for item in scan["candidates"]}
+    for entry in queue["entries"]:
+        assert entry["candidate_fingerprint"] == by_id[entry["candidate_id"]]["candidate_fingerprint"]
+        assert entry["dataset_fingerprint"] == scan["dataset_fingerprint"]
+
+
+def test_z_19_no_implicit_name_aliases(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    spellings = {value for teams in entry["original_teams"].values() for value in teams.values()}
+    assert {"休斯敦火箭", "休斯顿火箭", "俄克拉荷马城雷霆", "俄克拉荷马雷霆"} <= spellings
+    assert "alias" not in json.dumps(entry, ensure_ascii=False).lower()
+    live = candidate["team_names"]["500lq-2030-05-01-周六316"]
+    result = resolve_orientation(candidate, evidence_of(
+        item_for(candidate, home_team=live["home"], away_team=live["away"])))
+    assert result["status"] == STATUS_SOURCE_SIDE_MATCHED
+
+
+def test_z_20_no_automatic_odds_swapping(tmp_path):
+    queue = queue_for(workbench_fixture(tmp_path))
+    keys = _keys(queue)
+    assert "home_win" not in keys and "away_win" not in keys
+    assert "swap_applied" in keys
+
+
+def test_z_21_no_canonical_identity_rewrite(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    before = store_hashes(root)
+    command_prepare(root, str(tmp_path / "out"))
+    queue = queue_for(root)
+    assert store_hashes(root) == before
+    assert all(entry["canonical_ids"] for entry in queue["entries"])
+    assert queue["surviving_canonical_id"] is None
+
+
+def test_z_22_no_historical_snapshot_rewrite(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    before = json.loads((tmp_path / "data" / "prediction_snapshots.json").read_text(encoding="utf-8"))
+    command_prepare(root, str(tmp_path / "out"))
+    after = json.loads((tmp_path / "data" / "prediction_snapshots.json").read_text(encoding="utf-8"))
+    assert before == after
+    assert sorted(after["snapshots"]) == ["ps-live", "ps-lot"]
+
+
+def test_z_23_distinct_reference_counts_preserved(tmp_path):
+    dataset = load_dataset(workbench_fixture(tmp_path))
+    duplicated = [
+        {"candidate_id": "CAND-A", "canonical_ids": ["500j-2030-05-01-6308", "500lq-2030-05-01-周六308"]},
+        {"candidate_id": "CAND-B", "canonical_ids": ["500j-2030-05-01-6308", "500lq-2030-05-01-周六309"]},
+    ]
+    impact = unique_impact(dataset, duplicated)
+    assert impact["summed_reference_totals"]["odds"] == 3
+    assert impact["distinct_record_counts"]["odds"] == 2
+    assert impact["repeated_reference_counts"]["odds"] == 1
+    assert impact["counts_are_summed_not_unique"] is True
+    assert impact["executable"] is False and impact["apply_available"] is False
+
+
+def test_z_24_no_private_dataset_required(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert main(["prepare", "--data-dir", str(empty)]) == 0
+    assert main(["summary", "--data-dir", str(empty)]) == 0
+    assert main(["validate", "--data-dir", str(empty)]) == 0
+    document = command_validate(str(empty), None)
+    assert document["status"] == "NOT_AVAILABLE"
+
+
+def test_z_25_seven_protected_stores_unchanged(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    before = store_hashes(root)
+    assert len(before) == 7
+    command_prepare(root, str(tmp_path / "out"))
+    command_validate(root, None)
+    command_summary(root)
+    assert store_hashes(root) == before
+
+
+def test_z_26_no_production_runtime_activation(tmp_path):
+    assert production_boundary_audit()["production_activation"] == "NOT_ENABLED"
+    queue = queue_for(workbench_fixture(tmp_path))
+    assert queue["production_write_authorization"] is False
+    assert queue["executable"] is False
+    assert queue["surviving_canonical_id"] is None
+    template = orientation_evidence_template(queue)
+    assert template.get("surviving_canonical_id") is None
+    assert template.get("production_write_authorization") is None
+
+
+
+def test_z_27_pilot_packet_is_offline_and_unreviewed(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    out = tmp_path / "pilot"
+    document = command_pilot(root, str(out), limit=3)
+    assert document["candidate_count"] == 3
+    assert document["evidence_status"] == "EXTERNAL_EVIDENCE_NOT_RETRIEVED"
+    assert document["retrieved_reference_count"] == 0
+    assert document["human_reviewed_count"] == 0
+    assert document["priority_counts"] == {"P0": 1, "P1": 1, "P2": 1}
+    assert document["executable"] is False
+
+    proposals = json.loads((out / "evidence-proposals.json").read_text(encoding="utf-8"))
+    assert proposals["evidence"] == []
+    assert proposals["reviewed_proposal_count"] == 0
+    assert all(item["reference_source"] is None for item in proposals["proposals"])
+    assert all(item["human_verified"] is False for item in proposals["proposals"])
+    assert "http" not in json.dumps(proposals, ensure_ascii=False)
+
+    inventory = json.loads((out / "source-reference-inventory.json").read_text(encoding="utf-8"))
+    assert inventory["retrieved_reference_count"] == 0
+    assert all(item["references"] == [] for item in inventory["candidates"])
+
+    validation = json.loads((out / "evidence-validation.json").read_text(encoding="utf-8"))
+    assert validation["validation_status"] == "SUCCESS"
+    assert validation["total_rejected_count"] == 0
+
+    supplements = sorted((out / "candidate-dossier-supplements").glob("*.md"))
+    assert len(supplements) == 3
+    assert (out / "first-review-instructions.md").is_file()
+    assert (out / "unresolved-evidence-register.md").is_file()
+    assert (out / "pilot-summary.md").is_file()

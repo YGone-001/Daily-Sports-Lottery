@@ -284,6 +284,34 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.11 源侧匹配 vs 跨源同一性（工作台校正）
+
+- **匹配必须按 provider 侧分别进行**：外部记录只与**某一侧**队对一致时状态为
+  `SOURCE_SIDE_MATCHED`，**不得**直接升级为 `ORIENTATION_INDEPENDENTLY_SUPPORTED`。
+  旧实现把外部两队与两源四名并集比较，会把合法的单侧记录误判为 mismatch；该缺陷已修正。
+- **跨源同一性必须显式**：`cross_source_identity` 默认
+  `CROSS_SOURCE_IDENTITY_UNVERIFIED`；只有覆盖**全部 provider 侧**、无未决矛盾、
+  主队声明一致、fixture 标识不冲突时才变为已核验。
+- **别名只能由人工证明**：队名拼写差异需操作者另填
+  `team_name_correspondence`（`provider_team` / `source_team` /
+  `verification_status`），`SOURCE_REFERENCE_SUPPLIED` 状态**不构成**等价证据，
+  任何从拼写推断别名的自动化都不得新增。
+- **矛盾引用阻断结论**：`contradictory_references` 非空、多个已核验条目主队不一致、
+  或 fixture 标识互相竞争时，状态必须是 `ORIENTATION_CONTRADICTED`，
+  不得为了得到正向结论而丢弃冲突来源。
+- **证据状态只能由人工升级**：模板默认 `SOURCE_REFERENCE_SUPPLIED` 且 `checked_by`
+  为空；只有人工真正打开并阅读来源后才能改为 `SOURCE_REFERENCE_REVIEWED`。
+  模板不得预填虚构 reviewer。
+- **校验退出语义**：`SUCCESS = 0`、`REVIEW_REJECTED = 4`、`EVIDENCE_REJECTED = 5`、
+  `MULTIPLE_REJECTIONS = 6`；证据被拒**不得**返回成功。输出必须分别暴露
+  `review_rejected_count` / `evidence_rejected_count` / `total_rejected_count`。
+- **首批证据试点**：`pilot` 子命令只在离线生成证据包；未联网时一律记
+  `EXTERNAL_EVIDENCE_NOT_RETRIEVED`，**不得**编造 URL、fixture 标识或人工复核。
+- 其余约束（禁止自动归并、禁止交换主客与赔率、历史标识符不可改写、七存储完整、
+  `reports/` 本地排除、CI 先于最终报告）与 §4.9 / §4.10 一致，不得放宽。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

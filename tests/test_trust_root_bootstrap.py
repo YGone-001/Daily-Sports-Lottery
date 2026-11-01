@@ -24,7 +24,7 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v8-nba-review-workbench"
+SCOPE_VERSION = "offline-root-pilot-v9-review-evidence-hardening"
 ALLOWED_PATHS = frozenset((
     # trust-root pilot scope (unchanged)
     "utils/trust_root_bootstrap.py",
