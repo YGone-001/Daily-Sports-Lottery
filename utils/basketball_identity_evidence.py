@@ -30,7 +30,7 @@ NBA 跨源身份差异的**候选级证据**模块
 from __future__ import annotations
 
 import datetime as _datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils.source_identity import fingerprint
@@ -226,7 +226,9 @@ class LotteryNumberInterpretation:
     method: str = METHOD_MALFORMED
     confidence: str = CONFIDENCE_MALFORMED
     converts: bool = False
-    authoritative: bool = AUTHORITATIVE
+    #: 权威标志**不是构造参数**：外部无法构造一个自称权威的解释对象，
+    #: ``dataclasses.replace()`` 也无法把它提升为 ``True``。序列化恒为 ``False``。
+    authoritative: bool = field(default=False, init=False, repr=False, compare=False)
     weekday_matches_event_date: bool | None = None
     supporting_evidence: tuple[str, ...] = ()
     contradictory_evidence: tuple[str, ...] = ()
@@ -463,9 +465,11 @@ class CrossSourceCandidateEvidence:
     kickoff_relation: str = RELATION_MISSING
     numbers_comparable: bool = False
     numbers_agree: bool | None = None
-    authorizes_odds_merge: bool = False
-    authorizes_event_admission: bool = False
-    authoritative: bool = AUTHORITATIVE
+    #: 三个权威标志**不是构造参数**：候选证据对象永远不能自称权威、不能授权
+    #: 合并或入册，``dataclasses.replace()`` 也无法把它们提升为 ``True``。
+    authorizes_odds_merge: bool = field(default=False, init=False, repr=False, compare=False)
+    authorizes_event_admission: bool = field(default=False, init=False, repr=False, compare=False)
+    authoritative: bool = field(default=False, init=False, repr=False, compare=False)
     supporting_evidence: tuple[str, ...] = ()
     contradictory_evidence: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()

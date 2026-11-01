@@ -24,7 +24,7 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v7-cross-source-evidence"
+SCOPE_VERSION = "offline-root-pilot-v8-nba-review-workbench"
 ALLOWED_PATHS = frozenset((
     # trust-root pilot scope (unchanged)
     "utils/trust_root_bootstrap.py",
@@ -64,7 +64,10 @@ ALLOWED_PATHS = frozenset((
     # nba cross-source identity discrepancy evidence
     "utils/basketball_identity_evidence.py",
     "tools/nba_identity_discrepancy_audit.py",
-    "tests/test_nba_cross_source_identity.py"))
+    "tests/test_nba_cross_source_identity.py",
+    # nba human review workbench
+    "tools/nba_human_review_workbench.py",
+    "tests/test_nba_human_review_workbench.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

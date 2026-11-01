@@ -250,6 +250,40 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.10 NBA 复核工作台：离线、可复核、不可执行
+
+- **工作台用法**：`tools/nba_human_review_workbench` 提供 `prepare` / `show` / `validate` /
+  `summary`。`prepare` 产出优先队列、每候选 15 问卷宗、空白评审模板、独立主客证据模板与
+  使用说明；全部产物写入 `reports/` 或仓库外的操作者目录，**不得**写入 `data/`。
+- **候选优先级不是批准等级**：`P0`（编号/队名矛盾）→ `P1`（精确反向 + 编号对应）→
+  `P2`（队名变体/音译）→ `P3`（其他），只决定复核顺序，**不得**被读作置信度，更不得
+  自动转成任何决定。
+- **独立主客证据**：操作者以外部队列/技术统计/文档补录证据，条目必须带
+  `reference_identifier` / `publisher` / `source_reference` / `retrieved_at` /
+  `actual_event_date` / `away_team` / `home_team` / `checked_by` / `verification_status`。
+  只有 `SOURCE_REFERENCE_REVIEWED` 且日期与队对匹配的条目才能支持方向；URL 的存在
+  **不是**内容已核验的证明；工作台**不**联网抓取；自动化/模型字段一律拒绝。
+- **人工决定 provenance**：评审记录沿用既有 schema，`label_provenance` 必须是
+  `HUMAN_REVIEWED`；`AUTOMATED` / `MODEL_GENERATED` / `DERIVED` / `PROXY` 一律拒绝。
+  同一候选的矛盾决定**不得**按"最新一条"取胜。人工决定是**复核证据**，
+  **不是**签名治理授权。
+- **评审文件校验**：`validate` 复用既有校验器，拒绝未知候选、过期数据集/候选指纹、
+  Canonical ID 不一致、缺失绑定与携带 `approved` / `signature` / `merge` /
+  `surviving_canonical_id` 等生产语义字段的记录。
+- **去重历史引用**：逐对计数会重复统计同一历史记录；受影响记录数必须以**去重**计数为准，
+  且 `prediction_snapshots` / `odds_snapshots` / `settlements` / `evaluation_rows`
+  的既有标识符**不可改写**。
+- **候选权威标志不变式**：`CrossSourceCandidateEvidence` 与
+  `LotteryNumberInterpretation` 的 `authoritative` / `authorizes_odds_merge` /
+  `authorizes_event_admission` 是 `init=False` 常量字段，构造与
+  `dataclasses.replace()` 都**不能**把它们置为 `True`，序列化恒为 `false`。
+- **禁止自动归并、禁止交换赔率**：工作台不选存活 Canonical ID、不删除记录、不生成修复
+  清单、不交换主客队与 `home_win`/`away_win`。
+- **保护数据完整**：七个受保护存储在每次运行前后必须字节不变。
+- **CI 先于最终报告**、**`reports/` 本地排除**：与本文件其余章节一致，不得例外。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程
