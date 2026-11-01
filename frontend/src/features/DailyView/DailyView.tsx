@@ -7,6 +7,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { Skeleton } from '@/components/Skeleton';
 import { Icon } from '@/components/Icon';
 import { MatchRow } from './MatchRow';
+import { availableDatesFor, resolveDisplayDate, shouldClearDate } from './dateSelection';
 import styles from './DailyView.module.css';
 
 interface LeagueGroup {
@@ -22,8 +23,12 @@ export const DailyView: React.FC = () => {
   const currentSport = searchParams.get('sport') || 'all';
 
   const { data: datesData } = useDates();
-  const availableDates = datesData?.dates || [];
-  const displayDate = rawDate || availableDates[0];
+  const allDates = datesData?.dates || [];
+  const datesBySport = datesData?.dates_by_sport;
+  // 运动感知：选择「篮球」时不能默认落在只有足球的日期上，否则「当日无篮球」
+  // 会被误报成「没有比赛」。判定逻辑见 ./dateSelection（有单元测试）。
+  const availableDates = availableDatesFor(currentSport, allDates, datesBySport);
+  const displayDate = resolveDisplayDate(rawDate, availableDates);
 
   const {
     data: matches = [],
@@ -40,6 +45,10 @@ export const DailyView: React.FC = () => {
         next.set('sport', sport);
       } else {
         next.delete('sport');
+      }
+      // 换运动后若当前日期在新运动下没有比赛，清掉过期日期，避免误导性空列表。
+      if (shouldClearDate(next.get('date'), sport, allDates, datesBySport)) {
+        next.delete('date');
       }
       return next;
     });

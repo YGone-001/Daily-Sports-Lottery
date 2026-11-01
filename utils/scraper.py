@@ -70,6 +70,23 @@ def _match_key(match: dict) -> str:
     )
 
 
+def _fill_missing_odds(target: dict, source: dict) -> bool:
+    """
+    把 ``source`` 中**缺失**的盘口键补进 ``target``，绝不覆盖已有值。
+
+    直播源与竞彩 XML 是两类互补市场（直播给胜负，XML 的 sf 给胜负、dxf 给大小分）。
+    既有实现只要目标已有任意盘口就整行跳过，导致直播行永远拿不到 dxf 大小分。
+    """
+    changed = False
+    for key, value in source.items():
+        if value is None:
+            continue
+        if target.get(key) is None:
+            target[key] = value
+            changed = True
+    return changed
+
+
 def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[dict]]:
     """
     把竞彩赔率挂到已有赛程上。
@@ -78,7 +95,10 @@ def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[
     2. 主客队对 fallback (sport + date + home + away)
     不使用开赛时间，不单独使用 (date, home)。
 
-    返回 (成功挂载的场次数, 被消费的赔率源行列表)。
+    合并口径（见 AGENTS.md §4.7）：**已有值优先，只补缺失键**。
+    直播行自带胜负盘，XML 的 dxf 大小分因此可以补入；已有完整覆盖时不会有任何改动。
+
+    返回 (被补充盘口的场次数, 被消费的赔率源行列表)。
     被消费的行不再作为兜底候选，避免同一市场事件重复入册。
     """
     count = 0
@@ -86,26 +106,36 @@ def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[
     used_ids: set[int] = set()
 
     for m in matches:
-        if m.get("odds"):
+        # 同一场竞彩赛事会有**多个玩法行**（篮球 sf 胜负 + dxf 大小分；
+        # 足球 spf + nspf）。必须全部消费，否则大小分永远补不上。
+        matched_rows = [
+            r for r in odds_rows
+            if id(r) not in used_ids and same_event(m, r) and r.get("odds")
+        ]
+        if not matched_rows:
             continue
-        matched_row = None
-        for r in odds_rows:
-            if id(r) in used_ids:
-                continue
-            if same_event(m, r):
-                matched_row = r
-                break
 
-        if matched_row and matched_row.get("odds"):
-            m["odds"] = dict(matched_row["odds"])
-            count += 1
-            used.append(matched_row)
-            used_ids.add(id(matched_row))
+        target = m.get("odds") if isinstance(m.get("odds"), dict) else {}
+        touched = False
+        for r in matched_rows:
+            source = r["odds"]
+            if not target:
+                target.update(source)
+                touched = True
+            elif _fill_missing_odds(target, source):
+                touched = True
+
+            used.append(r)
+            used_ids.add(id(r))
             # 用赔率源的联赛名补全（更规范）
-            if matched_row.get("league") and not m.get("league"):
-                m["league"] = matched_row["league"]
-            if matched_row.get("jczq_no") and not m.get("jczq_no"):
-                m["jczq_no"] = matched_row["jczq_no"]
+            if r.get("league") and not m.get("league"):
+                m["league"] = r["league"]
+            if r.get("jczq_no") and not m.get("jczq_no"):
+                m["jczq_no"] = r["jczq_no"]
+
+        if touched:
+            m["odds"] = target
+            count += 1
     return count, used
 
 

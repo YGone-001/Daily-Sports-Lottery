@@ -203,6 +203,11 @@ export interface SettlementRecord {
 // 可用日期与联赛列表响应（对应 /api/dates）
 export interface DatesResponse {
   dates: string[]
+  /** 按运动分组的比赛日：选择「篮球」时不应默认落到只有足球的日期 */
+  dates_by_sport?: {
+    football: string[]
+    basketball: string[]
+  }
   leagues: {
     football: string[]
     basketball: string[]

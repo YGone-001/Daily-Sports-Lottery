@@ -166,6 +166,29 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - 历史 `snapshot_id` / `settlement_id` / `evaluation_id` **不可变**：
   对未来归并的影响只做说明，绝不重写既有快照、结算或评估标识符。
 
+### 4.7 篮球赛程、在售市场与盘口合并
+
+- **NBA 赛程 ≠ 竞彩在售**：一场比赛可以已排期但没有被竞彩篮球市场收录。
+  没有可用盘口的赛事**不得**被升级进 `market_tracked` 集合，也**不得**凭空补赔率。
+- **市场准入契约**（`utils.scraper._admit_market_candidates`）：
+  已跟踪事件即使本轮无盘口也保持生命周期连续；**首次出现**的新候选必须满足
+  `has_usable_market_odds()` 才准入，并打上 `market_tracked = true`。
+  不得为"让比赛显示出来"而放宽该判定。
+- **盘口合并优先级**（`utils.scraper._attach_odds`）：同一事件的所有玩法行
+  （篮球 `sf` 胜负 + `dxf` 大小分；足球 `spf` + `nspf`）都要被消费；
+  合并口径是**已有值优先、只补缺失键**，绝不覆盖既有有效价格。
+  不得因为"已有任意盘口"就跳过独立匹配到的另一类市场。
+- **源诊断契约**（`utils.fetcher_500`）：`live_basketball` / `jclq_sf` / `jclq_dxf`
+  必须分别报告 `status`（`unavailable` / `empty` / `ok`）、`rows`、`nba_rows`、
+  `valid_market_rows`、`parser_errors`、`last_success_at`、`last_nba_success_at`。
+  `refresh()` 的单一成功标志**不**构成数据可用性证据；命中缓存**不得**刷新
+  `checked_at`，避免把旧结果伪装成刚成功。
+- **运动感知日期**：`/api/dates` 提供 `dates_by_sport`；前端选择「篮球」后**不得**
+  停留在该运动没有比赛的日期上，否则会把"当日无篮球"误报成"没有比赛"。
+  已存储但当前日期不可见（`STORED_BUT_NOT_DISPLAYED`）必须与"数据缺失"区分开。
+- **红线不变**：`same_event()` 语义、Canonical ID 唯一、Phase 2-T 强编号作用域、
+  缺编号 fail-closed、归属冲突拒绝、历史快照与结算不可改写、生产映射未启用。
+
 ---
 
 ## 五、本地报告与交付顺序

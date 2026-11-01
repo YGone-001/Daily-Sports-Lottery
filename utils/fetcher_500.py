@@ -71,15 +71,72 @@ def source_diagnostics() -> dict:
     return copy.deepcopy(_DIAGNOSTICS)
 
 
+def is_nba_league(text: object) -> bool:
+    """NBA 联赛识别：英文 ``NBA`` 或中文 ``美国职业篮球``（竞彩 XML 使用中文）。"""
+    value = str(text or "")
+    return "NBA" in value.upper() or "美国职业篮球" in value
+
+
+def _play_odds_coverage(sport: str, play: str, odds: dict) -> bool:
+    """
+    某个**玩法**是否给出完整可用盘口（逐玩法判定，不把两种玩法混为一谈）。
+
+    ``sf`` / ``nspf`` = 胜负（篮球无平），``dxf`` = 大小分。
+    """
+    from utils.market_coverage import (
+        basketball_has_moneyline,
+        basketball_has_total,
+        football_has_one_x_two,
+        football_has_total,
+    )
+
+    if not isinstance(odds, dict) or not odds:
+        return False
+    if sport == "basketball":
+        if play == "sf":
+            return basketball_has_moneyline(odds)
+        if play == "dxf":
+            return basketball_has_total(odds)
+        return False
+    if sport == "football":
+        if play in ("spf", "nspf"):
+            return football_has_one_x_two(odds)
+        if play == "dxf":
+            return football_has_total(odds)
+        return False
+    return False
+
+
 def _record_diag(source: str, status: str, *, rows: int = 0,
-                 parser_errors: int = 0, note: str = "") -> None:
-    _DIAGNOSTICS[source] = {
+                 parser_errors: int = 0, note: str = "",
+                 nba_rows: int = 0, valid_market_rows: int = 0) -> None:
+    """
+    记录一次**真实请求**的结果。
+
+    诊断只在确实发起请求并得到响应（或确实失败）时写入：命中缓存不会刷新
+    ``checked_at``，因此缓存命中不会被伪装成「刚刚成功抓取」。
+    """
+    previous = _DIAGNOSTICS.get(source) or {}
+    entry = {
         "status": status,
         "rows": rows,
         "parser_errors": parser_errors,
         "note": note,
         "checked_at": datetime.now(BEIJING_TZ).isoformat(),
+        "nba_rows": nba_rows,
+        "valid_market_rows": valid_market_rows,
+        "last_success_at": previous.get("last_success_at"),
+        "last_success_rows": previous.get("last_success_rows", 0),
+        "last_nba_success_at": previous.get("last_nba_success_at"),
+        "last_nba_success_rows": previous.get("last_nba_success_rows", 0),
     }
+    if status == "ok" and rows > 0:
+        entry["last_success_at"] = entry["checked_at"]
+        entry["last_success_rows"] = rows
+        if nba_rows > 0:
+            entry["last_nba_success_at"] = entry["checked_at"]
+            entry["last_nba_success_rows"] = nba_rows
+    _DIAGNOSTICS[source] = entry
     if status != "ok" or parser_errors:
         print(
             f"[500fetcher] {source}: status={status} rows={rows} "
@@ -462,7 +519,14 @@ def fetch_live_basketball() -> list[dict]:
                 note="reachable but matchList empty / no rows parsed",
             )
         else:
-            _record_diag(source, "ok", rows=len(collected), parser_errors=parser_errors)
+            from utils.market_coverage import has_usable_market_odds
+
+            nba_rows = sum(1 for row in collected if is_nba_league(row.get("league")))
+            valid_rows = sum(1 for row in collected if has_usable_market_odds(row))
+            _record_diag(
+                source, "ok", rows=len(collected), parser_errors=parser_errors,
+                nba_rows=nba_rows, valid_market_rows=valid_rows,
+            )
 
         return collected
 
@@ -813,11 +877,15 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
         by_id: dict[str, dict] = {}      # 按竞彩 match id 聚合
         parser_errors = 0
         reachable = False
+        play_ids: dict[str, set[str]] = {play: set() for play in cfg["plays"]}
+        play_status: dict[str, str] = {play: "unavailable" for play in cfg["plays"]}
+        play_errors: dict[str, int] = {play: 0 for play in cfg["plays"]}
 
         for play in cfg["plays"]:
             try:
                 xml = _fetch_xml(cfg["lot"], play)
                 reachable = True
+                play_status[play] = "empty"
             except Exception as exc:  # noqa: BLE001
                 print(f"[500fetcher] 竞彩XML {cfg['lot']}/{play} 失败: {exc}")
                 continue
@@ -826,6 +894,7 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
                 mid = attrs.get("id")
                 if not mid:
                     parser_errors += 1
+                    play_errors[play] += 1
                     continue
                 latest = rows[0] if rows else {}
 
@@ -853,6 +922,10 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
                     }
                     by_id[mid] = entry
 
+                play_ids[play].add(mid)
+                if play_status[play] != "ok":
+                    play_status[play] = "ok"
+
                 odds = entry["odds"]
 
                 if play in ("spf", "nspf", "sf"):
@@ -878,6 +951,20 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
             out.append(entry)
 
         source = f"jczq_odds_{sport}"
+        for play in cfg["plays"]:
+            play_entries = [by_id[mid] for mid in sorted(play_ids[play])]
+            _record_diag(
+                f"{cfg['lot']}_{play}",
+                play_status[play],
+                rows=len(play_entries),
+                parser_errors=play_errors[play],
+                nba_rows=sum(1 for e in play_entries if is_nba_league(e.get("league"))),
+                valid_market_rows=sum(
+                    1 for e in play_entries if _play_odds_coverage(sport, play, e.get("odds") or {})
+                ),
+                note=f"per-play lottery market ({cfg['lot']}/{play})",
+            )
+
         if not reachable:
             _record_diag(source, "unavailable", note="all play XML unreachable")
         elif not out:
@@ -886,7 +973,13 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
                 note="reachable but no matches on sale",
             )
         else:
-            _record_diag(source, "ok", rows=len(out), parser_errors=parser_errors)
+            from utils.market_coverage import has_usable_market_odds
+
+            _record_diag(
+                source, "ok", rows=len(out), parser_errors=parser_errors,
+                nba_rows=sum(1 for e in out if is_nba_league(e.get("league"))),
+                valid_market_rows=sum(1 for e in out if has_usable_market_odds(e)),
+            )
 
         return out
 

@@ -133,10 +133,27 @@ def get_match_by_id(match_id: str) -> dict:
     return {}
 
 
-def get_available_dates() -> list[str]:
-    """返回有赛事的日期列表（降序）"""
-    dates = {m.get("date") for m in get_all_matches() if m.get("date")}
+def get_available_dates(sport: str | None = None) -> list[str]:
+    """
+    返回有赛事的日期列表（降序）。
+
+    ``sport`` 给定时只统计该运动的比赛日：前端选择「篮球」后不应默认落到
+    一个只有足球的日期（那会把「当日无篮球」误报成「没有比赛」）。
+    """
+    dates = {
+        m.get("date")
+        for m in get_all_matches()
+        if m.get("date") and (sport is None or m.get("sport") == sport)
+    }
     return sorted(dates, reverse=True)
+
+
+def get_available_dates_by_sport() -> dict[str, list[str]]:
+    """按运动分组的可用比赛日（足球 / 篮球），供前端做运动感知的日期选择。"""
+    return {
+        "football": get_available_dates("football"),
+        "basketball": get_available_dates("basketball"),
+    }
 
 
 def get_available_dates_with_upcoming() -> set[str]:

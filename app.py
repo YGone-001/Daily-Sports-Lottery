@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
@@ -248,13 +249,19 @@ def api_match_settlements(match_id):
 
 @app.route("/api/dates")
 def api_dates():
+    sport = request.args.get("sport")
+    if sport == "all":
+        sport = None
+    leagues = {
+        "football": get_leagues("football"),
+        "basketball": get_leagues("basketball"),
+    }
     return jsonify(
         {
-            "dates": get_available_dates(),
-            "leagues": {
-                "football": get_leagues("football"),
-                "basketball": get_leagues("basketball"),
-            },
+            # 未指定 sport 时保持既有语义（全部比赛日）；指定时只返回该运动的比赛日。
+            "dates": get_available_dates(sport),
+            "dates_by_sport": daily_loader.get_available_dates_by_sport(),
+            "leagues": leagues,
         }
     )
 
@@ -287,8 +294,57 @@ def api_status():
             "dates": get_available_dates(),
             "team_pool": strength_stats(),
             "today_stats": get_daily_stats(),
+            "source_health": build_source_health(),
         }
     )
+
+
+def build_source_health() -> dict:
+    """
+    篮球同步的只读诊断：每个数据源的**阶段**与计数，而不是一个笼统的成功标志。
+
+    - 只暴露状态、计数与时间戳，不暴露 URL、凭证或原始报文；
+    - ``age_seconds`` 由读取时刻计算，缓存命中不会把旧结果伪装成「刚刚成功」；
+    - ``displayed`` 说明「已存储」与「当前默认日期可见」是两件事。
+    """
+    from utils.fetcher_500 import source_diagnostics, is_nba_league
+    from utils.market_coverage import has_usable_market_odds
+
+    diagnostics = source_diagnostics()
+    now = get_beijing_now()
+    sources: dict[str, dict] = {}
+    for name in ("live_basketball", "jclq_sf", "jclq_dxf"):
+        entry = dict(diagnostics.get(name) or {"status": "not_probed"})
+        checked_at = entry.get("checked_at")
+        age_seconds = None
+        if checked_at:
+            try:
+                age_seconds = int((now - datetime.fromisoformat(checked_at)).total_seconds())
+            except (TypeError, ValueError):
+                age_seconds = None
+        entry["age_seconds"] = age_seconds
+        sources[name] = entry
+
+    basketball = [m for m in daily_loader.get_all_matches() if m.get("sport") == "basketball"]
+    nba = [m for m in basketball if is_nba_league(m.get("league"))]
+    default_date = get_default_date()
+    return {
+        "sources": sources,
+        "stored": {
+            "basketball": len(basketball),
+            "nba": len(nba),
+            "basketball_with_valid_market": sum(1 for m in basketball if has_usable_market_odds(m)),
+        },
+        "displayed": {
+            "default_date": default_date,
+            "basketball_on_default_date": len(daily_loader.get_matches_by_date(default_date, "basketball")),
+            "nba_on_default_date": sum(
+                1 for m in basketball if m.get("date") == default_date and is_nba_league(m.get("league"))
+            ),
+        },
+        "basketball_dates": get_available_dates("basketball")[:7],
+        "nba_dates": sorted({m.get("date") for m in nba if m.get("date")}, reverse=True)[:7],
+    }
 
 
 @app.route("/api/history")

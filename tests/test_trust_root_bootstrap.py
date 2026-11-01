@@ -24,7 +24,7 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v4-duplicate-review"
+SCOPE_VERSION = "offline-root-pilot-v5-basketball-sync"
 ALLOWED_PATHS = frozenset((
     # trust-root pilot scope (unchanged)
     "utils/trust_root_bootstrap.py",
@@ -48,7 +48,17 @@ ALLOWED_PATHS = frozenset((
     # offline duplicate review and reconciliation preview
     "tools/real_sports_duplicate_review.py",
     "tests/test_real_sports_duplicate_review.py",
-    "docs/duplicate-review-workflow.md"))
+    "docs/duplicate-review-workflow.md",
+    # basketball lottery synchronization
+    "utils/fetcher_500.py",
+    "utils/scraper.py",
+    "utils/daily_loader.py",
+    "app.py",
+    "tests/test_basketball_sync_integrity.py",
+    "frontend/src/features/DailyView/DailyView.tsx",
+    "frontend/src/features/DailyView/dateSelection.ts",
+    "frontend/src/features/DailyView/dateSelection.test.ts",
+    "frontend/src/types/match.ts"))
 
 
 @pytest.fixture(scope="session", autouse=True)
