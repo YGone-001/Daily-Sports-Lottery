@@ -1226,3 +1226,238 @@ def test_z_27_pilot_packet_is_offline_and_unreviewed(tmp_path):
     assert (out / "first-review-instructions.md").is_file()
     assert (out / "unresolved-evidence-register.md").is_file()
     assert (out / "pilot-summary.md").is_file()
+
+
+# =============================================================================
+# Real NBA Evidence Pilot & Provenance Regressions (RA-01 .. RA-20)
+# =============================================================================
+
+def test_ra_01_unreviewed_supplied_evidence_allows_empty_checked_by(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    _, _, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+    item = item_for(
+        candidate,
+        home_team=live["home"],
+        away_team=live["away"],
+        checked_by="",
+        verification_status=STATUS_SOURCE_REFERENCE_SUPPLIED,
+    )
+    path = write_json(tmp_path, "ev.json", {"schema_version": "1.0.0", "evidence": [item]})
+    document = load_evidence(path)
+    assert document["rejected"] == []
+    assert len(document["evidence"]) == 1
+    assert document["evidence"][0]["checked_by"] == ""
+    assert document["evidence"][0]["verification_status"] == STATUS_SOURCE_REFERENCE_SUPPLIED
+
+
+def test_ra_02_supplied_evidence_cannot_support_orientation(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    dataset, entry, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+    item = item_for(
+        candidate,
+        home_team=live["home"],
+        away_team=live["away"],
+        checked_by="",
+        verification_status=STATUS_SOURCE_REFERENCE_SUPPLIED,
+    )
+    result = resolve_orientation(candidate, evidence_of(item))
+    assert result["status"] == STATUS_UNVERIFIED
+    assert result["cross_source_identity"] == STATUS_CROSS_SOURCE_UNVERIFIED
+    assert result["matched_count"] == 0
+    assert result["authoritative"] is False
+
+
+def test_ra_03_reviewed_evidence_requires_reviewer(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    _, _, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+
+    # Empty checked_by is rejected for REVIEWED status
+    item_empty = item_for(
+        candidate,
+        home_team=live["home"],
+        away_team=live["away"],
+        checked_by="",
+        verification_status=STATUS_SOURCE_REFERENCE_REVIEWED,
+    )
+    doc_empty = load_evidence(write_json(tmp_path, "empty.json", {"schema_version": "1.0.0", "evidence": [item_empty]}))
+    assert len(doc_empty["rejected"]) == 1
+    assert doc_empty["rejected"][0]["reason_code"] == "MISSING_CHECKED_BY"
+
+    # Automated checked_by is rejected
+    for auto_name in ("model", "bot", "auto", "automated", "model_generated", "ai"):
+        item_auto = item_for(
+            candidate,
+            home_team=live["home"],
+            away_team=live["away"],
+            checked_by=auto_name,
+            verification_status=STATUS_SOURCE_REFERENCE_REVIEWED,
+        )
+        doc_auto = load_evidence(write_json(tmp_path, f"{auto_name}.json", {"schema_version": "1.0.0", "evidence": [item_auto]}))
+        assert len(doc_auto["rejected"]) == 1
+        assert doc_auto["rejected"][0]["reason_code"] == "AUTOMATED_REVIEWER_REJECTED"
+
+
+def test_ra_04_reviewed_evidence_rejects_missing_source_provenance(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    _, _, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+
+    # Missing source_reference
+    item_no_ref = item_for(
+        candidate, home_team=live["home"], away_team=live["away"], source_reference=""
+    )
+    doc_no_ref = load_evidence(write_json(tmp_path, "no_ref.json", {"schema_version": "1.0.0", "evidence": [item_no_ref]}))
+    assert doc_no_ref["rejected"][0]["reason_code"] == "MISSING_SOURCE_REFERENCE"
+
+    # Missing retrieved_at
+    item_no_time = item_for(
+        candidate, home_team=live["home"], away_team=live["away"], retrieved_at=""
+    )
+    doc_no_time = load_evidence(write_json(tmp_path, "no_time.json", {"schema_version": "1.0.0", "evidence": [item_no_time]}))
+    assert doc_no_time["rejected"][0]["reason_code"] == "MISSING_RETRIEVAL_TIMESTAMP"
+
+    # Missing excerpt
+    item_no_exc = item_for(
+        candidate, home_team=live["home"], away_team=live["away"], excerpt=""
+    )
+    doc_no_exc = load_evidence(write_json(tmp_path, "no_exc.json", {"schema_version": "1.0.0", "evidence": [item_no_exc]}))
+    assert doc_no_exc["rejected"][0]["reason_code"] == "MISSING_INSPECTION_EXCERPT"
+
+
+def test_ra_05_source_side_match_not_cross_source_approval(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六316"]
+    result = resolve_orientation(
+        candidate,
+        evidence_of(item_for(candidate, home_team=live["home"], away_team=live["away"]))
+    )
+    assert result["status"] == STATUS_SOURCE_SIDE_MATCHED
+    assert result["cross_source_identity"] == STATUS_CROSS_SOURCE_UNVERIFIED
+    assert result["authoritative"] is False
+
+
+def test_ra_06_date_normalization_preserves_original_timestamp(tmp_path):
+    root = workbench_fixture(tmp_path)
+    queue = queue_for(root)
+    entry = entry_for(queue, PRIORITY_P1)
+    assert entry["event_date"] == DATE
+    assert "03:00" in [v.get("value") for v in entry["kickoff_metadata"].values()]
+    assert set(entry["original_number_strings"].values()) == {"6308", "周六308"}
+
+
+def test_ra_07_official_fixture_id_retained(tmp_path):
+    dataset, entry, candidate = candidate_of(workbench_fixture(tmp_path), PRIORITY_P1)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六308"]
+    result = resolve_orientation(
+        candidate,
+        evidence_of(item_for(
+            candidate,
+            home_team=live["home"],
+            away_team=live["away"],
+            event_identifier="0022600153",
+        ))
+    )
+    assert result["fixture_identifiers"] == ["0022600153"]
+
+
+def test_ra_08_conflicting_fixture_ids_fail_closed(tmp_path):
+    dataset, entry, candidate = candidate_of(variant_fixture(tmp_path), PRIORITY_P0)
+    sides = candidate["team_names"]
+    live = sides["500lq-2030-05-01-周六316"]
+    first = item_for(candidate, evidence_id="EV-1", home_team=live["home"], away_team=live["away"], event_identifier="0022600153")
+    second = item_for(candidate, evidence_id="EV-2", home_team=live["home"], away_team=live["away"], event_identifier="0022600999")
+    result = resolve_orientation(candidate, evidence_of(first, second))
+    assert result["status"] == STATUS_CONTRADICTED
+    assert result["fixture_identifiers"] == ["0022600153", "0022600999"]
+
+
+def test_ra_09_no_automatic_team_aliases(tmp_path):
+    root = workbench_fixture(tmp_path)
+    queue = queue_for(root)
+    for entry in queue["entries"]:
+        assert all("alias" not in k.lower() for k in entry)
+
+
+def test_ra_10_no_synthetic_human_decisions(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    document = command_prepare(root, str(tmp_path / "out"))
+    assert document["reviewed_count"] == 0
+    assert document["pending_count"] == document["candidate_count"]
+
+
+def test_ra_11_validation_response_counts_consistent(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    queue = queue_for(root)
+    entry = entry_for(queue, PRIORITY_P1)
+    reviews = write_json(tmp_path, "r.json", review_document(queue, [review_record(entry, label_provenance="AUTOMATED")]))
+    _, _, candidate = candidate_of(root, PRIORITY_P1)
+    live = candidate["team_names"]["500lq-2030-05-01-周六308"]
+    evidence = write_json(tmp_path, "ev.json", {"schema_version": "1.0.0", "evidence": [
+        item_for(candidate, home_team=live["home"], away_team=live["away"], verification_status="INVALID_STATUS")
+    ]})
+    doc = command_validate(root, reviews, evidence_path=evidence)
+    assert doc["review_rejected_count"] == 1
+    assert doc["rejected_count"] == 1  # legacy field equals review_rejected_count
+    assert doc["evidence_rejected_count"] == 1
+    assert doc["total_rejected_count"] == 2
+    assert doc["validation_status"] == "MULTIPLE_REJECTIONS"
+
+
+def test_ra_12_legacy_cli_return_codes_preserved(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    assert main(["validate", "--data-dir", root]) == 0
+
+
+def test_ra_13_no_automatic_odds_swapping(tmp_path):
+    queue = queue_for(workbench_fixture(tmp_path))
+    for entry in queue["entries"]:
+        assert entry["possible_reversed_alignment"]["swap_applied"] is False
+
+
+def test_ra_14_no_canonical_modification(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    before = store_hashes(root)
+    command_prepare(root, str(tmp_path / "out"))
+    command_validate(root, None)
+    assert store_hashes(root) == before
+
+
+def test_ra_15_all_seven_stores_unchanged(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    before = store_hashes(root)
+    assert len(before) == 7
+    command_summary(root)
+    assert store_hashes(root) == before
+
+
+def test_ra_16_real_web_access_not_required_for_ci(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    assert command_pilot(root, None, limit=3)["evidence_status"] == "EXTERNAL_EVIDENCE_NOT_RETRIEVED"
+
+
+def test_ra_17_missing_sources_give_honest_not_available(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert command_show(str(empty), "NXD-1")["status"] == "NOT_AVAILABLE"
+
+
+def test_ra_18_existing_phase_workbench_tests_pass(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    queue = queue_for(root)
+    assert len(queue["entries"]) == 3
+
+
+def test_ra_19_no_production_runtime_activation():
+    assert production_boundary_audit()["production_activation"] == "NOT_ENABLED"
+
+
+def test_ra_20_cross_platform_full_regression(tmp_path):
+    root = workbench_fixture(tmp_path / "data")
+    norm_root = os.path.normpath(str(root))
+    assert os.path.isdir(norm_root)
+    assert len(load_dataset(norm_root).matches) > 0

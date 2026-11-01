@@ -336,7 +336,8 @@ def load_evidence(path: str | None) -> dict[str, Any]:
                 }
             )
             continue
-        if record.get("verification_status") not in EVIDENCE_STATUS_VALUES:
+        status = record.get("verification_status")
+        if status not in EVIDENCE_STATUS_VALUES:
             rejected.append(
                 {
                     "index": index,
@@ -346,16 +347,61 @@ def load_evidence(path: str | None) -> dict[str, Any]:
                 }
             )
             continue
-        if not str(record.get("checked_by") or "").strip():
-            rejected.append(
-                {
-                    "index": index,
-                    "evidence_id": record.get("evidence_id"),
-                    "reason_code": "MISSING_CHECKED_BY",
-                    "detail": "an evidence item needs a human 'checked_by' identity",
-                }
-            )
-            continue
+        if status == STATUS_SOURCE_REFERENCE_REVIEWED:
+            checked_by = str(record.get("checked_by") or "").strip()
+            if not checked_by:
+                rejected.append(
+                    {
+                        "index": index,
+                        "evidence_id": record.get("evidence_id"),
+                        "reason_code": "MISSING_CHECKED_BY",
+                        "detail": "a reviewed evidence item requires a human 'checked_by' identity",
+                    }
+                )
+                continue
+            if checked_by.lower() in ("model", "bot", "auto", "automated", "model_generated", "ai", "proxy"):
+                rejected.append(
+                    {
+                        "index": index,
+                        "evidence_id": record.get("evidence_id"),
+                        "reason_code": "AUTOMATED_REVIEWER_REJECTED",
+                        "detail": "checked_by cannot be automated or model-assigned",
+                    }
+                )
+                continue
+            source_ref = str(record.get("source_reference") or "").strip()
+            if not source_ref:
+                rejected.append(
+                    {
+                        "index": index,
+                        "evidence_id": record.get("evidence_id"),
+                        "reason_code": "MISSING_SOURCE_REFERENCE",
+                        "detail": "a reviewed evidence item requires an independent source reference",
+                    }
+                )
+                continue
+            retrieved_at = str(record.get("retrieved_at") or "").strip()
+            if not retrieved_at:
+                rejected.append(
+                    {
+                        "index": index,
+                        "evidence_id": record.get("evidence_id"),
+                        "reason_code": "MISSING_RETRIEVAL_TIMESTAMP",
+                        "detail": "a reviewed evidence item requires a retrieval timestamp",
+                    }
+                )
+                continue
+            excerpt = str(record.get("excerpt") or "").strip()
+            if not excerpt:
+                rejected.append(
+                    {
+                        "index": index,
+                        "evidence_id": record.get("evidence_id"),
+                        "reason_code": "MISSING_INSPECTION_EXCERPT",
+                        "detail": "a reviewed evidence item requires a factual inspection excerpt",
+                    }
+                )
+                continue
         if not isinstance(record.get("contradictory_references"), list):
             rejected.append(
                 {
@@ -1203,7 +1249,16 @@ def _validation_exit_code(review_rejected: int, evidence_rejected: int) -> int:
 
 
 def command_validate(data_dir: str | None, reviews_path: str | None, *, evidence_path: str | None = None) -> dict[str, Any]:
-    """Validate an imported review file against the current NBA queue."""
+    """
+    Validate an imported review file and optional evidence against the current NBA queue.
+
+    Rejection count contract:
+    - ``rejected_count``: legacy alias for ``review_rejected_count``, returning the count of
+      rejected review decisions from ``validate_reviews()`` for backward compatibility.
+    - ``review_rejected_count``: explicit count of rejected review records.
+    - ``evidence_rejected_count``: explicit count of rejected orientation evidence items.
+    - ``total_rejected_count``: sum of ``review_rejected_count + evidence_rejected_count``.
+    """
     try:
         dataset = _load_dataset_or_error(data_dir)
     except AuditInputError as exc:
@@ -1791,9 +1846,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "candidate_count": document.get("candidate_count"),
                     "reviewed_count": document.get("reviewed_count"),
                     "pending_count": document.get("pending_count"),
-                    "rejected_count": document.get("total_rejected_count"),
+                    "rejected_count": document.get("rejected_count"),
                     "review_rejected_count": document.get("review_rejected_count"),
                     "evidence_rejected_count": document.get("evidence_rejected_count"),
+                    "total_rejected_count": document.get("total_rejected_count"),
                     "validation_status": document.get("validation_status"),
                     "label_status": document.get("label_status"),
                     "executable": document.get("executable"),
