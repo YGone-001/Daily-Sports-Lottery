@@ -215,6 +215,41 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.9 跨源身份差异：候选证据 ≠ Canonical 身份
+
+- **Canonical 身份 vs 候选证据**：`same_event()` 仍是唯一的运行时判等方式；
+  `utils/basketball_identity_evidence` 只产出**候选级**证据（`CANDIDATE_SAME_EVENT` /
+  `CANDIDATE_DIFFERENT_EVENT` / `AMBIGUOUS` / `INSUFFICIENT_EVIDENCE` /
+  `CONTRADICTORY_EVIDENCE`），且 `authoritative` / `is_approval` /
+  `authorizes_odds_merge` / `authorizes_event_admission` **恒为 False**。
+  候选结论**不得**被当作 Canonical 归属决定。
+- **编号书写形态只是假设**：展示式 `周六308` 与编码式 `6308` 的对应关系来自
+  **观测一致性**，不是 provider 契约。解释函数必须同时给出方法、支持证据、矛盾证据与
+  置信分类；证据不足时返回非权威结果。**不得**对四位数字统一剥离首位数字，
+  也**不得**在运行时路径改写 `normalize_competition_number()`。
+- **原始编号必须保留**：任何解释都要保留 provider 实际写下的原始字符串，
+  禁止用解释结果覆盖 `jczq_no` / `matchnum` / `round` 或 Canonical ID 中的编号段。
+- **主客方向未决**：两源主客顺序相反时只报告 `REVERSED_HOME_AWAY`，
+  **不得**自动交换主客队、**不得**交换 `home_win` / `away_win`、**不得**跨未决方向
+  合并大小分与胜负盘。反向本身**不构成**同一事件的证据。
+- **禁止自动归并**：候选可以计数、可以排队、可以预览，但**不得**自动选择存活
+  Canonical ID、**不得**删除较弱记录、**不得**生成可执行修复清单。
+- **既有评审工作流兼容**：差异候选人沿用既有 `candidate_id` / `candidate_fingerprint` /
+  `dataset_fingerprint` / `canonical_ids` 绑定与 `label_provenance = HUMAN_REVIEWED` 校验；
+  自动化诊断**不得**写入人工决定，评审文件里**不得**出现生产授权或变更语义字段。
+- **历史引用不可改写**：`prediction_snapshots` / `odds_snapshots` / `settlements` /
+  `evaluation_rows` 的既有标识符只做**只读计数**，任何预览都不得改写它们指向的
+  Canonical ID。
+- **真实数据验收边界**：无人工复核标签时，候选数与分类数是**诊断统计**，
+  不得称为"已确认重复"；本机真实数据结论不得外推到 CI 或其它环境。
+  真实数据缺失时只报 `NOT_AVAILABLE`，不得编造候选数量。
+- **本机报告**：审计产物写入 `reports/`（本机 Git 元数据排除）或仓库外的临时目录，
+  **不得**写入 `data/`、不得提交、不得推送。
+- **CI 顺序不变**：本地回归 → 前向单行提交 → 推送 → 定位**最终 SHA** 的 workflow →
+  等待终态 → 核对四个 job → 才写最终报告。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

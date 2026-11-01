@@ -24,7 +24,7 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v6-operational-acceptance"
+SCOPE_VERSION = "offline-root-pilot-v7-cross-source-evidence"
 ALLOWED_PATHS = frozenset((
     # trust-root pilot scope (unchanged)
     "utils/trust_root_bootstrap.py",
@@ -60,7 +60,11 @@ ALLOWED_PATHS = frozenset((
     "frontend/src/features/DailyView/dateSelection.test.ts",
     "frontend/src/types/match.ts",
     # basketball operational acceptance
-    "tests/test_basketball_operational_acceptance.py"))
+    "tests/test_basketball_operational_acceptance.py",
+    # nba cross-source identity discrepancy evidence
+    "utils/basketball_identity_evidence.py",
+    "tools/nba_identity_discrepancy_audit.py",
+    "tests/test_nba_cross_source_identity.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)
