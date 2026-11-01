@@ -789,10 +789,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 write_text(args.markdown, render_scan_markdown(document))
             print(json.dumps(
                 {
-                    "real_data_available": document["real_data_available"],
-                    "candidate_count": document["candidate_count"],
-                    "candidate_class_counts": document["candidate_class_counts"],
-                    "negative_control_count": document["negative_control_count"],
+                    "real_data_available": document.get("real_data_available"),
+                    "candidate_count": document.get("candidate_count"),
+                    "candidate_class_counts": document.get("candidate_class_counts", {}),
+                    "negative_control_count": document.get("negative_control_count"),
                 },
                 ensure_ascii=False, sort_keys=True,
             ))

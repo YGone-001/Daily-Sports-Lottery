@@ -98,6 +98,17 @@ REVIEWER = "test-reviewer"
 
 DATE = "2030-05-01"
 
+#: The real stores live outside the tracked tree in CI checkouts. Tests that need them
+#: are skipped there and the absence path is asserted instead — synthetic fixtures stay
+#: the ordinary CI path.
+REAL_DATA_AVAILABLE = all(
+    os.path.isfile(os.path.join(DATA_DIR, name)) for name in PROTECTED_STORES
+)
+requires_real_data = pytest.mark.skipif(
+    not REAL_DATA_AVAILABLE,
+    reason="real dataset is not present in this checkout (CI) — synthetic path used instead",
+)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -610,8 +621,15 @@ def test_nx_25_missing_real_dataset_reports_not_available(tmp_path):
     assert document["decision"] == "NO-GO"
     with pytest.raises(AuditInputError):
         load_dataset(str(empty))
+    # The CLI must survive the missing dataset instead of raising.
+    output = tmp_path / "absent.json"
+    assert main(["scan", "--data-dir", str(empty), "--output", str(output)]) == 0
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written["status"] == "NOT_AVAILABLE"
+    assert written["candidate_count"] is None
 
 
+@requires_real_data
 def test_nx_26_seven_protected_json_files_unchanged():
     before = protected_store_hashes()
     assert len(before) == 7
@@ -622,25 +640,42 @@ def test_nx_26_seven_protected_json_files_unchanged():
     assert store_hashes(DATA_DIR) == before
 
 
-def test_nx_27_no_production_activation():
+def test_nx_27_no_production_activation(tmp_path):
     audit = production_boundary_audit()
     assert audit["production_activation"] == "NOT_ENABLED"
-    scan = command_scan(DATA_DIR, max_controls=1)
-    assert scan["production_write_authorization"] is False
-    assert scan["executable"] is False
-    assert scan["surviving_canonical_id"] is None
-    assert scan["decision"] == "NO-GO"
+    root = duplicate_pair_fixture(tmp_path)
+    document = command_scan(root, max_controls=1)
+    assert document["real_data_available"] is True
+    assert document["production_write_authorization"] is False
+    assert document["executable"] is False
+    assert document["surviving_canonical_id"] is None
+    assert document["approval_count"] == 0
+    assert document["decision"] == "NO-GO"
 
 
 def test_nx_28_ci_covers_both_platforms_and_output_is_byte_stable(tmp_path):
     ci = open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
     assert ci.count("os: [ubuntu-latest, windows-latest]") == 2
 
+    root = duplicate_pair_fixture(tmp_path / "fixture")
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
-    assert main(["scan", "--data-dir", DATA_DIR, "--output", str(first), "--max-controls", "1"]) == 0
-    assert main(["scan", "--data-dir", DATA_DIR, "--output", str(second), "--max-controls", "1"]) == 0
+    assert main(["scan", "--data-dir", root, "--output", str(first), "--max-controls", "1"]) == 0
+    assert main(["scan", "--data-dir", root, "--output", str(second), "--max-controls", "1"]) == 0
     assert first.read_bytes() == second.read_bytes()
+
+
+@requires_real_data
+def test_nx_29_real_dataset_scan_matches_local_stores():
+    """Real-data measurement is reported separately from the synthetic CI path."""
+    document = command_scan(DATA_DIR, max_controls=1)
+    inventory = document["inventory"]
+    assert document["real_data_available"] is True
+    assert inventory["basketball_records"] > 0
+    assert document["candidate_count"] == len(document["candidates"])
+    assert sum(document["candidate_class_counts"].values()) == document["candidate_count"]
+    assert document["human_reviewed_count"] == 0
+    assert document["approval_count"] == 0
 
 
 # ---------------------------------------------------------------------------
