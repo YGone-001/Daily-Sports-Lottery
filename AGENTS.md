@@ -322,6 +322,10 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - **证据矛盾与主客反向阻断**：两源主客相反时（如 `500lq` 客队在前与 `500j` 主队在前），必须独立比对真实场地与官方主队，未决前**严禁自动交换主客或赔率**；若外部证据存在冲突引用或相互竞争的赛事实别码，状态必须保持 `ORIENTATION_CONTRADICTED`。
 - **评审决定权限边界**：人工操作者录入的决定仅作为**复核证据**（Review Evidence），**绝不**等同生产修复授权，**绝不**替代 Ed25519 签名治理；未获操作者参与时保持 `UNREVIEWED` 并报告 `OPERATOR_REVIEW_REQUIRED`，严禁伪造人工决定。
 - **工件本机隔离与七存储保护**：所有外部事实证据、对比矩阵与操作者卷宗仅保存在 Git 排除的本地 `reports/` 目录；七个受保护存储（`daily_matches.json` 等）在运行前后必须**字节不变**。
+- **四类标识符必须分开陈述**：`NBA_OFFICIAL_GAME_ID`（如 `0022600153`，属于 NBA.com）、`THIRD_PARTY_ARCHIVE_ID`（如 Basketball-Reference 的 `202610260DEN`）、`LOTTERY_SOURCE_MATCH_NUMBER`（如 `6316` / `周六316`）与 `PROJECT_CANONICAL_ID`（如 `500j-…` / `500lq-…`）**不得**混用字段或互相代称；**严禁**把第三方归档 ID 写成 `official_fixture_id`，**严禁**编造 `00226-DEN-GSW` 这类无来源支持的「近似官方」编号。
+- **数据集指纹变化即使既有候选失效**：`dataset_fingerprint` 一旦变化（真实同步、修复、剔除等），此前记录的 `candidate_id` 与 `candidate_fingerprint` 全部视为 `STALE_CANDIDATE_FINGERPRINT`；**不得**沿用旧指纹出具评审记录。证据可按**同一对 Canonical ID** 重新绑定，但必须在记录中保留原证据编号、原始标识符与重新绑定依据。
+- **未打开原始来源不得升级证据**：操作者只以其它渠道（如虎扑、赛程聚合页）对照时间时，外部证据保持 `SOURCE_REFERENCE_SUPPLIED`、`checked_by` 留空；人工**决定**（`HUMAN_REVIEWED`）可与未核验证据并存，但**不得**据此声明来源已核验或建立跨源同一性。
+- **评审记录必须绑定当前身份**：每条记录都必须携带当前 `dataset_fingerprint`、`candidate_fingerprint`、`canonical_ids`、真实 `reviewer`、`decided_at` 与 `evidence_reference`；矛盾评估写入 `notes`。记录中**不得**出现 `approved` / `signature` / `merge` / `surviving_canonical_id` 等生产语义字段。
 
 ---
 
