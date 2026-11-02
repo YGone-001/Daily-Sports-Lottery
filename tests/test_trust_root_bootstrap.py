@@ -61,6 +61,8 @@ ALLOWED_PATHS = frozenset((
     "frontend/src/types/match.ts",
     # basketball operational acceptance
     "tests/test_basketball_operational_acceptance.py",
+    # canonical ingestion ownership regression
+    "tests/test_canonical_ingestion_guard.py",
     # nba cross-source identity discrepancy evidence
     "utils/basketball_identity_evidence.py",
     "tools/nba_identity_discrepancy_audit.py",

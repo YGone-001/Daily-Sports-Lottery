@@ -288,6 +288,45 @@ def test_ig_05_abbreviated_names_without_strong_identity_do_not_fuzzy_reconcile(
     assert {m["id"] for m in merged} == {"canon-full", "live-abbr"}
 
 
+def test_ig_05b_abbreviated_update_does_not_orphan_later_observation():
+    """IG-05b: 同一批次内先以简称更新既有队名，随后同归属的全名观测仍应归并。
+
+    回归场景（真实批次曾必然 500）：带强编号的简称行先把既有 Canonical 记录的队名
+    改写为简称，随后一条无编号但队名为全名的同事件观测因队名 fallback 失配被打成
+    「新事件」，又被预检赋予了同一个 Canonical ID，最终以 INCOMING_SHARED_ID 拒绝。
+    归属应以预检结果为准，且与本批次行序无关。
+    """
+    existing = [
+        _match("canon-1003", jczq_no="1003", home="哥德堡盖斯", away="AIK索尔纳")
+    ]
+    incoming = [
+        _match("canon-1003", jczq_no="1003", home="盖斯", away="索尔纳",
+               odds=FOOTBALL_1X2),
+        _match("live-1362837", jczq_no=None, home="哥德堡盖斯", away="AIK索尔纳"),
+    ]
+
+    for ordering in itertools.permutations(range(len(incoming))):
+        merged, added, _updated = scraper._merge(
+            copy.deepcopy(existing),
+            [copy.deepcopy(incoming[i]) for i in ordering],
+        )
+        assert added == 0, ordering
+        assert len(merged) == 1, ordering
+        assert merged[0]["id"] == "canon-1003", ordering
+        assert merged[0]["jczq_no"] == "1003", ordering
+
+
+def test_ig_05c_conflicting_strong_number_still_rejected_when_names_abbreviated():
+    """IG-05c: 简称不放大归属——强编号不同且队名相同的两条记录仍是两个事件。"""
+    existing = [_match("canon-007", jczq_no="007", home="盖斯", away="索尔纳")]
+    incoming = [_match("live-1", jczq_no="008", home="哥德堡盖斯", away="AIK索尔纳")]
+
+    merged, added, _updated = scraper._merge(existing, incoming)
+
+    assert added == 1
+    assert {m["id"] for m in merged} == {"canon-007", "live-1"}
+
+
 def test_ig_06_reused_alias_within_one_batch_rejected():
     """IG-06: 批次内同一源别名被复用为不同事件 -> 拒绝（Case F）。"""
     incoming = [

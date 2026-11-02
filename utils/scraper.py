@@ -306,6 +306,10 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
 
     from utils.match_identity import competition_event_key, team_event_key
 
+    position_by_id: dict[str, int] = {
+        str(m.get("id")): i for i, m in enumerate(result)
+    }
+
     for inc_idx, inc in enumerate(incoming):
         if not isinstance(inc, dict):
             raise CanonicalIdentityCollisionError(f"inc_index_{inc_idx}", "MALFORMED_INCOMING_RECORD", "Incoming record is not a dictionary")
@@ -327,17 +331,31 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
         if len(matching_indices) > 1:
             raise CanonicalIdentityCollisionError(str(inc_mid), "AMBIGUOUS_CANONICAL_OWNERSHIP", "Multiple matching Canonical records found")
 
-        if inc_mid and inc_mid in id_owner:
+        # Canonical 归属以预检结果为准。预检基于**合并前**快照判定，而本循环会通过
+        # resolve_match_update 改写排期元数据（队名、联赛、开赛时间）；队名同时是
+        # same_event 的 fallback 身份键，若逐条重新计算，处理顺序就会影响判定：
+        # 先以简称更新的记录，会让随后同事件的全名记录不再判等，从而被误当成
+        # 「新事件又复用了既有 ID」而整体拒绝（真实批次曾因此必然 500）。
+        owner_pos = plan.owner_index_by_index[inc_idx]
+        anchored_id = (
+            str(existing[owner_pos].get("id") or "")
+            if owner_pos is not None
+            else plan.canonical_id_by_index[inc_idx]
+        )
+        if anchored_id:
+            match_idx = position_by_id.get(anchored_id, -1)
+
+        if match_idx < 0 and inc_mid and inc_mid in id_owner:
             owner = id_owner[inc_mid]
             if not same_event(owner, inc):
                 raise CanonicalIdentityCollisionError(inc_mid, "SAME_SOURCE_ALIAS_DIFFERENT_EVENT", "Source alias reused for different event")
             if matching_indices:
                 match_idx = matching_indices[0]
-        else:
-            if len(matching_indices) == 1:
-                match_idx = matching_indices[0]
-                if inc_mid:
-                    id_owner[inc_mid] = result[match_idx]
+        elif match_idx < 0 and len(matching_indices) == 1:
+            match_idx = matching_indices[0]
+
+        if match_idx >= 0 and inc_mid and inc_mid not in id_owner:
+            id_owner[inc_mid] = result[match_idx]
 
         if match_idx >= 0:
             old = result[match_idx]
@@ -372,6 +390,7 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
 
             seen_ids.add(mid)
             id_owner[mid] = m
+            position_by_id[mid] = len(result)
 
             m["market_tracked"] = True
             result.append(m)
