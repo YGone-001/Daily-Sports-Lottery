@@ -327,6 +327,15 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - **未打开原始来源不得升级证据**：操作者只以其它渠道（如虎扑、赛程聚合页）对照时间时，外部证据保持 `SOURCE_REFERENCE_SUPPLIED`、`checked_by` 留空；人工**决定**（`HUMAN_REVIEWED`）可与未核验证据并存，但**不得**据此声明来源已核验或建立跨源同一性。
 - **评审记录必须绑定当前身份**：每条记录都必须携带当前 `dataset_fingerprint`、`candidate_fingerprint`、`canonical_ids`、真实 `reviewer`、`decided_at` 与 `evidence_reference`；矛盾评估写入 `notes`。记录中**不得**出现 `approved` / `signature` / `merge` / `surviving_canonical_id` 等生产语义字段。
 
+### 4.13 彩票编号比赛日语义与提供方显示顺序
+
+- **编号星期绑定销售日分组，不绑定开赛日**：竞彩篮球编号的星期 token（如 `周六316`）绑定的是**销售日分组窗口**（北京时间 11:30 至次日 11:30），既不等于北京开赛日，也不等于美方当地日期。实测 77 条 `500lq` 记录中，NBA 31/31 的星期 token 等于北京日期前一天；同日开赛的 12 条白天场（NBL / 德篮 / 西篮）等于当天；0 条例外。
+- **星期差不是同一性矛盾**：编号星期与北京日期不一致时，分类为 `DATE_SEMANTIC_MISMATCH`，**不得**据此判定 `DIFFERENT_EVENT`，**不得**生成矛盾告警。
+- **证据强度**：上述语义来自第三方归档分组表头与本地观测，**不是**官方 provider schema 契约；取得官方文本前状态为 `PARTIAL`，不得声称已验证。
+- **原始编号不可改写**：解释必须保留 provider 写下的原始字符串；禁止自动剥离或纠正星期 token，不得在运行时路径修改 `normalize_competition_number()`。
+- **提供方显示顺序 ≠ 真实主客**：`500lq` 的 `home` 字段是**显示第一位**（客队在前），其 `home_win` / `away_win` 跟随显示顺序；`500j` 的 `home` / `away` 与真实场地主客一致。该观察经跨源赔率镜像与归档显示顺序确认到「字段与赔率同向」，但「提供商是否将其定义为主胜」**未成文**，故 `MARKET_HOME_WIN_SEMANTICS` 仍为未独立验证。
+- **禁止动作**：不得交换 `home_win` / `away_win`，不得改写主客字段，不得据此自动归并 Canonical 记录。
+
 ---
 
 ## 五、本地报告与交付顺序
