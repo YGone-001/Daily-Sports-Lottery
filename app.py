@@ -280,8 +280,18 @@ def api_refresh():
     try:
         stats = scraper.refresh(verbose=False)
         return jsonify(stats)
-    except scraper.RefreshBusyError:
-        return jsonify({"status": "busy", "message": "Refresh in progress"}), 409
+    except scraper.RefreshBusyError as exc:
+        return (
+            jsonify(
+                {
+                    "status": "busy",
+                    "message": "Refresh in progress",
+                    # 所有权是**建议性**元数据：锁是否释放只由 OS 锁决定。
+                    "active_writer": getattr(exc, "owner", None),
+                }
+            ),
+            409,
+        )
 
 
 @app.route("/api/status")
@@ -410,8 +420,19 @@ def start_background_scraper():
                 print(f"\n[Auto-Sync] {get_beijing_now().strftime('%H:%M:%S')} 开始抓取...")
                 stats = scraper.refresh(verbose=True)
                 print(f"[Auto-Sync] 完成: {stats.get('added')} 新增 / {stats.get('total')} 总计")
-            except scraper.RefreshBusyError:
-                print("[Auto-Sync] 跳过: 另一个刷新进程正在运行 (RefreshBusyError)")
+            except scraper.RefreshBusyError as exc:
+                # 不再静默跳过：明确写出是谁持有写入者锁，便于判断本实例是否在吃旧数据。
+                owner = getattr(exc, "owner", None) or {}
+                holder = (
+                    f"pid={owner.get('pid')} host={owner.get('host')} "
+                    f"action={owner.get('action')} since={owner.get('started_at')}"
+                    if owner
+                    else "unknown (no in-progress marker)"
+                )
+                print(
+                    "[Auto-Sync] 跳过: 另一个写入者正在刷新 (RefreshBusyError) "
+                    f"持有者: {holder}"
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"[Auto-Sync] 异常: {exc}")
             time.sleep(config.SCRAPE_INTERVAL_SECONDS)

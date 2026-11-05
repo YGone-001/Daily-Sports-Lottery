@@ -69,7 +69,15 @@ ALLOWED_PATHS = frozenset((
     "tests/test_nba_cross_source_identity.py",
     # nba human review workbench
     "tools/nba_human_review_workbench.py",
-    "tests/test_nba_human_review_workbench.py"))
+    "tests/test_nba_human_review_workbench.py",
+    # refresh writer ownership and cross-store consistency
+    "utils/refresh_state.py",
+    "utils/concurrency.py",
+    "tests/test_concurrency.py",
+    "tests/test_canonical_mapping_governance.py",
+    # durable local human-review evidence
+    "utils/evidence_store.py",
+    "tests/test_refresh_ownership_and_evidence.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

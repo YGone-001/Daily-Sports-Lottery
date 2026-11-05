@@ -1139,8 +1139,8 @@ def test_pg_30_refresh_never_writes_a_governance_ledger(isolated_data_dir, monke
     scraper.refresh(verbose=False)
 
     listing_after = sorted(os.listdir(str(isolated_data_dir)))
-    # 刷新只会新增运行时锁文件，绝不新增任何治理工件。
-    assert set(listing_after) - set(listing_before) <= {".refresh.lock"}
+    # 刷新只会新增运行时锁文件与刷新代标记，绝不新增任何治理工件。
+    assert set(listing_after) - set(listing_before) <= {".refresh.lock", ".refresh_state.json"}
     assert not any("ledger" in name for name in listing_after)
     assert not any("governance" in name for name in listing_after)
 

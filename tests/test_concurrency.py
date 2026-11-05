@@ -165,7 +165,16 @@ def test_t02_http_and_scheduler_overlap(isolated_data_dir, monkeypatch):
                 try: job()
                 except BreakLoop: pass
 
-            mock_print.assert_any_call("[Auto-Sync] 跳过: 另一个刷新进程正在运行 (RefreshBusyError)")
+            # 跳过必须显式记录，并带出写入者信息（不再静默）。
+            skip_messages = [
+                arg
+                for call in mock_print.call_args_list
+                for arg in call.args
+                if isinstance(arg, str) and arg.startswith("[Auto-Sync] 跳过")
+            ]
+            assert skip_messages, "a rejected background refresh must be logged"
+            assert "RefreshBusyError" in skip_messages[0]
+            assert "持有者" in skip_messages[0]
 
             for call in mock_print.call_args_list:
                 args, _ = call

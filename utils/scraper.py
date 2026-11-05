@@ -18,6 +18,7 @@ from datetime import datetime
 
 from utils.concurrency import acquire_refresh_lock, RefreshBusyError
 from utils import fetcher_500
+from utils import refresh_state
 from utils.daily_loader import (
     add_time_status,
     enrich_match,
@@ -792,8 +793,35 @@ def _refresh_impl(verbose: bool = True) -> dict:
 
 
 def refresh(verbose: bool = True) -> dict:
-    with acquire_refresh_lock():
-        return _refresh_impl(verbose=verbose)
+    """
+    执行一次完整刷新。
+
+    全程持有跨进程写入者锁；并在持锁期间发布「代」标记，使只读方能够判断
+    盘上七个库是否来自同一次成功刷新（见 ``utils.refresh_state``）。
+    标记失败不影响刷新本身，也绝不回滚已经落盘的单个文件。
+    """
+    with acquire_refresh_lock() as lease:
+        try:
+            lease.begin()
+        except OSError:
+            # 标记只是可观测性产物，写不出来不应阻断刷新。
+            pass
+        try:
+            result = _refresh_impl(verbose=verbose)
+        except BaseException as exc:
+            try:
+                lease.complete(
+                    refresh_state.STATUS_FAILED,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except OSError:
+                pass
+            raise
+        try:
+            lease.complete(refresh_state.STATUS_COMPLETED)
+        except OSError:
+            pass
+        return result
 
 
 if __name__ == "__main__":
