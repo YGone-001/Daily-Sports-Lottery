@@ -449,12 +449,24 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - **七文件不是一个事务**：每个 JSON 由 `atomic_write_json` 原子替换，但一次刷新跨文件
   可达数分钟，因此**不得**声称七文件原子性。读方必须用
   `refresh_state.consistency()` 判定；`consistent = False` 时**不得**把七库当作同一快照。
+- **原子替换 ≠ 无逻辑丢更新**：`os.replace` 只保证单文件不撕裂。任何"读-改-写"若跨进程
+  没有排他段，仍会丢掉别人的新增（见 §4.17）。不得以"用了原子写"论证并发安全。
+- **一致性必须失败即关闭**，以下任一情况一律 `consistent = False`：
+  标记缺失/不可读/损坏（`NO_REFRESH_STATE_MARKER` / `REFRESH_STATE_UNREADABLE` /
+  `MALFORMED_REFRESH_MARKER`）、schema 不支持、状态取值未知（`UNKNOWN_REFRESH_STATUS`）、
+  标记只覆盖部分库（`INCOMPLETE_MARKER`）、**七个库未全部存在**（`STORE_MISSING`）、
+  摘要与标记不符（`STORES_CHANGED_SINCE_MARKER`）、读取摘要期间代号或状态改变
+  （`GENERATION_CHANGED_DURING_READ`）。
+- **顾问性，不是保证**：`consistency()` 返回 `advisory=True`、
+  `permanent_guarantee=False`、`seven_file_atomicity=False`。一次成功观测**不**代表后续读
+  仍然一致；任何非刷新写入（例如 HTTP GET 物化预测快照）都会立即让已发布摘要失效。
+  需要内部一致的多文件视图时，必须显式重新验证，不得复用旧结论。
 - **无标记 = 不可判定**：`NO_REFRESH_STATE_MARKER` 必须按"不可判定"处理，**不得**当作一致。
 - **中断恢复**：进程被 kill 时由 OS 释放字节锁；状态停留在 `IN_PROGRESS`，读方据此判为
   混合状态；下一次刷新推进 `generation` 即可自愈，**不需要**也不允许手工删锁。
 - **不得删除** `.refresh.lock`；不得用 `.gitignore` 或"隐藏旁路开关"替代该锁。
-- **新增文件白名单**：一次刷新只允许新增 `.refresh.lock` 与 `.refresh_state.json`
-  两个运行时文件，其余新增一律视为越界。
+- **新增文件白名单**：一次刷新只允许新增 `.refresh.lock`、`.refresh_state.json`、
+  `.snapshots.lock` 三个运行时文件，其余新增一律视为越界。
 
 ---
 
@@ -464,22 +476,39 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   显式参数 > 环境变量 `DSL_EVIDENCE_DIR` > `~/.daily-sports-lottery/evidence`。
   **仓库内路径一律拒绝**（`EVIDENCE_DIR_INSIDE_REPOSITORY`），不依赖 `.gitignore`，
   也不得写进任何受跟踪文件。
+- **包含性按解析后的真实路径判定**：`realpath` + `normcase`，因此符号链接、Windows
+  目录联接（junction）、大小写别名、相对路径别名指向仓库内部时一律拒绝
+  （`EVIDENCE_DIR_INSIDE_REPOSITORY`）；解析失败即失败关闭（`PATH_RESOLUTION_FAILED`）。
+  外部的合法目录必须继续可用。
 - **分片键**：`pair_key(sorted(canonical_ids))`。**不含**数据集指纹、队名、比分与时间；
-  数据集刷新**不得**让证据字节消失。
-- **追加式历史**：记录不可修改、不可删除。同一 `(reviewer, decided_at)` 但内容不同 →
-  `CONFLICTING_REWRITE`；完全相同的重复提交 → `IDEMPOTENT_DUPLICATE`（不产生第二份）。
+  数据集刷新**不得**让证据字节消失。`pair_key` 只是**稳定查找地址**，**不是**新的批准：
+  地址命中不等于决定仍然有效。
+- **追加式历史 + 单写者**：读-校验-追加-替换必须整体位于同一把跨进程排他锁
+  （`<EVIDENCE_DIR>/.evidence.lock`）内，**不得**只依赖 `os.replace`；锁获取失败即
+  `EVIDENCE_WRITER_BUSY` 失败关闭，绝不覆盖。记录不可修改、不可删除。
+- **追加语义**：同一 `(reviewer, decided_at)` 但内容不同 → `CONFLICTING_REWRITE`；
+  完全相同的重复提交 → `IDEMPOTENT_DUPLICATE`（不产生第二份）。
 - **矛盾决定**：同一对出现互斥决定时 `decision_summary()` 返回 `CONFLICTING_LABEL` 且
-  `effective_decision = None`，**不得**按"最新一条"取胜。
+  `effective_decision = None`，**不得**按"最新一条"取胜；两个有效决定都保留。
 - **校验复用既有 schema**：`label_provenance` 必须是 `HUMAN_REVIEWED`；
   `reviewer` 不得是 `model` / `bot` / `auto` / `ai` / `system` 等；
   `approved` / `signature` / `merge` / `surviving_canonical_id` 等生产语义字段命中即拒。
+- **存储侧也要校验**：`load_pair()` 必须校验分片 schema / `kind` / `pair_key` 与
+  `canonical_ids` 的一致性，并**逐条**校验历史记录；不合规即
+  `CORRUPT_EVIDENCE_FILE`（附精确原因），**不得**静默重置、**不得**用空文件覆盖。
 - **五个维度必须分开陈述**：持久化、当前有效性、候选身份、数据集新鲜度、生产授权。
   `inspect_record()` 恒返回 `auto_reattached = False` 与 `production_authorized = False`。
 - **重绑定只能由操作者完成**：即便 `BOUND`，下一步仍是 `OPERATOR_REVIEW_REQUIRED`；
-  指纹变化 → `STALE_DATASET_FINGERPRINT`；候选 ID 变化 → `CANDIDATE_ID_CHANGED`；
+  候选 ID 变化 → `CANDIDATE_ID_CHANGED`；**候选指纹变化 →
+  `CANDIDATE_FINGERPRINT_CHANGED`**（提供了 `current_candidate_fingerprint` 才校验，
+  但一旦提供就必须匹配）；数据集指纹变化 → `STALE_DATASET_FINGERPRINT`；
   同一对标的多候选 → `AMBIGUOUS_IDENTITY`（**拒绝，不猜**）；队名相似度**不是**身份输入。
-- **损坏不得静默重置**：读取失败抛 `CORRUPT_EVIDENCE_FILE`，**不得**覆盖或丢弃原文件。
-- **只读导出**：`export_copy()` 复制分片并附 SHA-256 清单，导出目标同样不得位于仓库内。
+- **只读导出**：`export_copy()` 先**完整校验**每个分片（损坏即拒绝），复制后比对
+  SHA-256，并显式声明 `point_in_time_consistent = False`
+  （导出是逐文件复制，不是跨文件点时间快照）。导出目标同样不得位于仓库内。
+- **来源留存 ≠ 来源核验**：`retain_source_copy()` 只留存字节 + 摘要，恒返回
+  `verified_by_human = False` / `sets_review_provenance = False` /
+  `sets_verification_status = False`，且必须保留原始路径与 `sha256`。
 - **不打印证据正文**：任何命令、日志、异常信息都不得回显记录内容。
 
 ---
@@ -498,6 +527,44 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - **日期可见性**：`get_available_dates_by_sport()` 是运动感知日期契约；
   选择篮球时不得停留在 `basketball` 列表之外的日期（否则 `UI_DATE_HIDDEN`）。
 - **不得**因历史数据集缺少某日期就断言源侧无供给：必须先做只读核验再下结论。
+
+---
+
+### 4.17 预测快照的跨进程写入者所有权
+
+- **写入者不止刷新进程**：`ensure_snapshot()` 被 `GET /`、`GET /match/<id>`、
+  `GET /api/today`、`GET /api/matches`、`GET /api/match/<id>` 调用，这些 HTTP 读路径
+  会**物化**赛前快照。它们与 `scraper.refresh()` 可能处于**不同进程**。
+- **进程内 `RLock` 不够**：`utils.prediction_snapshots._LOCK` 只在单进程内互斥；
+  跨进程必须使用 sidecar 排他锁 `<DATA_DIR>/.snapshots.lock`
+  （`utils.concurrency.acquire_sidecar_lock`）。
+- **读-改-写整体在锁内**：`_load_store()` → 去重判断 → `_save_store()` 必须在同一临界区；
+  锁外读到的旧视图**不得**用于写回，否则会覆盖别的进程刚新增的快照。
+- **不得复用 `.refresh.lock`**：GET 路径不得因为刷新进行中而失败，也不得阻塞刷新。
+  两把锁的获取顺序固定为「刷新锁 → 快照锁」，**禁止**反向，避免死锁；
+  `refresh()` 内部物化快照属于同一顺序，因此不会自我死锁。
+- **忙时必须显式降级**：快照锁超时返回既有记录并置 `created = False`，**不写**、
+  不谎报成功、不静默丢弃；`_create_or_get()` 的 `(snapshot, created)` 契约保持不变。
+- **锁文件不删除**：崩溃由 OS 释放字节锁；保留锁文件不会阻塞下一个写者。
+- **快照身份与时序不变**：`snapshot_id = sha256(match_id|slot|model_version)`、
+  「每场每版本一条」「已有快照不可覆盖」「仅 `upcoming` 且开赛时间已知才新建」
+  全部保持；本次修正**不**改变预测数学、`same_event()`、编号解释或赔率方向。
+
+---
+
+### 4.18 人工决定的显式持久化入口
+
+- **唯一写路径**：`tools.nba_human_review_workbench persist --reviews <file> --confirm`。
+  没有 `--confirm` 一律 `EXPLICIT_CONFIRMATION_REQUIRED`，**零写入**。
+- **只读命令绝不落盘**：`validate` / `summary` / `prepare` / `show` / `pilot` 不得写入证据目录。
+- **不得自动生成人工属性**：`reviewer`、`decided_at`、`decision`、来源核验结论
+  全部来自操作者文件；自动化只做校验与复制。
+- **先校验后持久化**：只有 `validation_status = SUCCESS` 的记录才会写入；
+  被拒记录一条都不落盘。
+- **来源状态分离**：`SOURCE_REFERENCE_SUPPLIED` **绝不**因持久化变成
+  `SOURCE_REFERENCE_REVIEWED`；`retain_source_copy()` 不得写入任何核验结论。
+- **合成夹具 ≠ 运营验收**：没有真实操作者参与时，`DURABLE_OPERATOR_WORKFLOW`
+  必须报告为 `BLOCKED`/`PARTIAL`，测试夹具不得当作真实人工复核证据。
 
 ---
 

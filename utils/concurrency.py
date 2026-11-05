@@ -1,7 +1,9 @@
+import errno
 import os
 import threading
+import time
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Iterator
 
 import config
 from utils import refresh_state
@@ -18,6 +20,114 @@ class RefreshBusyError(Exception):
     def __init__(self, message: str, owner: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.owner = owner
+
+
+class SidecarLockBusy(Exception):
+    """
+    Raised when a sidecar single-writer lock could not be acquired in time.
+
+    Sidecar locks protect **one** store's read-modify-write section (for example
+    the prediction snapshot store). They never represent refresh semantics and
+    must never be used to infer whether a refresh is running.
+    """
+
+    def __init__(self, lock_path: str, timeout: float) -> None:
+        super().__init__(f"sidecar lock busy: {lock_path} (timeout={timeout}s)")
+        self.lock_path = lock_path
+        self.timeout = timeout
+
+
+# ---------------------------------------------------------------------------
+# OS byte-range lock primitives (shared by every single-writer section)
+# ---------------------------------------------------------------------------
+
+def _try_os_lock(fd: int) -> bool:
+    """
+    Attempt a non-blocking exclusive 1-byte lock. ``True`` = acquired.
+
+    Only *busy* conditions return ``False``; any other OS error propagates so the
+    caller fails closed instead of pretending to hold a lock.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if os.name == "nt" and exc.errno in (errno.EACCES, errno.EDEADLOCK):
+            return False
+        if os.name != "nt" and exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return False
+        raise
+    return True
+
+
+def _release_os_lock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _open_lock_file(lock_path: str) -> int:
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    # Windows byte-range locking needs at least one byte in the file.
+    if os.fstat(fd).st_size == 0:
+        os.write(fd, b"0")
+    return fd
+
+
+@contextmanager
+def acquire_sidecar_lock(
+    lock_name: str,
+    *,
+    data_dir: str | None = None,
+    timeout: float = 5.0,
+) -> Iterator[str]:
+    """
+    Exclusive single-writer lock for one non-refresh store's read-modify-write.
+
+    - Cross-process and cross-platform (Windows ``msvcrt`` / POSIX ``flock``).
+    - ``timeout=0`` is a single non-blocking attempt.
+    - Distinguishes "busy" from real I/O errors: only busy raises
+      :class:`SidecarLockBusy`; everything else propagates (fail closed).
+    - The lock file is **never** deleted, so a crash can never block the next
+      writer: the OS drops the byte lock when the process dies.
+    """
+    directory = data_dir or config.DATA_DIR
+    lock_path = os.path.join(directory, lock_name)
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    fd = _open_lock_file(lock_path)
+    acquired = False
+    try:
+        while True:
+            if _try_os_lock(fd):
+                acquired = True
+                break
+            if time.monotonic() >= deadline:
+                raise SidecarLockBusy(lock_path, timeout) from None
+            time.sleep(0.05)
+        yield lock_path
+    finally:
+        try:
+            if acquired:
+                _release_os_lock(fd)
+        finally:
+            os.close(fd)
 
 # Process-local thread guards per DATA_DIR
 _THREAD_GUARDS = {}
@@ -112,45 +222,19 @@ def acquire_refresh_lock(action: str = "refresh"):
             os.write(fd, b"0")
         os.lseek(fd, 0, os.SEEK_SET)
 
-        # Apply OS lock
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            # On Windows, EACCES (13) or EDEADLOCK (36) indicates busy. On POSIX, EWOULDBLOCK/EAGAIN.
-            import errno
-            if os.name == "nt" and e.errno in (errno.EACCES, errno.EDEADLOCK):
-                raise RefreshBusyError(
-                    "Refresh is already running in another process.",
-                    owner=active_writer(data_dir),
-                ) from None
-            elif os.name != "nt" and e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-                raise RefreshBusyError(
-                    "Refresh is already running in another process.",
-                    owner=active_writer(data_dir),
-                ) from None
-            raise # Re-raise unexpected I/O errors
+        # Apply OS lock (non-blocking: a second refresh must be rejected, not queued)
+        if not _try_os_lock(fd):
+            raise RefreshBusyError(
+                "Refresh is already running in another process.",
+                owner=active_writer(data_dir),
+            )
 
         yield RefreshLease(data_dir, refresh_state.owner_record(action))
 
     finally:
         try:
             if fd is not None:
-                try:
-                    if os.name == "nt":
-                        import msvcrt
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                finally:
-                    os.close(fd)
+                _release_os_lock(fd)
+                os.close(fd)
         finally:
             thread_guard.release()

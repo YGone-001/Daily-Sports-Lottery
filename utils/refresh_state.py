@@ -74,22 +74,73 @@ def _now_iso() -> str:
     return datetime.now(timezone(timedelta(hours=8))).isoformat()
 
 
-def read_state(data_dir: str) -> dict[str, Any] | None:
-    """
-    宽容读取刷新状态。
+STATUS_KNOWN = frozenset({STATUS_IN_PROGRESS, STATUS_COMPLETED, STATUS_FAILED})
 
-    文件缺失、损坏、半截、类型不符一律返回 `None`；调用方必须把 `None`
-    当作「不可判定」而不是「一致」。
+#: 一致性判定结果代码。除 `CONSISTENT_SNAPSHOT` 外，其余都不允许被读作"同一快照"。
+REASON_CONSISTENT = "CONSISTENT_SNAPSHOT"
+REASON_NO_MARKER = "NO_REFRESH_STATE_MARKER"
+REASON_UNREADABLE = "REFRESH_STATE_UNREADABLE"
+REASON_MALFORMED = "MALFORMED_REFRESH_MARKER"
+REASON_UNSUPPORTED = "UNSUPPORTED_MARKER_SCHEMA"
+REASON_UNKNOWN_STATUS = "UNKNOWN_REFRESH_STATUS"
+REASON_INCOMPLETE_MARKER = "INCOMPLETE_MARKER"
+REASON_NO_DIGESTS = "MARKER_WITHOUT_STORE_DIGESTS"
+REASON_IN_PROGRESS = "REFRESH_IN_PROGRESS"
+REASON_FAILED = "REFRESH_FAILED"
+REASON_STORE_MISSING = "STORE_MISSING"
+REASON_STORES_CHANGED = "STORES_CHANGED_SINCE_MARKER"
+REASON_GENERATION_CHANGED = "GENERATION_CHANGED_DURING_READ"
+
+
+def inspect_state(data_dir: str) -> dict[str, Any]:
+    """
+    读取刷新状态并区分「缺失」与「存在但不可读/不合契约」。
+
+    `read_state()` 只返回 ``dict | None``，无法表达"损坏"；一致性判定必须
+    能区分二者，否则会把损坏标记静默当成"没有标记"。
     """
     path = state_path(data_dir)
+    if not os.path.exists(path):
+        return {"state": None, "error": REASON_NO_MARKER}
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        return {"state": None, "error": REASON_UNREADABLE}
     if not isinstance(payload, dict):
-        return None
-    return payload
+        return {"state": None, "error": REASON_MALFORMED}
+
+    if payload.get("schema_version") != STATE_SCHEMA_VERSION:
+        return {"state": payload, "error": REASON_UNSUPPORTED}
+    status = payload.get("status")
+    if status not in STATUS_KNOWN:
+        return {"state": payload, "error": REASON_UNKNOWN_STATUS}
+    if not isinstance(payload.get("generation"), int):
+        return {"state": payload, "error": REASON_MALFORMED}
+    stores = payload.get("stores")
+    if stores is None or not isinstance(stores, dict):
+        return {"state": payload, "error": REASON_MALFORMED}
+    if status == STATUS_IN_PROGRESS:
+        # 进行中的标记尚未产生摘要，结构合法即可；一致性由状态本身否决。
+        return {"state": payload, "error": None}
+    if set(stores) != set(PROTECTED_STORES):
+        return {"state": payload, "error": REASON_INCOMPLETE_MARKER}
+    if not stores:
+        return {"state": payload, "error": REASON_NO_DIGESTS}
+    # `None` = 该库在完成时刻不存在（由 complete() 显式记录），不是格式错误。
+    if any(value is not None and not isinstance(value, str) for value in stores.values()):
+        return {"state": payload, "error": REASON_MALFORMED}
+    return {"state": payload, "error": None}
+
+
+def read_state(data_dir: str) -> dict[str, Any] | None:
+    """
+    宽容读取刷新状态（保持既有签名）。
+
+    文件缺失、损坏、半截、类型不符一律返回 `None`；调用方必须把 `None`
+    当作「不可判定」而不是「一致」。需要区分原因时用 :func:`inspect_state`。
+    """
+    return inspect_state(data_dir)["state"]
 
 
 def store_digests(data_dir: str) -> dict[str, str]:
@@ -146,8 +197,13 @@ def complete(
     outcome: str,
     error: str | None = None,
 ) -> dict[str, Any]:
-    """标记本次刷新结束，并把结束时七个库的摘要一并记下。"""
-    digests = store_digests(data_dir)
+    """
+    标记本次刷新结束，并把结束时**七个**库的摘要一并记下。
+
+    缺失的库记为 `None`，从而让一致性判定能明确区分"该库当时不存在"，
+    而不是把缺失从标记里悄悄省略掉。
+    """
+    present = store_digests(data_dir)
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
         "status": outcome,
@@ -155,7 +211,7 @@ def complete(
         "owner": dict(owner),
         "started_at": owner.get("started_at"),
         "finished_at": _now_iso(),
-        "stores": digests,
+        "stores": {name: present.get(name) for name in PROTECTED_STORES},
         "error": error,
     }
     _write_state(data_dir, payload)
@@ -164,62 +220,77 @@ def complete(
 
 def consistency(data_dir: str) -> dict[str, Any]:
     """
-    只读判定：盘上七个库是否属于同一次成功刷新的完整快照。
+    只读判定：盘上七个库是否属于同一次**成功**刷新的完整快照。
 
-    返回 `consistent` 为 True 才表示「可安全当作同一快照读取」。
-    `None` 状态（无标记）按**不可判定**处理，不算一致。
+    这是一个**顾问性**观测，不是事务保证：
+
+    - 只有 ``consistent = True`` 才表示"此刻看起来属于同一代"；
+    - 任何时刻都不代表后续读一定一致——非刷新写入（例如 HTTP GET 物化预测快照）
+      会立刻让已发布的摘要失效；
+    - **不**声称七文件原子性。
+
+    失败即关闭：标记缺失/损坏/字段不全/状态未知/缺库/摘要不符/读取期间代号变化，
+    一律返回 ``consistent = False``。
     """
-    state = read_state(data_dir)
+    first = inspect_state(data_dir)
+    state = first["state"]
+    status = state.get("status") if isinstance(state, dict) else None
+    generation = state.get("generation") if isinstance(state, dict) else None
+    owner = state.get("owner") if isinstance(state, dict) else None
+
     current = store_digests(data_dir)
-    if state is None:
-        return {
-            "decidable": False,
-            "consistent": False,
-            "status": None,
-            "generation": None,
-            "owner": None,
-            "reason": "NO_REFRESH_STATE_MARKER",
-            "mismatched": sorted(current),
-            "missing": sorted(set(PROTECTED_STORES) - set(current)),
-            "unexpected": [],
-        }
+    # 读完摘要再读一次标记：若期间换代或改写，则本次观测本身是撕裂的。
+    second = inspect_state(data_dir)
 
-    status = state.get("status")
-    recorded_raw = state.get("stores")
-    recorded = recorded_raw if isinstance(recorded_raw, dict) else {}
-    expected = set(recorded)
+    base = {
+        "advisory": True,
+        "permanent_guarantee": False,
+        "seven_file_atomicity": False,
+        "status": status,
+        "generation": generation,
+        "owner": owner,
+        "mismatched": [],
+        "missing": sorted(set(PROTECTED_STORES) - set(current)),
+        "unexpected": [],
+    }
 
-    # 标记记录过但盘上已消失 / 盘上摘要与标记不一致 / 标记之后才出现的新库，
-    # 三者都说明当前不属于该代的完整快照。
+    if first["error"]:
+        reason = first["error"]
+        return dict(base, decidable=(reason not in (REASON_NO_MARKER, REASON_UNREADABLE)), consistent=False, reason=reason)
+
+    recorded = state.get("stores") or {}
+    expected = set(PROTECTED_STORES)
+
     mismatched = sorted(
-        name
-        for name, digest in current.items()
-        if name in expected and recorded.get(name) != digest
+        name for name, digest in current.items() if recorded.get(name) != digest
     )
-    missing = sorted(expected - set(current))
     unexpected = sorted(set(current) - expected)
+    missing = sorted(expected - set(current))
+    base.update(mismatched=mismatched, missing=missing, unexpected=unexpected)
 
     if status == STATUS_IN_PROGRESS:
-        reason = "REFRESH_IN_PROGRESS"
+        reason = REASON_IN_PROGRESS
     elif status == STATUS_FAILED:
-        reason = "REFRESH_FAILED"
+        reason = REASON_FAILED
     elif not recorded:
-        reason = "MARKER_WITHOUT_STORE_DIGESTS"
-    elif mismatched or unexpected:
-        reason = "STORES_CHANGED_SINCE_MARKER"
+        reason = REASON_NO_DIGESTS
     elif missing:
-        reason = "STORE_MISSING"
+        reason = REASON_STORE_MISSING
+    elif mismatched or unexpected:
+        reason = REASON_STORES_CHANGED
+    elif second["state"] is None or second["state"].get("generation") != generation:
+        reason = REASON_GENERATION_CHANGED
+    elif second["state"].get("status") != status:
+        reason = REASON_GENERATION_CHANGED
+    elif second["error"]:
+        reason = second["error"]
     else:
-        reason = "CONSISTENT_SNAPSHOT"
+        reason = REASON_CONSISTENT
 
-    return {
-        "decidable": True,
-        "consistent": reason == "CONSISTENT_SNAPSHOT",
-        "status": status,
-        "generation": state.get("generation"),
-        "owner": state.get("owner"),
-        "reason": reason,
-        "mismatched": mismatched,
-        "missing": missing,
-        "unexpected": unexpected,
-    }
+    return dict(
+        base,
+        decidable=True,
+        consistent=reason == REASON_CONSISTENT,
+        reason=reason,
+        observed_generation_after_digest=(second["state"] or {}).get("generation"),
+    )

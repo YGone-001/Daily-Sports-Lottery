@@ -87,6 +87,7 @@ QUEUE_KIND = "READ_ONLY_NBA_HUMAN_REVIEW_QUEUE"
 DOSSIER_KIND = "NBA_CANDIDATE_REVIEW_DOSSIER"
 SUMMARY_KIND = "READ_ONLY_NBA_REVIEW_SUMMARY"
 VALIDATION_KIND = "READ_ONLY_NBA_REVIEW_VALIDATION"
+PERSIST_KIND = "OPERATOR_EVIDENCE_PERSISTENCE"
 PREPARE_KIND = "READ_ONLY_NBA_REVIEW_PREPARE"
 EVIDENCE_KIND = "NBA_INDEPENDENT_ORIENTATION_EVIDENCE"
 
@@ -1318,6 +1319,108 @@ def command_validate(data_dir: str | None, reviews_path: str | None, *, evidence
     }
 
 
+def command_persist(
+    data_dir: str | None,
+    reviews_path: str | None,
+    *,
+    evidence_path: str | None = None,
+    evidence_dir: str | None = None,
+    confirm: bool = False,
+    source_references: Sequence[str] = (),
+) -> dict[str, Any]:
+    """
+    Persist **already operator-authored** review decisions into the durable store.
+
+    This is the only write path. It never creates a reviewer, a decision, a
+    timestamp or a source-verification claim; it only copies what the operator
+    wrote, after the existing validator accepted it against the current queue.
+
+    ``confirm`` must be supplied explicitly: nothing is written as a side effect
+    of ``validate`` or ``summary``.
+    """
+    from utils import evidence_store
+
+    base = {
+        "kind": PERSIST_KIND,
+        "schema_version": WORKBENCH_SCHEMA_VERSION,
+        "executable": False,
+        "apply_available": False,
+        "production_write_authorization": False,
+        "surviving_canonical_id": None,
+        "decision": "NO-GO",
+    }
+
+    if not confirm:
+        return dict(base, status="EXPLICIT_CONFIRMATION_REQUIRED",
+                    reason="pass --confirm to persist operator-authored decisions")
+    if not reviews_path:
+        return dict(base, status="REVIEW_FILE_REQUIRED")
+
+    validation = command_validate(data_dir, reviews_path, evidence_path=evidence_path)
+    if not validation.get("real_data_available"):
+        return dict(base, status="DATASET_NOT_AVAILABLE",
+                    reason=validation.get("reason"))
+    if validation["validation_status"] != "SUCCESS":
+        return dict(
+            base,
+            status="REJECTED",
+            validation_status=validation["validation_status"],
+            review_rejected_count=validation["review_rejected_count"],
+            evidence_rejected_count=validation["evidence_rejected_count"],
+            rejected=validation["rejected"],
+            persisted_count=0,
+        )
+
+    accepted = list((validation.get("accepted") or {}).values())
+    if not accepted:
+        return dict(base, status="NOTHING_TO_PERSIST", persisted_count=0)
+
+    persisted: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for record in accepted:
+        try:
+            result = evidence_store.append_record(record, configured_dir=evidence_dir)
+            persisted.append(
+                {
+                    "candidate_id": record.get("candidate_id"),
+                    "pair_key": result["pair_key"],
+                    "outcome": result["status"],
+                    "record_count": result["record_count"],
+                    "conflict": result.get("conflict", False),
+                }
+            )
+        except evidence_store.EvidenceStoreError as exc:
+            errors.append(
+                {
+                    "candidate_id": record.get("candidate_id"),
+                    "reason_code": exc.code,
+                }
+            )
+
+    retained: list[dict[str, Any]] = []
+    for path in source_references:
+        try:
+            manifest = evidence_store.retain_source_copy(path, configured_dir=evidence_dir)
+            retained.append({"sha256": manifest["sha256"], "size": manifest["size"]})
+        except evidence_store.EvidenceStoreError as exc:
+            errors.append({"source_reference": path, "reason_code": exc.code})
+
+    return dict(
+        base,
+        status="PERSISTED" if persisted and not errors else ("PARTIAL" if persisted else "FAILED"),
+        staging_dir_description="EXTERNAL_EVIDENCE_DIRECTORY",
+        persisted_count=len(persisted),
+        persisted=persisted,
+        retained_source_count=len(retained),
+        retained_sources=retained,
+        error_count=len(errors),
+        errors=errors,
+        # 明确：持久化 ≠ 生产授权，也 ≠ 已核验来源。
+        review_evidence_only=True,
+        production_authorized=False,
+    )
+
+
 def command_summary(data_dir: str | None, *, reviews_path: str | None = None,
                     evidence_path: str | None = None) -> dict[str, Any]:
     """Coverage dashboard plus unresolved/contradictory register."""
@@ -1746,6 +1849,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     validate.add_argument("--evidence", default=None)
     validate.add_argument("--output", default=None)
 
+    persist = subparsers.add_parser(
+        "persist", help="persist operator-authored decisions into the durable store"
+    )
+    persist.add_argument("--data-dir", default=None)
+    persist.add_argument("--reviews", required=True)
+    persist.add_argument("--evidence", default=None)
+    persist.add_argument("--evidence-dir", default=None)
+    persist.add_argument("--source-reference", action="append", default=[])
+    persist.add_argument(
+        "--confirm",
+        action="store_true",
+        help="explicit operator acknowledgement; without it nothing is written",
+    )
+    persist.add_argument("--output", default=None)
+
     pilot = subparsers.add_parser("pilot", help="first evidence packet (offline)")
     pilot.add_argument("--data-dir", default=None)
     pilot.add_argument("--output-dir", default=None)
@@ -1860,6 +1978,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 int(document.get("review_rejected_count") or 0),
                 int(document.get("evidence_rejected_count") or 0),
             )
+        if args.command == "persist":
+            document = command_persist(
+                args.data_dir,
+                args.reviews,
+                evidence_path=args.evidence,
+                evidence_dir=args.evidence_dir,
+                confirm=args.confirm,
+                source_references=tuple(args.source_reference or ()),
+            )
+            if args.output:
+                write_json(args.output, document)
+            print(json.dumps(
+                {
+                    "status": document.get("status"),
+                    "persisted_count": document.get("persisted_count"),
+                    "retained_source_count": document.get("retained_source_count"),
+                    "error_count": document.get("error_count"),
+                    "review_evidence_only": document.get("review_evidence_only"),
+                    "production_authorized": document.get("production_authorized"),
+                },
+                ensure_ascii=False, sort_keys=True,
+            ))
+            if document.get("status") == "PERSISTED":
+                return EXIT_OK
+            return EXIT_INPUT_ERROR
         if args.command == "pilot":
             document = command_pilot(args.data_dir, args.output_dir, limit=args.limit)
             if args.output:

@@ -90,6 +90,22 @@ def _child(head: str) -> str:
     )
 
 
+def _seed_seven(directory) -> None:
+    """Create all seven protected stores so a completed marker can be complete."""
+    shapes = {
+        "prediction_snapshots.json": {"version": 1, "snapshots": {}},
+        "odds_snapshots.json": {"version": 1, "snapshots": {}},
+        "settlements.json": {"version": 1, "settlements": {}},
+        "evaluation_rows.json": {"version": 1, "rows": {}},
+        "team_strength.json": {"version": 1, "teams": {}},
+        "calibrated.json": {"version": 1, "sports": {}},
+    }
+    for name, payload in shapes.items():
+        with open(os.path.join(str(directory), name), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+    _seed_store(directory)
+
+
 def _seed_store(directory) -> None:
     """One already-tracked upcoming match, so a refresh has something to rewrite."""
     daily_loader.save_json(
@@ -129,7 +145,7 @@ def _store_hashes(directory) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def test_ro_01_refresh_publishes_generation_and_digests(isolated_data_dir, empty_providers):
-    _seed_store(isolated_data_dir)
+    _seed_seven(isolated_data_dir)
     scraper.refresh(verbose=False)
 
     state = refresh_state.read_state(str(isolated_data_dir))
@@ -155,7 +171,7 @@ def test_ro_02_second_refresh_advances_generation(isolated_data_dir, empty_provi
 
 
 def test_ro_03_mixed_snapshot_is_detected(isolated_data_dir, empty_providers):
-    _seed_store(isolated_data_dir)
+    _seed_seven(isolated_data_dir)
     scraper.refresh(verbose=False)
     assert refresh_state.consistency(str(isolated_data_dir))["consistent"] is True
 
@@ -267,7 +283,7 @@ def test_ro_07_busy_error_reports_the_active_writer(isolated_data_dir):
 
 
 def test_ro_08_second_instance_never_writes_the_stores(isolated_data_dir, empty_providers):
-    _seed_store(isolated_data_dir)
+    _seed_seven(isolated_data_dir)
     scraper.refresh(verbose=False)
     before = _store_hashes(isolated_data_dir)
     generation_before = refresh_state.read_state(str(isolated_data_dir))["generation"]

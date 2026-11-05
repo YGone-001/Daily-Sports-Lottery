@@ -77,7 +77,10 @@ ALLOWED_PATHS = frozenset((
     "tests/test_canonical_mapping_governance.py",
     # durable local human-review evidence
     "utils/evidence_store.py",
-    "tests/test_refresh_ownership_and_evidence.py"))
+    "tests/test_refresh_ownership_and_evidence.py",
+    # cross-process evidence and snapshot write ownership corrections
+    "utils/prediction_snapshots.py",
+    "tests/test_evidence_concurrency_and_consistency.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

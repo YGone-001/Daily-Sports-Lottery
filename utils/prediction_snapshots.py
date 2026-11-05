@@ -22,8 +22,12 @@
   显式传入的 `model_version` 始终优先。身份哈希格式保持不变。
 - 时序：仅 `upcoming` 允许新建；`live` / `finished` 一律拒绝新建，
   但已有快照仍可读取。
-- 并发：进程内 `threading.RLock` 保护「读-改-写」，配合原子落盘，
-  避免重复快照与并发写坏 JSON。
+- 并发：**两级**保护。
+  1. 进程内 `threading.RLock`：Flask 线程之间互斥；
+  2. 跨进程 sidecar 锁 `<DATA_DIR>/.snapshots.lock`：`scraper.refresh()`（另一进程）
+     与 HTTP GET 物化路径都会写同一个存储，仅靠进程内锁无法避免"读到旧视图后覆盖"。
+     该锁**不**复用 `.refresh.lock`：GET 路径不得因为刷新进行中而失败或阻塞刷新。
+     获取超时后**不写**、只读返回既有记录并置 `created=False`（显式降级，绝不静默丢写）。
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ from datetime import datetime
 
 import config
 from utils.atomic_json import atomic_write_json, load_json_file
+from utils.concurrency import SidecarLockBusy, acquire_sidecar_lock
 from utils.daily_loader import add_time_status, get_beijing_now, get_match_datetime
 
 # 赛前快照的「生成槽位」常量。
@@ -49,6 +54,10 @@ MODEL_NAMES = {
 
 # 进程内锁：Flask 请求线程与后台抓取线程共享同一进程时，保护快照文件的读-改-写。
 _LOCK = threading.RLock()
+
+# 跨进程 sidecar 锁：与抓取进程（另一进程）串行化同一存储的读-改-写。
+SNAPSHOT_LOCK_NAME = ".snapshots.lock"
+SNAPSHOT_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -309,13 +318,30 @@ def _create_or_get(
     )
 
     with _LOCK:
-        store = _load_store()
-        existing = store["snapshots"].get(snapshot_id)
-        if isinstance(existing, dict):
-            # 不可变：已有快照一律原样返回，绝不用新状态覆盖。
-            return existing, False
-        store["snapshots"][snapshot_id] = snapshot
-        _save_store(store)
+        # 跨进程单写者：刷新进程与 HTTP GET 物化路径都会走到这里。
+        try:
+            lease = acquire_sidecar_lock(
+                SNAPSHOT_LOCK_NAME,
+                data_dir=config.DATA_DIR,
+                timeout=SNAPSHOT_LOCK_TIMEOUT_SECONDS,
+            )
+            lease.__enter__()
+        except SidecarLockBusy:
+            # 显式降级：不写、不谎报 created=True；只返回当前既有记录。
+            fallback = _load_store()["snapshots"].get(snapshot_id)
+            return (fallback if isinstance(fallback, dict) else None), False
+
+        try:
+            # 必须在跨进程锁内重新读取，否则会用锁外的旧视图覆盖别人的新增。
+            store = _load_store()
+            existing = store["snapshots"].get(snapshot_id)
+            if isinstance(existing, dict):
+                # 不可变：已有快照一律原样返回，绝不用新状态覆盖。
+                return existing, False
+            store["snapshots"][snapshot_id] = snapshot
+            _save_store(store)
+        finally:
+            lease.__exit__(None, None, None)
 
     return snapshot, True
 

@@ -52,6 +52,7 @@ REQUIRED_RECORD_KEYS = frozenset(
 BINDING_BOUND = "BOUND_TO_CURRENT_CANDIDATE"
 BINDING_STALE_FINGERPRINT = "STALE_DATASET_FINGERPRINT"
 BINDING_CANDIDATE_CHANGED = "CANDIDATE_ID_CHANGED"
+BINDING_CANDIDATE_FINGERPRINT_CHANGED = "CANDIDATE_FINGERPRINT_CHANGED"
 BINDING_CANONICAL_CHANGED = "CANONICAL_IDS_CHANGED"
 BINDING_AMBIGUOUS = "AMBIGUOUS_IDENTITY"
 BINDING_UNKNOWN_CANDIDATE = "CANDIDATE_NOT_IN_CURRENT_DATASET"
@@ -94,12 +95,53 @@ def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _canonical(path: str) -> str:
+    """
+    Canonical filesystem form used for containment decisions.
+
+    `realpath` resolves symlinks and Windows directory junctions/reparse points,
+    `normcase` makes comparison case-insensitive on Windows and case-sensitive on
+    POSIX — exactly the platform's own path semantics.
+    """
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser(path))))
+
+
+def _is_inside(path: str, root: str) -> bool:
+    """True when `path` is `root` itself or lives below it (canonical form)."""
+    try:
+        return os.path.commonpath([_canonical(path), _canonical(root)]) == _canonical(root)
+    except ValueError:
+        # Different drives on Windows: cannot be nested.
+        return False
+
+
+def assert_outside_repository(path: str, *, code: str) -> str:
+    """
+    Reject any path that resolves inside the checkout.
+
+    Containment is decided on **resolved** paths, so a symlink/junction pointing
+    back into the repository is refused even when the literal string looks
+    external. Ambiguous resolution fails closed.
+    """
+    try:
+        resolved = _canonical(path)
+    except OSError as exc:  # pragma: no cover - defensive
+        raise EvidenceStoreError("PATH_RESOLUTION_FAILED", f"{path}: {exc}") from None
+    if _is_inside(resolved, _repo_root()):
+        raise EvidenceStoreError(
+            code,
+            "path resolves inside the checkout; evidence must live outside the repository",
+        )
+    return os.path.abspath(os.path.expanduser(path))
+
+
 def resolve_evidence_dir(configured: str | None = None) -> str:
     """
     解析证据目录。优先级：显式入参 > 环境变量 > 用户主目录默认值。
 
-    位于仓库内的一律拒绝：证据必须留在 Git 跟踪范围之外，且不得依赖
-    `.gitignore` 或 `info/exclude` 来"看起来"没被跟踪。
+    位于仓库内的一律拒绝（按**解析后**的真实路径判定，覆盖符号链接、
+    Windows 目录联接与大小写差异），也不得依赖 `.gitignore` / `info/exclude`
+    来"看起来"没被跟踪。
     """
     candidate = configured or os.environ.get(ENV_VAR)
     if candidate:
@@ -107,13 +149,7 @@ def resolve_evidence_dir(configured: str | None = None) -> str:
     else:
         directory = os.path.abspath(os.path.join(os.path.expanduser("~"), DEFAULT_SUBDIR))
 
-    repo = _repo_root()
-    if directory == repo or directory.startswith(repo + os.sep):
-        raise EvidenceStoreError(
-            "EVIDENCE_DIR_INSIDE_REPOSITORY",
-            "evidence must live outside the checkout so it cannot become tracked content",
-        )
-    return directory
+    return assert_outside_repository(directory, code="EVIDENCE_DIR_INSIDE_REPOSITORY")
 
 
 def describe_storage(configured: str | None = None) -> dict[str, Any]:
@@ -241,7 +277,12 @@ def _content_sha(record: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def load_pair(evidence_dir: str, key: str) -> dict[str, Any] | None:
-    """读取一个分片；损坏时抛错，绝不静默重置。"""
+    """
+    读取并**完整校验**一个分片。
+
+    损坏、结构不符、分片元数据与 `pair_key` 不一致、或其中任一条历史记录
+    不合 schema 时一律抛错：绝不静默重置，也绝不用空文件覆盖。
+    """
     path = _record_path(evidence_dir, key)
     if not os.path.isfile(path):
         return None
@@ -252,18 +293,65 @@ def load_pair(evidence_dir: str, key: str) -> dict[str, Any] | None:
         raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: {type(exc).__name__}") from None
     if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
         raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: unexpected shape")
+
+    if str(payload.get("schema_version")) != STORE_SCHEMA_VERSION:
+        raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: unsupported shard schema")
+    if payload.get("kind") not in (None, STORE_KIND):
+        raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: unexpected shard kind")
+    if str(payload.get("pair_key")) != key:
+        raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: pair_key mismatch")
+
+    canonical = payload.get("canonical_ids")
+    if not isinstance(canonical, list):
+        raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: canonical_ids missing")
+    try:
+        derived = pair_key(canonical)
+    except EvidenceStoreError as exc:
+        raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: {exc.code}") from None
+    if derived != key:
+        raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}: canonical ids do not match shard")
+
+    seen: dict[tuple[str, str], str] = {}
+    for index, record in enumerate(payload["records"]):
+        if not isinstance(record, Mapping):
+            raise EvidenceStoreError("CORRUPT_EVIDENCE_FILE", f"{key}[{index}]: not an object")
+        try:
+            clean = validate_record(record)
+        except EvidenceStoreError as exc:
+            raise EvidenceStoreError(
+                "CORRUPT_EVIDENCE_FILE", f"{key}[{index}]: {exc.code}"
+            ) from None
+        if sorted(clean["canonical_ids"]) != sorted(canonical):
+            raise EvidenceStoreError(
+                "CORRUPT_EVIDENCE_FILE", f"{key}[{index}]: record pair differs from shard"
+            )
+        identity = _record_identity(clean)
+        digest = _content_sha(clean)
+        if identity in seen and seen[identity] != digest:
+            raise EvidenceStoreError(
+                "CORRUPT_EVIDENCE_FILE", f"{key}[{index}]: conflicting duplicate identity"
+            )
+        seen[identity] = digest
     return payload
+
+
+EVIDENCE_LOCK_NAME = ".evidence.lock"
+EVIDENCE_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 def append_record(record: Mapping[str, Any], *, configured_dir: str | None = None) -> dict[str, Any]:
     """
     追加一条人工决定。返回写入结果摘要。
 
+    - 读-校验-追加-替换整体位于**同一把跨进程排他锁**内：`os.replace` 只保证
+      单文件不撕裂，**不**能防止两个写者各自读到旧视图后互相覆盖；
     - 完全相同的记录重复提交 -> `IDEMPOTENT_DUPLICATE`，不产生第二份副本；
     - 同一 (reviewer, decided_at) 但内容不同 -> `CONFLICTING_REWRITE`，拒绝；
+    - 两个有效但互斥的决定**都保留**，由读取端报告 `CONFLICTING_LABEL`；
     - 历史记录不可修改、不可删除。
     """
     from utils.atomic_json import atomic_write_json
+    from utils.concurrency import SidecarLockBusy, acquire_sidecar_lock
 
     payload = validate_record(record)
     directory = resolve_evidence_dir(configured_dir)
@@ -271,35 +359,52 @@ def append_record(record: Mapping[str, Any], *, configured_dir: str | None = Non
     os.makedirs(record_dir, exist_ok=True)
 
     key = pair_key(payload["canonical_ids"])
-    existing = load_pair(directory, key) or {
-        "schema_version": STORE_SCHEMA_VERSION,
-        "kind": STORE_KIND,
-        "pair_key": key,
-        "canonical_ids": sorted({str(item) for item in payload["canonical_ids"]}),
-        "records": [],
-    }
+    path = _record_path(directory, key)
 
-    for prior in existing["records"]:
-        if _record_identity(prior) == _record_identity(payload):
-            if _content_sha(prior) == _content_sha(payload):
-                return {
-                    "status": "IDEMPOTENT_DUPLICATE",
+    try:
+        with acquire_sidecar_lock(
+            EVIDENCE_LOCK_NAME,
+            data_dir=directory,
+            timeout=EVIDENCE_LOCK_TIMEOUT_SECONDS,
+        ):
+            existing = load_pair(directory, key)
+            created_shard = existing is None
+            if existing is None:
+                existing = {
+                    "schema_version": STORE_SCHEMA_VERSION,
+                    "kind": STORE_KIND,
                     "pair_key": key,
-                    "record_count": len(existing["records"]),
-                    "path": _record_path(directory, key),
+                    "canonical_ids": sorted({str(item) for item in payload["canonical_ids"]}),
+                    "records": [],
                 }
-            raise EvidenceStoreError("CONFLICTING_REWRITE", "same reviewer/time with different content")
 
-    updated = dict(existing)
-    updated["records"] = list(existing["records"]) + [payload]
-    atomic_write_json(_record_path(directory, key), updated)
+            for prior in existing["records"]:
+                if _record_identity(prior) == _record_identity(payload):
+                    if _content_sha(prior) == _content_sha(payload):
+                        return {
+                            "status": "IDEMPOTENT_DUPLICATE",
+                            "pair_key": key,
+                            "record_count": len(existing["records"]),
+                            "path": path,
+                        }
+                    raise EvidenceStoreError(
+                        "CONFLICTING_REWRITE", "same reviewer/time with different content"
+                    )
+
+            updated = dict(existing)
+            updated["records"] = list(existing["records"]) + [payload]
+            atomic_write_json(path, updated)
+    except SidecarLockBusy as exc:
+        # 失败即关闭：绝不在没有拿到写者锁的情况下覆盖别人刚写入的历史。
+        raise EvidenceStoreError("EVIDENCE_WRITER_BUSY", str(exc)) from None
 
     summary = decision_summary(updated)
     return {
         "status": "APPENDED",
         "pair_key": key,
         "record_count": len(updated["records"]),
-        "path": _record_path(directory, key),
+        "path": path,
+        "shard_created": created_shard,
         # 追加后若该对出现互相矛盾的决定，立即在结果里暴露，绝不在读取端按时间取胜。
         "decision_state": summary["reason"],
         "conflict": summary["conflict"],
@@ -367,17 +472,24 @@ def inspect_record(
     current_candidate_id: str | None,
     current_dataset_fingerprint: str | None,
     candidates_sharing_pair: int = 1,
+    current_candidate_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """
     Classify how a stored decision relates to the **current** dataset.
 
     Persisting evidence never makes stale evidence valid: `BOUND_TO_CURRENT_CANDIDATE`
     still requires `OPERATOR_REVIEW_REQUIRED` before the decision may be reused,
-    because the dataset fingerprint recorded at decision time is part of the
-    evidence. Team names are deliberately not an input here.
+    because the dataset fingerprint and candidate fingerprint recorded at
+    decision time are part of the evidence. Team names are deliberately not an
+    input here.
+
+    ``current_candidate_fingerprint`` is optional for backward compatibility; when
+    it is supplied the stored value must match, otherwise the binding is reported
+    as drifted instead of silently trusted.
     """
     stored_ids = sorted({str(item) for item in (record.get("canonical_ids") or [])})
     current_ids = sorted({str(item) for item in (current_canonical_ids or [])})
+    stored_candidate_fingerprint = str(record.get("candidate_fingerprint") or "")
 
     if candidates_sharing_pair > 1:
         binding = BINDING_AMBIGUOUS
@@ -389,6 +501,11 @@ def inspect_record(
         binding = BINDING_UNKNOWN_CANDIDATE
     elif str(record.get("candidate_id")) != str(current_candidate_id):
         binding = BINDING_CANDIDATE_CHANGED
+    elif (
+        current_candidate_fingerprint is not None
+        and str(current_candidate_fingerprint) != stored_candidate_fingerprint
+    ):
+        binding = BINDING_CANDIDATE_FINGERPRINT_CHANGED
     elif str(record.get("dataset_fingerprint")) != str(current_dataset_fingerprint):
         binding = BINDING_STALE_FINGERPRINT
     else:
@@ -400,6 +517,8 @@ def inspect_record(
         "binding": binding,
         "stored_candidate_id": record.get("candidate_id"),
         "current_candidate_id": current_candidate_id,
+        "stored_candidate_fingerprint": stored_candidate_fingerprint or None,
+        "current_candidate_fingerprint": current_candidate_fingerprint,
         "stored_dataset_fingerprint": record.get("dataset_fingerprint"),
         "current_dataset_fingerprint": current_dataset_fingerprint,
         # 五个维度分别陈述：已持久化 ≠ 当前有效 ≠ 已重绑定 ≠ 已授权生产。
@@ -418,41 +537,113 @@ def inspect_record(
 # Read-only export / backup
 # ---------------------------------------------------------------------------
 
+EXPORT_STATUS_ADVISORY = "COMPLETED_ADVISORY"
+EXPORT_STATUS_UNSTABLE = "COMPLETED_BUT_SOURCE_CHANGED_DURING_COPY"
+
+
+def _sha256_file(path: str) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def retain_source_copy(
+    source_path: str,
+    *,
+    configured_dir: str | None = None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """
+    保存被引用的外部来源副本（或至少记录其完整性摘要），供日后复核。
+
+    刻意**不**产生任何溯源声明：不写 reviewer、不写 decided_at、不改
+    `verification_status`、不声称有人读过该来源。它只是"字节留存 + 摘要"。
+    """
+    from utils.atomic_json import atomic_write_json
+
+    directory = resolve_evidence_dir(configured_dir)
+    origin = os.path.abspath(os.path.expanduser(source_path))
+    if not os.path.isfile(origin):
+        raise EvidenceStoreError("SOURCE_REFERENCE_NOT_FOUND", origin)
+
+    digest = _sha256_file(origin)
+    store_dir = os.path.join(directory, "source_references")
+    os.makedirs(store_dir, exist_ok=True)
+    basename = label or os.path.basename(origin) or "source.bin"
+    safe = "".join(ch for ch in basename if ch.isalnum() or ch in "._-") or "source.bin"
+    target = os.path.join(store_dir, f"{digest[:16]}-{safe}")
+    if not os.path.isfile(target):
+        shutil.copyfile(origin, target)
+
+    manifest = {
+        "kind": "RETAINED_SOURCE_REFERENCE",
+        "schema_version": STORE_SCHEMA_VERSION,
+        "sha256": digest,
+        "size": os.path.getsize(target),
+        "stored_as": target,
+        "original_path": origin,
+        # 明确的非声明：留存字节不等于有人核验过。
+        "verified_by_human": False,
+        "sets_review_provenance": False,
+        "sets_verification_status": False,
+    }
+    atomic_write_json(os.path.join(store_dir, f"{digest[:16]}.manifest.json"), manifest)
+    return manifest
+
+
 def export_copy(destination: str, *, configured_dir: str | None = None) -> dict[str, Any]:
     """
     只读导出：把分片连同清单复制到目标目录。
 
-    导出不改变任何决定，不写入仓库内路径，不生成新的证据身份。
+    - 导出前逐个**完整校验**源分片，损坏直接拒绝（`CORRUPT_EVIDENCE_FILE`）；
+    - 复制后再校验目标与源一致；若复制期间源发生变化，显式标记为
+      `COMPLETED_BUT_SOURCE_CHANGED_DURING_COPY`，**不**声称点时间一致；
+    - 不改变任何决定，不写入仓库内路径（含符号链接/目录联接解析后位于仓库内的情况）。
     """
     from utils.atomic_json import atomic_write_json
 
     source = resolve_evidence_dir(configured_dir)
-    target_dir = os.path.abspath(os.path.expanduser(destination))
-    repo = _repo_root()
-    if target_dir == repo or target_dir.startswith(repo + os.sep):
-        raise EvidenceStoreError("EXPORT_INTO_REPOSITORY", target_dir)
+    target_dir = assert_outside_repository(destination, code="EXPORT_INTO_REPOSITORY")
 
     record_dir = os.path.join(source, RECORD_DIRNAME)
     entries: list[dict[str, Any]] = []
+    unstable: list[str] = []
     os.makedirs(target_dir, exist_ok=True)
     if os.path.isdir(record_dir):
         for name in sorted(os.listdir(record_dir)):
             if not name.endswith(".json"):
                 continue
+            key = name[: -len(".json")]
+            # 完整校验（含每条历史记录），损坏即中止，绝不导出半坏集合。
+            load_pair(source, key)
+
             src = os.path.join(record_dir, name)
+            before = _sha256_file(src)
             dst = os.path.join(target_dir, name)
             shutil.copyfile(src, dst)
-            with open(dst, "rb") as handle:
-                entries.append({"file": name, "sha256": hashlib.sha256(handle.read()).hexdigest()})
+            after = _sha256_file(src)
+            copied = _sha256_file(dst)
+            if not (before == after == copied):
+                unstable.append(name)
+            entries.append(
+                {"file": name, "sha256": copied, "source_sha256": before, "stable": before == after}
+            )
 
     manifest = {
         "kind": "HUMAN_REVIEW_EVIDENCE_EXPORT",
         "schema_version": STORE_SCHEMA_VERSION,
+        "export_status": EXPORT_STATUS_UNSTABLE if unstable else EXPORT_STATUS_ADVISORY,
         "source_directory": source,
         "file_count": len(entries),
         "files": entries,
+        "unstable_files": unstable,
         "read_only": True,
         "no_decisions_changed": True,
+        # 导出是逐个文件复制的，**不**是跨文件点时间快照。
+        "point_in_time_consistent": False,
+        "limitation": (
+            "per-file copy with digest verification; a concurrent append between two "
+            "files would not be represented atomically"
+        ),
     }
     atomic_write_json(os.path.join(target_dir, "export_manifest.json"), manifest)
     return manifest
