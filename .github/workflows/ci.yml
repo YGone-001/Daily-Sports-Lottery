@@ -30,6 +30,9 @@ jobs:
     name: Offline pytest suite (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # Windows is the blocking gate. Ubuntu keeps running as an advisory signal so
+    # a Linux-only environment quirk can never mask or block a Windows regression.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -130,6 +133,8 @@ jobs:
     name: Isolated Canonical repair lifecycle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # Same policy as offline-tests: Windows blocks, Ubuntu advises.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:

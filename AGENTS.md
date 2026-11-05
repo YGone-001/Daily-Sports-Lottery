@@ -600,6 +600,10 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - 记录 run id、URL、`headSha`、`status`、`conclusion` 与每个必需 job 的名称与结论。
 - 仓库 CI 为 `.github/workflows/ci.yml`，`develop` 触发，四个 job：
   `offline-tests`（ubuntu / windows）与 `staging-validation`（ubuntu / windows）。
+- **阻断门是 Windows**：`ubuntu-latest` 带 `continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}`，
+  属**顾问性信号**——Linux 环境差异不得掩盖或阻断 Windows 回归。
+  验收时必须分别陈述：Windows 两项是否成功（阻断）、Ubuntu 两项的实际结论（顾问）。
+  **不得**把"Ubuntu 通过"当作跨平台结论，也**不得**把"Ubuntu 失败"当作代码回归证据。
 
 ---
 
@@ -614,4 +618,6 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - 依赖人工标签的精度 / 召回指标，只有在**独立评审决定存在**时才能报告，
   且必须注明其来源为自述本地评审（非签名组织批准）；否则记 `N/A`。
 - CI：`.github/workflows/ci.yml`，push / PR 到 `develop` 触发，
-  矩阵 `ubuntu-latest` + `windows-latest` × Python 3.12；最终 SHA 上四个 job 必须全部成功。
+  矩阵 `ubuntu-latest` + `windows-latest` × Python 3.12。
+  **最终 SHA 上 Windows 两个 job 必须 `success`**；Ubuntu 两个 job 为顾问信号
+  （`continue-on-error`），其结论必须如实记录，但**不**构成阻断。

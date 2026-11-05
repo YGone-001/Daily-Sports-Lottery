@@ -350,13 +350,25 @@ def test_er_08_09_link_escaping_into_repository_is_refused(tmp_path):
     except OSError as exc:  # pragma: no cover - privileges vary by host
         pytest.skip(f"cannot create a directory link here: {exc}")
 
+    # 1) 链接解析后落在仓库内 -> 拒绝
     with pytest.raises(evidence_store.EvidenceStoreError) as excinfo:
         evidence_store.resolve_evidence_dir(str(link / "reports" / "evidence"))
     assert excinfo.value.code == "EVIDENCE_DIR_INSIDE_REPOSITORY"
 
+    # 2) 含 `..` 的别名在任何平台都必须按解析结果判定
     with pytest.raises(evidence_store.EvidenceStoreError):
-        evidence_store.resolve_evidence_dir(ROOT.upper())
+        evidence_store.resolve_evidence_dir(
+            os.path.join(ROOT, "reports", "..", "reports", "evidence")
+        )
 
+    # 3) 大小写别名只在大小写不敏感的文件系统上构成同一路径（Windows）
+    if os.name == "nt":
+        with pytest.raises(evidence_store.EvidenceStoreError):
+            evidence_store.resolve_evidence_dir(ROOT.upper())
+        with pytest.raises(evidence_store.EvidenceStoreError):
+            evidence_store.export_copy(ROOT.upper())
+
+    # 4) 真正外部的目录继续可用
     allowed = evidence_store.resolve_evidence_dir(str(tmp_path / "outside"))
     assert allowed.endswith("outside")
 
