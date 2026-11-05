@@ -552,3 +552,22 @@ def test_bs_23_source_health_payload_is_safe(isolated_data_dir):
     serialized = json.dumps(health, ensure_ascii=False)
     for forbidden in ("http://", "https://", "token", "password", "cookie"):
         assert forbidden not in serialized.lower()
+
+
+# ---------------------------------------------------------------------------
+# BS-24: date selection survives a dataset with no actionable match
+# ---------------------------------------------------------------------------
+
+def test_bs_24_default_date_without_actionable_days(monkeypatch):
+    """
+    A dataset whose matches have all kicked off (or finished) must not crash
+    date selection: the distance helper is required by the fallback branch too.
+    """
+    monkeypatch.setattr(daily_loader, "get_available_dates", lambda *a, **k: ["2026-11-02"])
+    monkeypatch.setattr(daily_loader, "get_logical_matchday", lambda *a, **k: "2026-11-05")
+    monkeypatch.setattr(daily_loader, "get_all_matches", lambda *a, **k: [])
+    monkeypatch.setattr(
+        daily_loader, "get_available_dates_with_upcoming", lambda *a, **k: ["2026-11-02"]
+    )
+
+    assert daily_loader.get_default_date() == "2026-11-02"

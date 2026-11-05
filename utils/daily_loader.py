@@ -192,19 +192,19 @@ def get_default_date() -> str:
         if start and now < start:
             actionable_days.add(m.get("date") or "")
 
-    if actionable_days:
-        # 取离今天最近的可投注日（优先今天及以后）
-        def _dist(d: str) -> tuple[int, int]:
-            try:
-                delta = (
-                    datetime.strptime(d, "%Y-%m-%d").date()
-                    - datetime.strptime(today, "%Y-%m-%d").date()
-                ).days
-            except ValueError:
-                return (1, 9999)
-            # 今天/未来排前面，且越近越优先
-            return (0 if delta >= 0 else 1, abs(delta))
+    # 取离今天最近的可投注日（优先今天及以后）
+    def _dist(d: str) -> tuple[int, int]:
+        try:
+            delta = (
+                datetime.strptime(d, "%Y-%m-%d").date()
+                - datetime.strptime(today, "%Y-%m-%d").date()
+            ).days
+        except ValueError:
+            return (1, 9999)
+        # 今天/未来排前面，且越近越优先
+        return (0 if delta >= 0 else 1, abs(delta))
 
+    if actionable_days:
         return sorted(actionable_days, key=_dist)[0]
 
     # 2. 逻辑今天有数据就用今天
