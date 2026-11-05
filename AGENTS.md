@@ -436,6 +436,71 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.14 刷新写入者所有权与跨文件一致性
+
+- **互斥权威只有一个**：`utils.concurrency.acquire_refresh_lock()` 持有的
+  `<DATA_DIR>/.refresh.lock` OS 字节锁。`active_writer()` 与 `RefreshBusyError.owner`
+  只是**建议性**元数据，**绝不**用来判断锁是否空闲。
+- **第二个实例不得静默**：被拒时必须显式记录持有者
+  （`pid` / `host` / `action` / `started_at`）；被拒实例**不得**写入任何受保护存储。
+- **代标记**：`utils.refresh_state` 在**持锁期间**写 `<DATA_DIR>/.refresh_state.json`
+  （`IN_PROGRESS` / `COMPLETED` / `FAILED` + `generation` + 结束时七库摘要）。
+  不在锁内写它的调用方（例如生产修复）不会声称刷新语义。
+- **七文件不是一个事务**：每个 JSON 由 `atomic_write_json` 原子替换，但一次刷新跨文件
+  可达数分钟，因此**不得**声称七文件原子性。读方必须用
+  `refresh_state.consistency()` 判定；`consistent = False` 时**不得**把七库当作同一快照。
+- **无标记 = 不可判定**：`NO_REFRESH_STATE_MARKER` 必须按"不可判定"处理，**不得**当作一致。
+- **中断恢复**：进程被 kill 时由 OS 释放字节锁；状态停留在 `IN_PROGRESS`，读方据此判为
+  混合状态；下一次刷新推进 `generation` 即可自愈，**不需要**也不允许手工删锁。
+- **不得删除** `.refresh.lock`；不得用 `.gitignore` 或"隐藏旁路开关"替代该锁。
+- **新增文件白名单**：一次刷新只允许新增 `.refresh.lock` 与 `.refresh_state.json`
+  两个运行时文件，其余新增一律视为越界。
+
+---
+
+### 4.15 持久化人工证据与稳定身份
+
+- **位置**：`utils.evidence_store.resolve_evidence_dir()`，优先级
+  显式参数 > 环境变量 `DSL_EVIDENCE_DIR` > `~/.daily-sports-lottery/evidence`。
+  **仓库内路径一律拒绝**（`EVIDENCE_DIR_INSIDE_REPOSITORY`），不依赖 `.gitignore`，
+  也不得写进任何受跟踪文件。
+- **分片键**：`pair_key(sorted(canonical_ids))`。**不含**数据集指纹、队名、比分与时间；
+  数据集刷新**不得**让证据字节消失。
+- **追加式历史**：记录不可修改、不可删除。同一 `(reviewer, decided_at)` 但内容不同 →
+  `CONFLICTING_REWRITE`；完全相同的重复提交 → `IDEMPOTENT_DUPLICATE`（不产生第二份）。
+- **矛盾决定**：同一对出现互斥决定时 `decision_summary()` 返回 `CONFLICTING_LABEL` 且
+  `effective_decision = None`，**不得**按"最新一条"取胜。
+- **校验复用既有 schema**：`label_provenance` 必须是 `HUMAN_REVIEWED`；
+  `reviewer` 不得是 `model` / `bot` / `auto` / `ai` / `system` 等；
+  `approved` / `signature` / `merge` / `surviving_canonical_id` 等生产语义字段命中即拒。
+- **五个维度必须分开陈述**：持久化、当前有效性、候选身份、数据集新鲜度、生产授权。
+  `inspect_record()` 恒返回 `auto_reattached = False` 与 `production_authorized = False`。
+- **重绑定只能由操作者完成**：即便 `BOUND`，下一步仍是 `OPERATOR_REVIEW_REQUIRED`；
+  指纹变化 → `STALE_DATASET_FINGERPRINT`；候选 ID 变化 → `CANDIDATE_ID_CHANGED`；
+  同一对标的多候选 → `AMBIGUOUS_IDENTITY`（**拒绝，不猜**）；队名相似度**不是**身份输入。
+- **损坏不得静默重置**：读取失败抛 `CORRUPT_EVIDENCE_FILE`，**不得**覆盖或丢弃原文件。
+- **只读导出**：`export_copy()` 复制分片并附 SHA-256 清单，导出目标同样不得位于仓库内。
+- **不打印证据正文**：任何命令、日志、异常信息都不得回显记录内容。
+
+---
+
+### 4.16 NBA 供给诊断分级
+
+- **七类必须分别陈述**，不得统称 "NBA unavailable"：
+  `SOURCE_HAS_NO_FIXTURE` / `SOURCE_FETCH_FAILED` / `SOURCE_PARSE_FAILED` /
+  `FIXTURE_FILTERED` / `INGESTION_REJECTED` / `PERSISTENCE_FAILED` / `UI_DATE_HIDDEN`。
+- **"无可用盘口"属于 `FIXTURE_FILTERED`**：这是 `_admit_market_candidates` 的既有准入契约，
+  不是取数失败，也不是解析失败。
+- **只读源核验**：允许直接调用 `utils.fetcher_500` 的读取函数做覆盖审计；
+  **不得**调用 `scraper.refresh()`，**不得**获取写入者锁，**不得**落盘。
+- **联赛标签等价**：`is_nba_league()` 把 `NBA` 与 `美国职业篮球联盟` 视为同一联赛；
+  不得因标签写法不同而漏计。
+- **日期可见性**：`get_available_dates_by_sport()` 是运动感知日期契约；
+  选择篮球时不得停留在 `basketball` 列表之外的日期（否则 `UI_DATE_HIDDEN`）。
+- **不得**因历史数据集缺少某日期就断言源侧无供给：必须先做只读核验再下结论。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程
