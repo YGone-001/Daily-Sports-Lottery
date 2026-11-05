@@ -543,7 +543,9 @@ def test_sn_18_reports_directory_is_ignored_locally():
     assert result.returncode == 0, result.stderr
     assert "reports" in result.stdout
     assert content.count("/reports/") <= 1, "the reports rule must not be duplicated"
-    assert "reports" in content
+    # AGENTS.md §5.1 mandates the `/reports/` form; accept any configured spelling.
+    assert configured, "a reports exclusion rule must be present"
+    assert all("reports" in line for line in configured)
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is required for the tracked-file check")
