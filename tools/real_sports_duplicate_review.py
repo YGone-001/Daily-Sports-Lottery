@@ -937,15 +937,15 @@ def validate_reviews(queue: Mapping[str, Any], reviews_document: Mapping[str, An
         "schema_version": REVIEW_SCHEMA_VERSION,
         "dataset_fingerprint": dataset_fp,
         "candidate_count": total,
+        # Carry the accepted record **verbatim** (minus the internal row index) so a
+        # downstream persistence writer receives exactly what the operator wrote.
+        # The durable evidence schema requires the identity fields the previous
+        # trimmed projection dropped, so trimming here made every real persistence
+        # attempt fail closed with `INCOMPLETE_RECORD`. `candidate_class` stays in
+        # the payload as a queue-side diagnostic; consumers that write records must
+        # project onto their own schema instead of mutating this one.
         "accepted": {
-            cid: {
-                "candidate_class": accepted[cid]["candidate_class"],
-                "decision": accepted[cid]["decision"],
-                "reviewer": accepted[cid]["reviewer"],
-                "decided_at": accepted[cid]["decided_at"],
-                "evidence_reference": accepted[cid]["evidence_reference"],
-                "notes": accepted[cid]["notes"],
-            }
+            cid: {key: value for key, value in accepted[cid].items() if key != "_index"}
             for cid in sorted(accepted)
         },
         "rejected": rejected,

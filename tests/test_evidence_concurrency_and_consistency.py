@@ -635,12 +635,20 @@ def test_er_19_operator_persist_requires_explicit_confirmation(tmp_path, monkeyp
             "review_rejected_count": 0,
             "evidence_rejected_count": 0,
             "rejected": [],
+            # A confirmed persist must carry the fingerprint it was validated
+            # against; without it freshness can never be verified and the
+            # operational status is `PARTIAL`, not `PERSISTED`.
+            "dataset_fingerprint": "df-er",
             "accepted": {"NXD-er19": _evidence_record("19")},
         },
     )
+    monkeypatch.setattr(wb, "_load_dataset_or_error", lambda data_dir: object())
+    monkeypatch.setattr(wb, "dataset_fingerprint", lambda dataset: "df-er")
     persisted = wb.command_persist(None, "reviews.json", evidence_dir=evidence, confirm=True)
     assert persisted["status"] == "PERSISTED"
     assert persisted["persisted_count"] == 1
+    assert persisted["freshness_state"] == "UNCHANGED"
+    assert persisted["freshness_verified"] is True
     assert persisted["review_evidence_only"] is True
 
     key = evidence_store.pair_key(_evidence_record("19")["canonical_ids"])

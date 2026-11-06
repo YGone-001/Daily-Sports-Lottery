@@ -596,6 +596,31 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - **输出最小化**：报告与 CLI 输出**不得**包含 `reviewer` / `notes` / `decided_at`
   或来源正文；只保留审计所需的 pair key、Canonical 对、记录数、绑定结果、
   冲突标记与下一步动作。
+- **观测完成 ≠ 对账干净**：`status` 只回答"这次检查跑完了没有"。对账结论必须由
+  `reconciliation_verdict` 单独陈述，四种取值互斥：
+  `AUDIT_COMPLETE_AND_CLEAN` / `AUDIT_COMPLETE_WITH_CORRUPTION` /
+  `AUDIT_INCOMPLETE` / `AUDIT_INPUT_UNAVAILABLE`。只有第一种可以令
+  `strict_acceptance_ready = true`。
+- **损坏证据永远不是 clean**：存在损坏分片（含不支持的 schema、结构合法但历史记录
+  不合规）时，裁决必须是 `AUDIT_COMPLETE_WITH_CORRUPTION`，**不得**因为"其余分片
+  都正常"就报 `AUDIT_COMPLETE_AND_CLEAN`；混合存储**不得**被描述为"已完全对账"。
+  同一存储中合法的分片仍必须可见（`stored_record_count` 不得被清零）。
+- **不可读分片不得被重置**：不重写、不修复、不用空文件覆盖；缺失的证据目录
+  **不得**被创建，且只能报 `AUDIT_INPUT_UNAVAILABLE`——观测成功**不**等于对账完成。
+- **空目录可以干净，但覆盖为零**：已存在但无分片的存储裁决为
+  `AUDIT_COMPLETE_AND_CLEAN`，同时必须给出
+  `evidence_coverage_status = NO_STORED_EVIDENCE`。
+  **干净 ≠ 有人工复核覆盖**，两者必须分开陈述。
+- **枚举与读取是两个步骤**：`list_pairs()` 与随后的 `load_pair()` 之间存在窗口，
+  另一个获授权的写者可以替换或删除分片。因此：
+  - 单条读取失败必须转成显式观测（`CORRUPT` + `detected_during=READ_AFTER_ENUMERATION`
+    或 `VANISHED` + `persisted_state = STORED_BUT_VANISHED_DURING_AUDIT`），
+    **不得**变成未捕获异常（那只会给出 traceback 与无法解释的退出码）；
+  - 只有**两次枚举**描述同一视图时才可以声称观测一致
+    （`observation_stable = true`、`stability_reason = TWO_ENUMERATIONS_AGREE`）；
+    否则裁决降级为 `AUDIT_INCOMPLETE`。
+  - 该一致性是**顾问性**观测：它不构成跨文件点时间原子性，最后一次读取之后的写入
+    仍然无法被这次运行感知。
 
 ---
 
@@ -615,6 +640,33 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
     记录已落盘（历史不可抹除），但**不得**声称"当前有效"；
   - 无法重算 → `RECHECK_UNAVAILABLE`，同样不得声称新鲜。
 - **不引入七文件事务**：跨文件一致性仍为顾问性（§4.14），不得用本节的检测替代事务。
+- **耐久性与当前有效性必须分开陈述**：以下字段各自独立，不得互相替代——
+  `durable_record_written`（是否真的写下去了）、`persisted_record_count`、
+  `persistence_outcome`（`PERSISTED` / `PARTIAL` / `FAILED` / `NOT_ATTEMPTED`）、
+  `freshness_check_completed`、`freshness_verified`、`freshness_state`、
+  `current_dataset_binding_verified`、`batch_atomic`（恒为 `false`）。
+- **`status = PERSISTED` 的确切含义**：**全部**被接受的记录都已耐久写入、**且**
+  写入后的数据集指纹比较真实完成并且相等。缺任一条件即降级为 `PARTIAL`
+  （已有记录仍保留）或 `FAILED`（一条都没写入）。**不得**在未验证新鲜度时返回
+  `PERSISTED`。
+- **四类新鲜度必须分别保留**：`UNCHANGED`、`DATASET_CHANGED_DURING_PERSIST`、
+  `VALIDATION_FINGERPRINT_MISSING`、`RECHECK_UNAVAILABLE`。
+  `freshness_verified` **只能**在比较真实完成且相等时为 `true`：
+  - 校验结果未携带指纹 → `VALIDATION_FINGERPRINT_MISSING`，不得声称新鲜；
+  - 写入后无法重新加载数据集 → `RECHECK_UNAVAILABLE`；
+  - 重新加载成功但算不出指纹 → 同样是 `RECHECK_UNAVAILABLE`，
+    **不得**谎报为"数据集已变更"；
+  - 一条记录都没写入时 → `NOT_RECHECKED`（没有可声称新鲜的对象）。
+- **幂等重复不产生新证据**：`IDEMPOTENT_DUPLICATE` 仍然计入 `persisted_count`，
+  但重复提交**不**刷新证据，也**不**绕过指纹校验——指纹缺失时它同样只能得到
+  `PARTIAL`。
+- **写入尝试与前置拒绝分开**：`EXPLICIT_CONFIRMATION_REQUIRED` /
+  `REVIEW_FILE_REQUIRED` / `DATASET_NOT_AVAILABLE` / `REJECTED` /
+  `NOTHING_TO_PERSIST` 属于"连尝试都没有开始"，此时
+  `persistence_outcome = NOT_ATTEMPTED`；只有真正执行过追加的调用才会出现
+  `PERSISTED` / `PARTIAL` / `FAILED`。
+- **不得回滚**：部分成功后不得撤销已写入的记录，也不得改写历史；未验证新鲜度只影响
+  结论，不影响落盘事实。
 
 ---
 
@@ -634,6 +686,36 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   `REAL_HUMAN_REVIEW_ACCEPTANCE` 标为 PASS。
 - **真实持久化需单独授权**：即使存在操作者文件，也**不得**在未获单独明确授权时
   对真实证据目录执行 `persist --confirm`。
+
+---
+
+### 4.22 结果完整性与退出码契约
+
+对账与持久化的结论必须能被**进程退出码**判定，不必先解析详细 JSON。
+
+| 命令 | 退出码 | 含义 |
+| --- | ---: | --- |
+| 全部只读命令 | `0` | 观测完成且无拒绝 |
+| `validate` | `4` / `5` / `6` | 评审被拒 / 证据被拒 / 两者皆有 |
+| `audit-persisted` | `0` | `reconciliation_verdict = AUDIT_COMPLETE_AND_CLEAN` |
+| `audit-persisted` | `7` | 观测完成但对账不干净：损坏、不稳定或证据目录缺失 |
+| `audit-persisted` | `2` | 输入不可用（数据集缺失、证据路径被拒） |
+| `persist` | `0` | `status = PERSISTED`（耐久 + 新鲜度已验证） |
+| `persist` | `8` | 追加已执行但整体未达可验证完成（部分写入 / 新鲜度未验证） |
+| `persist` | `2` | 前置拒绝，连写入尝试都没有开始 |
+
+- `7` 与 `8` 是**新增**码，**不得**与 `2` / `3` / `4` 的既有含义复用；
+  也不得把它们并入 `2`（那会把"跑完但不干净"与"输入不可用"混为一谈）。
+- 退出码 `0` 只表示**本次观测/本次写入**通过严格验收，**不**表示：
+  人工复核已完成、证据已由人核验、覆盖率达标、或生产授权存在。
+- CLI 摘要必须直接暴露决定性字段（裁决、`corrupt_shard_count`、
+  `vanished_shard_count`、`observation_stable`、`freshness_state`、
+  `freshness_verified`、`persistence_outcome`），操作者不该为了发现损坏去翻详细报告。
+- 任何组合都**不得**授权生产：`executable` / `apply_available` /
+  `production_write_authorization` / `production_authorized` 恒为 `false`，
+  `surviving_canonical_id` 恒为 `null`，`decision` 恒为 `NO-GO`。
+- 合成夹具只能验证机制：通过本节的回归**不**构成 `REAL_HUMAN_REVIEW_ACCEPTANCE`。
+
 
 ---
 

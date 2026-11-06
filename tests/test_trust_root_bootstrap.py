@@ -82,7 +82,9 @@ ALLOWED_PATHS = frozenset((
     "utils/prediction_snapshots.py",
     "tests/test_evidence_concurrency_and_consistency.py",
     # persisted evidence reconciliation against the current candidate dataset
-    "tests/test_persisted_evidence_reconciliation.py"))
+    "tests/test_persisted_evidence_reconciliation.py",
+    # reconciliation and persistence result-integrity corrections
+    "tests/test_persisted_evidence_result_integrity.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -96,12 +96,44 @@ PERSISTED_STALE = "STORED_BUT_STALE"
 PERSISTED_AMBIGUOUS = "STORED_BUT_AMBIGUOUS"
 PERSISTED_CONFLICT = "STORED_WITH_CONFLICT"
 PERSISTED_BOUND = "STORED_AND_CURRENTLY_BOUND"
+#: 枚举时存在、读取时已消失的分片：不是"损坏"，而是这次观测本身不稳定。
+PERSISTED_VANISHED = "STORED_BUT_VANISHED_DURING_AUDIT"
+
+#: 对账裁决：把「观测完成」与「对账干净」分开陈述。
+#: 只要存在损坏分片、读不到的分片或核对期间视图不稳定，就**不得**报 CLEAN。
+RECONCILIATION_CLEAN = "AUDIT_COMPLETE_AND_CLEAN"
+RECONCILIATION_WITH_CORRUPTION = "AUDIT_COMPLETE_WITH_CORRUPTION"
+RECONCILIATION_INCOMPLETE = "AUDIT_INCOMPLETE"
+RECONCILIATION_INPUT_UNAVAILABLE = "AUDIT_INPUT_UNAVAILABLE"
+#: 只有 CLEAN 才算"严格验收可通过"；其余一律为非零退出码。
+RECONCILIATION_STRICT_ACCEPTANCE = frozenset({RECONCILIATION_CLEAN})
+
+#: 持久化结论：把「已耐久落盘」与「新鲜度已验证」分开陈述。
+PERSISTENCE_PERSISTED = "PERSISTED"
+PERSISTENCE_PARTIAL = "PARTIAL"
+PERSISTENCE_FAILED = "FAILED"
+PERSISTENCE_NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+VERIFICATION_COMPLETE = "VERIFIED_COMPLETE"
+VERIFICATION_FRESHNESS_UNVERIFIED = "FRESHNESS_UNVERIFIED"
+VERIFICATION_INCOMPLETE = "INCOMPLETE"
+VERIFICATION_FAILED = "FAILED"
+VERIFICATION_NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+#: 新鲜度状态词表（只有 UNCHANGED 可以声称"当前有效"）。
+FRESHNESS_UNCHANGED = "UNCHANGED"
+FRESHNESS_CHANGED = "DATASET_CHANGED_DURING_PERSIST"
+FRESHNESS_VALIDATION_FINGERPRINT_MISSING = "VALIDATION_FINGERPRINT_MISSING"
+FRESHNESS_RECHECK_UNAVAILABLE = "RECHECK_UNAVAILABLE"
+FRESHNESS_NOT_RECHECKED = "NOT_RECHECKED"
 
 #: 无论上面哪一种，人工复核动作始终未完成——持久化不等于批准。
 ACTION_OPERATOR_REVIEW_REQUIRED = "OPERATOR_REVIEW_REQUIRED"
 ACTION_REATTACH_REQUIRED = "REATTACH_BY_OPERATOR_REQUIRED"
 ACTION_ADJUDICATE_REQUIRED = "ADJUDICATE_CONFLICT_REQUIRED"
 ACTION_COLLECT_EVIDENCE = "COLLECT_OPERATOR_DECISION"
+#: 损坏/消失的分片只能上报与调查：本工具不修复、不重建、不删除。
+ACTION_REPORT_AND_INVESTIGATE = "REPORT_AND_INVESTIGATE"
 
 #: 绑定严重度排序：用于把"同一分片内多条记录"折叠成单一分片结论。
 _BINDING_PRECEDENCE = (
@@ -146,6 +178,13 @@ STATUS_CROSS_SOURCE_UNVERIFIED = "CROSS_SOURCE_IDENTITY_UNVERIFIED"
 #: 证据校验退出码（沿用既有 `EXIT_REVIEW_REJECTED = 4`，仅新增后两者）。
 EXIT_EVIDENCE_REJECTED = 5
 EXIT_MULTIPLE_REJECTIONS = 6
+#: 只读对账"跑完了但对账不干净"：存在损坏/读不到的分片、核对期间视图不稳定，
+#: 或证据目录缺失导致真实对账从未完成。**不**与 `EXIT_INPUT_ERROR = 2` 复用：
+#: 后者表示输入本身不可用（数据集缺失/路径被拒），本码表示观测完成但不可接受。
+EXIT_RECONCILIATION_NOT_CLEAN = 7
+#: 持久化"写入尝试已执行但整体未达可验证完成"：部分追加、全部追加但新鲜度未验证。
+#: **不**与 `EXIT_INPUT_ERROR = 2` 复用：后者表示连写入尝试都没有开始。
+EXIT_PERSIST_INCOMPLETE = 8
 EVIDENCE_STATUS_VALUES = (
     STATUS_SOURCE_REFERENCE_SUPPLIED,
     STATUS_SOURCE_REFERENCE_REVIEWED,
@@ -1344,6 +1383,85 @@ def command_validate(data_dir: str | None, reviews_path: str | None, *, evidence
     }
 
 
+def _durable_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Project a validated review record onto the durable evidence schema.
+
+    The validator annotates accepted records with queue-side diagnostics
+    (``candidate_class``); the durable store rejects unknown fields. Only the
+    operator-authored fields are carried over — nothing is synthesised, so a
+    record missing a required field still fails closed with `INCOMPLETE_RECORD`
+    instead of being silently completed here.
+    """
+    from utils import evidence_store
+
+    allowed = evidence_store.REQUIRED_RECORD_KEYS | {"notes"}
+    return {key: value for key, value in record.items() if key in allowed}
+
+
+def _freshness_block(
+    *,
+    validated_fingerprint: str | None,
+    persisted_count: int,
+    data_dir: str | None,
+) -> dict[str, Any]:
+    """
+    Re-measure the dataset fingerprint **after** the appends and report it as a
+    bounded observation, never as a guarantee.
+
+    ``freshness_verified`` is true only when a real comparison happened and the
+    two fingerprints matched. A missing validation fingerprint, an unreadable
+    dataset or a changed dataset all leave it false — none of them may be read
+    as "currently valid".
+    """
+    state = FRESHNESS_NOT_RECHECKED
+    verified = False
+    completed = False
+    post_fingerprint: str | None = None
+
+    if not persisted_count:
+        # Nothing was written, so there is no persisted record to be fresh about.
+        return {
+            "freshness_state": state,
+            "freshness_verified": False,
+            "freshness_check_completed": False,
+            "dataset_fingerprint_after_persist": None,
+        }
+
+    try:
+        post_dataset = _load_dataset_or_error(data_dir)
+        post_fingerprint = dataset_fingerprint(post_dataset)
+    except AuditInputError:
+        state = FRESHNESS_RECHECK_UNAVAILABLE
+        return {
+            "freshness_state": state,
+            "freshness_verified": False,
+            "freshness_check_completed": False,
+            "dataset_fingerprint_after_persist": None,
+        }
+
+    if not validated_fingerprint:
+        state = FRESHNESS_VALIDATION_FINGERPRINT_MISSING
+    elif post_fingerprint is None:
+        # The reload succeeded but produced no fingerprint: that is an unavailable
+        # recheck, **not** evidence that the dataset changed.
+        state = FRESHNESS_RECHECK_UNAVAILABLE
+    else:
+        completed = True
+        if post_fingerprint == validated_fingerprint:
+            state = FRESHNESS_UNCHANGED
+            verified = True
+        else:
+            state = FRESHNESS_CHANGED
+
+    return {
+        "freshness_state": state,
+        "freshness_verified": verified,
+        "freshness_check_completed": completed,
+        "dataset_fingerprint_after_persist": post_fingerprint,
+    }
+
+
 def command_persist(
     data_dir: str | None,
     reviews_path: str | None,
@@ -1373,6 +1491,21 @@ def command_persist(
         "production_write_authorization": False,
         "surviving_canonical_id": None,
         "decision": "NO-GO",
+        # 默认值覆盖所有「连写入尝试都没有开始」的前置拒绝：
+        # 调用方可以无条件读取这些字段，不必区分提前返回与正常返回。
+        "persistence_outcome": PERSISTENCE_NOT_ATTEMPTED,
+        "verification_outcome": VERIFICATION_NOT_ATTEMPTED,
+        "strict_acceptance_ready": False,
+        "durable_record_written": False,
+        "persisted_count": 0,
+        "persisted_record_count": 0,
+        "error_count": 0,
+        "freshness_state": FRESHNESS_NOT_RECHECKED,
+        "freshness_check_completed": False,
+        "freshness_verified": False,
+        "current_dataset_binding_verified": False,
+        "batch_atomic": False,
+        "production_authorized": False,
     }
 
     if not confirm:
@@ -1403,11 +1536,12 @@ def command_persist(
     persisted: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for record in accepted:
+        payload = _durable_record(record)
         try:
-            result = evidence_store.append_record(record, configured_dir=evidence_dir)
+            result = evidence_store.append_record(payload, configured_dir=evidence_dir)
             persisted.append(
                 {
-                    "candidate_id": record.get("candidate_id"),
+                    "candidate_id": payload.get("candidate_id"),
                     "pair_key": result["pair_key"],
                     "outcome": result["status"],
                     "record_count": result["record_count"],
@@ -1417,7 +1551,7 @@ def command_persist(
         except evidence_store.EvidenceStoreError as exc:
             errors.append(
                 {
-                    "candidate_id": record.get("candidate_id"),
+                    "candidate_id": payload.get("candidate_id"),
                     "reason_code": exc.code,
                 }
             )
@@ -1433,42 +1567,62 @@ def command_persist(
     # 校验 → 追加之间的新鲜度边界：数据集可能在此期间被刷新。
     # 这里只做**检测**，不改写已追加的历史记录，也不声称批次原子性。
     validated_fingerprint = validation.get("dataset_fingerprint")
-    freshness_state = "NOT_RECHECKED"
-    freshness_verified = False
-    post_fingerprint = None
-    try:
-        post_dataset = _load_dataset_or_error(data_dir)
-        post_fingerprint = dataset_fingerprint(post_dataset)
-        if not validated_fingerprint:
-            # 校验结果没有携带指纹 -> 无法比较，**不得**声称新鲜，也不得谎报变更。
-            freshness_state = "VALIDATION_FINGERPRINT_MISSING"
-        elif post_fingerprint == validated_fingerprint:
-            freshness_state = "UNCHANGED"
-            freshness_verified = True
-        else:
-            freshness_state = "DATASET_CHANGED_DURING_PERSIST"
-    except AuditInputError:
-        freshness_state = "RECHECK_UNAVAILABLE"
+    freshness = _freshness_block(
+        validated_fingerprint=validated_fingerprint,
+        persisted_count=len(persisted),
+        data_dir=data_dir,
+    )
 
-    status = "PERSISTED" if persisted and not errors else ("PARTIAL" if persisted else "FAILED")
-    if status == "PERSISTED" and freshness_state == "DATASET_CHANGED_DURING_PERSIST":
-        # 记录已落盘但已绑定到过期数据集：不得声称"当前有效"。
+    # 「是否耐久落盘」与「是否当前有效」是两个独立事实，分别陈述：
+    # - persistence_outcome 只回答"写下去了没有"；
+    # - status 是**操作验收**结论，只有耐久 + 新鲜度已验证才算 PERSISTED。
+    persistence_outcome = (
+        PERSISTENCE_PERSISTED
+        if persisted and not errors
+        else (PERSISTENCE_PARTIAL if persisted else PERSISTENCE_FAILED)
+    )
+
+    if persistence_outcome == PERSISTENCE_PERSISTED and freshness["freshness_verified"]:
+        status = "PERSISTED"
+        verification_outcome = VERIFICATION_COMPLETE
+    elif persisted:
         status = "PARTIAL"
+        verification_outcome = (
+            VERIFICATION_INCOMPLETE
+            if freshness["freshness_check_completed"]
+            else VERIFICATION_FRESHNESS_UNVERIFIED
+        )
+    else:
+        status = "FAILED"
+        verification_outcome = VERIFICATION_FAILED
 
     return dict(
         base,
         status=status,
+        persistence_outcome=persistence_outcome,
+        verification_outcome=verification_outcome,
+        strict_acceptance_ready=(status == "PERSISTED"),
         staging_dir_description="EXTERNAL_EVIDENCE_DIRECTORY",
+        # 以下三项只描述**耐久性**：写成功不代表当前有效。
+        durable_record_written=bool(persisted),
         persisted_count=len(persisted),
+        persisted_record_count=len(persisted),
         persisted=persisted,
         retained_source_count=len(retained),
         retained_sources=retained,
         error_count=len(errors),
         errors=errors,
         dataset_fingerprint_at_validation=validated_fingerprint,
-        dataset_fingerprint_after_persist=post_fingerprint,
-        freshness_state=freshness_state,
-        freshness_verified=freshness_verified,
+        dataset_fingerprint_after_persist=freshness["dataset_fingerprint_after_persist"],
+        freshness_state=freshness["freshness_state"],
+        freshness_check_completed=freshness["freshness_check_completed"],
+        freshness_verified=freshness["freshness_verified"],
+        # 记录与**当前**数据集的绑定是否被验证过；只有 UNCHANGED 才为 true。
+        current_dataset_binding_verified=freshness["freshness_verified"],
+        freshness_note=(
+            "a durable append is a historical storage result; freshness is a bounded "
+            "observation taken immediately after the write and is never a permanent guarantee"
+        ),
         batch_atomic=False,
         batch_atomic_note=(
             "records are appended one at a time under a per-store writer lock; "
@@ -1493,11 +1647,31 @@ def _persisted_state_for(binding: str, *, conflict: bool) -> str:
 def _action_for(state: str) -> str:
     if state == PERSISTED_CONFLICT:
         return ACTION_ADJUDICATE_REQUIRED
+    if state == PERSISTED_VANISHED:
+        return ACTION_REPORT_AND_INVESTIGATE
     if state in (PERSISTED_AMBIGUOUS, PERSISTED_STALE):
         return ACTION_REATTACH_REQUIRED
     if state == PERSISTED_NO_STORED_EVIDENCE:
         return ACTION_COLLECT_EVIDENCE
     return ACTION_OPERATOR_REVIEW_REQUIRED
+
+
+def _evidence_view_signature(pairs: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, int]]:
+    """
+    Content-level fingerprint of one enumeration of the evidence store.
+
+    Used only to detect whether two enumerations describe the same view; it is a
+    change detector, deliberately not a digest of record bodies (record content
+    must never be echoed by this read-only command).
+    """
+    return sorted(
+        (
+            str(item.get("pair_key")),
+            str(item.get("status")),
+            int(item.get("record_count") or 0),
+        )
+        for item in pairs
+    )
 
 
 def _worst_binding(bindings: Sequence[str]) -> str:
@@ -1525,6 +1699,9 @@ def command_audit_persisted(
       lookup address, not an authorization.
     - Corrupt shards are reported, never repaired.
     - A missing evidence directory is reported as absent, never created.
+    - ``status`` reports observational completion only. The reconciliation verdict
+      lives in ``reconciliation_verdict`` and is ``AUDIT_COMPLETE_AND_CLEAN`` only
+      when every shard was readable and a confirmation enumeration agreed.
     """
     from utils import evidence_store
 
@@ -1543,13 +1720,35 @@ def command_audit_persisted(
             "A stored decision is history, not a current approval.",
             "bound_record_count is not a count of independently reverified human decisions.",
             "Evidence persistence is per-record; a multi-record operation is not atomic.",
+            "Corrupt or unreadable shards are reported, never repaired or rewritten.",
+            "Enumeration and per-shard reads are separate steps: an authorized writer can "
+            "change the store in between, so a clean verdict is an advisory observation, "
+            "not a cross-file point-in-time guarantee.",
+            "A clean verdict never implies human-review coverage or production authority.",
         ],
     }
 
     try:
         dataset = _load_dataset_or_error(data_dir)
     except AuditInputError as exc:
-        return dict(base, real_data_available=False, status="NOT_AVAILABLE", reason=str(exc))
+        return dict(
+            base,
+            real_data_available=False,
+            status="NOT_AVAILABLE",
+            reason=str(exc),
+            audit_completed=False,
+            reconciliation_verdict=RECONCILIATION_INPUT_UNAVAILABLE,
+            reconciliation_reason="DATASET_NOT_AVAILABLE",
+            reconciliation_complete=False,
+            strict_acceptance_ready=False,
+            observation_stable=False,
+            stored_pair_count=0,
+            stored_record_count=0,
+            corrupt_shard_count=0,
+            vanished_shard_count=0,
+            evidence_coverage_status="NO_STORED_EVIDENCE",
+            genuine_operator_decision_count=0,
+        )
 
     current_fingerprint = dataset_fingerprint(dataset)
 
@@ -1563,6 +1762,18 @@ def command_audit_persisted(
             status="FAIL_CLOSED",
             evidence_store_status="PATH_REJECTED",
             reason_code=exc.code,
+            audit_completed=False,
+            reconciliation_verdict=RECONCILIATION_INPUT_UNAVAILABLE,
+            reconciliation_reason="EVIDENCE_PATH_REJECTED",
+            reconciliation_complete=False,
+            strict_acceptance_ready=False,
+            observation_stable=False,
+            stored_pair_count=0,
+            stored_record_count=0,
+            corrupt_shard_count=0,
+            vanished_shard_count=0,
+            evidence_coverage_status="NO_STORED_EVIDENCE",
+            genuine_operator_decision_count=0,
         )
 
     candidates = [item for item in build_candidates(dataset) if item.get("nba_scope")]
@@ -1575,10 +1786,20 @@ def command_audit_persisted(
 
     pair_reports: list[dict[str, Any]] = []
     corrupt_shard_count = 0
+    vanished_shard_count = 0
     stored_record_count = 0
+    first_signature: list[tuple[str, str, int]] = []
 
     if storage["exists"]:
-        for summary in evidence_store.list_pairs(evidence_dir):
+        try:
+            listed = evidence_store.list_pairs(evidence_dir)
+        except (evidence_store.EvidenceStoreError, OSError):
+            # 连枚举都失败：这次观测没有可陈述的内容。
+            listed = []
+            vanished_shard_count += 1
+        first_signature = _evidence_view_signature(listed)
+
+        for summary in listed:
             key = summary["pair_key"]
             if summary["status"] != "OK":
                 corrupt_shard_count += 1
@@ -1590,12 +1811,46 @@ def command_audit_persisted(
                         "record_count": 0,
                         "current_binding": None,
                         "persisted_state": "CORRUPT",
-                        "required_next_action": "REPORT_AND_INVESTIGATE",
+                        "required_next_action": ACTION_REPORT_AND_INVESTIGATE,
                     }
                 )
                 continue
 
-            payload = evidence_store.load_pair(storage["directory"], key)
+            # 枚举与单条读取之间存在窗口：另一个写者可以替换或删除分片。
+            # 读失败不得变成未捕获异常（那会给出 traceback 与退出码 1，
+            # 既不报告损坏也不报告"未完成"），必须转成显式的不可用观测。
+            try:
+                payload = evidence_store.load_pair(storage["directory"], key)
+            except evidence_store.EvidenceStoreError as exc:
+                corrupt_shard_count += 1
+                pair_reports.append(
+                    {
+                        "pair_key": key,
+                        "status": "CORRUPT",
+                        "reason_code": exc.code,
+                        "detected_during": "READ_AFTER_ENUMERATION",
+                        "record_count": 0,
+                        "current_binding": None,
+                        "persisted_state": "CORRUPT",
+                        "required_next_action": ACTION_REPORT_AND_INVESTIGATE,
+                    }
+                )
+                continue
+            if payload is None:
+                vanished_shard_count += 1
+                pair_reports.append(
+                    {
+                        "pair_key": key,
+                        "status": "VANISHED",
+                        "reason_code": "SHARD_VANISHED_DURING_AUDIT",
+                        "record_count": 0,
+                        "current_binding": None,
+                        "persisted_state": PERSISTED_VANISHED,
+                        "required_next_action": ACTION_REPORT_AND_INVESTIGATE,
+                    }
+                )
+                continue
+
             records = list(payload.get("records") or [])
             stored_record_count += len(records)
             decision = evidence_store.decision_summary(payload)
@@ -1654,13 +1909,13 @@ def command_audit_persisted(
         if item["conflict"]:
             conflicting_pair_count += 1
 
-    # 需要**额外**处置（重绑定/裁决/收集）的条目数；
+    # 需要**额外**处置（重绑定/裁决/调查）的条目数；
     # 单单"仍待人工复核"不算额外动作——那本来就是这个工作台的常态。
     operator_action_required_count = sum(
         1
         for item in pair_reports
         if item["persisted_state"] in (PERSISTED_STALE, PERSISTED_AMBIGUOUS, PERSISTED_CONFLICT)
-        or item["status"] == "CORRUPT"
+        or item["status"] in ("CORRUPT", "VANISHED")
     )
 
     candidate_views = []
@@ -1688,11 +1943,88 @@ def command_audit_persisted(
     else:
         store_status = "READABLE"
 
+    # 稳定性确认：再枚举一次，只有两次枚举描述同一个视图时才算"观测一致"。
+    # 这是**有界**的单一确认（不重试、不等待），也**不**声称跨文件点时间原子性。
+    observation_stable = True
+    stability_reason = "SINGLE_ENUMERATION_ONLY"
+    if storage["exists"]:
+        if not os.path.isdir(storage["directory"]):
+            # 整个证据目录在检查期间消失：两次枚举都会是"空"，但这不是干净。
+            observation_stable = False
+            stability_reason = "EVIDENCE_DIRECTORY_DISAPPEARED_DURING_AUDIT"
+        else:
+            try:
+                second_signature = _evidence_view_signature(
+                    evidence_store.list_pairs(evidence_dir)
+                )
+            except (evidence_store.EvidenceStoreError, OSError):
+                second_signature = None
+            if second_signature is None:
+                observation_stable = False
+                stability_reason = "CONFIRMATION_ENUMERATION_FAILED"
+            elif vanished_shard_count:
+                observation_stable = False
+                stability_reason = "SHARD_VANISHED_BETWEEN_ENUMERATION_AND_READ"
+            elif second_signature != first_signature:
+                observation_stable = False
+                stability_reason = "EVIDENCE_VIEW_CHANGED_DURING_AUDIT"
+            else:
+                stability_reason = "TWO_ENUMERATIONS_AGREE"
+
+    # 对账裁决：把"观测完成"与"对账干净"彻底分开。
+    if not storage["exists"]:
+        reconciliation_verdict = RECONCILIATION_INPUT_UNAVAILABLE
+        reconciliation_reason = "EVIDENCE_DIRECTORY_ABSENT"
+    elif corrupt_shard_count or vanished_shard_count or not observation_stable:
+        if observation_stable:
+            # 观测一致但存在读不出来的分片：检查完成，对账不干净。
+            reconciliation_verdict = RECONCILIATION_WITH_CORRUPTION
+            reconciliation_reason = "UNREADABLE_SHARDS_PRESENT"
+        else:
+            reconciliation_verdict = RECONCILIATION_INCOMPLETE
+            reconciliation_reason = stability_reason
+    else:
+        reconciliation_verdict = RECONCILIATION_CLEAN
+        reconciliation_reason = (
+            "NO_SHARDS_PRESENT" if not pair_reports else "ALL_SHARDS_READ_AND_STABLE"
+        )
+
+    # 覆盖口径与对账口径是两件事：对账可以"干净"而覆盖为零。
+    evidence_coverage_status = (
+        "STORED_EVIDENCE_PRESENT" if stored_record_count else "NO_STORED_EVIDENCE"
+    )
+
     return dict(
         base,
         real_data_available=True,
         dataset_fingerprint=current_fingerprint,
+        # `status` 只回答"这次检查是否跑完"，**不**回答"对账是否干净"。
         status="SUCCESS",
+        audit_completed=True,
+        reconciliation_verdict=reconciliation_verdict,
+        reconciliation_reason=reconciliation_reason,
+        # 损坏分片也属于"已完成的检查"，但**绝不**属于干净的对账。
+        reconciliation_complete=reconciliation_verdict
+        in (RECONCILIATION_CLEAN, RECONCILIATION_WITH_CORRUPTION),
+        strict_acceptance_ready=reconciliation_verdict in RECONCILIATION_STRICT_ACCEPTANCE,
+        observation_stable=observation_stable,
+        stability_reason=stability_reason,
+        stability_note=(
+            "two enumerations agreeing is evidence of a coherent read of this store, "
+            "not a cross-file point-in-time transaction; a writer may still change the "
+            "store immediately after the last read"
+        ),
+        reconciliation_note=(
+            "AUDIT_COMPLETE_AND_CLEAN requires every shard to be readable and both "
+            "enumerations to agree. A clean verdict means the reconciliation itself "
+            "found nothing wrong; it never establishes human-review coverage and never "
+            "authorizes production."
+        ),
+        evidence_coverage_status=evidence_coverage_status,
+        evidence_coverage_note=(
+            "coverage is independent of the reconciliation verdict: a clean verdict on "
+            "an empty store means there was nothing to reconcile, not that reviews exist"
+        ),
         evidence_store_status=store_status,
         evidence_directory_configured_by=storage["configured_by"],
         evidence_directory_exists=bool(storage["exists"]),
@@ -1705,6 +2037,7 @@ def command_audit_persisted(
         conflicting_pair_count=conflicting_pair_count,
         missing_candidate_count=missing_candidate_count,
         corrupt_shard_count=corrupt_shard_count,
+        vanished_shard_count=vanished_shard_count,
         operator_action_required_count=operator_action_required_count,
         candidates_with_stored_evidence=sum(
             1 for view in candidate_views if view["persisted_evidence_state"] != PERSISTED_NO_STORED_EVIDENCE
@@ -2206,10 +2539,13 @@ def render_audit_persisted_markdown(document: Mapping[str, Any]) -> str:
     lines = [
         "# Persisted evidence reconciliation (read-only)",
         "",
+        f"- reconciliation verdict: **`{document.get('reconciliation_verdict')}`**"
+        f" ({document.get('reconciliation_reason')})",
         f"- dataset fingerprint: `{document['dataset_fingerprint']}`",
         f"- evidence store: `{document['evidence_store_status']}`"
         f" (exists={document['evidence_directory_exists']},"
         f" configured_by={document['evidence_directory_configured_by']})",
+        f"- evidence coverage: `{document.get('evidence_coverage_status')}`",
         "",
         "| metric | value |",
         "| --- | --- |",
@@ -2224,6 +2560,10 @@ def render_audit_persisted_markdown(document: Mapping[str, Any]) -> str:
         "conflicting_pair_count",
         "missing_candidate_count",
         "corrupt_shard_count",
+        "vanished_shard_count",
+        "observation_stable",
+        "reconciliation_complete",
+        "strict_acceptance_ready",
         "operator_action_required_count",
         "genuine_operator_decision_count",
         "synthetic_record_count",
@@ -2362,9 +2702,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 write_json(args.output, document)
             if args.markdown:
                 write_text(args.markdown, render_audit_persisted_markdown(document))
+            # 决定性字段必须直接可见：操作者不该为了发现损坏去翻详细 JSON。
             print(json.dumps(
                 {
                     "status": document.get("status"),
+                    "reconciliation_verdict": document.get("reconciliation_verdict"),
+                    "reconciliation_complete": document.get("reconciliation_complete"),
+                    "strict_acceptance_ready": document.get("strict_acceptance_ready"),
                     "evidence_store_status": document.get("evidence_store_status"),
                     "dataset_fingerprint": document.get("dataset_fingerprint"),
                     "stored_pair_count": document.get("stored_pair_count"),
@@ -2376,13 +2720,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "conflicting_pair_count": document.get("conflicting_pair_count"),
                     "missing_candidate_count": document.get("missing_candidate_count"),
                     "corrupt_shard_count": document.get("corrupt_shard_count"),
+                    "vanished_shard_count": document.get("vanished_shard_count"),
+                    "observation_stable": document.get("observation_stable"),
+                    "evidence_coverage_status": document.get("evidence_coverage_status"),
                     "genuine_operator_decision_count": document.get("genuine_operator_decision_count"),
                     "production_authorized": document.get("production_authorized"),
                     "decision": document.get("decision"),
                 },
                 ensure_ascii=False, sort_keys=True,
             ))
-            return EXIT_OK if document.get("status") == "SUCCESS" else EXIT_INPUT_ERROR
+            if document.get("status") == "SUCCESS":
+                if document.get("strict_acceptance_ready"):
+                    return EXIT_OK
+                # 跑完但对账不干净（损坏/不稳定/证据缺失）-> 专用非零码。
+                # 数据集不可用与路径被拒走下面的 EXIT_INPUT_ERROR。
+                return EXIT_RECONCILIATION_NOT_CLEAN
+            return EXIT_INPUT_ERROR
         if args.command == "persist":
             document = command_persist(
                 args.data_dir,
@@ -2397,9 +2750,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(
                 {
                     "status": document.get("status"),
+                    "persistence_outcome": document.get("persistence_outcome"),
+                    "verification_outcome": document.get("verification_outcome"),
                     "persisted_count": document.get("persisted_count"),
                     "retained_source_count": document.get("retained_source_count"),
                     "error_count": document.get("error_count"),
+                    "freshness_state": document.get("freshness_state"),
+                    "freshness_verified": document.get("freshness_verified"),
+                    "batch_atomic": document.get("batch_atomic"),
                     "review_evidence_only": document.get("review_evidence_only"),
                     "production_authorized": document.get("production_authorized"),
                 },
@@ -2407,6 +2765,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             ))
             if document.get("status") == "PERSISTED":
                 return EXIT_OK
+            if document.get("persistence_outcome") != PERSISTENCE_NOT_ATTEMPTED:
+                # 写入尝试已执行但整体未达可验证完成：包含部分追加、全部追加但
+                # 新鲜度未验证，以及"尝试过但一条都没写下去"。
+                return EXIT_PERSIST_INCOMPLETE
             return EXIT_INPUT_ERROR
         if args.command == "pilot":
             document = command_pilot(args.data_dir, args.output_dir, limit=args.limit)

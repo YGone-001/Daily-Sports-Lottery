@@ -146,7 +146,7 @@ JSON 是主工件（确定性、`sort_keys`），同时提供人读 Markdown 摘
 人工决定持久化后，用只读对账命令确认它们与**当前**候选数据集的关系：
 
 ```bash
-# 5 个只读命令
+# 只读命令（全部不落盘）
 python -m tools.nba_human_review_workbench prepare --output-dir <dir>
 python -m tools.nba_human_review_workbench show --candidate-id <id>
 python -m tools.nba_human_review_workbench validate --reviews <file>
@@ -157,7 +157,7 @@ python -m tools.nba_human_review_workbench pilot --output-dir <dir>
 python -m tools.nba_human_review_workbench persist \
   --reviews <file> --evidence-dir <仓库外目录> --confirm
 
-# 只读对账（本阶段新增）
+# 只读对账
 python -m tools.nba_human_review_workbench audit-persisted \
   --evidence-dir <仓库外目录> --output <本地路径>/recon.json [--markdown <本地路径>/recon.md]
 ```
@@ -166,8 +166,10 @@ python -m tools.nba_human_review_workbench audit-persisted \
 
 | 情况 | 报告 | 自动动作 |
 | --- | --- | --- |
-| 证据目录不存在 | `evidence_store_status = NOT_PROVISIONED` | **不创建** |
-| 分片损坏 | `CORRUPT` + `corrupt_shard_count` | **不修复** |
+| 全部可读且两次枚举一致 | `AUDIT_COMPLETE_AND_CLEAN` | 无 |
+| 存在损坏分片（含不支持的 schema、历史记录不合规） | `AUDIT_COMPLETE_WITH_CORRUPTION` + `corrupt_shard_count` | **不修复、不重写** |
+| 枚举与读取之间分片被替换/删除，或两次枚举不一致 | `AUDIT_INCOMPLETE` + `observation_stable=false` | **不重试到底、不猜测** |
+| 证据目录不存在 | `AUDIT_INPUT_UNAVAILABLE`，`evidence_store_status = NOT_PROVISIONED` | **不创建** |
 | 当前数据集已无该对 | `CANDIDATE_NOT_IN_CURRENT_DATASET` | **不猜测** |
 | 同一对命中多个候选 | `AMBIGUOUS_IDENTITY` | **不裁决** |
 | 指纹漂移 | `STALE_DATASET_FINGERPRINT` / `CANDIDATE_FINGERPRINT_CHANGED` | **不重绑定** |
@@ -176,6 +178,53 @@ python -m tools.nba_human_review_workbench audit-persisted \
 
 > `pair_key` 命中只是"同一对源记录"的**查找地址**，不是新的批准。
 > `bound_record_count` **不是**"已独立复核的人工决定数"。
+
+### 5.2 `status` 与 `reconciliation_verdict` 不是一回事
+
+`status` 只说明**这次检查跑完了**（`SUCCESS` / `NOT_AVAILABLE` / `FAIL_CLOSED`）。
+对账结论看 `reconciliation_verdict`：
+
+| 裁决 | `strict_acceptance_ready` | 退出码 |
+| --- | --- | ---: |
+| `AUDIT_COMPLETE_AND_CLEAN` | `true` | `0` |
+| `AUDIT_COMPLETE_WITH_CORRUPTION` | `false` | `7` |
+| `AUDIT_INCOMPLETE` | `false` | `7` |
+| `AUDIT_INPUT_UNAVAILABLE` | `false` | `7`（数据集缺失或路径被拒时为 `2`） |
+
+- **损坏证据永远不会是 clean**：只要存在一个读不出来的分片，裁决就不可能是
+  `AUDIT_COMPLETE_AND_CLEAN`，退出码也不可能是 `0`。
+- **混合存储不是"已完全对账"**：干净分片仍然会被计数（`stored_record_count` 不清零），
+  但整体裁决仍是 `AUDIT_COMPLETE_WITH_CORRUPTION`。
+- **干净 ≠ 有覆盖**：已存在但为空的分片目录裁决为 `AUDIT_COMPLETE_AND_CLEAN`，
+  同时 `evidence_coverage_status = NO_STORED_EVIDENCE`。
+  退出码 `0` **不**代表已经有人工复核证据。
+- **缺失目录不等于已对账**：`evidence_store_status = NOT_PROVISIONED`，
+  裁决为 `AUDIT_INPUT_UNAVAILABLE`——观测成功，但对账从未完成。
+- **并发窗口是顾问性边界**：`list_pairs()` 与 `load_pair()` 之间允许另一个写者替换
+  分片。因此本命令只做**两次枚举**的确认，一致才标记 `observation_stable=true`；
+  它**不**声称跨文件点时间原子性，最后一次读取之后的写入无法被本次运行感知。
+
+### 5.3 `persist` 的结果字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `persistence_outcome` | 耐久性结论：`PERSISTED` / `PARTIAL` / `FAILED` / `NOT_ATTEMPTED` |
+| `status` | **操作验收**结论：只有"全部写入 + 新鲜度已验证"才是 `PERSISTED` |
+| `durable_record_written` / `persisted_record_count` | 是否真的写下去了、写了几条 |
+| `freshness_state` | `UNCHANGED` / `DATASET_CHANGED_DURING_PERSIST` / `VALIDATION_FINGERPRINT_MISSING` / `RECHECK_UNAVAILABLE` / `NOT_RECHECKED` |
+| `freshness_verified` | 只有真实比较完成且相等才为 `true` |
+| `batch_atomic` | 恒为 `false`：逐条追加，不是事务 |
+
+| 情形 | `status` | 退出码 |
+| --- | --- | ---: |
+| 全部写入 + 指纹未变 | `PERSISTED` | `0` |
+| 全部写入但数据集已变 / 指纹缺失 / 无法重算 | `PARTIAL` | `8` |
+| 部分写入（含来源留存失败） | `PARTIAL` | `8` |
+| 一条都没写入 | `FAILED` | `8` |
+| 未确认 / 无评审文件 / 数据集缺失 / 评审被拒 | 前置拒绝态 | `2` |
+
+> 已写入的记录**永不回滚**。新鲜度未验证只影响结论，不影响落盘事实。
+> 幂等重复（`IDEMPOTENT_DUPLICATE`）不产生新证据，也不绕过指纹校验。
 
 ---
 
