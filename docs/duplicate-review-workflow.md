@@ -141,6 +141,42 @@ python -m tools.real_sports_duplicate_review preview \
 输出位置：`reports/`（本机 Git 排除）或仓库外的临时目录。**不得**写入 `data/`。
 JSON 是主工件（确定性、`sort_keys`），同时提供人读 Markdown 摘要。
 
+### 5.1 NBA 复核工作台：已持久证据对账
+
+人工决定持久化后，用只读对账命令确认它们与**当前**候选数据集的关系：
+
+```bash
+# 5 个只读命令
+python -m tools.nba_human_review_workbench prepare --output-dir <dir>
+python -m tools.nba_human_review_workbench show --candidate-id <id>
+python -m tools.nba_human_review_workbench validate --reviews <file>
+python -m tools.nba_human_review_workbench summary
+python -m tools.nba_human_review_workbench pilot --output-dir <dir>
+
+# 唯一写路径（需显式确认）
+python -m tools.nba_human_review_workbench persist \
+  --reviews <file> --evidence-dir <仓库外目录> --confirm
+
+# 只读对账（本阶段新增）
+python -m tools.nba_human_review_workbench audit-persisted \
+  --evidence-dir <仓库外目录> --output <本地路径>/recon.json [--markdown <本地路径>/recon.md]
+```
+
+`audit-persisted` 的行为约定：
+
+| 情况 | 报告 | 自动动作 |
+| --- | --- | --- |
+| 证据目录不存在 | `evidence_store_status = NOT_PROVISIONED` | **不创建** |
+| 分片损坏 | `CORRUPT` + `corrupt_shard_count` | **不修复** |
+| 当前数据集已无该对 | `CANDIDATE_NOT_IN_CURRENT_DATASET` | **不猜测** |
+| 同一对命中多个候选 | `AMBIGUOUS_IDENTITY` | **不裁决** |
+| 指纹漂移 | `STALE_DATASET_FINGERPRINT` / `CANDIDATE_FINGERPRINT_CHANGED` | **不重绑定** |
+| 决定互相矛盾 | `conflict = true`，无 effective decision | **不按时间取胜** |
+| 绑定成功 | `BOUND_TO_CURRENT_CANDIDATE` | 仍需人工复核；**不授权生产** |
+
+> `pair_key` 命中只是"同一对源记录"的**查找地址**，不是新的批准。
+> `bound_record_count` **不是**"已独立复核的人工决定数"。
+
 ---
 
 ## 6. 与既有安全链的关系

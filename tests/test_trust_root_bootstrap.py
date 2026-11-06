@@ -80,7 +80,9 @@ ALLOWED_PATHS = frozenset((
     "tests/test_refresh_ownership_and_evidence.py",
     # cross-process evidence and snapshot write ownership corrections
     "utils/prediction_snapshots.py",
-    "tests/test_evidence_concurrency_and_consistency.py"))
+    "tests/test_evidence_concurrency_and_consistency.py",
+    # persisted evidence reconciliation against the current candidate dataset
+    "tests/test_persisted_evidence_reconciliation.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

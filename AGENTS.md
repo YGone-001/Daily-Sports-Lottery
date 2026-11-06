@@ -568,6 +568,75 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.19 已持久证据与当前候选的对账
+
+- **唯一对账入口**：`python -m tools.nba_human_review_workbench audit-persisted
+  --data-dir <DATA_DIR> --evidence-dir <EVIDENCE_DIR> [--output …] [--markdown …]`。
+  该命令对七个受保护存储与外部证据目录**都只读**：不创建缺失目录、不修复分片、
+  不重绑定、不写回任何记录。
+- **稳定身份只用于定位**：分片按 `pair_key(sorted(canonical_ids))` 查找当前候选。
+  **不得**用队名相似度、联赛标签、开赛时间或最近邻匹配来重建绑定关系。
+  `pair_key` 命中只代表"这是同一对源记录"，**不**代表决定仍然有效或已获批。
+- **绑定分类**沿用 `inspect_record()`：`BOUND_TO_CURRENT_CANDIDATE` /
+  `CANDIDATE_ID_CHANGED` / `CANDIDATE_FINGERPRINT_CHANGED` /
+  `STALE_DATASET_FINGERPRINT` / `AMBIGUOUS_IDENTITY`。额外允许两类**非冲突**结果：
+  `CANDIDATE_NOT_IN_CURRENT_DATASET`（当前数据集已无该对）与 `CORRUPT`
+  （分片不可读，只报告不修复）。
+- **队列侧状态词表**：`NO_STORED_EVIDENCE` / `STORED_BUT_STALE` /
+  `STORED_BUT_AMBIGUOUS` / `STORED_WITH_CONFLICT` / `STORED_AND_CURRENTLY_BOUND`。
+  **无论哪一种**，人工复核动作都未完成：`operator_review_required` 恒为 `true`，
+  `next_required_action` 只会是 `OPERATOR_REVIEW_REQUIRED` /
+  `REATTACH_BY_OPERATOR_REQUIRED` / `ADJUDICATE_CONFLICT_REQUIRED` /
+  `COLLECT_OPERATOR_DECISION`。
+- **计数口径**：`bound_record_count` **不是**"已独立复核的人工决定数"；
+  `genuine_operator_decision_count` 只统计**本次运行显式提供的操作者文件**，
+  自述 provenance 无法在本命令内独立验证，必须如实报 0 并说明原因。
+- **矛盾决定**：同一对出现互斥决定时保留全部历史、`conflict = true`、
+  不给出 effective decision，并按 `ADJUDICATE_CONFLICT_REQUIRED` 交还操作者。
+- **输出最小化**：报告与 CLI 输出**不得**包含 `reviewer` / `notes` / `decided_at`
+  或来源正文；只保留审计所需的 pair key、Canonical 对、记录数、绑定结果、
+  冲突标记与下一步动作。
+
+---
+
+### 4.20 批次持久化的非原子性与新鲜度边界
+
+- **逐条追加**：`persist` 对每条被接受的记录单独调用一次追加；多记录操作**不是**
+  原子批次（`batch_atomic = false`）。部分成功时必须分别列出
+  `persisted`（含 `APPENDED` / `IDEMPOTENT_DUPLICATE`）与 `errors`（含
+  `CONFLICTING_REWRITE` / `EVIDENCE_WRITER_BUSY` 等），不得抹掉已成功的历史。
+- **状态词表**：`PERSISTED` / `PARTIAL` / `FAILED`，并保留
+  `EXPLICIT_CONFIRMATION_REQUIRED` / `REVIEW_FILE_REQUIRED` / `REJECTED` /
+  `NOTHING_TO_PERSIST` 等前置拒绝状态。
+- **新鲜度边界**：校验与追加之间数据集可能被刷新。`persist` 必须在追加后重新计算
+  数据集指纹并与校验时的指纹比较：
+  - 一致 → `freshness_state = UNCHANGED`；
+  - 不一致 → `DATASET_CHANGED_DURING_PERSIST`，且状态**降级为 `PARTIAL`**——
+    记录已落盘（历史不可抹除），但**不得**声称"当前有效"；
+  - 无法重算 → `RECHECK_UNAVAILABLE`，同样不得声称新鲜。
+- **不引入七文件事务**：跨文件一致性仍为顾问性（§4.14），不得用本节的检测替代事务。
+
+---
+
+### 4.21 首次操作者复核包与真实输入门
+
+- **复核包只在本地产出**：`pilot --output-dir` 与 `prepare --output-dir` 写入
+  `reports/` 或操作者指定的外部目录；`pilot` 的卷宗在
+  `candidate-dossier-supplements/`，`prepare` 的在 `dossiers/`，二者**不互相覆盖**。
+- **复核包内容**：优先队列、候选卷宗、数据集指纹、原始来源编号字符串、
+  原始主客观测、可用独立方向证据、缺失证据要求、空白评审模板、未决登记册、
+  人工复核说明。全部为**只读派生**，不含任何自动决定。
+- **真实输入门**：人工决定仅在操作者**独立撰写并显式提供**时才算真实。
+  `reviewer` / `decided_at` / `decision` **不得**由测试、仓库元数据、模型或当前数据集推导。
+  未提供操作者文件时：`REAL_OPERATOR_INPUT = NOT_AVAILABLE`、
+  `GENUINE_OPERATOR_DECISIONS = 0`、`REAL_HUMAN_REVIEW_ACCEPTANCE = BLOCKED_OPERATOR_INPUT`。
+- **合成夹具不是验收**：合成测试只能验证机制，**不得**用于把
+  `REAL_HUMAN_REVIEW_ACCEPTANCE` 标为 PASS。
+- **真实持久化需单独授权**：即使存在操作者文件，也**不得**在未获单独明确授权时
+  对真实证据目录执行 `persist --confirm`。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

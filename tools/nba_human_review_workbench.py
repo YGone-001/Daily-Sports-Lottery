@@ -88,6 +88,31 @@ DOSSIER_KIND = "NBA_CANDIDATE_REVIEW_DOSSIER"
 SUMMARY_KIND = "READ_ONLY_NBA_REVIEW_SUMMARY"
 VALIDATION_KIND = "READ_ONLY_NBA_REVIEW_VALIDATION"
 PERSIST_KIND = "OPERATOR_EVIDENCE_PERSISTENCE"
+AUDIT_PERSISTED_KIND = "READ_ONLY_PERSISTED_EVIDENCE_RECONCILIATION"
+
+#: 队列/候选侧的可持久证据状态。刻意**不**包含任何"已接受/已批准"语义。
+PERSISTED_NO_STORED_EVIDENCE = "NO_STORED_EVIDENCE"
+PERSISTED_STALE = "STORED_BUT_STALE"
+PERSISTED_AMBIGUOUS = "STORED_BUT_AMBIGUOUS"
+PERSISTED_CONFLICT = "STORED_WITH_CONFLICT"
+PERSISTED_BOUND = "STORED_AND_CURRENTLY_BOUND"
+
+#: 无论上面哪一种，人工复核动作始终未完成——持久化不等于批准。
+ACTION_OPERATOR_REVIEW_REQUIRED = "OPERATOR_REVIEW_REQUIRED"
+ACTION_REATTACH_REQUIRED = "REATTACH_BY_OPERATOR_REQUIRED"
+ACTION_ADJUDICATE_REQUIRED = "ADJUDICATE_CONFLICT_REQUIRED"
+ACTION_COLLECT_EVIDENCE = "COLLECT_OPERATOR_DECISION"
+
+#: 绑定严重度排序：用于把"同一分片内多条记录"折叠成单一分片结论。
+_BINDING_PRECEDENCE = (
+    "BOUND_TO_CURRENT_CANDIDATE",
+    "CANDIDATE_FINGERPRINT_CHANGED",
+    "CANDIDATE_ID_CHANGED",
+    "STALE_DATASET_FINGERPRINT",
+    "CANONICAL_IDS_CHANGED",
+    "CANDIDATE_NOT_IN_CURRENT_DATASET",
+    "AMBIGUOUS_IDENTITY",
+)
 PREPARE_KIND = "READ_ONLY_NBA_REVIEW_PREPARE"
 EVIDENCE_KIND = "NBA_INDEPENDENT_ORIENTATION_EVIDENCE"
 
@@ -1405,9 +1430,34 @@ def command_persist(
         except evidence_store.EvidenceStoreError as exc:
             errors.append({"source_reference": path, "reason_code": exc.code})
 
+    # 校验 → 追加之间的新鲜度边界：数据集可能在此期间被刷新。
+    # 这里只做**检测**，不改写已追加的历史记录，也不声称批次原子性。
+    validated_fingerprint = validation.get("dataset_fingerprint")
+    freshness_state = "NOT_RECHECKED"
+    freshness_verified = False
+    post_fingerprint = None
+    try:
+        post_dataset = _load_dataset_or_error(data_dir)
+        post_fingerprint = dataset_fingerprint(post_dataset)
+        if not validated_fingerprint:
+            # 校验结果没有携带指纹 -> 无法比较，**不得**声称新鲜，也不得谎报变更。
+            freshness_state = "VALIDATION_FINGERPRINT_MISSING"
+        elif post_fingerprint == validated_fingerprint:
+            freshness_state = "UNCHANGED"
+            freshness_verified = True
+        else:
+            freshness_state = "DATASET_CHANGED_DURING_PERSIST"
+    except AuditInputError:
+        freshness_state = "RECHECK_UNAVAILABLE"
+
+    status = "PERSISTED" if persisted and not errors else ("PARTIAL" if persisted else "FAILED")
+    if status == "PERSISTED" and freshness_state == "DATASET_CHANGED_DURING_PERSIST":
+        # 记录已落盘但已绑定到过期数据集：不得声称"当前有效"。
+        status = "PARTIAL"
+
     return dict(
         base,
-        status="PERSISTED" if persisted and not errors else ("PARTIAL" if persisted else "FAILED"),
+        status=status,
         staging_dir_description="EXTERNAL_EVIDENCE_DIRECTORY",
         persisted_count=len(persisted),
         persisted=persisted,
@@ -1415,9 +1465,266 @@ def command_persist(
         retained_sources=retained,
         error_count=len(errors),
         errors=errors,
+        dataset_fingerprint_at_validation=validated_fingerprint,
+        dataset_fingerprint_after_persist=post_fingerprint,
+        freshness_state=freshness_state,
+        freshness_verified=freshness_verified,
+        batch_atomic=False,
+        batch_atomic_note=(
+            "records are appended one at a time under a per-store writer lock; "
+            "a multi-record operation is not atomic and partial results are reported above"
+        ),
         # 明确：持久化 ≠ 生产授权，也 ≠ 已核验来源。
         review_evidence_only=True,
         production_authorized=False,
+    )
+
+
+def _persisted_state_for(binding: str, *, conflict: bool) -> str:
+    if conflict:
+        return PERSISTED_CONFLICT
+    if binding == "AMBIGUOUS_IDENTITY":
+        return PERSISTED_AMBIGUOUS
+    if binding == "BOUND_TO_CURRENT_CANDIDATE":
+        return PERSISTED_BOUND
+    return PERSISTED_STALE
+
+
+def _action_for(state: str) -> str:
+    if state == PERSISTED_CONFLICT:
+        return ACTION_ADJUDICATE_REQUIRED
+    if state in (PERSISTED_AMBIGUOUS, PERSISTED_STALE):
+        return ACTION_REATTACH_REQUIRED
+    if state == PERSISTED_NO_STORED_EVIDENCE:
+        return ACTION_COLLECT_EVIDENCE
+    return ACTION_OPERATOR_REVIEW_REQUIRED
+
+
+def _worst_binding(bindings: Sequence[str]) -> str:
+    """Collapse per-record bindings into one deterministic shard-level verdict."""
+    if not bindings:
+        return "CANDIDATE_NOT_IN_CURRENT_DATASET"
+    ranked = sorted(bindings, key=lambda item: _BINDING_PRECEDENCE.index(item))
+    return ranked[0]
+
+
+def command_audit_persisted(
+    data_dir: str | None,
+    *,
+    evidence_dir: str | None = None,
+) -> dict[str, Any]:
+    """
+    Read-only reconciliation of **durably persisted** human-review evidence
+    against the **current** NBA candidate dataset.
+
+    Hard guarantees
+    ---------------
+    - Never writes the seven protected stores, never writes the evidence store.
+    - Never reattaches, rewrites or deletes a stored decision.
+    - Never treats a matching ``pair_key`` as a fresh approval: identity is a
+      lookup address, not an authorization.
+    - Corrupt shards are reported, never repaired.
+    - A missing evidence directory is reported as absent, never created.
+    """
+    from utils import evidence_store
+
+    base = {
+        "kind": AUDIT_PERSISTED_KIND,
+        "schema_version": WORKBENCH_SCHEMA_VERSION,
+        "executable": False,
+        "apply_available": False,
+        "production_write_authorization": False,
+        "production_authorized": False,
+        "surviving_canonical_id": None,
+        "no_mutation_performed": True,
+        "decision": "NO-GO",
+        "limitations": list(LIMITATIONS)
+        + [
+            "A stored decision is history, not a current approval.",
+            "bound_record_count is not a count of independently reverified human decisions.",
+            "Evidence persistence is per-record; a multi-record operation is not atomic.",
+        ],
+    }
+
+    try:
+        dataset = _load_dataset_or_error(data_dir)
+    except AuditInputError as exc:
+        return dict(base, real_data_available=False, status="NOT_AVAILABLE", reason=str(exc))
+
+    current_fingerprint = dataset_fingerprint(dataset)
+
+    try:
+        storage = evidence_store.describe_storage(evidence_dir)
+    except evidence_store.EvidenceStoreError as exc:
+        return dict(
+            base,
+            real_data_available=True,
+            dataset_fingerprint=current_fingerprint,
+            status="FAIL_CLOSED",
+            evidence_store_status="PATH_REJECTED",
+            reason_code=exc.code,
+        )
+
+    candidates = [item for item in build_candidates(dataset) if item.get("nba_scope")]
+    by_pair: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    candidate_pairs: dict[str, str] = {}
+    for candidate in candidates:
+        key = evidence_store.pair_key(candidate["canonical_ids"])
+        by_pair[key].append(candidate)
+        candidate_pairs[candidate["candidate_id"]] = key
+
+    pair_reports: list[dict[str, Any]] = []
+    corrupt_shard_count = 0
+    stored_record_count = 0
+
+    if storage["exists"]:
+        for summary in evidence_store.list_pairs(evidence_dir):
+            key = summary["pair_key"]
+            if summary["status"] != "OK":
+                corrupt_shard_count += 1
+                pair_reports.append(
+                    {
+                        "pair_key": key,
+                        "status": "CORRUPT",
+                        "reason_code": summary.get("code"),
+                        "record_count": 0,
+                        "current_binding": None,
+                        "persisted_state": "CORRUPT",
+                        "required_next_action": "REPORT_AND_INVESTIGATE",
+                    }
+                )
+                continue
+
+            payload = evidence_store.load_pair(storage["directory"], key)
+            records = list(payload.get("records") or [])
+            stored_record_count += len(records)
+            decision = evidence_store.decision_summary(payload)
+
+            sharing = by_pair.get(key, [])
+            bindings: list[str] = []
+            if sharing:
+                target = sharing[0]
+                for record in records:
+                    result = evidence_store.inspect_record(
+                        record,
+                        current_canonical_ids=target["canonical_ids"],
+                        current_candidate_id=target["candidate_id"],
+                        current_dataset_fingerprint=current_fingerprint,
+                        candidates_sharing_pair=len(sharing),
+                        current_candidate_fingerprint=target.get("candidate_fingerprint"),
+                    )
+                    bindings.append(result["binding"])
+            binding = _worst_binding(bindings)
+            state = _persisted_state_for(binding, conflict=bool(decision["conflict"]))
+
+            pair_reports.append(
+                {
+                    "pair_key": key,
+                    "status": "OK",
+                    "canonical_ids": list(payload.get("canonical_ids") or []),
+                    "record_count": len(records),
+                    "current_candidate_count": len(sharing),
+                    "current_binding": binding,
+                    "conflict": bool(decision["conflict"]),
+                    "decision_count": len(decision["decisions"]),
+                    "persisted_state": state,
+                    "required_next_action": _action_for(state),
+                    "current_candidate_id": sharing[0]["candidate_id"] if sharing else None,
+                }
+            )
+
+    stored_pairs = [item for item in pair_reports if item["status"] == "OK"]
+    stored_pair_count = len(stored_pairs)
+
+    bound_record_count = 0
+    stale_record_count = 0
+    ambiguous_pair_count = 0
+    conflicting_pair_count = 0
+    missing_candidate_count = 0
+    for item in stored_pairs:
+        binding = item["current_binding"]
+        if binding == "BOUND_TO_CURRENT_CANDIDATE":
+            bound_record_count += item["record_count"]
+        elif binding == "AMBIGUOUS_IDENTITY":
+            ambiguous_pair_count += 1
+        elif binding == "CANDIDATE_NOT_IN_CURRENT_DATASET":
+            missing_candidate_count += 1
+        else:
+            stale_record_count += item["record_count"]
+        if item["conflict"]:
+            conflicting_pair_count += 1
+
+    # 需要**额外**处置（重绑定/裁决/收集）的条目数；
+    # 单单"仍待人工复核"不算额外动作——那本来就是这个工作台的常态。
+    operator_action_required_count = sum(
+        1
+        for item in pair_reports
+        if item["persisted_state"] in (PERSISTED_STALE, PERSISTED_AMBIGUOUS, PERSISTED_CONFLICT)
+        or item["status"] == "CORRUPT"
+    )
+
+    candidate_views = []
+    for candidate in candidates:
+        key = candidate_pairs[candidate["candidate_id"]]
+        item = next((row for row in pair_reports if row["pair_key"] == key), None)
+        state = item["persisted_state"] if item else PERSISTED_NO_STORED_EVIDENCE
+        candidate_views.append(
+            {
+                "candidate_id": candidate["candidate_id"],
+                "pair_key": key,
+                "persisted_evidence_state": state,
+                "operator_review_required": True,
+                "required_next_action": _action_for(state),
+                "record_count": item["record_count"] if item else 0,
+            }
+        )
+
+    if not storage["exists"]:
+        store_status = "NOT_PROVISIONED"
+    elif not pair_reports and not stored_record_count:
+        store_status = "EMPTY"
+    elif corrupt_shard_count and corrupt_shard_count == len(pair_reports):
+        store_status = "UNREADABLE"
+    else:
+        store_status = "READABLE"
+
+    return dict(
+        base,
+        real_data_available=True,
+        dataset_fingerprint=current_fingerprint,
+        status="SUCCESS",
+        evidence_store_status=store_status,
+        evidence_directory_configured_by=storage["configured_by"],
+        evidence_directory_exists=bool(storage["exists"]),
+        stored_pair_count=stored_pair_count,
+        stored_record_count=stored_record_count,
+        current_candidate_count=len(candidates),
+        bound_record_count=bound_record_count,
+        stale_record_count=stale_record_count,
+        ambiguous_pair_count=ambiguous_pair_count,
+        conflicting_pair_count=conflicting_pair_count,
+        missing_candidate_count=missing_candidate_count,
+        corrupt_shard_count=corrupt_shard_count,
+        operator_action_required_count=operator_action_required_count,
+        candidates_with_stored_evidence=sum(
+            1 for view in candidate_views if view["persisted_evidence_state"] != PERSISTED_NO_STORED_EVIDENCE
+        ),
+        # 真实性口径：本命令看不到操作者身份，只能报告"记录自述为人工复核"。
+        genuine_operator_decision_count=0,
+        genuine_operator_decision_note=(
+            "no operator-authored file was supplied to this read-only command; "
+            "self-declared provenance cannot be independently verified here"
+        ),
+        stored_human_reviewed_record_count=stored_record_count,
+        stored_provenance_classification="SELF_DECLARED_LOCAL_HUMAN_REVIEW",
+        synthetic_record_count=0,
+        synthetic_record_count_note=(
+            "synthetic fixtures live in isolated temporary stores and are never counted here"
+        ),
+        production_authorized=False,
+        pairs=pair_reports,
+        candidates=candidate_views,
+        decision="NO-GO",
     )
 
 
@@ -1849,6 +2156,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     validate.add_argument("--evidence", default=None)
     validate.add_argument("--output", default=None)
 
+    audit_persisted = subparsers.add_parser(
+        "audit-persisted",
+        help="read-only reconciliation of persisted evidence against the current dataset",
+    )
+    audit_persisted.add_argument("--data-dir", default=None)
+    audit_persisted.add_argument("--evidence-dir", default=None)
+    audit_persisted.add_argument("--output", default=None)
+    audit_persisted.add_argument("--markdown", default=None)
+
     persist = subparsers.add_parser(
         "persist", help="persist operator-authored decisions into the durable store"
     )
@@ -1877,6 +2193,68 @@ def build_arg_parser() -> argparse.ArgumentParser:
     summary.add_argument("--output", default=None)
     summary.add_argument("--markdown", default=None)
     return parser
+
+
+def render_audit_persisted_markdown(document: Mapping[str, Any]) -> str:
+    """Audit-facing summary only: no record bodies, no reviewer identities."""
+    if document.get("status") != "SUCCESS":
+        return (
+            "# Persisted evidence reconciliation\n\n"
+            f"**{document.get('status')}** — {document.get('reason_code') or document.get('reason') or ''}\n"
+        )
+
+    lines = [
+        "# Persisted evidence reconciliation (read-only)",
+        "",
+        f"- dataset fingerprint: `{document['dataset_fingerprint']}`",
+        f"- evidence store: `{document['evidence_store_status']}`"
+        f" (exists={document['evidence_directory_exists']},"
+        f" configured_by={document['evidence_directory_configured_by']})",
+        "",
+        "| metric | value |",
+        "| --- | --- |",
+    ]
+    for field in (
+        "stored_pair_count",
+        "stored_record_count",
+        "current_candidate_count",
+        "bound_record_count",
+        "stale_record_count",
+        "ambiguous_pair_count",
+        "conflicting_pair_count",
+        "missing_candidate_count",
+        "corrupt_shard_count",
+        "operator_action_required_count",
+        "genuine_operator_decision_count",
+        "synthetic_record_count",
+    ):
+        lines.append(f"| `{field}` | {document.get(field)} |")
+
+    lines += ["", "## Pairs", "", "| pair_key | records | binding | state | next action |",
+              "| --- | --- | --- | --- | --- |"]
+    for item in document.get("pairs", []):
+        lines.append(
+            f"| `{item['pair_key']}` | {item.get('record_count', 0)} | "
+            f"`{item.get('current_binding')}` | `{item.get('persisted_state')}` | "
+            f"`{item.get('required_next_action')}` |"
+        )
+
+    lines += [
+        "",
+        "> `bound_record_count` is **not** a count of independently reverified human decisions.",
+        "> A stored decision is history; it is never a current approval.",
+        "",
+        "```text",
+        "executable = false",
+        "apply_available = false",
+        "production_write_authorization = false",
+        "production_authorized = false",
+        "surviving_canonical_id = null",
+        "decision = NO-GO",
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def render_summary_markdown(document: Mapping[str, Any]) -> str:
@@ -1978,6 +2356,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 int(document.get("review_rejected_count") or 0),
                 int(document.get("evidence_rejected_count") or 0),
             )
+        if args.command == "audit-persisted":
+            document = command_audit_persisted(args.data_dir, evidence_dir=args.evidence_dir)
+            if args.output:
+                write_json(args.output, document)
+            if args.markdown:
+                write_text(args.markdown, render_audit_persisted_markdown(document))
+            print(json.dumps(
+                {
+                    "status": document.get("status"),
+                    "evidence_store_status": document.get("evidence_store_status"),
+                    "dataset_fingerprint": document.get("dataset_fingerprint"),
+                    "stored_pair_count": document.get("stored_pair_count"),
+                    "stored_record_count": document.get("stored_record_count"),
+                    "current_candidate_count": document.get("current_candidate_count"),
+                    "bound_record_count": document.get("bound_record_count"),
+                    "stale_record_count": document.get("stale_record_count"),
+                    "ambiguous_pair_count": document.get("ambiguous_pair_count"),
+                    "conflicting_pair_count": document.get("conflicting_pair_count"),
+                    "missing_candidate_count": document.get("missing_candidate_count"),
+                    "corrupt_shard_count": document.get("corrupt_shard_count"),
+                    "genuine_operator_decision_count": document.get("genuine_operator_decision_count"),
+                    "production_authorized": document.get("production_authorized"),
+                    "decision": document.get("decision"),
+                },
+                ensure_ascii=False, sort_keys=True,
+            ))
+            return EXIT_OK if document.get("status") == "SUCCESS" else EXIT_INPUT_ERROR
         if args.command == "persist":
             document = command_persist(
                 args.data_dir,
