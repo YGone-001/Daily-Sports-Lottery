@@ -84,7 +84,9 @@ ALLOWED_PATHS = frozenset((
     # persisted evidence reconciliation against the current candidate dataset
     "tests/test_persisted_evidence_reconciliation.py",
     # reconciliation and persistence result-integrity corrections
-    "tests/test_persisted_evidence_result_integrity.py"))
+    "tests/test_persisted_evidence_result_integrity.py",
+    # evidence local-date vs Beijing-date conversion regression
+    "tests/test_evidence_date_semantics.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -34,8 +34,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from tools.nba_identity_discrepancy_audit import build_candidates, command_scan
@@ -560,6 +562,124 @@ def _maps_onto_side(
     return set(pair) == mapped
 
 
+#: Optional, explicitly attested conversion basis for an evidence item whose
+#: original NBA local date differs from the Beijing candidate date.
+#: These are **never** required by ``load_evidence()``; they only allow a reviewed
+#: item to be compared on a demonstrable UTC -> UTC+8 basis. Missing, ambiguous or
+#: inconsistent values fail closed and fall back to strict date equality.
+#: A plain UTC offset is used instead of an IANA zone database so behaviour is
+#: identical on Windows (no system tzdata) and Linux.
+DATE_CONVERSION_KEYS = (
+    "source_utc_offset",
+    "event_start_local",
+    "event_start_utc",
+    "beijing_event_date",
+    "local_time_semantics",
+)
+LOCAL_TIME_UNAMBIGUOUS = "UNAMBIGUOUS"
+_UTC_OFFSET_RE = re.compile(r"^([+-])(\d{2}):(\d{2})$")
+
+
+def _parse_utc_offset(value: Any) -> timedelta | None:
+    """Strict ``±HH:MM`` parsing; rejects out-of-range and minute overflow."""
+    if not isinstance(value, str):
+        return None
+    match = _UTC_OFFSET_RE.match(value.strip())
+    if not match:
+        return None
+    hours, minutes = int(match.group(2)), int(match.group(3))
+    if hours > 14 or minutes > 59 or (hours == 14 and minutes != 0):
+        return None
+    delta = timedelta(hours=hours, minutes=minutes)
+    return -delta if match.group(1) == "-" else delta
+
+
+def _naive_local_datetime(value: Any) -> datetime | None:
+    """An original local wall-clock time must be timezone-naive."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is None else None
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    """A UTC instant must be timezone-aware with a zero offset."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return None
+    return parsed
+
+
+def event_date_compatible(
+    item: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> tuple[bool, str]:
+    """
+    Decide whether an evidence item's original event date describes the candidate's date.
+
+    ``candidate.event_date`` is the **Beijing** calendar date from
+    ``daily_matches.json``; ``actual_event_date`` keeps the source's **original**
+    local game date (AGENTS.md §4.12/§4.13.1). A one-day difference is normal for
+    NBA games played in the US evening.
+
+    - Equal strings -> compatible (pre-existing behaviour, never weakened).
+    - Different strings -> compatible **only** with an explicit, self-consistent
+      conversion basis: original local timestamp + UTC offset + UTC instant +
+      declared Beijing date + an unambiguous local-time declaration. The derived
+      UTC instant, the derived Beijing date and the declared Beijing date must
+      all agree, and the original local date must remain intact.
+    - Anything missing, malformed, ambiguous or inconsistent -> incompatible.
+
+    This function never mutates the item, never infers a kickoff time from a
+    competition-number weekday token, and never infers venue direction.
+    """
+    candidate_date = str(candidate.get("event_date") or "")
+    local_date = str(item.get("actual_event_date") or "")
+    if not candidate_date or not local_date:
+        return False, "DATE_MISSING"
+    if local_date == candidate_date:
+        return True, "DATE_EQUAL"
+
+    if str(item.get("local_time_semantics") or "").upper() != LOCAL_TIME_UNAMBIGUOUS:
+        return False, "LOCAL_TIME_AMBIGUOUS_OR_UNDECLARED"
+    missing = [key for key in DATE_CONVERSION_KEYS if not item.get(key)]
+    if missing:
+        return False, "CONVERSION_BASIS_MISSING:" + ",".join(sorted(missing))
+
+    offset = _parse_utc_offset(item.get("source_utc_offset"))
+    if offset is None:
+        return False, "UNSUPPORTED_UTC_OFFSET"
+    local_dt = _naive_local_datetime(item.get("event_start_local"))
+    if local_dt is None:
+        return False, "UNSUPPORTED_LOCAL_TIMESTAMP"
+    utc_dt = _utc_datetime(item.get("event_start_utc"))
+    if utc_dt is None:
+        return False, "UNSUPPORTED_UTC_TIMESTAMP"
+
+    # The original local date must still be the source's own date.
+    if local_dt.date().isoformat() != local_date:
+        return False, "ORIGINAL_LOCAL_DATE_NOT_PRESERVED"
+
+    derived_utc = (local_dt - offset).replace(tzinfo=timezone.utc)
+    if derived_utc != utc_dt:
+        return False, "CONVERSION_INCONSISTENT"
+
+    beijing_dt = utc_dt.astimezone(timezone(timedelta(hours=8)))
+    beijing_date = beijing_dt.date().isoformat()
+    if beijing_date != candidate_date:
+        return False, "BEIJING_DATE_MISMATCH"
+    if str(item.get("beijing_event_date")) != beijing_date:
+        return False, "DECLARED_BEIJING_DATE_MISMATCH"
+    return True, "VERIFIED_TIMEZONE_CONVERSION"
+
+
 def resolve_orientation(
     candidate: Mapping[str, Any], evidence_document: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -587,12 +707,14 @@ def resolve_orientation(
     matched: list[dict[str, Any]] = []
     covered_sides: dict[str, set[str]] = {}
     corroborated_ids: set[str] = set()
+    date_semantics: dict[str, str] = {}
 
     def base(**kwargs: Any) -> dict[str, Any]:
         payload = {
             "supplied_count": len(supplied),
             "reviewed_count": len(reviewed),
             "unmatched": unmatched,
+            "date_semantics": date_semantics,
             "home_team_claims": {},
             "contradictory_references": [],
             "supporting_evidence_ids": [],
@@ -607,8 +729,10 @@ def resolve_orientation(
         return payload
 
     for item in reviewed:
-        if str(item.get("actual_event_date")) != str(candidate.get("event_date")):
-            unmatched.append(f"{item['evidence_id']}: event date mismatch")
+        compatible, date_reason = event_date_compatible(item, candidate)
+        date_semantics[str(item["evidence_id"])] = date_reason
+        if not compatible:
+            unmatched.append(f"{item['evidence_id']}: event date mismatch ({date_reason})")
             continue
         pair = _evidence_pair(item)
         if pair is None:

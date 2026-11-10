@@ -179,6 +179,32 @@ python -m tools.nba_human_review_workbench audit-persisted \
 > `pair_key` 命中只是"同一对源记录"的**查找地址**，不是新的批准。
 > `bound_record_count` **不是**"已独立复核的人工决定数"。
 
+### 5.1.1 独立方向证据的日期字段
+
+`validate --evidence <file>` 读取的证据文档顶层为 `{"evidence": [...]}`；
+每条记录必须带 `EVIDENCE_REQUIRED_KEYS` 中的 14 个字段（见工作台模板）。
+其中 `actual_event_date` **保留来源侧原始当地比赛日**，而候选的
+`event_date` 是 `daily_matches.json` 的**北京比赛日**——两者常相差 1 天。
+
+因此证据条目可**可选**携带一组换算字段，用于证明「不同日历日、同一场比赛」：
+
+| 字段 | 要求 |
+| --- | --- |
+| `source_utc_offset` | 严格 `±HH:MM`（如 EDT 写 `-04:00`），须由独立来源证实 |
+| `event_start_local` | naive ISO-8601 本地时间，不带时区 |
+| `event_start_utc` | aware UTC 时刻（`Z` 或 `+00:00`） |
+| `beijing_event_date` | 声明的北京日期，须与换算结果一致 |
+| `local_time_semantics` | 仅 `UNAMBIGUOUS` 可接受 |
+
+判定条件：`原始当地日期 = 本地时间戳日期`、`本地时间 − 偏移 = UTC 时刻`、
+`UTC + 8h 的日期 = 候选 event_date = 声明北京日期`。缺任一字段、格式非法、
+换算不自洽或本地时间歧义，一律回退为**严格日期相等**（失败即关闭）。
+
+这些字段是**可选扩展**，不加入 `EVIDENCE_REQUIRED_KEYS`，既有证据文件不受影响。
+换算通过**不**等于人工核验：条目仍需 `verification_status = SOURCE_REFERENCE_REVIEWED`
+与非空 `checked_by` 才支持方向；也不推断场地方向、不授权归并。
+详见 `AGENTS.md` §4.23。
+
 ### 5.2 `status` 与 `reconciliation_verdict` 不是一回事
 
 `status` 只说明**这次检查跑完了**（`SUCCESS` / `NOT_AVAILABLE` / `FAIL_CLOSED`）。

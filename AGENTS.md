@@ -716,6 +716,41 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   `surviving_canonical_id` 恒为 `null`，`decision` 恒为 `NO-GO`。
 - 合成夹具只能验证机制：通过本节的回归**不**构成 `REAL_HUMAN_REVIEW_ACCEPTANCE`。
 
+---
+
+### 4.23 独立来源证据的日期语义（当地日 vs 北京日）
+
+- **两个日期不是同一概念**：`candidate.event_date` 来自 `daily_matches.json` 的
+  `date`，是**北京比赛日**；证据条目的 `actual_event_date` 按 §4.12 必须保留
+  **来源侧原始当地比赛日**（NBA 官方标注的美方日期）。NBA 在美国晚间开赛时
+  两者通常相差 1 天（当地 `2026-10-27` → 北京 `2026-10-28`）。
+- **不得用裸字符串相等判等**：`tools.nba_human_review_workbench.resolve_orientation()`
+  曾直接比较 `str(actual_event_date) == str(candidate.event_date)`，
+  会把「有完整时区换算依据的同一场比赛」误判为 `event date mismatch`。
+  现由 `event_date_compatible()` 统一判定。
+- **兼容两条且仅两条路径**：
+  1. 两字符串相等 → `DATE_EQUAL`（既有行为，不削弱）；
+  2. 不相等时，**仅当**证据自带显式且自洽的换算依据才兼容。
+- **换算依据必须是可选扩展字段**（不改 `EVIDENCE_REQUIRED_KEYS`、不破坏既有文档）：
+  `source_utc_offset`（严格 `±HH:MM`）、`event_start_local`（naive ISO-8601 本地时间）、
+  `event_start_utc`（aware UTC）、`beijing_event_date`（声明的北京日期）、
+  `local_time_semantics`（仅 `UNAMBIGUOUS` 可接受）。
+  必须同时满足：原始当地日期 = 本地时间戳日期；`本地时间 − 偏移` = UTC 时刻；
+  `UTC + 8h` 的日期 = `candidate.event_date` = 声明的北京日期。
+- **失败即关闭**：字段缺失、格式非法、偏移越界、本地时间带时区、
+  UTC 时刻非 UTC、`AMBIGUOUS` / `NONEXISTENT` / 未声明的本地时间、
+  换算不一致、声明北京日期不符 —— 一律不兼容，回退到严格日期相等。
+- **用显式 UTC 偏移而非 IANA 时区库**：Windows 无系统 `tzdata`、`zoneinfo` 不可用，
+  而 CI 为 Linux；依赖 IANA 数据库会造成平台判定不一致。换算只用
+  `datetime` 算术，跨平台确定。偏移值必须由操作者从独立来源证实，不得推算。
+- **不得**从竞彩编号的星期 token 推断开赛时间；不得用换算结果覆盖
+  `actual_event_date` 或任何源记录时间字段；不得据换算推断场地方向。
+- **日期换算通过 ≠ 人工核验**：条目仍需 `SOURCE_REFERENCE_REVIEWED` +
+  非空 `checked_by`（§4.11/§4.12）才能支持方向；日期比较通过**不**产生
+  `HUMAN_REVIEWED` 溯源，**不**建立跨源同一性，**不**授权任何归并或生产写入。
+- `resolve_orientation()` 的 `date_semantics` 字段逐条给出判定原因，供只读审计；
+  `authoritative` 恒为 `false`。
+
 
 ---
 
