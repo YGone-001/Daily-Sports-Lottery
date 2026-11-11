@@ -197,7 +197,7 @@ def test_oa_04_no_basketball_dates_handled_honestly(isolated_data_dir):
 
 def test_oa_05_current_diagnostics_are_not_confused_with_cached_success(api_dataset):
     fetcher_500._CACHE.clear()
-    fetcher_500._DIAGNOSTICS.clear()
+    fetcher_500.reset_source_observation()
 
     health = client().get("/api/status").get_json()["source_health"]
     for name in ("live_basketball", "jclq_sf", "jclq_dxf"):

@@ -837,6 +837,53 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.26 NBA 刷新就绪与入库验收：执行成功 ≠ 业务成功
+
+- **三类授权互相独立**：①只读运营检查（读本地存储、读刷新标记、读历史证据、
+  通过既有只读适配器观测公有源、跑离线测试、在受保护存储之外写本机报告）；
+  ②隔离刷新演练（合成数据集、被 mock 的源响应、临时目录里跑真实 `refresh()`）；
+  ③真实运行库刷新。**开发指令本身不构成 ③ 的授权**，也不得从历史刷新、
+  既有批准或 `/api/refresh` 的存在推断授权。缺 ③ 时必须记
+  `REAL_REFRESH_AUTHORIZATION = NOT_GRANTED` / `REAL_REFRESH_EXECUTED = NO`，
+  未执行的验收项记 `NOT_EXECUTED_AUTHORIZATION_REQUIRED`，**不得**写成通过。
+- **`refresh_status = COMPLETED` ≠ `ALL_CURRENT_SOURCE_FIXTURES_INGESTED`**：
+  标记只说明本次刷新走到最后一步；业务级入库验收必须在刷新**之后**单独测量
+  新增/覆盖，且**不得**把上一批历史计数当作刷新后事实。
+- **五个概念必须分别陈述**：`LAST_REFRESH_SUCCESS`（`meta.last_refresh`）、
+  `CURRENT_SOURCE_OBSERVATION`（本进程真实抓取到的行）、
+  `SOURCE_FIXTURES_NOT_YET_INGESTED`、`MARKET_INELIGIBLE_FIXTURES`、
+  `POST_REFRESH_INGESTION_VERIFIED`（观测**晚于**最近刷新且无合格缺口）。
+- **覆盖不可判定必须写成不可判定**：无观测（`SOURCE_NOT_OBSERVED`）、任一篮球源
+  `unavailable` / `empty`（`SOURCE_NOT_HEALTHY`）、观测早于数据集
+  （`OBSERVATION_PREDATES_LAST_REFRESH`）、时间戳不可解析时，一律
+  `coverage_status = UNKNOWN` 且计数为 `null`，**绝不**返回 `0`。
+  空响应**不得**被读作「零缺口」；缓存命中**不得**产生新的观测时间戳。
+- **源观测只允许只读**：只能用 `utils.fetcher_500` 的读取函数（§4.16），
+  不得调用 `scraper.refresh()`、不得获取写入者锁、不得落盘响应正文。
+- **发布时刻不得推断**：只有在存在独立证据时才可写
+  `SOURCE_PUBLICATION_TIME_VERIFIED`；由观测时刻或比赛日推断的一律记
+  `SOURCE_AVAILABLE_AT_LATER_OBSERVATION`，其余记 `SOURCE_PUBLICATION_TIME_UNKNOWN`。
+- **严格整批身份预检是有意契约**：`validate_ingestion_identity(existing, incoming)`
+  在**市场准入之前**对整个观察批次执行（§4.7 / `docs/ingestion-identity-preflight.md` §2），
+  因此一条随后会被过滤的「无可用盘口」行同样能让整批 fail closed。
+  **不得**把它收窄成「只校验准入子集」：那会静默丢弃
+  `SAME_SOURCE_ALIAS_DIFFERENT_EVENT` 等源侧信号，也不会增加任何入库记录。
+  收窄只能由可复现的确定性缺陷证明其**错误**后另立治理条目。
+- **拒绝必须零写入**：整批拒绝时七个受保护存储字节不变，刷新标记写
+  `FAILED` 且带冲突类别，`consistency()` 随即 `consistent = False`。
+- **隔离演练可以写临时七存储，绝不写 `data/`**：演练必须走真实
+  `scraper.refresh()`、真实合并/准入/身份预检，且源适配器被 mock。
+  演练必须覆盖：合格新赛事准入、无盘口过滤、已跟踪身份保持、跨源同事件不重复、
+  WNBA 不计入 NBA、歧义整批拒绝（零写入）、源抓取失败显式报告、解析失败显式报告、
+  空响应不得读作健康覆盖、并发刷新被既有锁拒绝、刷新中断不得声称原子性、
+  既有预测快照不被覆盖、已结算比赛不重复结算。
+- **不得声称七文件原子性**：刷新跨文件可达数分钟；中断后**不得**自动回滚单个存储、
+  **不得**为了对上计数去修数、**不得**仅因函数未抛异常就宣布成功。
+- **`ISOLATED_REFRESH_REHEARSAL = PASS` 不等于 `REAL_REFRESH_EXECUTED`**，
+  也不等于 `POST_REFRESH_NBA_COVERAGE = VERIFIED`；三者必须分开陈述。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

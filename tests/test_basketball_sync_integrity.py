@@ -93,7 +93,9 @@ class _Resp:
 
 def _clear_caches():
     fetcher_500._CACHE.clear()
-    fetcher_500._DIAGNOSTICS.clear()
+    # ``reset_source_observation`` clears both the diagnostics and the retained
+    # observation rows, so a previous test can never masquerade as "just observed".
+    fetcher_500.reset_source_observation()
 
 
 def _patch_live(monkeypatch, text=None, *, error=None):
@@ -571,3 +573,538 @@ def test_bs_24_default_date_without_actionable_days(monkeypatch):
     )
 
     assert daily_loader.get_default_date() == "2026-11-02"
+
+
+# ---------------------------------------------------------------------------
+# BS-25 … BS-31: isolated end-to-end refresh rehearsal
+#
+# Every test in this section calls the **real** ``scraper.refresh()`` against a
+# temporary DATA_DIR with mocked source adapters. They prove code behaviour only:
+#
+#     ISOLATED_REFRESH_REHEARSAL   -> what this section proves
+#     REAL_REFRESH_EXECUTED        -> NOT executed (separate operator authorization)
+#     POST_REFRESH_VERIFIED        -> NOT verified (no authorized real refresh)
+#
+# The seven-store write set is deliberately exercised: an isolated rehearsal is
+# allowed to mutate its own temporary stores, never ``data/``.
+# ---------------------------------------------------------------------------
+
+from utils import refresh_state  # noqa: E402
+from utils.concurrency import RefreshBusyError  # noqa: E402
+from utils.ingestion_identity import CanonicalIdentityCollisionError  # noqa: E402
+from utils.match_identity import competition_number_for_match  # noqa: E402
+
+REHEARSAL_DATE = "2030-05-02"
+TRACKED_DATE = "2030-05-01"
+TRACKED_ID = "500j-2030-05-01-6301"
+
+
+def write_refresh_stores(directory, matches, *, prediction_snapshots=None,
+                         odds_snapshots=None, settlements=None, evaluation_rows=None):
+    """Write all seven protected stores so a refresh has a complete universe."""
+    os.makedirs(directory, exist_ok=True)
+    payloads = {
+        "daily_matches.json": {
+            "matches": list(matches),
+            "meta": {"last_refresh": "2030-01-01T00:00:00+08:00"},
+        },
+        "team_strength.json": {"teams": {}},
+        "calibrated.json": {"ids": []},
+        "prediction_snapshots.json": prediction_snapshots or {"version": 1, "snapshots": {}},
+        "odds_snapshots.json": odds_snapshots or {"version": 1, "snapshots": {}},
+        "settlements.json": settlements or {"version": 1, "settlements": {}},
+        "evaluation_rows.json": evaluation_rows or {"version": 1, "rows": {}},
+    }
+    for name, payload in payloads.items():
+        with open(os.path.join(directory, name), "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+    return directory
+
+
+def patch_refresh_sources(monkeypatch, *, live_basketball=(), live_football=(),
+                          xml=None, finished=()):
+    """Replace the four source adapters; no test ever reaches the network."""
+    rows = {"basketball": list(live_basketball), "football": list(live_football)}
+    monkeypatch.setattr(fetcher_500, "fetch_live_basketball", lambda: list(rows["basketball"]))
+    monkeypatch.setattr(
+        fetcher_500, "fetch_live_matches", lambda sport="football": list(rows["football"])
+    )
+    monkeypatch.setattr(
+        fetcher_500, "fetch_jczq_xml", lambda sport="football": list((xml or {}).get(sport, []))
+    )
+    monkeypatch.setattr(
+        fetcher_500, "fetch_finished_matches", lambda date=None: list(finished)
+    )
+
+
+def tracked_nba_row():
+    return {
+        "id": TRACKED_ID,
+        "sport": "basketball",
+        "league": "美国职业篮球联盟",
+        "round": "6301",
+        "date": TRACKED_DATE,
+        "time": "08:00",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "home_rank": None,
+        "away_rank": None,
+        "score": None,
+        "odds": {"home_win": 1.60, "away_win": 2.40, "matchnum": "6301"},
+        "jczq_no": "6301",
+        "market_tracked": True,
+    }
+
+
+def rehearsal_live(number, *, home, away, odds=True, league="NBA", date=REHEARSAL_DATE):
+    row = {
+        "id": f"500lq-{date}-{number}",
+        "sport": "basketball",
+        "league": league,
+        "round": "",
+        "date": date,
+        "time": "08:30",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": home,
+        "away": away,
+        "home_rank": None,
+        "away_rank": None,
+        "score": None,
+        "odds": (
+            {"home_win": 1.62, "away_win": 2.35, "total_line": 224.5, "over": 1.88, "under": 1.92}
+            if odds
+            else None
+        ),
+        "jczq_no": str(number),
+    }
+    return row
+
+
+def rehearsal_market(number, *, home, away, date=REHEARSAL_DATE, league="美国职业篮球联盟"):
+    return {
+        "id": f"500j-{date}-{number}",
+        "sport": "basketball",
+        "league": league,
+        "round": str(number),
+        "date": date,
+        "time": "00:00",
+        "kickoff_time_known": False,
+        "status": "upcoming",
+        "home": home,
+        "away": away,
+        "home_rank": None,
+        "away_rank": None,
+        "score": None,
+        "odds": {
+            "home_win": 1.58,
+            "away_win": 2.45,
+            "total_line": 226.5,
+            "over": 1.90,
+            "under": 1.90,
+            "matchnum": str(number),
+        },
+        "jczq_no": str(number),
+    }
+
+
+TEAMS = [
+    ("印第安那步行者", "华盛顿奇才"),
+    ("多伦多猛龙", "波士顿凯尔特人"),
+    ("纽约尼克斯", "克利夫兰骑士"),
+    ("孟菲斯灰熊", "丹佛掘金"),
+    ("新奥尔良鹈鹕", "布鲁克林篮网"),
+    ("芝加哥公牛", "圣安东尼奥马刺"),
+    ("密尔沃基雄鹿", "洛杉矶湖人"),
+    ("犹他爵士", "奥兰多魔术"),
+    ("休斯敦火箭", "金州勇士"),
+]
+
+
+def rehearsal_batch():
+    """Nine eligible NBA fixtures, three market-ineligible ones and a WNBA row."""
+    live = []
+    xml = {"basketball": [], "football": []}
+    for offset, (home, away) in enumerate(TEAMS):
+        number = 6401 + offset
+        live.append(rehearsal_live(number, home=home, away=away))
+        xml["basketball"].append(rehearsal_market(number, home=home, away=away))
+    for offset in range(3):
+        number = 6410 + offset
+        home, away = f"无盘口主队{offset}", f"无盘口客队{offset}"
+        live.append(rehearsal_live(number, home=home, away=away, odds=False))
+    live.append(
+        rehearsal_live(6501, home="拉斯维加斯王牌", away="纽约自由人", league="WNBA")
+    )
+    # The tracked event also arrives from the lottery market: it must not duplicate.
+    xml["basketball"].append(
+        rehearsal_market(6301, home="洛杉矶湖人", away="金州勇士", date=TRACKED_DATE)
+    )
+    return live, xml
+
+
+def test_bs_25_isolated_refresh_ingests_eligible_nba_and_preserves_identity(
+    isolated_data_dir, monkeypatch
+):
+    data_dir = write_refresh_stores(str(isolated_data_dir), [tracked_nba_row()])
+    live, xml = rehearsal_batch()
+    patch_refresh_sources(monkeypatch, live_basketball=live, xml=xml)
+
+    stats = scraper.refresh(verbose=False)
+
+    payload = json.loads(open(os.path.join(data_dir, "daily_matches.json"), encoding="utf-8").read())
+    matches = payload["matches"]
+    ids = [m["id"] for m in matches]
+
+    # 1) new NBA with usable odds -> admitted; 2) without usable odds -> filtered
+    assert stats["sources"]["market_rejected"] == 3
+    assert stats["added"] == 10, stats
+    assert len(matches) == 11
+    assert len(ids) == len(set(ids)), "canonical identity must stay unique"
+
+    # 3) already tracked event keeps its Canonical ID, even though the live alias differs
+    assert TRACKED_ID in ids
+    tracked = next(m for m in matches if m["id"] == TRACKED_ID)
+    assert tracked["home"] == "洛杉矶湖人" and tracked["away"] == "金州勇士"
+
+    # 4) the same established event from both sources stays a single record
+    lakers = [m for m in matches if m.get("date") == TRACKED_DATE]
+    assert len(lakers) == 1
+
+    nba_today = [
+        m for m in matches
+        if m.get("date") == REHEARSAL_DATE and fetcher_500.is_nba_league(m.get("league"))
+    ]
+    numbers = sorted(competition_number_for_match(m) for m in nba_today)
+    assert numbers == [str(n) for n in range(6401, 6410)]
+    assert all(m.get("market_tracked") is True for m in nba_today)
+    assert all(has_usable_market_odds(m) for m in nba_today), "no synthetic odds may appear"
+
+    # 5) WNBA is stored as basketball but is never counted as NBA
+    wnba = [m for m in matches if m.get("league") == "WNBA"]
+    assert len(wnba) == 1
+    assert fetcher_500.is_nba_league(wnba[0]["league"]) is False
+
+    # market orientation must be untouched: the live row's home/away survive
+    assert nba_today[0]["home"] in {home for home, _ in TEAMS}
+
+    # refresh generation transitions and the completed digest set
+    state = refresh_state.inspect_state(data_dir)
+    assert state["error"] is None
+    assert state["state"]["generation"] == 1
+    assert state["state"]["status"] == refresh_state.STATUS_COMPLETED
+    assert set(state["state"]["stores"]) == set(refresh_state.PROTECTED_STORES)
+    assert refresh_state.consistency(data_dir)["consistent"] is True
+
+    # prediction snapshots exist for the upcoming admitted matches and are not duplicated
+    snapshots = json.loads(
+        open(os.path.join(data_dir, "prediction_snapshots.json"), encoding="utf-8").read()
+    )["snapshots"]
+    assert len({s["match_id"] for s in snapshots.values()}) == len(snapshots)
+    assert stats["prediction_snapshots_added"] == len(snapshots)
+
+
+def test_bs_25b_repeated_refresh_creates_no_duplicates(isolated_data_dir, monkeypatch):
+    data_dir = write_refresh_stores(str(isolated_data_dir), [tracked_nba_row()])
+    live, xml = rehearsal_batch()
+    patch_refresh_sources(monkeypatch, live_basketball=live, xml=xml)
+    first = scraper.refresh(verbose=False)
+    ids_after_first = [
+        m["id"] for m in json.loads(
+            open(os.path.join(data_dir, "daily_matches.json"), encoding="utf-8").read()
+        )["matches"]
+    ]
+    snapshots_first = json.loads(
+        open(os.path.join(data_dir, "prediction_snapshots.json"), encoding="utf-8").read()
+    )
+
+    second = scraper.refresh(verbose=False)
+
+    ids_after_second = [
+        m["id"] for m in json.loads(
+            open(os.path.join(data_dir, "daily_matches.json"), encoding="utf-8").read()
+        )["matches"]
+    ]
+    snapshots_second = json.loads(
+        open(os.path.join(data_dir, "prediction_snapshots.json"), encoding="utf-8").read()
+    )
+
+    assert second["added"] == 0, second
+    assert ids_after_first == ids_after_second, "existing Canonical IDs must be stable"
+    assert second["prediction_snapshots_added"] == 0
+    assert snapshots_first == snapshots_second, "immutable snapshots must not be rewritten"
+    assert second["total"] == first["total"]
+    assert refresh_state.inspect_state(data_dir)["state"]["generation"] == 2
+
+
+def test_bs_26_ambiguous_identity_fails_closed_before_any_write(isolated_data_dir, monkeypatch):
+    data_dir = write_refresh_stores(str(isolated_data_dir), [])
+    before = store_hashes(data_dir)
+    bridge = rehearsal_live(7003, home="甲队", away="乙队", odds=False)
+    bridge.pop("jczq_no")
+    ambiguous = [
+        rehearsal_live(7001, home="甲队", away="乙队", odds=False),
+        rehearsal_live(7002, home="甲队", away="乙队", odds=False),
+        bridge,
+    ]
+    patch_refresh_sources(monkeypatch, live_basketball=ambiguous)
+
+    with pytest.raises(CanonicalIdentityCollisionError) as raised:
+        scraper.refresh(verbose=False)
+
+    assert raised.value.category == "AMBIGUOUS_CANONICAL_OWNERSHIP"
+    assert raised.value.reason == "non_clique_component"
+    # fail closed before the first protected-store write
+    assert store_hashes(data_dir) == before
+    state = refresh_state.inspect_state(data_dir)["state"]
+    assert state["status"] == refresh_state.STATUS_FAILED
+    assert "AMBIGUOUS_CANONICAL_OWNERSHIP" in (state.get("error") or "")
+    assert refresh_state.consistency(data_dir)["consistent"] is False
+
+
+def test_bs_26b_strict_batch_preflight_is_documented_behavior(isolated_data_dir, monkeypatch):
+    """
+    A market-ineligible row is *filtered* by admission, yet the ingestion identity
+    preflight runs on the whole observed batch first (AGENTS.md §4.3/§4.26).
+
+    This test pins that contract: it is intentional, not a silent NBA-ingestion
+    defect. Narrowing the guard to the admitted subset would drop the
+    ``SAME_SOURCE_ALIAS_DIFFERENT_EVENT`` signal for unfiltered rows, so the
+    strict batch semantics are preserved.
+    """
+    from utils.ingestion_identity import validate_ingestion_identity
+
+    orphan = {"sport": "basketball", "league": "NBA", "date": "2030-05-03", "home": "孤儿主队"}
+    # The row would never be admitted: no usable odds, no identity.
+    admitted, rejected = scraper._admit_market_candidates([dict(orphan)], existing=[])
+    assert admitted == [] and rejected == 1
+
+    with pytest.raises(CanonicalIdentityCollisionError) as raised:
+        validate_ingestion_identity([], [orphan])
+    assert raised.value.category == "INADEQUATE_EVENT_IDENTITY"
+
+    data_dir = write_refresh_stores(str(isolated_data_dir), [])
+    before = store_hashes(data_dir)
+    patch_refresh_sources(monkeypatch, live_basketball=[orphan])
+    with pytest.raises(CanonicalIdentityCollisionError):
+        scraper.refresh(verbose=False)
+    assert store_hashes(data_dir) == before
+
+
+def test_bs_27_source_fetch_failure_is_reported_and_does_not_block_other_source(
+    isolated_data_dir, monkeypatch
+):
+    data_dir = write_refresh_stores(str(isolated_data_dir), [])
+    live, xml = rehearsal_batch()
+
+    def boom():
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(fetcher_500, "fetch_live_basketball", boom)
+    monkeypatch.setattr(fetcher_500, "fetch_live_matches", lambda sport="football": [])
+    monkeypatch.setattr(
+        fetcher_500, "fetch_jczq_xml",
+        lambda sport="football": [
+            r for r in xml.get(sport, [])
+            if competition_number_for_match(r) != "6301"
+        ],
+    )
+    monkeypatch.setattr(fetcher_500, "fetch_finished_matches", lambda date=None: [])
+
+    stats = scraper.refresh(verbose=False)
+
+    assert str(stats["sources"]["live_basketball"]).startswith("error:")
+    assert stats["added"] == 9, stats
+    matches = json.loads(
+        open(os.path.join(data_dir, "daily_matches.json"), encoding="utf-8").read()
+    )["matches"]
+    assert len(matches) == 9
+
+
+def test_bs_28_concurrent_refresh_is_rejected_by_the_existing_lock(
+    isolated_data_dir, monkeypatch
+):
+    from utils.concurrency import acquire_refresh_lock
+
+    data_dir = write_refresh_stores(str(isolated_data_dir), [tracked_nba_row()])
+    before = store_hashes(data_dir)
+    live, xml = rehearsal_batch()
+    patch_refresh_sources(monkeypatch, live_basketball=live, xml=xml)
+
+    with acquire_refresh_lock(action="rehearsal_holder"):
+        with pytest.raises(RefreshBusyError):
+            scraper.refresh(verbose=False)
+
+    assert store_hashes(data_dir) == before, "a rejected writer must not touch any store"
+
+
+def test_bs_29_interrupted_refresh_is_not_reported_as_atomic(isolated_data_dir, monkeypatch):
+    data_dir = write_refresh_stores(str(isolated_data_dir), [tracked_nba_row()])
+    before = store_hashes(data_dir)
+    live, xml = rehearsal_batch()
+    patch_refresh_sources(monkeypatch, live_basketball=live, xml=xml)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("interrupted during odds history capture")
+
+    monkeypatch.setattr(scraper, "_capture_odds_history", explode)
+
+    with pytest.raises(RuntimeError):
+        scraper.refresh(verbose=False)
+
+    after = store_hashes(data_dir)
+    # The canonical store is written last, so it must not have been replaced.
+    assert after["daily_matches.json"] == before["daily_matches.json"]
+    state = refresh_state.inspect_state(data_dir)["state"]
+    assert state["status"] == refresh_state.STATUS_FAILED
+    assert "interrupted during odds history capture" in (state.get("error") or "")
+    consistency = refresh_state.consistency(data_dir)
+    assert consistency["consistent"] is False
+    assert consistency["reason"] == refresh_state.REASON_FAILED
+    assert consistency["seven_file_atomicity"] is False
+
+
+def test_bs_30_settlement_lifecycle_is_append_only(isolated_data_dir, monkeypatch):
+    data_dir = write_refresh_stores(str(isolated_data_dir), [])
+    upcoming = rehearsal_live(6601, home="波士顿凯尔特人", away="迈阿密热火")
+    patch_refresh_sources(monkeypatch, live_basketball=[upcoming])
+    first = scraper.refresh(verbose=False)
+    assert first["prediction_snapshots_added"] == 1
+
+    finished = dict(upcoming, status="finished", score={"ft": [101, 98]})
+    patch_refresh_sources(monkeypatch, live_basketball=[finished])
+    second = scraper.refresh(verbose=False)
+    assert second["settlements_added"] == 1
+    assert second["evaluation_rows_added"] == 1
+    settlements_after_second = store_hashes(data_dir)["settlements.json"]
+    rows_after_second = store_hashes(data_dir)["evaluation_rows.json"]
+    snapshots_after_second = store_hashes(data_dir)["prediction_snapshots.json"]
+
+    third = scraper.refresh(verbose=False)
+    assert third["settlements_added"] == 0, "an already settled match must not settle twice"
+    assert third["evaluation_rows_added"] == 0
+    assert store_hashes(data_dir)["settlements.json"] == settlements_after_second
+    assert store_hashes(data_dir)["evaluation_rows.json"] == rows_after_second
+    assert store_hashes(data_dir)["prediction_snapshots.json"] == snapshots_after_second
+
+    settled = json.loads(
+        open(os.path.join(data_dir, "settlements.json"), encoding="utf-8").read()
+    )["settlements"]
+    assert len(settled) == 1
+    settlement = next(iter(settled.values()))
+    assert settlement["final_score"] == {"home": 101, "away": 98}
+    assert settlement["actual_outcome"] == "home_win"
+
+    calibrated = json.loads(
+        open(os.path.join(data_dir, "calibrated.json"), encoding="utf-8").read()
+    )["ids"]
+    assert calibrated == [upcoming["id"]]
+
+
+def test_bs_31_nba_coverage_is_unknown_without_a_current_observation(isolated_data_dir):
+    from app import build_nba_coverage
+
+    _clear_caches()
+    coverage = build_nba_coverage([], "2026-11-11T09:51:47+08:00")
+    assert coverage["coverage_status"] == "UNKNOWN"
+    assert coverage["coverage_reason"] == "SOURCE_NOT_OBSERVED"
+    # "no observation" must never be reported as "zero missing fixtures"
+    assert coverage["source_fixtures_not_yet_ingested"] is None
+    assert coverage["market_ineligible_fixtures"] is None
+    assert coverage["post_refresh_ingestion_verified"] is False
+    assert coverage["current_source_observation"]["state"] == "NOT_OBSERVED"
+
+
+def test_bs_32_nba_coverage_separates_ingested_pending_and_ineligible(isolated_data_dir):
+    from app import build_nba_coverage
+
+    _clear_caches()
+    stored = [tracked_nba_row()]
+    live_rows = [
+        rehearsal_live(6301, home="洛杉矶湖人", away="金州勇士", date=TRACKED_DATE),
+        rehearsal_live(6401, home="印第安那步行者", away="华盛顿奇才"),
+        rehearsal_live(6410, home="无盘口主队", away="无盘口客队", odds=False),
+        rehearsal_live(6501, home="拉斯维加斯王牌", away="纽约自由人", league="WNBA"),
+    ]
+    xml_rows = [rehearsal_market(6401, home="印第安那步行者", away="华盛顿奇才")]
+
+    # Inject the exact same observation shape a real fetch produces.
+    fetcher_500._record_diag("live_basketball", "ok", rows=len(live_rows), nba_rows=3, valid_market_rows=2)
+    fetcher_500._record_observation("live_basketball", live_rows)
+    fetcher_500._record_diag("jczq_odds_basketball", "ok", rows=len(xml_rows), nba_rows=1, valid_market_rows=1)
+    fetcher_500._record_observation("jczq_odds_basketball", xml_rows)
+
+    coverage = build_nba_coverage(stored, "2020-01-01T00:00:00+08:00")
+
+    assert coverage["coverage_status"] == "KNOWN"
+    assert coverage["coverage_reason"] is None
+    # The tracked event is already ingested and is not counted as a gap.
+    assert coverage["already_ingested_fixtures"] == 1
+    # 6401 appears in both sources but is one unresolved event; 6410 has no market.
+    assert coverage["source_fixtures_not_yet_ingested"] == 1
+    assert coverage["market_ineligible_fixtures"] == 1
+    # WNBA is excluded from the NBA figure but stays visible as non-NBA basketball.
+    assert coverage["source_nba_fixtures_observed"] == 4
+    assert coverage["non_nba_basketball_fixtures"] == 1
+    assert coverage["post_refresh_ingestion_verified"] is False
+
+    # Once every eligible fixture is stored, ingestion is verified.
+    everything = stored + [
+        rehearsal_live(6401, home="印第安那步行者", away="华盛顿奇才"),
+    ]
+    complete = build_nba_coverage(everything, "2020-01-01T00:00:00+08:00")
+    assert complete["coverage_status"] == "KNOWN"
+    assert complete["source_fixtures_not_yet_ingested"] == 0
+    assert complete["post_refresh_ingestion_verified"] is True
+
+
+def test_bs_33_real_fetch_wiring_and_stale_observation(isolated_data_dir, monkeypatch):
+    from app import build_nba_coverage
+
+    _clear_caches()
+    _patch_live(monkeypatch, NBA_MATCHLIST_HTML)
+    _patch_xml(monkeypatch, {"sf": JCLQ_SF_XML, "dxf": JCLQ_DXF_XML})
+    assert fetcher_500.fetch_live_basketball()
+    assert fetcher_500.fetch_jczq_xml("basketball")
+
+    # The real adapters retained the parsed rows (no cache hit involved).
+    observed = fetcher_500.last_source_observation()
+    assert set(observed) == {"live_basketball", "jczq_odds_basketball"}
+    assert observed["live_basketball"]["status"] == "ok"
+    assert observed["live_basketball"]["checked_at"]
+
+    coverage = build_nba_coverage([], "2020-01-01T00:00:00+08:00")
+    assert coverage["coverage_status"] == "KNOWN"
+    # 6308 (both sources) is one pending event; 6309 has no usable market.
+    assert coverage["source_fixtures_not_yet_ingested"] == 1
+    assert coverage["market_ineligible_fixtures"] == 1
+    assert coverage["post_refresh_ingestion_verified"] is False
+
+    # A dataset refreshed after the observation makes coverage undecidable.
+    stale = build_nba_coverage([], "2030-01-01T00:00:00+08:00")
+    assert stale["coverage_status"] == "UNKNOWN"
+    assert stale["coverage_reason"] == "OBSERVATION_PREDATES_LAST_REFRESH"
+    assert stale["source_fixtures_not_yet_ingested"] is None
+
+    # A cache hit must not move the observation forward either.
+    first = fetcher_500.last_source_observation()["live_basketball"]["checked_at"]
+    fetcher_500.fetch_live_basketball()
+    assert fetcher_500.last_source_observation()["live_basketball"]["checked_at"] == first
+
+
+def test_bs_34_empty_source_is_not_reported_as_healthy_coverage(isolated_data_dir, monkeypatch):
+    from app import build_nba_coverage
+
+    _clear_caches()
+    _patch_live(monkeypatch, BASKETBALL_EMPTY_SHELL_HTML)
+    _patch_xml(monkeypatch, {"sf": JCLQ_SF_EMPTY_XML, "dxf": JCLQ_SF_EMPTY_XML})
+    assert fetcher_500.fetch_live_basketball() == []
+    assert fetcher_500.fetch_jczq_xml("basketball") == []
+
+    coverage = build_nba_coverage([], "2020-01-01T00:00:00+08:00")
+    assert coverage["coverage_status"] == "UNKNOWN"
+    assert coverage["coverage_reason"] == "SOURCE_NOT_HEALTHY"
+    assert coverage["source_nba_fixtures_observed"] is None
+    assert coverage["post_refresh_ingestion_verified"] is False

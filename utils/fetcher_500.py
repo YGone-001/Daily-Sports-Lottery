@@ -65,10 +65,45 @@ CACHE_TTL = 120  # 秒
 # parser_errors 单独计数，表示「有响应但解析失败的行数」。
 _DIAGNOSTICS: dict[str, dict] = {}
 
+#: 最近一次**真实抓取**得到的行（仅内存态，绝不落盘）。
+#:
+#: 只保留计数无法回答「哪些源赛事尚未入库」，因此保留解析后的行快照。
+#: 命中缓存**不会**更新它：缓存命中不代表发起过新的源观测，把旧结果包装成
+#: 「刚观测到」会让覆盖缺口看起来已经消失（见 AGENTS.md §4.26）。
+_OBSERVED: dict[str, dict] = {}
+
 
 def source_diagnostics() -> dict:
     """返回最近一次各数据源抓取的结构化诊断（深拷贝副本，不暴露内部状态）。"""
     return copy.deepcopy(_DIAGNOSTICS)
+
+
+def last_source_observation() -> dict:
+    """
+    返回最近一次真实抓取保留的行快照（深拷贝）。
+
+    形态：``{source_name: {"checked_at": iso|None, "count": int, "rows": [...]}}``。
+    这是**进程内**观测：新进程、只读端点或缓存命中都不会凭空产生它，
+    调用方必须把「没有观测」当作不可判定，而不是「没有缺口」。
+    """
+    return copy.deepcopy(_OBSERVED)
+
+
+def reset_source_observation() -> None:
+    """清空内存态观测与诊断（测试隔离与显式复位用，不触碰任何文件）。"""
+    _OBSERVED.clear()
+    _DIAGNOSTICS.clear()
+
+
+def _record_observation(source: str, rows: list[dict]) -> None:
+    """记录一次真实抓取的行快照；``checked_at`` 取自同一次诊断写入。"""
+    entry = _DIAGNOSTICS.get(source) or {}
+    _OBSERVED[source] = {
+        "checked_at": entry.get("checked_at"),
+        "status": entry.get("status"),
+        "count": len(rows),
+        "rows": copy.deepcopy(list(rows)),
+    }
 
 
 def is_nba_league(text: object) -> bool:
@@ -537,6 +572,7 @@ def fetch_live_basketball() -> list[dict]:
                 nba_rows=nba_rows, valid_market_rows=valid_rows,
             )
 
+        _record_observation(source, collected)
         return collected
 
     return _cached(key, 90, loader)
@@ -990,6 +1026,7 @@ def fetch_jczq_xml(sport: str = "football") -> list[dict]:
                 valid_market_rows=sum(1 for e in out if has_usable_market_odds(e)),
             )
 
+        _record_observation(source, out)
         return out
 
     return _cached(key, 180, loader)

@@ -87,7 +87,9 @@ ALLOWED_PATHS = frozenset((
     # reconciliation and persistence result-integrity corrections
     "tests/test_persisted_evidence_result_integrity.py",
     # evidence local-date vs Beijing-date conversion regression
-    "tests/test_evidence_date_semantics.py"))
+    "tests/test_evidence_date_semantics.py",
+    # refresh-readiness and durable nba supply diagnostics
+    "docs/ingestion-identity-preflight.md"))
 
 
 @pytest.fixture(scope="session", autouse=True)

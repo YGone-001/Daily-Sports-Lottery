@@ -315,7 +315,9 @@ def build_source_health() -> dict:
 
     - 只暴露状态、计数与时间戳，不暴露 URL、凭证或原始报文；
     - ``age_seconds`` 由读取时刻计算，缓存命中不会把旧结果伪装成「刚刚成功」；
-    - ``displayed`` 说明「已存储」与「当前默认日期可见」是两件事。
+    - ``displayed`` 说明「已存储」与「当前默认日期可见」是两件事；
+    - ``coverage`` 说明「最近一次刷新成功」与「当前源赛事是否都已入库」是两件事
+      （AGENTS.md §4.26）：刷新标记成功**不**等价于源侧无缺口。
     """
     from utils.fetcher_500 import source_diagnostics, is_nba_league
     from utils.market_coverage import has_usable_market_odds
@@ -354,7 +356,149 @@ def build_source_health() -> dict:
         },
         "basketball_dates": get_available_dates("basketball")[:7],
         "nba_dates": sorted({m.get("date") for m in nba if m.get("date")}, reverse=True)[:7],
+        "coverage": build_nba_coverage(nba, get_meta().get("last_refresh")),
     }
+
+
+#: 源覆盖诊断的状态词表。二者互斥，且**不得**由 `refresh_status` 推断。
+COVERAGE_KNOWN = "KNOWN"
+COVERAGE_UNKNOWN = "UNKNOWN"
+
+#: 构造「当前源观测」的篮球数据源：缺任一个都无法断言覆盖已完整。
+BASKETBALL_OBSERVATION_SOURCES = ("live_basketball", "jczq_odds_basketball")
+
+
+def _parse_timestamp(value):
+    """宽容解析 ISO 时间戳；不可解析即 ``None``（不可判定，绝不猜测）。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def _classify_observed_fixtures(rows, stored):
+    """
+    把源观测行分为「已入库 / 合格未入库 / 无可用盘口」。
+
+    判等只走 ``same_event``（AGENTS.md §4.7/§4.16）：不比较队名相似度、不按联赛名
+    计数、不推断主客方向。同一事件在同一批观测里出现多次（直播行 + 竞彩行）时，
+    先与已存记录判等；未入库的行之间同样按 ``same_event`` 去重，避免重复计数。
+    """
+    from utils.match_identity import same_event
+    from utils.market_coverage import has_usable_market_odds
+
+    already = 0
+    pending = 0
+    ineligible = 0
+    pending_rows: list[dict] = []
+    for row in rows:
+        if any(same_event(row, stored_match) for stored_match in stored):
+            already += 1
+            continue
+        if any(same_event(row, other) for other in pending_rows):
+            continue
+        if has_usable_market_odds(row):
+            pending += 1
+            pending_rows.append(row)
+        else:
+            ineligible += 1
+            pending_rows.append(row)
+    return already, pending, ineligible
+
+
+def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
+    """
+    NBA 源覆盖诊断：把「最近一次刷新成功」与「当前源赛事是否已入库」分开陈述。
+
+    五种状态必须分别可见（AGENTS.md §4.26）：
+
+    - ``LAST_REFRESH_SUCCESS``：``meta.last_refresh``（刷新最后一次成功落盘的时刻）；
+    - ``CURRENT_SOURCE_OBSERVATION``：本轮进程**真实抓取**到的行（缓存命中不算）；
+    - ``SOURCE_FIXTURES_NOT_YET_INGESTED``：源有、库无，且盘口合格；
+    - ``MARKET_INELIGIBLE_FIXTURES``：源有、库无，按既有准入契约被过滤；
+    - ``POST_REFRESH_INGESTION_VERIFIED``：观测**晚于**最近一次刷新且无合格缺口。
+
+    观测缺失、源不可达/为空、或观测早于数据集时，计数一律返回 ``None`` 并置
+    ``coverage_status = UNKNOWN``——**绝不**把「没观测」写成「零缺口」。
+    """
+    from utils.fetcher_500 import is_nba_league, last_source_observation
+
+    observation = last_source_observation()
+    sources: dict[str, dict] = {}
+    observed_at = None
+    observed_rows: list[dict] = []
+    states: list[str] = []
+
+    for name in BASKETBALL_OBSERVATION_SOURCES:
+        entry = observation.get(name)
+        if not entry:
+            states.append("NOT_OBSERVED")
+            sources[name] = {"status": "not_observed", "checked_at": None, "rows": 0}
+            continue
+        status = entry.get("status")
+        checked_at = entry.get("checked_at")
+        sources[name] = {"status": status, "checked_at": checked_at, "rows": entry.get("count", 0)}
+        states.append(str(status or "unknown"))
+        stamp = _parse_timestamp(checked_at)
+        if stamp is not None and (observed_at is None or stamp < observed_at):
+            observed_at = stamp
+        for row in entry.get("rows") or []:
+            if row.get("sport") == "basketball":
+                observed_rows.append(row)
+
+    coverage = {
+        "coverage_status": COVERAGE_UNKNOWN,
+        "coverage_reason": None,
+        "last_refresh_success": {"at": last_refresh_at},
+        "current_source_observation": {
+            "state": "NOT_OBSERVED" if "NOT_OBSERVED" in states else "OBSERVED",
+            "observed_at": observed_at.isoformat() if observed_at else None,
+            "sources": sources,
+        },
+        "source_nba_fixtures_observed": None,
+        "source_fixtures_not_yet_ingested": None,
+        "already_ingested_fixtures": None,
+        "market_ineligible_fixtures": None,
+        "non_nba_basketball_fixtures": None,
+        "post_refresh_ingestion_verified": False,
+    }
+
+    if "NOT_OBSERVED" in states:
+        coverage["coverage_reason"] = "SOURCE_NOT_OBSERVED"
+        return coverage
+    if any(state != "ok" for state in states):
+        coverage["coverage_reason"] = "SOURCE_NOT_HEALTHY"
+        return coverage
+    if observed_at is None:
+        coverage["coverage_reason"] = "OBSERVATION_TIMESTAMP_UNUSABLE"
+        return coverage
+
+    refresh_at = _parse_timestamp(last_refresh_at)
+    if refresh_at is None:
+        coverage["coverage_reason"] = "LAST_REFRESH_TIMESTAMP_UNUSABLE"
+        return coverage
+    if observed_at <= refresh_at:
+        coverage["coverage_reason"] = "OBSERVATION_PREDATES_LAST_REFRESH"
+        return coverage
+
+    nba_rows = [row for row in observed_rows if is_nba_league(row.get("league"))]
+    already, pending, ineligible = _classify_observed_fixtures(nba_rows, stored_nba)
+
+    coverage.update(
+        coverage_status=COVERAGE_KNOWN,
+        source_nba_fixtures_observed=len(nba_rows),
+        source_fixtures_not_yet_ingested=pending,
+        already_ingested_fixtures=already,
+        market_ineligible_fixtures=ineligible,
+        non_nba_basketball_fixtures=len(observed_rows) - len(nba_rows),
+        post_refresh_ingestion_verified=pending == 0,
+    )
+    return coverage
 
 
 @app.route("/api/history")

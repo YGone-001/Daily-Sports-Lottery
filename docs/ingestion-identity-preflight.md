@@ -400,3 +400,70 @@ Out of scope for this boundary, by explicit governance:
 A safe upstream correction to provider-ID provenance (for example deriving a stable
 finished-feed identifier, or a sport-scoped `500j` namespace) requires changing
 historical source contracts and remains **DEFERRED**.
+
+---
+
+## 15. Refresh readiness 与 NBA 入库验收口径
+
+本节记录「刷新管线能否安全摄入当前合格 NBA 赛事」这一运营问题的判定口径，
+与 §2 的严格整批预检互为补充，**不改变**任何身份语义。
+
+### 15.1 严格整批预检是有意的，不是缺陷
+
+§2 已说明：预检在**市场准入之前**、对整个观察批次执行。因此一条随后会被
+`_admit_market_candidates` 过滤掉的「无可用盘口」行，同样可以让整批被拒绝：
+
+| 场景 | 当前行为 | 结论 |
+| :--- | :--- | :--- |
+| 新无盘口行与另一条无盘口行共用源 ID 却指向不同事件 | `SAME_SOURCE_ALIAS_DIFFERENT_EVENT`，整批拒绝 | 保留 |
+| 缺编号行桥接两条互斥强编号 | `AMBIGUOUS_CANONICAL_OWNERSHIP`（`non_clique_component`），整批拒绝 | 保留 |
+| 无 ID、无强编号、无客队的孤儿行 | `INADEQUATE_EVENT_IDENTITY`，整批拒绝 | 保留 |
+
+**不做收窄的原因**：把预检改为只校验「准入子集」会静默丢弃
+`SAME_SOURCE_ALIAS_DIFFERENT_EVENT` 这类源侧一致性信号（被过滤行不再报告），
+与 §11「不把身份冲突误分类为普通故障」相冲突。收窄也**不会**增加任何 NBA 入库，
+因为被过滤行本来就不会进入 Canonical 集合。
+
+运行时可观测性由刷新标记保证：整批拒绝时 `refresh()` 写入
+`status = FAILED` 且 `error` 含冲突类别，`utils.refresh_state.consistency()`
+随即判定 `consistent = False`（`REFRESH_FAILED`），不会把失败伪装成成功。
+
+### 15.2 「刷新成功」不等于「源赛事已全部入库」
+
+`_refresh_impl` 的七个存储写入**不是**一个事务（AGENTS.md §4.14）。
+`status = COMPLETED` 只说明本次刷新走到了最后一步，不说明当前源侧赛事都已入库。
+因此 `/api/status` 的 `source_health` 额外给出 `coverage` 块，把五个概念分开陈述：
+
+| 概念 | 字段 | 语义 |
+| :--- | :--- | :--- |
+| `LAST_REFRESH_SUCCESS` | `coverage.last_refresh_success.at` | 最近一次成功落盘的时刻（`meta.last_refresh`） |
+| `CURRENT_SOURCE_OBSERVATION` | `coverage.current_source_observation` | 本轮进程**真实抓取**到的行；缓存命中不产生新观测 |
+| `SOURCE_FIXTURES_NOT_YET_INGESTED` | `coverage.source_fixtures_not_yet_ingested` | 源有、库无，且盘口合格 |
+| `MARKET_INELIGIBLE_FIXTURES` | `coverage.market_ineligible_fixtures` | 源有、库无，按准入契约被过滤 |
+| `POST_REFRESH_INGESTION_VERIFIED` | `coverage.post_refresh_ingestion_verified` | 观测晚于最近刷新且无合格缺口 |
+
+**不可判定必须写成不可判定**：以下任一情况一律
+`coverage_status = UNKNOWN` 且各计数返回 `null`（**绝不**返回 `0`）：
+
+- `SOURCE_NOT_OBSERVED`：本进程没有观测（新进程、或只读端点从未抓取）；
+- `SOURCE_NOT_HEALTHY`：任一篮球源 `unavailable` / `empty` ——空响应**不得**被读成
+  「零缺口」；
+- `OBSERVATION_PREDATES_LAST_REFRESH`：观测早于数据集，无法据此判断入库结果；
+- `OBSERVATION_TIMESTAMP_UNUSABLE` / `LAST_REFRESH_TIMESTAMP_UNUSABLE`：时间戳不可解析。
+
+判等只走 `same_event`：同一事件同时出现在直播源与竞彩源时按事件去重，
+不按联赛名计数、不比较队名相似度、不推断主客方向。WNBA 等非 NBA 联赛
+只计入 `non_nba_basketball_fixtures`，**不**进入 NBA 口径（`is_nba_league`）。
+
+### 15.3 隔离演练与真实刷新的边界
+
+`tests/test_basketball_sync_integrity.py` 的 BS-25 … BS-34 用真实
+`scraper.refresh()` 在临时 `DATA_DIR` 上、以被 mock 的源适配器完成端到端演练，
+覆盖：合格新赛事准入、无盘口过滤、已跟踪身份保持、跨源同事件不重复、
+WNBA 不计入 NBA、歧义整批拒绝且零写入、源抓取失败显式报告、
+并发刷新被拒、刷新中断不声称原子性、快照不覆盖、结算不重复。
+
+这些用例只证明**代码行为**：`ISOLATED_REFRESH_REHEARSAL` 通过不等于
+`REAL_REFRESH_EXECUTED`。对真实 `data/` 执行刷新必须另有操作者显式授权，
+且授权缺失时只能记 `NOT_EXECUTED_AUTHORIZATION_REQUIRED`。
+
