@@ -747,22 +747,284 @@ def test_er_22_source_retention_does_not_invent_review_provenance(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ER-24 — repository protected stores untouched
+# ER-24 — repository protected stores unchanged across a read-only boundary
+#
+# Integrity is a property of an *operation boundary*, not of a fixed digest:
+# a legitimate refresh rewrites every protected store, so a historical
+# constant is not an invariant.  The corrected contract observes the stores
+# at T0, performs the read-only work under examination, and re-observes at T1.
 # ---------------------------------------------------------------------------
 
-def test_er_24_real_seven_stores_are_untouched():
-    expected = {
-        "daily_matches.json": "917912b5ad1988ad030f21b3478da012df9d51695fe10418fc70e2ec917c487c",
-        "prediction_snapshots.json": "e073543dc9e58e8890d6fc83c81998b85465526f03ad7d84d8fadddfe4569c01",
-        "odds_snapshots.json": "53fa6805975a628d6bf0c19b8407464a6ef92d3f848c2c05daea161dc9a9abaa",
-        "settlements.json": "d1d4b0e2504f727d4364c46175e19d29e39066286422aa28298624459c1539f8",
-        "evaluation_rows.json": "b114c1b1e0f0fbb6c297f1127849b7bed1ac886d0fd0631b8a7b441afb7398bd",
-        "team_strength.json": "e54c31285326fd4816b6ecb0809457cbf0e1ea3236e98769401fab63802f9748",
-        "calibrated.json": "f6f81202453b12f5cbf800d52097e4446365e2f80b34f929fef0d5097f541e61",
+#: Distinct outcomes. A differing digest alone is never evidence of an
+#: unauthorized write, and "missing" is never equivalent to "unchanged".
+PROTECTED_STORES_UNCHANGED = "PROTECTED_STORES_UNCHANGED"
+UNAUTHORIZED_TEST_MUTATION = "UNAUTHORIZED_TEST_MUTATION"
+EXTERNAL_CONCURRENT_REFRESH = "EXTERNAL_CONCURRENT_REFRESH"
+HISTORICAL_HASH_MISMATCH = "HISTORICAL_HASH_MISMATCH"
+PROTECTED_STORE_MISSING = "PROTECTED_STORE_MISSING"
+PROTECTED_STORE_UNREADABLE = "PROTECTED_STORE_UNREADABLE"
+
+_STORE_PRESENT = "PRESENT"
+_STORE_MISSING = "MISSING"
+_STORE_UNREADABLE = "UNREADABLE"
+
+
+def _observe_protected_stores(directory) -> dict:
+    """Byte-level observation of the seven protected stores (read-only)."""
+    observation = {}
+    for name in refresh_state.PROTECTED_STORES:
+        path = os.path.join(str(directory), name)
+        if not os.path.lexists(path):
+            observation[name] = {"state": _STORE_MISSING, "sha256": None, "size": None}
+            continue
+        try:
+            with open(path, "rb") as handle:
+                payload = handle.read()
+        except OSError as exc:
+            observation[name] = {
+                "state": _STORE_UNREADABLE,
+                "sha256": None,
+                "size": None,
+                "error": type(exc).__name__,
+            }
+            continue
+        observation[name] = {
+            "state": _STORE_PRESENT,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+    return observation
+
+
+def _refresh_generation(directory):
+    """Advisory read of the refresh marker generation; never a write."""
+    state = refresh_state.inspect_state(str(directory)).get("state") or {}
+    generation = state.get("generation")
+    return generation if isinstance(generation, int) else None
+
+
+def _compare_protected_stores(before, after, *, directory, before_generation=None) -> dict:
+    """
+    Compare two observations of the same seven stores.
+
+    A change is classified, never assumed: an advanced/`IN_PROGRESS` refresh
+    marker means another writer was active, everything else is an unexplained
+    mutation of the protected data.  Both fail the boundary — only the
+    diagnostic differs.
+    """
+    deleted, appeared, replaced, unreadable = [], [], [], []
+    for name in before:
+        old, new = before[name], after[name]
+        if new["state"] == _STORE_UNREADABLE:
+            unreadable.append(name)
+        elif old["state"] == _STORE_PRESENT and new["state"] == _STORE_MISSING:
+            deleted.append(name)
+        elif old["state"] == _STORE_MISSING and new["state"] == _STORE_PRESENT:
+            appeared.append(name)
+        elif old["state"] == _STORE_PRESENT and new["state"] == _STORE_PRESENT:
+            if old["sha256"] != new["sha256"]:
+                replaced.append(name)
+
+    incomplete = sorted(
+        name
+        for name, seen in before.items()
+        if seen["state"] != _STORE_PRESENT
+    )
+    changed = sorted(set(unreadable) | set(deleted) | set(appeared) | set(replaced))
+
+    if unreadable:
+        verdict = PROTECTED_STORE_UNREADABLE
+    elif deleted or incomplete:
+        verdict = PROTECTED_STORE_MISSING
+    elif changed:
+        marker_state = refresh_state.inspect_state(str(directory)).get("state") or {}
+        concurrent = (
+            marker_state.get("status") == refresh_state.STATUS_IN_PROGRESS
+            or (
+                before_generation is not None
+                and marker_state.get("generation") != before_generation
+            )
+        )
+        verdict = EXTERNAL_CONCURRENT_REFRESH if concurrent else UNAUTHORIZED_TEST_MUTATION
+    else:
+        verdict = PROTECTED_STORES_UNCHANGED
+
+    return {
+        "verdict": verdict,
+        "changed": changed,
+        "deleted": sorted(deleted),
+        "appeared": sorted(appeared),
+        "replaced": sorted(replaced),
+        "unreadable": sorted(unreadable),
+        "incomplete_at_t0": incomplete,
     }
+
+
+def _read_only_boundary_operations(data_dir: str) -> dict:
+    """
+    The read-only work whose non-mutation property ER-24 actually verifies.
+
+    These are the real read paths (`daily_loader` consumers and the advisory
+    refresh-consistency reader). None of them may write a protected store.
+    """
+    matches = daily_loader.get_all_matches()
+    meta = daily_loader.get_meta()
+    report = refresh_state.consistency(str(data_dir))
+    snapshots = (
+        prediction_snapshots.get_snapshots_for_match(str(matches[0].get("id")))
+        if matches and matches[0].get("id")
+        else []
+    )
+    return {"matches": matches, "meta": meta, "consistency": report, "snapshots": snapshots}
+
+
+def test_er_24_real_seven_stores_are_untouched():
     data = os.path.join(ROOT, "data")
     if not os.path.isfile(os.path.join(data, "daily_matches.json")):
         pytest.skip("no private runtime dataset in this checkout")
-    for name, digest in expected.items():
-        with open(os.path.join(data, name), "rb") as handle:
-            assert hashlib.sha256(handle.read()).hexdigest() == digest, name
+
+    t0_generation = _refresh_generation(data)
+    t0 = _observe_protected_stores(data)
+
+    incomplete = sorted(name for name, seen in t0.items() if seen["state"] != _STORE_PRESENT)
+    assert not incomplete, (
+        PROTECTED_STORE_MISSING
+        + ": a real dataset is present but these protected stores are missing or "
+        f"unreadable: {incomplete}"
+    )
+
+    observed = _read_only_boundary_operations(data)
+    assert isinstance(observed["matches"], list)
+    assert isinstance(observed["meta"], dict)
+    assert observed["consistency"]["advisory"] is True
+
+    t1 = _observe_protected_stores(data)
+    report = _compare_protected_stores(
+        t0, t1, directory=data, before_generation=t0_generation
+    )
+    assert report["verdict"] == PROTECTED_STORES_UNCHANGED, report
+
+
+# ---------------------------------------------------------------------------
+# ER-24 negative controls — isolated temporary stores only.
+#
+# No control below touches the repository's protected stores: every byte it
+# mutates lives under pytest's `tmp_path`.
+# ---------------------------------------------------------------------------
+
+def _seed_protected_stores(directory, salt: str = "t0") -> None:
+    for name in refresh_state.PROTECTED_STORES:
+        with open(os.path.join(str(directory), name), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"store": name, "salt": salt}))
+
+
+def test_er_24b_single_store_change_is_detected(tmp_path):
+    _seed_protected_stores(tmp_path)
+    t0 = _observe_protected_stores(tmp_path)
+    (tmp_path / "settlements.json").write_text('{"tampered": true}', encoding="utf-8")
+    report = _compare_protected_stores(t0, _observe_protected_stores(tmp_path), directory=tmp_path)
+    assert report["verdict"] == UNAUTHORIZED_TEST_MUTATION
+    assert report["changed"] == ["settlements.json"]
+
+
+def test_er_24c_multiple_store_changes_are_detected(tmp_path):
+    _seed_protected_stores(tmp_path)
+    t0 = _observe_protected_stores(tmp_path)
+    for name in ("daily_matches.json", "odds_snapshots.json"):
+        (tmp_path / name).write_text('{"tampered": true}', encoding="utf-8")
+    report = _compare_protected_stores(t0, _observe_protected_stores(tmp_path), directory=tmp_path)
+    assert report["verdict"] == UNAUTHORIZED_TEST_MUTATION
+    assert report["changed"] == ["daily_matches.json", "odds_snapshots.json"]
+
+
+def test_er_24d_deleted_store_is_detected_and_is_not_unchanged(tmp_path):
+    _seed_protected_stores(tmp_path)
+    t0 = _observe_protected_stores(tmp_path)
+    os.remove(os.path.join(str(tmp_path), "evaluation_rows.json"))
+    after = _observe_protected_stores(tmp_path)
+    report = _compare_protected_stores(t0, after, directory=tmp_path)
+    assert report["verdict"] == PROTECTED_STORE_MISSING
+    assert report["deleted"] == ["evaluation_rows.json"]
+    assert after["evaluation_rows.json"]["state"] == _STORE_MISSING
+
+
+def test_er_24e_partial_private_dataset_is_reported_not_skipped(tmp_path):
+    _seed_protected_stores(tmp_path)
+    os.remove(os.path.join(str(tmp_path), "team_strength.json"))
+    t0 = _observe_protected_stores(tmp_path)
+    report = _compare_protected_stores(t0, _observe_protected_stores(tmp_path), directory=tmp_path)
+    assert report["incomplete_at_t0"] == ["team_strength.json"]
+    assert report["verdict"] == PROTECTED_STORE_MISSING
+
+
+def test_er_24f_replacing_bytes_with_equal_length_is_detected(tmp_path):
+    _seed_protected_stores(tmp_path)
+    t0 = _observe_protected_stores(tmp_path)
+    path = os.path.join(str(tmp_path), "calibrated.json")
+    with open(path, "rb") as handle:
+        payload = handle.read()
+    with open(path, "wb") as handle:
+        handle.write(payload[:-1] + (b" " if payload[-1:] != b" " else b"\n"))
+    report = _compare_protected_stores(t0, _observe_protected_stores(tmp_path), directory=tmp_path)
+    assert report["verdict"] == UNAUTHORIZED_TEST_MUTATION
+    assert report["changed"] == ["calibrated.json"]
+
+
+def test_er_24g_independently_refreshed_starting_bytes_do_not_false_fail(tmp_path):
+    """
+    A legitimate refresh may leave *any* initial digest; only stability across
+    the boundary is required.  This is exactly what a fixed historical
+    constant cannot express.
+    """
+    _seed_protected_stores(tmp_path, salt="refreshed-2026-11-10")
+    t0 = _observe_protected_stores(tmp_path)
+    historical = "917912b5ad1988ad030f21b3478da012df9d51695fe10418fc70e2ec917c487c"
+    mismatches = sorted(
+        name for name, seen in t0.items() if seen["sha256"] == historical
+    )
+    assert mismatches == [], "fixture is not distinguishable from the historical constant"
+    report = _compare_protected_stores(t0, _observe_protected_stores(tmp_path), directory=tmp_path)
+    assert report["verdict"] == PROTECTED_STORES_UNCHANGED
+    assert report["verdict"] != HISTORICAL_HASH_MISMATCH
+
+
+def test_er_24h_identical_t0_t1_bytes_pass(tmp_path):
+    _seed_protected_stores(tmp_path)
+    t0 = _observe_protected_stores(tmp_path)
+    assert _compare_protected_stores(t0, _observe_protected_stores(tmp_path), directory=tmp_path)[
+        "verdict"
+    ] == PROTECTED_STORES_UNCHANGED
+
+
+def test_er_24i_concurrent_refresh_is_attributed_not_misread_as_mutation(tmp_path):
+    _seed_protected_stores(tmp_path)
+    with open(os.path.join(str(tmp_path), refresh_state.STATE_FILENAME), "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": refresh_state.STATE_SCHEMA_VERSION,
+                "status": refresh_state.STATUS_COMPLETED,
+                "generation": 7,
+                "stores": {},
+            },
+            handle,
+        )
+    t0 = _observe_protected_stores(tmp_path)
+    generation = _refresh_generation(tmp_path)
+
+    with open(os.path.join(str(tmp_path), refresh_state.STATE_FILENAME), "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": refresh_state.STATE_SCHEMA_VERSION,
+                "status": refresh_state.STATUS_COMPLETED,
+                "generation": 8,
+                "stores": {},
+            },
+            handle,
+        )
+    (tmp_path / "daily_matches.json").write_text('{"refreshed": true}', encoding="utf-8")
+
+    report = _compare_protected_stores(
+        t0, _observe_protected_stores(tmp_path), directory=tmp_path, before_generation=generation
+    )
+    assert report["verdict"] == EXTERNAL_CONCURRENT_REFRESH
+    assert report["changed"] == ["daily_matches.json"]

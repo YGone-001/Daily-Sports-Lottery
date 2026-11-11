@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 from io import BytesIO
@@ -360,16 +361,403 @@ def test_rb32_existing_full_strict_shadow_and_override(strict_scene):
         snapshot=scene.snapshot, read_context=override, observation_attestation=scene.observation_attestation))
 
 
-def test_rb33_active_versioned_change_scope_and_production_import_closure():
+# ---------------------------------------------------------------------------
+# RB-33 — versioned-source scope is a different question from the untracked
+# runtime inventory.
+#
+# The previous predicate merged `git ls-files --cached` with
+# `git ls-files --others --exclude-standard` and compared the union against the
+# historical versioned baseline. That made every legitimate untracked runtime
+# artifact (e.g. `data/.snapshots.lock`) look like an unauthorized versioned
+# change. Versioned scope and runtime hygiene are separated below; the union is
+# never compared to the baseline again.
+# ---------------------------------------------------------------------------
+
+#: Runtime sidecars the current implementation creates inside the data
+#: directory, taken from the code rather than assumed:
+#: `utils.concurrency.acquire_refresh_lock` -> `<DATA_DIR>/.refresh.lock`,
+#: `utils.refresh_state` -> `<DATA_DIR>/.refresh_state.json`,
+#: `utils.prediction_snapshots` -> `<DATA_DIR>/.snapshots.lock`.
+#: Exact paths only. They are runtime artifacts: never registered in
+#: ALLOWED_PATHS, never committed, never deleted.
+EXPECTED_RUNTIME_SIDECARS = frozenset((
+    "data/.refresh.lock",
+    "data/.refresh_state.json",
+    "data/.snapshots.lock",
+))
+
+#: `reports/` is a checkout-local artifact root (AGENTS.md §5.1): excluded via
+#: local Git metadata, never committed. Operator notes, audit dumps and repro
+#: scripts live there by policy.
+LOCAL_ARTIFACT_ROOTS = ("reports/",)
+
+#: Private key material is rejected wherever it appears, including inside a
+#: tolerated local artifact root.
+SENSITIVE_SUFFIXES = frozenset((
+    ".pem", ".key", ".pfx", ".p12", ".der", ".jks", ".keystore", ".kdbx", ".gpg", ".asc",
+))
+
+#: Executable / importable source is rejected unless it sits under a local
+#: artifact root: a stray module inside the code tree would be importable.
+EXECUTABLE_SUFFIXES = frozenset((
+    ".py", ".pyw", ".pyi", ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe", ".com",
+    ".ps1", ".psm1", ".sh", ".bash", ".bat", ".cmd", ".vbs",
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+))
+
+RUNTIME_SIDECAR = "RUNTIME_SIDECAR"
+LOCAL_ARTIFACT = "LOCAL_ARTIFACT"
+LOCAL_UNRELATED_ARTIFACT = "LOCAL_UNRELATED_ARTIFACT"
+REJECTED = "REJECTED"
+
+
+def _under(path: str, prefix: str) -> bool:
+    return path == prefix.rstrip("/") or path.startswith(prefix)
+
+
+def _classify_untracked_path(root: Path, path: str) -> dict:
+    """
+    Classify one untracked path. Exact-path decisions only — no wildcards.
+
+    Order matters: key material is rejected before any tolerance applies, so a
+    sidecar allowance or a local artifact root can never conceal it.
+    """
+    entry = {"path": path, "classification": None, "reason": None}
+
+    if path.startswith("/") or "\\" in path or ".." in path.split("/"):
+        entry.update(classification=REJECTED, reason="UNTRACKED_PATH_NOT_NORMALIZED")
+        return entry
+
+    if Path(path).suffix.lower() in SENSITIVE_SUFFIXES:
+        entry.update(classification=REJECTED, reason="SENSITIVE_KEY_ARTIFACT")
+        return entry
+
+    if path in EXPECTED_RUNTIME_SIDECARS:
+        target = root / path
+        try:
+            real_parent = Path(os.path.realpath(target.parent))
+            real_target = Path(os.path.realpath(target))
+        except OSError:
+            entry.update(classification=REJECTED, reason="RUNTIME_SIDECAR_UNRESOLVABLE")
+            return entry
+        # A symlink/junction substituting a known lock path fails closed.
+        if target.is_symlink() or real_target.parent != real_parent:
+            entry.update(classification=REJECTED, reason="RUNTIME_SIDECAR_PATH_SUBSTITUTED")
+            return entry
+        if real_parent != Path(os.path.realpath(root / "data")):
+            entry.update(classification=REJECTED, reason="RUNTIME_SIDECAR_OUTSIDE_DATA_DIR")
+            return entry
+        entry.update(classification=RUNTIME_SIDECAR, reason="KNOWN_RUNTIME_ARTIFACT")
+        return entry
+
+    if any(_under(path, prefix) for prefix in LOCAL_ARTIFACT_ROOTS):
+        entry.update(classification=LOCAL_ARTIFACT, reason="LOCAL_ONLY_ARTIFACT_ROOT")
+        return entry
+
+    # `data/` holds the protected stores: only the known sidecars above may
+    # appear there untracked, so no blanket tolerance is granted.
+    if _under(path, "data/"):
+        entry.update(classification=REJECTED, reason="UNEXPECTED_DATA_DIRECTORY_ARTIFACT")
+        return entry
+
+    if Path(path).suffix.lower() in EXECUTABLE_SUFFIXES:
+        entry.update(classification=REJECTED, reason="UNEXPECTED_EXECUTABLE_SOURCE")
+        return entry
+
+    entry.update(classification=LOCAL_UNRELATED_ARTIFACT, reason="UNRELATED_UNTRACKED_ARTIFACT")
+    return entry
+
+
+def _versioned_scope_report(root: Path, tracked, untracked, baseline: dict) -> dict:
+    """
+    Two independent verdicts:
+
+    - ``versioned_scope_ok``: the tracked set outside ALLOWED_PATHS still equals
+      the historical baseline set and those files are byte-identical.
+    - ``untracked_ok``: no untracked path is key material, unexpected source, or
+      an unexpected artifact inside the protected data directory.
+
+    Untracked paths are additionally reported individually, so nothing is
+    silently invisible even when it is tolerated.
+    """
+    tracked_set = set(tracked)
+    unscoped = set(baseline) - ALLOWED_PATHS
+
+    unexpected_additions = sorted(tracked_set - ALLOWED_PATHS - unscoped)
+    unexpected_removals = sorted(unscoped - tracked_set)
+    modified = []
+    for name in sorted(unscoped & tracked_set):
+        current = (root / name).read_bytes().replace(b"\r\n", b"\n")
+        if current != baseline[name].replace(b"\r\n", b"\n"):
+            modified.append(name)
+
+    inventory = [_classify_untracked_path(root, path) for path in untracked]
+    rejected = [entry for entry in inventory if entry["classification"] == REJECTED]
+    sensitive = sorted(
+        path
+        for path in list(tracked) + list(untracked)
+        if Path(path).suffix.lower() in SENSITIVE_SUFFIXES
+    )
+
+    return {
+        "scope_version": SCOPE_VERSION,
+        "unexpected_tracked_additions": unexpected_additions,
+        "unexpected_tracked_removals": unexpected_removals,
+        "modified_outside_scope": modified,
+        "untracked_inventory": inventory,
+        "runtime_sidecars": [
+            entry["path"] for entry in inventory if entry["classification"] == RUNTIME_SIDECAR
+        ],
+        "rejected_untracked": rejected,
+        "sensitive_paths": sensitive,
+        "versioned_scope_ok": not (unexpected_additions or unexpected_removals or modified),
+        "untracked_ok": not rejected and not sensitive,
+    }
+
+
+def _git_paths(root, *args: str):
+    output = subprocess.check_output(["git", *args], cwd=str(root)).decode("utf-8")
+    return [path for path in output.split("\0") if path]
+
+
+def _baseline_archive() -> dict:
     raw = subprocess.check_output(["git", "archive", "--format=tar", BASELINE], cwd=ROOT)
     with tarfile.open(fileobj=BytesIO(raw), mode="r:") as archive:
-        baseline = {m.name: archive.extractfile(m).read() for m in archive.getmembers() if m.isfile()}
-    listed = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT).decode().split("\0")
-    assert {p for p in listed if p} - ALLOWED_PATHS == set(baseline) - ALLOWED_PATHS, SCOPE_VERSION
-    for name in set(baseline) - ALLOWED_PATHS:
-        assert (ROOT / name).read_bytes().replace(b"\r\n", b"\n") == baseline[name].replace(b"\r\n", b"\n"), name
+        return {m.name: archive.extractfile(m).read() for m in archive.getmembers() if m.isfile()}
+
+
+def test_rb33_active_versioned_change_scope_and_production_import_closure():
+    baseline = _baseline_archive()
+    tracked = _git_paths(ROOT, "ls-files", "--cached", "-z")
+    untracked = _git_paths(ROOT, "ls-files", "--others", "--exclude-standard", "-z")
+    report = _versioned_scope_report(ROOT, tracked, untracked, baseline)
+
+    assert report["versioned_scope_ok"], report
+    assert report["rejected_untracked"] == [], report
+    assert report["sensitive_paths"] == [], report
     assert production_boundary_audit()["production_activation"] == "NOT_ENABLED"
-    assert not any(Path(p).suffix in {".pem", ".key", ".pfx"} for p in listed if p)
+
+
+# ---------------------------------------------------------------------------
+# RB-33 adversarial controls — temporary repositories / directories only.
+#
+# The active project's Git history is never mutated: each control builds its
+# own repository under `tmp_path` and drives the same predicates.
+# ---------------------------------------------------------------------------
+
+_TEMPORARY_REPOSITORY_FILES = {
+    "utils/trust_root_bootstrap.py": b"# synthetic trust root module\n",
+    "utils/concurrency.py": b"# synthetic lock module\n",
+    "data/.gitkeep": b"",
+    "docs/notes.md": b"# synthetic notes\n",
+}
+
+
+def _git_command(root: Path, *args: str) -> str:
+    return subprocess.check_output(
+        [
+            "git",
+            "-c", "user.email=ci@example.invalid",
+            "-c", "user.name=CI",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(root),
+        stderr=subprocess.STDOUT,
+    ).decode("utf-8")
+
+
+def _temporary_repository(tmp_path: Path, files=None) -> Path:
+    files = dict(files or _TEMPORARY_REPOSITORY_FILES)
+    root = tmp_path / "repo"
+    root.mkdir(parents=True)
+    for name, payload in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    _git_command(root, "init", "--quiet")
+    _git_command(root, "add", "--all")
+    _git_command(root, "commit", "--quiet", "-m", "synthetic baseline")
+    return root
+
+
+def _temporary_report(root: Path, files=None) -> dict:
+    baseline = dict(files or _TEMPORARY_REPOSITORY_FILES)
+    tracked = _git_paths(root, "ls-files", "--cached", "-z")
+    untracked = _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z")
+    return _versioned_scope_report(root, tracked, untracked, baseline)
+
+
+def test_rb33b_untracked_snapshot_lock_does_not_fail_versioned_scope(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "data" / ".snapshots.lock").write_bytes(b"0")
+
+    report = _temporary_report(root)
+    assert report["runtime_sidecars"] == ["data/.snapshots.lock"], report
+    assert report["versioned_scope_ok"] is True, report
+    assert report["untracked_ok"] is True, report
+    assert report["rejected_untracked"] == [], report
+    # The lock is a runtime artifact, never an authorized versioned path.
+    assert "data/.snapshots.lock" not in ALLOWED_PATHS
+
+
+def test_rb33c_tracked_source_change_outside_scope_still_fails(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "docs" / "notes.md").write_bytes(b"# tampered outside scope\n")
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is False
+    assert report["modified_outside_scope"] == ["docs/notes.md"], report
+
+
+def test_rb33d_new_unexpected_tracked_path_still_fails(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "utils" / "runtime_override.py").write_bytes(b"# unauthorized module\n")
+    _git_command(root, "add", "--all")
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is False
+    assert report["unexpected_tracked_additions"] == ["utils/runtime_override.py"], report
+
+
+def test_rb33d2_removed_baseline_path_still_fails(tmp_path):
+    root = _temporary_repository(tmp_path)
+    _git_command(root, "rm", "--quiet", "docs/notes.md")
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is False
+    assert report["unexpected_tracked_removals"] == ["docs/notes.md"], report
+
+
+def test_rb33e_untracked_executable_source_in_code_directory_is_rejected(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "utils" / "runtime_override.py").write_bytes(b"# unauthorized module\n")
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is True
+    assert report["untracked_ok"] is False, report
+    assert report["rejected_untracked"] == [
+        {
+            "path": "utils/runtime_override.py",
+            "classification": REJECTED,
+            "reason": "UNEXPECTED_EXECUTABLE_SOURCE",
+        }
+    ], report
+
+
+def test_rb33f_private_key_artifact_is_still_rejected(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "data" / "owner.pem").write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    (root / "reports" / "keys").mkdir(parents=True)
+    (root / "reports" / "keys" / "owner.p12").write_bytes(b"\x00")
+
+    report = _temporary_report(root)
+    assert report["untracked_ok"] is False, report
+    assert report["sensitive_paths"] == ["data/owner.pem", "reports/keys/owner.p12"], report
+    reasons = {entry["path"]: entry["reason"] for entry in report["rejected_untracked"]}
+    assert reasons == {
+        "data/owner.pem": "SENSITIVE_KEY_ARTIFACT",
+        "reports/keys/owner.p12": "SENSITIVE_KEY_ARTIFACT",
+    }, report
+
+
+def test_rb33f2_unexpected_artifact_in_the_data_directory_is_rejected(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "data" / "production_activation.json").write_bytes(b"{}")
+
+    report = _temporary_report(root)
+    assert report["untracked_ok"] is False, report
+    assert report["rejected_untracked"] == [
+        {
+            "path": "data/production_activation.json",
+            "classification": REJECTED,
+            "reason": "UNEXPECTED_DATA_DIRECTORY_ARTIFACT",
+        }
+    ], report
+
+
+def test_rb33g_runtime_sidecar_symlink_substitution_fails_closed(tmp_path):
+    root = _temporary_repository(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    victim = elsewhere / "copy-of-lock"
+    victim.write_bytes(b"0")
+    try:
+        os.symlink(str(victim), str(root / "data" / ".snapshots.lock"))
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - privileges vary by host
+        pytest.skip(f"cannot create a file symlink here: {exc}")
+
+    report = _temporary_report(root)
+    assert report["runtime_sidecars"] == [], report
+    assert report["untracked_ok"] is False, report
+    assert report["rejected_untracked"] == [
+        {
+            "path": "data/.snapshots.lock",
+            "classification": REJECTED,
+            "reason": "RUNTIME_SIDECAR_PATH_SUBSTITUTED",
+        }
+    ], report
+
+
+def test_rb33h_local_report_artifacts_stay_out_of_the_versioned_verdict(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "reports").mkdir()
+    (root / "reports" / "PHASE-REPORT.md").write_bytes(b"# local report\n")
+    (root / "reports" / "_probe.py").write_bytes(b"print('repro')\n")
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is True, report
+    assert report["untracked_ok"] is True, report
+    classifications = {
+        entry["path"]: entry["classification"] for entry in report["untracked_inventory"]
+    }
+    assert classifications == {
+        "reports/PHASE-REPORT.md": LOCAL_ARTIFACT,
+        "reports/_probe.py": LOCAL_ARTIFACT,
+    }, report
+
+
+def test_rb33i_unrelated_untracked_note_is_inventory_only(tmp_path):
+    root = _temporary_repository(tmp_path)
+    (root / "operator-note.md").write_bytes(b"# local work memory\n")
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is True, report
+    assert report["untracked_ok"] is True, report
+    # Visible in the inventory, never reclassified as an authorized code change.
+    assert report["untracked_inventory"] == [
+        {
+            "path": "operator-note.md",
+            "classification": LOCAL_UNRELATED_ARTIFACT,
+            "reason": "UNRELATED_UNTRACKED_ARTIFACT",
+        }
+    ], report
+    assert "operator-note.md" not in ALLOWED_PATHS
+
+
+def test_rb33j_production_activation_remains_disabled(tmp_path):
+    root = _temporary_repository(tmp_path)
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is True and report["untracked_ok"] is True
+
+    audit = production_boundary_audit()
+    assert audit["production_activation"] == "NOT_ENABLED"
+    assert audit["production_runtime_reader"] == "NOT_ENABLED"
+    assert audit["production_mapping_write_authorization"] == "NOT_GRANTED"
+
+
+def test_rb33k_trust_root_baseline_checks_still_operate(tmp_path):
+    root = _temporary_repository(tmp_path)
+    # An unauthorized module next to the trust root still fails, and the
+    # baseline byte comparison still detects a change to an unscoped file.
+    (root / "utils" / "trust_root_shadow.py").write_bytes(b"# unregistered trust root\n")
+    (root / "docs" / "notes.md").write_bytes(b"# rewritten\n")
+    _git_command(root, "add", "--all")
+
+    report = _temporary_report(root)
+    assert report["unexpected_tracked_additions"] == ["utils/trust_root_shadow.py"], report
+    assert report["modified_outside_scope"] == ["docs/notes.md"], report
+    assert report["versioned_scope_ok"] is False
 
 
 def test_rb34_seven_store_integrity(protected_bytes):
