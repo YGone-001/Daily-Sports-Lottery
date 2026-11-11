@@ -607,6 +607,17 @@ def test_ro_21_nba_league_label_variants_are_equivalent():
     assert fetcher_500.is_nba_league(None) is False
 
 
+def test_ro_21b_womens_league_is_not_counted_as_nba():
+    """WNBA 是独立联赛：`"NBA" in "WNBA"` 为真，不能因此计入 NBA 供给。"""
+    assert fetcher_500.is_nba_league("WNBA") is False
+    assert fetcher_500.is_nba_league("美国女子篮球联盟") is False
+    assert fetcher_500.is_nba_league("wnba") is False
+    # 回归：既有 NBA 标签必须仍然命中。
+    assert fetcher_500.is_nba_league("NBA") is True
+    assert fetcher_500.is_nba_league("美国职业篮球联盟") is True
+    assert fetcher_500.is_nba_league("NBA常规赛") is True
+
+
 def test_ro_22_nba_fixture_without_market_is_filtered_not_failed():
     nba_no_market = {
         "sport": "basketball",

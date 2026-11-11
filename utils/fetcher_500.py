@@ -72,9 +72,18 @@ def source_diagnostics() -> dict:
 
 
 def is_nba_league(text: object) -> bool:
-    """NBA 联赛识别：英文 ``NBA`` 或中文 ``美国职业篮球``（竞彩 XML 使用中文）。"""
-    value = str(text or "")
-    return "NBA" in value.upper() or "美国职业篮球" in value
+    """NBA 联赛识别：英文 ``NBA`` 或中文 ``美国职业篮球``（竞彩 XML 使用中文）。
+
+    WNBA 是**独立**联赛，但 ``"NBA" in "WNBA"`` 为真；不显式排除就会把女子联赛
+    计入 NBA 供给诊断与覆盖率。排除仅针对女子联赛标识，``NBA`` 与
+    ``美国职业篮球`` 的既有等价关系保持不变。
+    """
+    value = str(text or "").upper()
+    if not value:
+        return False
+    if "WNBA" in value or "女子篮球" in value:
+        return False
+    return "NBA" in value or "美国职业篮球" in value
 
 
 def _play_odds_coverage(sport: str, play: str, odds: dict) -> bool:

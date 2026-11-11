@@ -806,6 +806,37 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.25 忽略工件清单、NBA 联赛口径与只读端点边界
+
+- **忽略路径不是不可见路径**：`git ls-files --others --exclude-standard` 不会列出被忽略目录的
+  子项（本机 `reports/` 被 `.git/info/exclude` 整目录排除），只按该命令收集会让
+  `reports/*.pem` 绕过「敏感密钥在哪都拒绝」的契约。清单必须**同时**读取
+  `git ls-files --others --ignored --exclude-standard`。
+- **忽略扫描必须显式限定**：只扫描承载仓库工件的根（`reports/`、`data/`、`artifacts/`、
+  `.runtime/`、`instance/`、`docs/analysis/`）。依赖与构建树（`.venv/`、
+  `frontend/node_modules/`、`frontend/dist/`）是第三方产物，含公开 CA 证书
+  （实测 `.venv/Lib/site-packages/certifi/cacert.pem`），**不得**纳入扫描。
+- **忽略工件只做一件事**：敏感密钥后缀一律拒绝（`SENSITIVE_KEY_ARTIFACT_IGNORED`）；
+  已知运行时旁车仍按精确路径放行；其余计为 `IGNORED_LOCAL_ARTIFACT`，
+  **永不**被当作已授权版本化变更，也**永不**因被忽略而从清单中消失。
+- **折叠目录必须展开**：Git 可能返回被忽略目录本身（`reports/`）而不是其子项，
+  两种形态必须给出同一文件列表（只枚举名字，不读取内容，不跟随符号链接）。
+- **NBA 口径排除 WNBA**：`fetcher_500.is_nba_league()` 曾因 `"NBA" in "WNBA"` 把女子联赛
+  计入 NBA 供给（真实数据上多计 3 场、凭空多出 2 个「NBA 比赛日」）。
+  `WNBA` / `美国女子篮球联盟` **不**属于 NBA；该修正只改统计口径，
+  **不**改变市场准入、赔率合并或主客方向。
+- **只读端点的真实边界**（隔离合成存储实测）：`/api/dates`、`/api/status`、
+  `/api/match/<id>/snapshots` **不写任何存储**；`/api/today`、`/api/matches`、
+  `/api/match/<id>` 会物化赛前预测快照（隔离夹具中还会触达球队库），
+  **不得**当作只读探针使用。运营验收只允许使用上述三个不写库的 GET 端点。
+- **运动感知日期不是可选装饰**：当日默认日期可能只有足球（实测 `2026-11-12` 仅足球）；
+  前端必须按 `dates_by_sport` 选择该运动的日期，否则会把「当日无篮球」误报成「没有比赛」。
+- **源比数据集新不是代码缺陷**：源已列出而数据集缺失的赛事，若其比赛日晚于
+  `meta.last_refresh` 且数据集该日无任何记录，原因是「源在最近一次刷新之后才发布」，
+  记为 `FIXTURE_PENDING_NEXT_REFRESH`，**不得**记为 `PERSISTENCE_FAILED`。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

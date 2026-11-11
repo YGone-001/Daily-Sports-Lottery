@@ -391,6 +391,20 @@ EXPECTED_RUNTIME_SIDECARS = frozenset((
 #: scripts live there by policy.
 LOCAL_ARTIFACT_ROOTS = ("reports/",)
 
+#: Ignored-path inspection is bounded to roots that hold repository / operator
+#: artifacts. Dependency and build trees (`.venv/`, `frontend/node_modules/`,
+#: `frontend/dist/`) are third-party output, not repository artifacts: they ship
+#: public CA bundles such as `.venv/Lib/site-packages/certifi/cacert.pem`, so an
+#: unbounded ignored scan would reject a healthy checkout.
+IGNORED_ARTIFACT_ROOTS = (
+    "reports/",
+    "data/",
+    "artifacts/",
+    ".runtime/",
+    "instance/",
+    "docs/analysis/",
+)
+
 #: Private key material is rejected wherever it appears, including inside a
 #: tolerated local artifact root.
 SENSITIVE_SUFFIXES = frozenset((
@@ -408,11 +422,32 @@ EXECUTABLE_SUFFIXES = frozenset((
 RUNTIME_SIDECAR = "RUNTIME_SIDECAR"
 LOCAL_ARTIFACT = "LOCAL_ARTIFACT"
 LOCAL_UNRELATED_ARTIFACT = "LOCAL_UNRELATED_ARTIFACT"
+IGNORED_LOCAL_ARTIFACT = "IGNORED_LOCAL_ARTIFACT"
 REJECTED = "REJECTED"
 
 
 def _under(path: str, prefix: str) -> bool:
     return path == prefix.rstrip("/") or path.startswith(prefix)
+
+
+def _sidecar_substitution_reason(root: Path, path: str):
+    """
+    Rejection reason when a known sidecar path is substituted, else ``None``.
+
+    A symlink/junction pointing at the same *name* elsewhere would let an
+    attacker place a lock path that resolves outside `data/`.
+    """
+    target = root / path
+    try:
+        real_parent = Path(os.path.realpath(target.parent))
+        real_target = Path(os.path.realpath(target))
+    except OSError:
+        return "RUNTIME_SIDECAR_UNRESOLVABLE"
+    if target.is_symlink() or real_target.parent != real_parent:
+        return "RUNTIME_SIDECAR_PATH_SUBSTITUTED"
+    if real_parent != Path(os.path.realpath(root / "data")):
+        return "RUNTIME_SIDECAR_OUTSIDE_DATA_DIR"
+    return None
 
 
 def _classify_untracked_path(root: Path, path: str) -> dict:
@@ -433,19 +468,9 @@ def _classify_untracked_path(root: Path, path: str) -> dict:
         return entry
 
     if path in EXPECTED_RUNTIME_SIDECARS:
-        target = root / path
-        try:
-            real_parent = Path(os.path.realpath(target.parent))
-            real_target = Path(os.path.realpath(target))
-        except OSError:
-            entry.update(classification=REJECTED, reason="RUNTIME_SIDECAR_UNRESOLVABLE")
-            return entry
-        # A symlink/junction substituting a known lock path fails closed.
-        if target.is_symlink() or real_target.parent != real_parent:
-            entry.update(classification=REJECTED, reason="RUNTIME_SIDECAR_PATH_SUBSTITUTED")
-            return entry
-        if real_parent != Path(os.path.realpath(root / "data")):
-            entry.update(classification=REJECTED, reason="RUNTIME_SIDECAR_OUTSIDE_DATA_DIR")
+        reason = _sidecar_substitution_reason(root, path)
+        if reason:
+            entry.update(classification=REJECTED, reason=reason)
             return entry
         entry.update(classification=RUNTIME_SIDECAR, reason="KNOWN_RUNTIME_ARTIFACT")
         return entry
@@ -468,16 +493,85 @@ def _classify_untracked_path(root: Path, path: str) -> dict:
     return entry
 
 
-def _versioned_scope_report(root: Path, tracked, untracked, baseline: dict) -> dict:
+def _expand_ignored_entries(root: Path, entries) -> list:
+    """
+    Turn ignored Git entries into concrete repository-relative file paths.
+
+    Git reports an ignored directory in either shape: collapsed as `reports/`,
+    or as its individual children. Both must yield the same file list, otherwise
+    key material inside an ignored directory stays invisible to the inventory.
+    Contents are never read; only names are enumerated.
+    """
+    expanded, seen = [], set()
+    for raw in entries:
+        path = str(raw).rstrip("/")
+        if not path:
+            continue
+        if not any(_under(path, prefix) for prefix in IGNORED_ARTIFACT_ROOTS):
+            continue
+        base = root / path
+        collapsed = str(raw).endswith("/") or base.is_dir()
+        if not collapsed:
+            if path not in seen:
+                seen.add(path)
+                expanded.append(path)
+            continue
+        for current, directories, files in os.walk(base):
+            # Never follow a substituted directory: report it, do not walk in.
+            directories[:] = sorted(
+                name for name in directories
+                if not os.path.islink(os.path.join(current, name))
+            )
+            for name in sorted(files):
+                candidate = os.path.relpath(os.path.join(current, name), str(root))
+                candidate = candidate.replace(os.sep, "/")
+                if candidate not in seen:
+                    seen.add(candidate)
+                    expanded.append(candidate)
+    return sorted(expanded)
+
+
+def _classify_ignored_path(root: Path, path: str) -> dict:
+    """
+    Classify one ignored repository artifact.
+
+    An ignored path is never versioned code, so it can never authorize a scope
+    change. Only key material is refused here; ordinary reports and local
+    diagnostics remain permitted local artifacts.
+    """
+    entry = {"path": path, "classification": None, "reason": None}
+
+    if path.startswith("/") or "\\" in path or ".." in path.split("/"):
+        entry.update(classification=REJECTED, reason="UNTRACKED_PATH_NOT_NORMALIZED")
+        return entry
+
+    if Path(path).suffix.lower() in SENSITIVE_SUFFIXES:
+        entry.update(classification=REJECTED, reason="SENSITIVE_KEY_ARTIFACT_IGNORED")
+        return entry
+
+    if path in EXPECTED_RUNTIME_SIDECARS:
+        reason = _sidecar_substitution_reason(root, path)
+        if reason:
+            entry.update(classification=REJECTED, reason=reason)
+            return entry
+        entry.update(classification=RUNTIME_SIDECAR, reason="KNOWN_RUNTIME_ARTIFACT_IGNORED")
+        return entry
+
+    entry.update(classification=IGNORED_LOCAL_ARTIFACT, reason="LOCAL_ONLY_IGNORED_ARTIFACT")
+    return entry
+
+
+def _versioned_scope_report(root: Path, tracked, untracked, baseline: dict, ignored=()) -> dict:
     """
     Two independent verdicts:
 
     - ``versioned_scope_ok``: the tracked set outside ALLOWED_PATHS still equals
       the historical baseline set and those files are byte-identical.
-    - ``untracked_ok``: no untracked path is key material, unexpected source, or
-      an unexpected artifact inside the protected data directory.
+    - ``untracked_ok``: no untracked **or ignored** path is key material, no
+      visible untracked path is unexpected source, and nothing unexpected
+      appears inside the protected data directory.
 
-    Untracked paths are additionally reported individually, so nothing is
+    Untracked and ignored paths are reported individually, so nothing is
     silently invisible even when it is tolerated.
     """
     tracked_set = set(tracked)
@@ -493,9 +587,16 @@ def _versioned_scope_report(root: Path, tracked, untracked, baseline: dict) -> d
 
     inventory = [_classify_untracked_path(root, path) for path in untracked]
     rejected = [entry for entry in inventory if entry["classification"] == REJECTED]
+
+    ignored_files = _expand_ignored_entries(root, ignored)
+    ignored_inventory = [_classify_ignored_path(root, path) for path in ignored_files]
+    rejected_ignored = [
+        entry for entry in ignored_inventory if entry["classification"] == REJECTED
+    ]
+
     sensitive = sorted(
         path
-        for path in list(tracked) + list(untracked)
+        for path in list(tracked) + list(untracked) + ignored_files
         if Path(path).suffix.lower() in SENSITIVE_SUFFIXES
     )
 
@@ -505,13 +606,17 @@ def _versioned_scope_report(root: Path, tracked, untracked, baseline: dict) -> d
         "unexpected_tracked_removals": unexpected_removals,
         "modified_outside_scope": modified,
         "untracked_inventory": inventory,
-        "runtime_sidecars": [
-            entry["path"] for entry in inventory if entry["classification"] == RUNTIME_SIDECAR
-        ],
+        "ignored_inventory": ignored_inventory,
+        "runtime_sidecars": sorted(
+            entry["path"]
+            for entry in inventory + ignored_inventory
+            if entry["classification"] == RUNTIME_SIDECAR
+        ),
         "rejected_untracked": rejected,
+        "rejected_ignored": rejected_ignored,
         "sensitive_paths": sensitive,
         "versioned_scope_ok": not (unexpected_additions or unexpected_removals or modified),
-        "untracked_ok": not rejected and not sensitive,
+        "untracked_ok": not rejected and not rejected_ignored and not sensitive,
     }
 
 
@@ -530,10 +635,12 @@ def test_rb33_active_versioned_change_scope_and_production_import_closure():
     baseline = _baseline_archive()
     tracked = _git_paths(ROOT, "ls-files", "--cached", "-z")
     untracked = _git_paths(ROOT, "ls-files", "--others", "--exclude-standard", "-z")
-    report = _versioned_scope_report(ROOT, tracked, untracked, baseline)
+    ignored = _git_paths(ROOT, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+    report = _versioned_scope_report(ROOT, tracked, untracked, baseline, ignored)
 
     assert report["versioned_scope_ok"], report
     assert report["rejected_untracked"] == [], report
+    assert report["rejected_ignored"] == [], report
     assert report["sensitive_paths"] == [], report
     assert production_boundary_audit()["production_activation"] == "NOT_ENABLED"
 
@@ -567,7 +674,7 @@ def _git_command(root: Path, *args: str) -> str:
     ).decode("utf-8")
 
 
-def _temporary_repository(tmp_path: Path, files=None) -> Path:
+def _temporary_repository(tmp_path: Path, files=None, exclude_lines=()) -> Path:
     files = dict(files or _TEMPORARY_REPOSITORY_FILES)
     root = tmp_path / "repo"
     root.mkdir(parents=True)
@@ -576,6 +683,11 @@ def _temporary_repository(tmp_path: Path, files=None) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
     _git_command(root, "init", "--quiet")
+    if exclude_lines:
+        (root / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (root / ".git" / "info" / "exclude").write_bytes(
+            "".join(line + "\n" for line in exclude_lines).encode("utf-8")
+        )
     _git_command(root, "add", "--all")
     _git_command(root, "commit", "--quiet", "-m", "synthetic baseline")
     return root
@@ -585,7 +697,8 @@ def _temporary_report(root: Path, files=None) -> dict:
     baseline = dict(files or _TEMPORARY_REPOSITORY_FILES)
     tracked = _git_paths(root, "ls-files", "--cached", "-z")
     untracked = _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z")
-    return _versioned_scope_report(root, tracked, untracked, baseline)
+    ignored = _git_paths(root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+    return _versioned_scope_report(root, tracked, untracked, baseline, ignored)
 
 
 def test_rb33b_untracked_snapshot_lock_does_not_fail_versioned_scope(tmp_path):
@@ -758,6 +871,181 @@ def test_rb33k_trust_root_baseline_checks_still_operate(tmp_path):
     assert report["unexpected_tracked_additions"] == ["utils/trust_root_shadow.py"], report
     assert report["modified_outside_scope"] == ["docs/notes.md"], report
     assert report["versioned_scope_ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# RB-33 ignored-artifact visibility — the `reports/` blind spot.
+#
+# `git ls-files --others --exclude-standard` never returns children of an
+# ignored directory, so key material placed under `reports/` used to be
+# invisible to the inventory that claims to reject it everywhere. The controls
+# below drive real Git ignore behaviour in temporary repositories.
+# ---------------------------------------------------------------------------
+
+_IGNORED_REPORTS_EXCLUDE = ("/reports/", "data/*.json")
+
+
+def test_rb33l_ignored_reports_stay_permitted_local_artifacts(tmp_path):
+    root = _temporary_repository(tmp_path, exclude_lines=_IGNORED_REPORTS_EXCLUDE)
+    (root / "reports").mkdir()
+    (root / "reports" / "ordinary-report.md").write_bytes(b"# local report\n")
+    (root / "reports" / "diagnostic.py").write_bytes(b"print('local repro')\n")
+
+    # The ordinary inventory genuinely does not see the ignored children.
+    assert _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z") == []
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is True, report
+    assert report["untracked_ok"] is True, report
+    assert report["untracked_inventory"] == [], report
+    assert {
+        entry["path"]: entry["classification"] for entry in report["ignored_inventory"]
+    } == {
+        "reports/diagnostic.py": IGNORED_LOCAL_ARTIFACT,
+        "reports/ordinary-report.md": IGNORED_LOCAL_ARTIFACT,
+    }, report
+    # Ignored artifacts never become authorized versioned paths.
+    assert "reports/diagnostic.py" not in ALLOWED_PATHS
+
+
+def test_rb33m_ignored_sensitive_key_inside_reports_is_rejected(tmp_path):
+    root = _temporary_repository(tmp_path, exclude_lines=_IGNORED_REPORTS_EXCLUDE)
+    (root / "reports").mkdir()
+    (root / "reports" / "owner.pem").write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+
+    assert _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z") == []
+
+    report = _temporary_report(root)
+    assert report["untracked_ok"] is False, report
+    assert report["sensitive_paths"] == ["reports/owner.pem"], report
+    assert report["rejected_ignored"] == [
+        {
+            "path": "reports/owner.pem",
+            "classification": REJECTED,
+            "reason": "SENSITIVE_KEY_ARTIFACT_IGNORED",
+        }
+    ], report
+    # Rejection is a security verdict, never a versioned-scope change.
+    assert report["versioned_scope_ok"] is True
+
+
+def test_rb33n_ignored_nested_sensitive_key_is_rejected(tmp_path):
+    root = _temporary_repository(tmp_path, exclude_lines=_IGNORED_REPORTS_EXCLUDE)
+    (root / "reports" / "nested" / "deeper").mkdir(parents=True)
+    (root / "reports" / "nested" / "deeper" / "service.key").write_bytes(b"secret\n")
+    (root / "reports" / "nested" / "ordinary.md").write_bytes(b"# note\n")
+
+    report = _temporary_report(root)
+    assert report["untracked_ok"] is False, report
+    assert [entry["path"] for entry in report["rejected_ignored"]] == [
+        "reports/nested/deeper/service.key"
+    ], report
+    assert report["rejected_ignored"][0]["reason"] == "SENSITIVE_KEY_ARTIFACT_IGNORED"
+    assert {
+        entry["path"] for entry in report["ignored_inventory"]
+    } == {"reports/nested/deeper/service.key", "reports/nested/ordinary.md"}
+
+
+def test_rb33o_collapsed_ignored_directory_entry_is_expanded(tmp_path):
+    """Git may report the ignored directory itself; children must still be seen."""
+    root = _temporary_repository(tmp_path, exclude_lines=_IGNORED_REPORTS_EXCLUDE)
+    (root / "reports" / "nested").mkdir(parents=True)
+    (root / "reports" / "owner.pem").write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    (root / "reports" / "nested" / "leak.key").write_bytes(b"secret\n")
+
+    collapsed = _expand_ignored_entries(root, ["reports/"])
+    assert collapsed == ["reports/nested/leak.key", "reports/owner.pem"], collapsed
+
+    report = _versioned_scope_report(
+        root,
+        _git_paths(root, "ls-files", "--cached", "-z"),
+        _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z"),
+        dict(_TEMPORARY_REPOSITORY_FILES),
+        ["reports/"],
+    )
+    assert report["untracked_ok"] is False, report
+    assert sorted(entry["path"] for entry in report["rejected_ignored"]) == [
+        "reports/nested/leak.key",
+        "reports/owner.pem",
+    ], report
+
+
+def test_rb33p_ignored_paths_outside_artifact_roots_are_not_scanned(tmp_path):
+    """Dependency trees ship public CA bundles; scanning them would be wrong."""
+    root = _temporary_repository(tmp_path, exclude_lines=("/venv/", "/reports/"))
+    (root / "venv" / "lib").mkdir(parents=True)
+    (root / "venv" / "lib" / "cacert.pem").write_bytes(b"public ca bundle\n")
+
+    report = _temporary_report(root)
+    assert _git_paths(root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z") == [
+        "venv/lib/cacert.pem"
+    ]
+    assert report["ignored_inventory"] == [], report
+    assert report["untracked_ok"] is True, report
+    assert report["versioned_scope_ok"] is True, report
+
+
+def test_rb33q_ignored_runtime_sidecar_stays_permitted(tmp_path):
+    root = _temporary_repository(
+        tmp_path, exclude_lines=("data/*.json", "data/.snapshots.lock")
+    )
+    (root / "data" / ".snapshots.lock").write_bytes(b"0")
+
+    assert _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z") == []
+
+    report = _temporary_report(root)
+    assert report["runtime_sidecars"] == ["data/.snapshots.lock"], report
+    assert report["untracked_ok"] is True, report
+    assert report["rejected_ignored"] == [], report
+
+
+def test_rb33r_ignored_sidecar_symlink_still_fails_closed(tmp_path):
+    root = _temporary_repository(
+        tmp_path, exclude_lines=("data/*.json", "data/.snapshots.lock")
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    victim = elsewhere / "copy-of-lock"
+    victim.write_bytes(b"0")
+    try:
+        os.symlink(str(victim), str(root / "data" / ".snapshots.lock"))
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - privileges vary
+        pytest.skip(f"cannot create a file symlink here: {exc}")
+
+    report = _temporary_report(root)
+    assert report["untracked_ok"] is False, report
+    assert [entry["reason"] for entry in report["rejected_ignored"]] == [
+        "RUNTIME_SIDECAR_PATH_SUBSTITUTED"
+    ], report
+
+
+def test_rb33s_visible_sensitive_key_is_still_rejected_without_ignore(tmp_path):
+    """The original visible-path rule must not be replaced by the ignored scan."""
+    root = _temporary_repository(tmp_path)
+    (root / "reports").mkdir()
+    (root / "reports" / "owner.pem").write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+
+    report = _temporary_report(root)
+    assert report["untracked_ok"] is False, report
+    assert report["rejected_untracked"] == [
+        {
+            "path": "reports/owner.pem",
+            "classification": REJECTED,
+            "reason": "SENSITIVE_KEY_ARTIFACT",
+        }
+    ], report
+
+
+def test_rb33t_ignored_artifacts_do_not_mask_tracked_changes(tmp_path):
+    """An ignored artifact must never hide an unauthorized tracked change."""
+    root = _temporary_repository(tmp_path, exclude_lines=_IGNORED_REPORTS_EXCLUDE)
+    (root / "reports").mkdir()
+    (root / "reports" / "ordinary-report.md").write_bytes(b"# local report\n")
+    (root / "docs" / "notes.md").write_bytes(b"# tampered\n")
+
+    report = _temporary_report(root)
+    assert report["versioned_scope_ok"] is False, report
+    assert report["modified_outside_scope"] == ["docs/notes.md"], report
 
 
 def test_rb34_seven_store_integrity(protected_bytes):
