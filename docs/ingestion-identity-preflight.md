@@ -445,13 +445,14 @@ historical source contracts and remains **DEFERRED**.
 **不可判定必须写成不可判定**：以下任一情况一律
 `coverage_status = UNKNOWN` 且各计数返回 `null`（**绝不**返回 `0`）：
 
-- `SOURCE_NOT_OBSERVED`：本进程没有观测（新进程、或只读端点从未抓取）；
+- `SOURCE_NOT_OBSERVED`：本进程没有观测（新进程、或只读端点从未抓取）；`current_source_observation.scope = "PROCESS_LOCAL"` 且 `shared_across_processes = false`；
 - `SOURCE_NOT_HEALTHY`：任一篮球源 `unavailable` / `empty` ——空响应**不得**被读成
   「零缺口」；
 - `OBSERVATION_PREDATES_LAST_REFRESH`：观测早于数据集，无法据此判断入库结果；
-- `OBSERVATION_TIMESTAMP_UNUSABLE` / `LAST_REFRESH_TIMESTAMP_UNUSABLE`：时间戳不可解析。
+- `OBSERVATION_TIMESTAMP_UNUSABLE` / `LAST_REFRESH_TIMESTAMP_UNUSABLE`：时间戳不可解析；
+- `IDENTITY_UNRESOLVED`：源观测中存在身份不足、非团桥接、多所有者或源别名冲突行，分类无法唯一建立事件集合（同时暴露 `identity_unresolved_rows`）。
 
-判等只走 `same_event`：同一事件同时出现在直播源与竞彩源时按事件去重，
+判等只走 `same_event`：同一事件同时出现在直播源与竞彩源时按事件连通分量与团校验去重（多条观测中只要至少一条独立满足 `has_usable_market_odds()` 即归类为合格，与行序无关；不合并跨源赔率字段）。`coverage` 同时保留既有字段与事件级字段（`raw_nba_source_rows`、`distinct_established_nba_events`、`already_ingested_events`、`market_eligible_pending_events`、`market_ineligible_events`、`identity_unresolved_rows`）。
 不按联赛名计数、不比较队名相似度、不推断主客方向。WNBA 等非 NBA 联赛
 只计入 `non_nba_basketball_fixtures`，**不**进入 NBA 口径（`is_nba_league`）。
 

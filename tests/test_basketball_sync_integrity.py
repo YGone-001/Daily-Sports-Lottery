@@ -1108,3 +1108,465 @@ def test_bs_34_empty_source_is_not_reported_as_healthy_coverage(isolated_data_di
     assert coverage["coverage_reason"] == "SOURCE_NOT_HEALTHY"
     assert coverage["source_nba_fixtures_observed"] is None
     assert coverage["post_refresh_ingestion_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# BS-35 … BS-44: deterministic, order-independent coverage classification
+# ---------------------------------------------------------------------------
+
+def _record_pair_observation(live_rows, xml_rows):
+    """Populate the in-memory process-local observation store deterministically."""
+    _clear_caches()
+    fetcher_500._record_diag(
+        "live_basketball",
+        "ok",
+        rows=len(live_rows),
+        nba_rows=sum(1 for r in live_rows if fetcher_500.is_nba_league(r.get("league"))),
+        valid_market_rows=sum(1 for r in live_rows if has_usable_market_odds(r)),
+    )
+    fetcher_500._record_observation("live_basketball", live_rows)
+    fetcher_500._record_diag(
+        "jczq_odds_basketball",
+        "ok",
+        rows=len(xml_rows),
+        nba_rows=sum(1 for r in xml_rows if fetcher_500.is_nba_league(r.get("league"))),
+        valid_market_rows=sum(1 for r in xml_rows if has_usable_market_odds(r)),
+    )
+    fetcher_500._record_observation("jczq_odds_basketball", xml_rows)
+
+
+def test_bs_35_coverage_ineligible_then_eligible_same_event(isolated_data_dir):
+    from app import _classify_observed_fixtures, build_nba_coverage
+
+    ineligible = rehearsal_live(6401, home="印第安那步行者", away="华盛顿奇才", odds=False)
+    eligible = rehearsal_market(6401, home="印第安那步行者", away="华盛顿奇才")
+    ineligible_snap = json.dumps(ineligible, sort_keys=True)
+    eligible_snap = json.dumps(eligible, sort_keys=True)
+
+    assert _classify_observed_fixtures([ineligible, eligible], []) == (0, 1, 0)
+    # Classification must never merge odds fields or mutate source rows.
+    assert json.dumps(ineligible, sort_keys=True) == ineligible_snap
+    assert json.dumps(eligible, sort_keys=True) == eligible_snap
+
+    _record_pair_observation([ineligible], [eligible])
+    cov = build_nba_coverage([], "2020-01-01T00:00:00+08:00")
+    assert cov["coverage_status"] == "KNOWN"
+    assert cov["raw_nba_source_rows"] == 2
+    assert cov["distinct_established_nba_events"] == 1
+    assert cov["already_ingested_events"] == 0
+    assert cov["market_eligible_pending_events"] == 1
+    assert cov["market_ineligible_events"] == 0
+    assert cov["identity_unresolved_rows"] == 0
+    assert cov["source_fixtures_not_yet_ingested"] == 1
+    assert cov["market_ineligible_fixtures"] == 0
+    assert cov["post_refresh_ingestion_verified"] is False
+
+
+def test_bs_36_coverage_eligible_then_ineligible_same_event(isolated_data_dir):
+    from app import _classify_observed_fixtures, build_nba_coverage
+
+    ineligible = rehearsal_live(6401, home="印第安那步行者", away="华盛顿奇才", odds=False)
+    eligible = rehearsal_market(6401, home="印第安那步行者", away="华盛顿奇才")
+
+    assert _classify_observed_fixtures([eligible, ineligible], []) == (0, 1, 0)
+
+    _record_pair_observation([eligible], [ineligible])
+    cov = build_nba_coverage([], "2020-01-01T00:00:00+08:00")
+    assert cov["coverage_status"] == "KNOWN"
+    assert cov["raw_nba_source_rows"] == 2
+    assert cov["distinct_established_nba_events"] == 1
+    assert cov["market_eligible_pending_events"] == 1
+    assert cov["market_ineligible_events"] == 0
+    assert cov["identity_unresolved_rows"] == 0
+    assert cov["post_refresh_ingestion_verified"] is False
+
+
+def test_bs_37_coverage_two_eligible_representations_same_event(isolated_data_dir):
+    from app import _classify_observed_fixtures, build_nba_coverage
+
+    live_ok = rehearsal_live(6401, home="印第安那步行者", away="华盛顿奇才", odds=True)
+    xml_ok = rehearsal_market(6401, home="印第安那步行者", away="华盛顿奇才")
+
+    assert _classify_observed_fixtures([live_ok, xml_ok], []) == (0, 1, 0)
+    _record_pair_observation([live_ok], [xml_ok])
+    cov = build_nba_coverage([], "2020-01-01T00:00:00+08:00")
+    assert cov["raw_nba_source_rows"] == 2
+    assert cov["distinct_established_nba_events"] == 1
+    assert cov["market_eligible_pending_events"] == 1
+    assert cov["market_ineligible_events"] == 0
+
+
+def test_bs_38_coverage_two_ineligible_representations_same_event(isolated_data_dir):
+    from app import _classify_observed_fixtures, build_nba_coverage
+
+    # Two incomplete representations must NOT have their odds merged to become eligible.
+    partial_home = rehearsal_live(6402, home="多伦多猛龙", away="波士顿凯尔特人", odds=False)
+    partial_home["odds"] = {"home_win": 1.60}
+    partial_away = rehearsal_market(6402, home="多伦多猛龙", away="波士顿凯尔特人")
+    partial_away["odds"] = {"away_win": 2.40, "matchnum": "6402"}
+
+    assert has_usable_market_odds(partial_home) is False
+    assert has_usable_market_odds(partial_away) is False
+    assert _classify_observed_fixtures([partial_home, partial_away], []) == (0, 0, 1)
+
+    _record_pair_observation([partial_home], [partial_away])
+    cov = build_nba_coverage([], "2020-01-01T00:00:00+08:00")
+    assert cov["coverage_status"] == "KNOWN"
+    assert cov["raw_nba_source_rows"] == 2
+    assert cov["distinct_established_nba_events"] == 1
+    assert cov["market_eligible_pending_events"] == 0
+    assert cov["market_ineligible_events"] == 1
+    assert cov["post_refresh_ingestion_verified"] is True
+
+
+def test_bs_39_coverage_already_present_in_canonical_deduplicated(isolated_data_dir):
+    from app import _classify_observed_fixtures, build_nba_coverage
+
+    stored = [tracked_nba_row()]
+    live_no_odds = rehearsal_live(
+        6301, home="洛杉矶湖人", away="金州勇士", odds=False, date=TRACKED_DATE
+    )
+    xml_ok = rehearsal_market(
+        6301, home="洛杉矶湖人", away="金州勇士", date=TRACKED_DATE
+    )
+
+    assert _classify_observed_fixtures([live_no_odds], stored) == (1, 0, 0)
+    assert _classify_observed_fixtures([live_no_odds, xml_ok], stored) == (1, 0, 0)
+    assert _classify_observed_fixtures([xml_ok, live_no_odds], stored) == (1, 0, 0)
+
+    _record_pair_observation([live_no_odds], [xml_ok])
+    cov = build_nba_coverage(stored, "2020-01-01T00:00:00+08:00")
+    assert cov["coverage_status"] == "KNOWN"
+    assert cov["raw_nba_source_rows"] == 2
+    assert cov["distinct_established_nba_events"] == 1
+    assert cov["already_ingested_events"] == 1
+    assert cov["already_ingested_fixtures"] == 1
+    assert cov["market_eligible_pending_events"] == 0
+    assert cov["market_ineligible_events"] == 0
+    assert cov["post_refresh_ingestion_verified"] is True
+
+
+def test_bs_40_coverage_strong_number_mismatch_stays_distinct(isolated_data_dir):
+    from app import _classify_observed_fixtures
+
+    r1 = rehearsal_live(6308, home="洛杉矶湖人", away="金州勇士", odds=False)
+    r2 = rehearsal_market(6309, home="洛杉矶湖人", away="金州勇士")
+
+    assert _classify_observed_fixtures([r1, r2], []) == (0, 1, 1)
+    assert _classify_observed_fixtures([r2, r1], []) == (0, 1, 1)
+
+    stored = [rehearsal_market(6308, home="洛杉矶湖人", away="金州勇士")]
+    assert _classify_observed_fixtures([r2], stored) == (0, 1, 0)
+
+
+def test_bs_41_coverage_reversed_teams_and_ambiguous_identity(isolated_data_dir):
+    import itertools
+    from app import _classify_observed_fixtures, build_nba_coverage
+
+    # Reversed team names without matching strong competition numbers stay separate.
+    rev_a = rehearsal_live(6308, home="洛杉矶湖人", away="金州勇士", odds=False)
+    rev_a["jczq_no"] = ""
+    rev_b = rehearsal_market(6308, home="金州勇士", away="洛杉矶湖人")
+    rev_b["jczq_no"] = ""
+    rev_b["round"] = ""
+    assert _classify_observed_fixtures([rev_a, rev_b], []) == (0, 1, 1)
+    assert _classify_observed_fixtures([rev_b, rev_a], []) == (0, 1, 1)
+
+    # Display-form '周三304' vs encoded '3304' with reversed teams are NOT merged by same_event().
+    disp = rehearsal_live(304, home="华盛顿奇才", away="印第安纳步行者", odds=False, date="2030-05-02")
+    disp["jczq_no"] = "周三304"
+    enc = rehearsal_market(3304, home="印第安纳步行者", away="华盛顿奇才", date="2030-05-02")
+    assert _classify_observed_fixtures([disp, enc], []) == (0, 1, 1)
+
+    # Non-transitive triangle: X (no number) bridges Y (6308) and Z (6309) -> UNRESOLVED in every order.
+    x_bridge = rehearsal_live(6308, home="甲队", away="乙队", odds=False)
+    x_bridge["jczq_no"] = ""
+    x_bridge["id"] = "500lq-2030-05-02-x"
+    y_num = rehearsal_market(6308, home="甲队", away="乙队")
+    z_num = rehearsal_market(6309, home="甲队", away="乙队")
+    for perm in itertools.permutations([x_bridge, y_num, z_num]):
+        assert _classify_observed_fixtures(list(perm), []) == (None, None, None)
+
+    _record_pair_observation([x_bridge], [y_num, z_num])
+    cov = build_nba_coverage([], "2020-01-01T00:00:00+08:00")
+    assert cov["coverage_status"] == "UNKNOWN"
+    assert cov["coverage_reason"] == "IDENTITY_UNRESOLVED"
+    assert cov["classification_status"] == "IDENTITY_UNRESOLVED"
+    assert cov["raw_nba_source_rows"] == 3
+    assert cov["identity_unresolved_rows"] == 3
+    assert cov["distinct_established_nba_events"] is None
+    assert cov["market_eligible_pending_events"] is None
+    assert cov["source_fixtures_not_yet_ingested"] is None
+    assert cov["post_refresh_ingestion_verified"] is False
+    assert "NON_CLIQUE_COMPONENT" in cov["unresolved_reasons"]
+
+    # Multiple stored Canonical owners for an unnumbered source row -> unresolved.
+    multi_stored = [
+        rehearsal_market(6308, home="甲队", away="乙队"),
+        rehearsal_market(6309, home="甲队", away="乙队"),
+    ]
+    assert _classify_observed_fixtures([x_bridge], multi_stored) == (None, None, None)
+
+    # Same source ID claiming incompatible events -> unresolved.
+    alias_a = rehearsal_market(6401, home="甲队", away="乙队")
+    alias_b = rehearsal_market(6402, home="丙队", away="丁队")
+    alias_b["id"] = alias_a["id"]
+    assert _classify_observed_fixtures([alias_a, alias_b], []) == (None, None, None)
+
+    # Inadequate event identity -> unresolved.
+    orphan = {"sport": "basketball", "league": "NBA", "date": REHEARSAL_DATE, "home": "孤儿"}
+    assert _classify_observed_fixtures([orphan], []) == (None, None, None)
+
+
+def test_bs_42_coverage_similar_team_names_not_collapsed(isolated_data_dir):
+    from app import _classify_observed_fixtures
+
+    a = rehearsal_live(6401, home="休斯敦火箭", away="金州勇士", odds=False)
+    a["jczq_no"] = ""
+    b = rehearsal_market(6401, home="休斯顿火箭", away="金州勇士")
+    b["jczq_no"] = ""
+    b["round"] = ""
+
+    assert _classify_observed_fixtures([a, b], []) == (0, 1, 1)
+    assert _classify_observed_fixtures([b, a], []) == (0, 1, 1)
+
+
+def test_bs_43_coverage_nba_and_wnba_distinction(isolated_data_dir):
+    from app import build_nba_coverage
+
+    nba_inelig = rehearsal_live(6308, home="洛杉矶湖人", away="金州勇士", odds=False)
+    nba_elig = rehearsal_market(6308, home="洛杉矶湖人", away="金州勇士")
+    wnba_same_no = rehearsal_live(6308, home="拉斯维加斯王牌", away="纽约自由人", league="WNBA", odds=True)
+    wnba_stored = rehearsal_market(6308, home="拉斯维加斯王牌", away="纽约自由人", league="美国女子篮球联盟")
+
+    _record_pair_observation([nba_inelig, wnba_same_no], [nba_elig])
+    cov = build_nba_coverage([wnba_stored], "2020-01-01T00:00:00+08:00")
+    assert cov["coverage_status"] == "KNOWN"
+    assert cov["raw_nba_source_rows"] == 2
+    assert cov["distinct_established_nba_events"] == 1
+    assert cov["already_ingested_events"] == 0
+    assert cov["market_eligible_pending_events"] == 1
+    assert cov["market_ineligible_events"] == 0
+    assert cov["non_nba_basketball_fixtures"] == 1
+
+
+def test_bs_44_coverage_multiple_independent_fixtures_order_independent(isolated_data_dir):
+    from app import _classify_observed_fixtures, build_nba_coverage
+
+    stored = [tracked_nba_row()]
+    # Event 1: already ingested, appears twice (ineligible + eligible)
+    e1_a = rehearsal_live(6301, home="洛杉矶湖人", away="金州勇士", odds=False, date=TRACKED_DATE)
+    e1_b = rehearsal_market(6301, home="洛杉矶湖人", away="金州勇士", date=TRACKED_DATE)
+    # Event 2: pending, ineligible then eligible
+    e2_a = rehearsal_live(6401, home="印第安那步行者", away="华盛顿奇才", odds=False)
+    e2_b = rehearsal_market(6401, home="印第安那步行者", away="华盛顿奇才")
+    # Event 3: pending, eligible then ineligible
+    e3_a = rehearsal_market(6402, home="多伦多猛龙", away="波士顿凯尔特人")
+    e3_b = rehearsal_live(6402, home="多伦多猛龙", away="波士顿凯尔特人", odds=False)
+    # Event 4: ineligible only (appears twice without usable odds)
+    e4_a = rehearsal_live(6403, home="纽约尼克斯", away="克利夫兰骑士", odds=False)
+    e4_b = rehearsal_live(6403, home="纽约尼克斯", away="克利夫兰骑士", odds=False)
+    e4_b["id"] = "500j-2030-05-02-6403"
+    # Event 5: eligible only
+    e5_a = rehearsal_market(6404, home="孟菲斯灰熊", away="丹佛掘金")
+
+    forward = [e1_a, e1_b, e2_a, e2_b, e3_a, e3_b, e4_a, e4_b, e5_a]
+    backward = list(reversed(forward))
+    ineligible_first = sorted(forward, key=lambda r: (has_usable_market_odds(r), str(r["id"])))
+    eligible_first = sorted(forward, key=lambda r: (not has_usable_market_odds(r), str(r["id"])))
+
+    for order in (forward, backward, ineligible_first, eligible_first):
+        assert _classify_observed_fixtures(order, stored) == (1, 3, 1)
+
+    _record_pair_observation(
+        [e1_a, e2_a, e3_b, e4_a, rehearsal_live(6501, home="W1", away="W2", league="WNBA")],
+        [e1_b, e2_b, e3_a, e4_b, e5_a],
+    )
+    cov_a = build_nba_coverage(stored, "2020-01-01T00:00:00+08:00")
+
+    _record_pair_observation(
+        [e1_b, e2_b, e3_a, e4_b, e5_a],
+        [e1_a, e2_a, e3_b, e4_a, rehearsal_live(6501, home="W1", away="W2", league="WNBA")],
+    )
+    cov_b = build_nba_coverage(stored, "2020-01-01T00:00:00+08:00")
+
+    for cov in (cov_a, cov_b):
+        assert cov["coverage_status"] == "KNOWN"
+        assert cov["raw_nba_source_rows"] == 9
+        assert cov["distinct_established_nba_events"] == 5
+        assert cov["already_ingested_events"] == 1
+        assert cov["market_eligible_pending_events"] == 3
+        assert cov["market_ineligible_events"] == 1
+        assert cov["identity_unresolved_rows"] == 0
+        assert cov["non_nba_basketball_fixtures"] == 1
+        assert cov["post_refresh_ingestion_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# BS-45 … BS-48: process-local source observation scope and status safety
+# ---------------------------------------------------------------------------
+
+def test_bs_45_cross_process_source_observation_scope(isolated_data_dir):
+    import subprocess
+    import sys
+
+    data_dir = write_refresh_stores(str(isolated_data_dir), [tracked_nba_row()])
+    env = {**os.environ, "PYTHONPATH": ROOT, "PYTHONIOENCODING": "utf-8"}
+
+    # Process 1: never fetched -> SOURCE_NOT_OBSERVED with explicit process-local scope
+    code_unfetched = (
+        "import json, sys\n"
+        f"sys.path.insert(0, r'{ROOT}')\n"
+        "import config\n"
+        f"config.DATA_DIR = r'{data_dir}'\n"
+        "import app\n"
+        "print(json.dumps(app.build_nba_coverage([], '2020-01-01T00:00:00+08:00')))\n"
+    )
+    res1 = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", code_unfetched],
+        capture_output=True, text=True, timeout=60, env=env, cwd=ROOT,
+    )
+    assert res1.returncode == 0, res1.stderr
+    cov1 = json.loads(res1.stdout.strip().splitlines()[-1])
+    assert cov1["coverage_status"] == "UNKNOWN"
+    assert cov1["coverage_reason"] == "SOURCE_NOT_OBSERVED"
+    obs1 = cov1["current_source_observation"]
+    assert obs1["state"] == "NOT_OBSERVED"
+    assert obs1["scope"] == "PROCESS_LOCAL"
+    assert obs1["shared_across_processes"] is False
+    assert obs1["persistent"] is False
+    assert obs1["available"] is False
+    assert obs1["unavailable_reason"] == "SOURCE_NOT_OBSERVED"
+
+    # Process 2: fetches mocked providers -> sees its own local observation
+    code_fetched = (
+        "import json, sys\n"
+        f"sys.path.insert(0, r'{ROOT}')\n"
+        "import config\n"
+        f"config.DATA_DIR = r'{data_dir}'\n"
+        "from utils import fetcher_500\n"
+        "import app\n"
+        "class _R:\n"
+        "    def __init__(self, t): self.content = t.encode('utf-8')\n"
+        "    def raise_for_status(self): pass\n"
+        f"html = {NBA_MATCHLIST_HTML!r}\n"
+        f"sf_xml = {JCLQ_SF_XML!r}\n"
+        f"dxf_xml = {JCLQ_DXF_XML!r}\n"
+        "fetcher_500.requests.get = lambda *a, **k: _R(html)\n"
+        "fetcher_500._fetch_xml = lambda lot, play: sf_xml if play == 'sf' else dxf_xml\n"
+        "fetcher_500.fetch_live_basketball()\n"
+        "fetcher_500.fetch_jczq_xml('basketball')\n"
+        "print(json.dumps(app.build_nba_coverage([], '2020-01-01T00:00:00+08:00')))\n"
+    )
+    res2 = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", code_fetched],
+        capture_output=True, text=True, timeout=60, env=env, cwd=ROOT,
+    )
+    assert res2.returncode == 0, res2.stderr
+    cov2 = json.loads(res2.stdout.strip().splitlines()[-1])
+    assert cov2["coverage_status"] == "KNOWN"
+    assert cov2["current_source_observation"]["state"] == "OBSERVED"
+    assert cov2["current_source_observation"]["scope"] == "PROCESS_LOCAL"
+    assert cov2["current_source_observation"]["available"] is True
+    assert cov2["market_eligible_pending_events"] == 1
+    assert cov2["market_ineligible_events"] == 1
+
+    # Process 3 against the exact same DATA_DIR does NOT inherit Process 2's observation
+    res3 = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", code_unfetched],
+        capture_output=True, text=True, timeout=60, env=env, cwd=ROOT,
+    )
+    assert res3.returncode == 0, res3.stderr
+    cov3 = json.loads(res3.stdout.strip().splitlines()[-1])
+    assert cov3["coverage_status"] == "UNKNOWN"
+    assert cov3["coverage_reason"] == "SOURCE_NOT_OBSERVED"
+    assert cov3["current_source_observation"]["available"] is False
+
+
+def test_bs_46_http_status_does_not_fetch_providers_or_mutate_stores(isolated_data_dir, monkeypatch):
+    import requests
+    import app as flask_app
+
+    _clear_caches()
+    data_dir = write_refresh_stores(str(isolated_data_dir), [tracked_nba_row()])
+    before = store_hashes(data_dir)
+
+    def forbid(*args, **kwargs):
+        raise AssertionError("HTTP status probe must not fetch external providers")
+
+    monkeypatch.setattr(requests, "get", forbid)
+    monkeypatch.setattr(requests.Session, "get", forbid)
+    monkeypatch.setattr(fetcher_500, "_fetch_xml", forbid)
+
+    resp = flask_app.app.test_client().get("/api/status")
+    assert resp.status_code == 200
+    cov = resp.get_json()["source_health"]["coverage"]
+    assert cov["coverage_status"] == "UNKNOWN"
+    assert cov["coverage_reason"] == "SOURCE_NOT_OBSERVED"
+    assert cov["current_source_observation"]["scope"] == "PROCESS_LOCAL"
+    assert cov["current_source_observation"]["available"] is False
+    assert store_hashes(data_dir) == before
+
+
+def test_bs_47_cache_hit_does_not_advance_observation_timestamp(isolated_data_dir, monkeypatch):
+    import time
+
+    _clear_caches()
+    _patch_live(monkeypatch, NBA_MATCHLIST_HTML)
+    _patch_xml(monkeypatch, {"sf": JCLQ_SF_XML, "dxf": JCLQ_DXF_XML})
+
+    fetcher_500.fetch_live_basketball()
+    fetcher_500.fetch_jczq_xml("basketball")
+    first_obs = fetcher_500.last_source_observation()
+
+    time.sleep(0.02)
+    fetcher_500.fetch_live_basketball()
+    fetcher_500.fetch_jczq_xml("basketball")
+    second_obs = fetcher_500.last_source_observation()
+
+    assert second_obs["live_basketball"]["checked_at"] == first_obs["live_basketball"]["checked_at"]
+    assert second_obs["jczq_odds_basketball"]["checked_at"] == first_obs["jczq_odds_basketball"]["checked_at"]
+
+
+def test_bs_48_completed_refresh_and_predating_observation_semantics(isolated_data_dir, monkeypatch):
+    import app as flask_app
+
+    _clear_caches()
+    data_dir = write_refresh_stores(str(isolated_data_dir), [tracked_nba_row()])
+    # Produce a genuinely COMPLETED + CONSISTENT generation marker via isolated refresh
+    patch_refresh_sources(monkeypatch, live_basketball=[rehearsal_live(6301, home="洛杉矶湖人", away="金州勇士", date=TRACKED_DATE)])
+    scraper.refresh(verbose=False)
+    assert refresh_state.consistency(data_dir)["consistent"] is True
+
+    _clear_caches()
+    # 1) A completed refresh alone (no current observation) cannot claim complete coverage.
+    resp = flask_app.app.test_client().get("/api/status")
+    assert resp.status_code == 200
+    cov = resp.get_json()["source_health"]["coverage"]
+    assert cov["coverage_status"] == "UNKNOWN"
+    assert cov["coverage_reason"] == "SOURCE_NOT_OBSERVED"
+    assert cov["post_refresh_ingestion_verified"] is False
+
+    # 2) An observation predating last_refresh cannot establish post-refresh coverage.
+    _record_pair_observation([rehearsal_live(6301, home="洛杉矶湖人", away="金州勇士", date=TRACKED_DATE)], [])
+    predating = flask_app.build_nba_coverage([tracked_nba_row()], "2099-01-01T00:00:00+08:00")
+    assert predating["coverage_status"] == "UNKNOWN"
+    assert predating["coverage_reason"] == "OBSERVATION_PREDATES_LAST_REFRESH"
+    assert predating["post_refresh_ingestion_verified"] is False
+    assert predating["market_eligible_pending_events"] is None
+
+    # 3) A newer observation showing a missing eligible NBA fixture reports pending > 0.
+    newer = flask_app.build_nba_coverage(
+        [tracked_nba_row()],
+        "2020-01-01T00:00:00+08:00",
+    )
+    # Replace observation with a missing eligible event
+    _record_pair_observation(
+        [rehearsal_live(6401, home="印第安那步行者", away="华盛顿奇才", odds=False)],
+        [rehearsal_market(6401, home="印第安那步行者", away="华盛顿奇才")],
+    )
+    newer_gap = flask_app.build_nba_coverage([tracked_nba_row()], "2020-01-01T00:00:00+08:00")
+    assert newer["coverage_status"] == "KNOWN"
+    assert newer_gap["coverage_status"] == "KNOWN"
+    assert newer_gap["market_eligible_pending_events"] == 1
+    assert newer_gap["post_refresh_ingestion_verified"] is False

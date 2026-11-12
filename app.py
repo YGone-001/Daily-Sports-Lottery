@@ -335,6 +335,7 @@ def build_source_health() -> dict:
             except (TypeError, ValueError):
                 age_seconds = None
         entry["age_seconds"] = age_seconds
+        entry["observation_scope"] = "PROCESS_LOCAL"
         sources[name] = entry
 
     basketball = [m for m in daily_loader.get_all_matches() if m.get("sport") == "basketball"]
@@ -381,34 +382,188 @@ def _parse_timestamp(value):
     return parsed
 
 
-def _classify_observed_fixtures(rows, stored):
-    """
-    把源观测行分为「已入库 / 合格未入库 / 无可用盘口」。
+def _norm_source_id(record: dict) -> str | None:
+    raw = record.get("id")
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    return stripped or None
 
-    判等只走 ``same_event``（AGENTS.md §4.7/§4.16）：不比较队名相似度、不按联赛名
-    计数、不推断主客方向。同一事件在同一批观测里出现多次（直播行 + 竞彩行）时，
-    先与已存记录判等；未入库的行之间同样按 ``same_event`` 去重，避免重复计数。
+
+def classify_observed_fixtures(rows, stored) -> dict:
     """
-    from utils.match_identity import same_event
+    把源观测行分为「已入库 / 合格未入库 / 无可用盘口」，并显式分离身份未决行。
+
+    判等只走 ``same_event``（AGENTS.md §4.7/§4.16）：不推断队名别名、不交换主客、
+    不合并跨源赔率字段。同一事件在观测中出现多条记录时，先用连通分量与团校验
+    建立无歧义的事件集合；只要该集合中至少一条**独立**满足 ``has_usable_market_odds()``，
+    该事件即归类为合格，结果与观测行顺序无关。
+    """
     from utils.market_coverage import has_usable_market_odds
+    from utils.match_identity import competition_event_key, same_event, team_event_key
+
+    rows_list = list(rows or ())
+    stored_list = list(stored or ())
+
+    valid_indices: list[int] = []
+    unresolved_indices: set[int] = set()
+    reasons: set[str] = set()
+
+    for idx, row in enumerate(rows_list):
+        if not isinstance(row, dict):
+            unresolved_indices.add(idx)
+            reasons.add("MALFORMED_SOURCE_ROW")
+            continue
+        if competition_event_key(row) is None and team_event_key(row) is None:
+            unresolved_indices.add(idx)
+            reasons.add("INADEQUATE_EVENT_IDENTITY")
+            continue
+        valid_indices.append(idx)
+
+    stored_by_id: dict[str, list[int]] = {}
+    for s_idx, s_match in enumerate(stored_list):
+        if not isinstance(s_match, dict):
+            continue
+        sid = _norm_source_id(s_match)
+        if sid is not None:
+            stored_by_id.setdefault(sid, []).append(s_idx)
+
+    alias_groups: dict[str, list[int]] = {}
+    alias_conflicted: set[int] = set()
+    for idx in valid_indices:
+        row = rows_list[idx]
+        rid = _norm_source_id(row)
+        if rid is None:
+            continue
+        alias_groups.setdefault(rid, []).append(idx)
+        for s_idx in stored_by_id.get(rid, ()):
+            if not same_event(stored_list[s_idx], row):
+                alias_conflicted.add(idx)
+                reasons.add("SAME_SOURCE_ALIAS_DIFFERENT_EVENT")
+
+    for members in alias_groups.values():
+        if len(members) < 2:
+            continue
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                if not same_event(rows_list[members[i]], rows_list[members[j]]):
+                    alias_conflicted.add(members[i])
+                    alias_conflicted.add(members[j])
+                    reasons.add("SAME_SOURCE_ALIAS_DIFFERENT_EVENT")
+
+    parent = {idx: idx for idx in valid_indices}
+
+    def _find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    row_buckets: dict[tuple, list[int]] = {}
+    for idx in valid_indices:
+        row = rows_list[idx]
+        row_buckets.setdefault((row.get("sport"), row.get("date")), []).append(idx)
+
+    for bucket in row_buckets.values():
+        for i in range(len(bucket)):
+            for j in range(i + 1, len(bucket)):
+                a, b = bucket[i], bucket[j]
+                if same_event(rows_list[a], rows_list[b]):
+                    _union(a, b)
+
+    components: dict[int, list[int]] = {}
+    for idx in valid_indices:
+        components.setdefault(_find(idx), []).append(idx)
+
+    stored_buckets: dict[tuple, list[int]] = {}
+    for s_idx, s_match in enumerate(stored_list):
+        if isinstance(s_match, dict):
+            stored_buckets.setdefault((s_match.get("sport"), s_match.get("date")), []).append(s_idx)
 
     already = 0
     pending = 0
     ineligible = 0
-    pending_rows: list[dict] = []
-    for row in rows:
-        if any(same_event(row, stored_match) for stored_match in stored):
+
+    for comp in components.values():
+        if any(idx in alias_conflicted for idx in comp):
+            unresolved_indices.update(comp)
+            continue
+
+        is_clique = all(
+            same_event(rows_list[comp[i]], rows_list[comp[j]])
+            for i in range(len(comp))
+            for j in range(i + 1, len(comp))
+        )
+        if not is_clique:
+            unresolved_indices.update(comp)
+            reasons.add("NON_CLIQUE_COMPONENT")
+            continue
+
+        owner_sets: set[tuple[int, ...]] = set()
+        for idx in comp:
+            row = rows_list[idx]
+            candidates = stored_buckets.get((row.get("sport"), row.get("date")), ())
+            owners = tuple(
+                s_idx for s_idx in candidates if same_event(stored_list[s_idx], row)
+            )
+            owner_sets.add(owners)
+
+        if len(owner_sets) != 1:
+            unresolved_indices.update(comp)
+            reasons.add("COMPONENT_OWNER_INCONSISTENCY")
+            continue
+
+        owners = next(iter(owner_sets))
+        if len(owners) > 1:
+            unresolved_indices.update(comp)
+            reasons.add("MULTIPLE_CANONICAL_OWNERS")
+            continue
+
+        if len(owners) == 1:
             already += 1
-            continue
-        if any(same_event(row, other) for other in pending_rows):
-            continue
-        if has_usable_market_odds(row):
+        elif any(has_usable_market_odds(rows_list[idx]) for idx in comp):
             pending += 1
-            pending_rows.append(row)
         else:
             ineligible += 1
-            pending_rows.append(row)
-    return already, pending, ineligible
+
+    unresolved_count = len(unresolved_indices)
+    if unresolved_count > 0:
+        return {
+            "classification_status": "IDENTITY_UNRESOLVED",
+            "raw_source_rows": len(rows_list),
+            "distinct_established_events": None,
+            "already_ingested_events": None,
+            "market_eligible_pending_events": None,
+            "market_ineligible_events": None,
+            "identity_unresolved_rows": unresolved_count,
+            "unresolved_reasons": sorted(reasons),
+        }
+
+    return {
+        "classification_status": "RESOLVED",
+        "raw_source_rows": len(rows_list),
+        "distinct_established_events": already + pending + ineligible,
+        "already_ingested_events": already,
+        "market_eligible_pending_events": pending,
+        "market_ineligible_events": ineligible,
+        "identity_unresolved_rows": 0,
+        "unresolved_reasons": [],
+    }
+
+
+def _classify_observed_fixtures(rows, stored):
+    """兼容三元组返回接口；存在未决身份时返回 ``(None, None, None)``。"""
+    summary = classify_observed_fixtures(rows, stored)
+    return (
+        summary["already_ingested_events"],
+        summary["market_eligible_pending_events"],
+        summary["market_ineligible_events"],
+    )
 
 
 def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
@@ -418,13 +573,13 @@ def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
     五种状态必须分别可见（AGENTS.md §4.26）：
 
     - ``LAST_REFRESH_SUCCESS``：``meta.last_refresh``（刷新最后一次成功落盘的时刻）；
-    - ``CURRENT_SOURCE_OBSERVATION``：本轮进程**真实抓取**到的行（缓存命中不算）；
+    - ``CURRENT_SOURCE_OBSERVATION``：本轮进程**真实抓取**到的行（进程内局部状态，缓存命中不算）；
     - ``SOURCE_FIXTURES_NOT_YET_INGESTED``：源有、库无，且盘口合格；
     - ``MARKET_INELIGIBLE_FIXTURES``：源有、库无，按既有准入契约被过滤；
-    - ``POST_REFRESH_INGESTION_VERIFIED``：观测**晚于**最近一次刷新且无合格缺口。
+    - ``POST_REFRESH_INGESTION_VERIFIED``：观测**晚于**最近一次刷新且无合格缺口、无身份未决。
 
-    观测缺失、源不可达/为空、或观测早于数据集时，计数一律返回 ``None`` 并置
-    ``coverage_status = UNKNOWN``——**绝不**把「没观测」写成「零缺口」。
+    观测缺失、源不可达/为空、观测早于数据集、或存在未决身份时，计数一律返回 ``None``
+    并置 ``coverage_status = UNKNOWN``——**绝不**把「没观测/未决」写成「零缺口」。
     """
     from utils.fetcher_500 import is_nba_league, last_source_observation
 
@@ -438,11 +593,21 @@ def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
         entry = observation.get(name)
         if not entry:
             states.append("NOT_OBSERVED")
-            sources[name] = {"status": "not_observed", "checked_at": None, "rows": 0}
+            sources[name] = {
+                "status": "not_observed",
+                "checked_at": None,
+                "rows": 0,
+                "scope": "PROCESS_LOCAL",
+            }
             continue
         status = entry.get("status")
         checked_at = entry.get("checked_at")
-        sources[name] = {"status": status, "checked_at": checked_at, "rows": entry.get("count", 0)}
+        sources[name] = {
+            "status": status,
+            "checked_at": checked_at,
+            "rows": entry.get("count", 0),
+            "scope": "PROCESS_LOCAL",
+        }
         states.append(str(status or "unknown"))
         stamp = _parse_timestamp(checked_at)
         if stamp is not None and (observed_at is None or stamp < observed_at):
@@ -451,15 +616,39 @@ def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
             if row.get("sport") == "basketball":
                 observed_rows.append(row)
 
+    has_unobserved = "NOT_OBSERVED" in states
+    sources_healthy = (not has_unobserved) and all(state == "ok" for state in states)
+    if has_unobserved:
+        obs_unavailable_reason = "SOURCE_NOT_OBSERVED"
+    elif not sources_healthy:
+        obs_unavailable_reason = "SOURCE_NOT_HEALTHY"
+    elif observed_at is None:
+        obs_unavailable_reason = "OBSERVATION_TIMESTAMP_UNUSABLE"
+    else:
+        obs_unavailable_reason = None
+
     coverage = {
         "coverage_status": COVERAGE_UNKNOWN,
         "coverage_reason": None,
+        "classification_status": "NOT_EVALUATED",
         "last_refresh_success": {"at": last_refresh_at},
         "current_source_observation": {
-            "state": "NOT_OBSERVED" if "NOT_OBSERVED" in states else "OBSERVED",
+            "state": "NOT_OBSERVED" if has_unobserved else "OBSERVED",
+            "scope": "PROCESS_LOCAL",
+            "shared_across_processes": False,
+            "persistent": False,
+            "available": obs_unavailable_reason is None,
+            "unavailable_reason": obs_unavailable_reason,
             "observed_at": observed_at.isoformat() if observed_at else None,
             "sources": sources,
         },
+        "raw_nba_source_rows": None,
+        "distinct_established_nba_events": None,
+        "already_ingested_events": None,
+        "market_eligible_pending_events": None,
+        "market_ineligible_events": None,
+        "identity_unresolved_rows": None,
+        "unresolved_reasons": [],
         "source_nba_fixtures_observed": None,
         "source_fixtures_not_yet_ingested": None,
         "already_ingested_fixtures": None,
@@ -468,14 +657,8 @@ def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
         "post_refresh_ingestion_verified": False,
     }
 
-    if "NOT_OBSERVED" in states:
-        coverage["coverage_reason"] = "SOURCE_NOT_OBSERVED"
-        return coverage
-    if any(state != "ok" for state in states):
-        coverage["coverage_reason"] = "SOURCE_NOT_HEALTHY"
-        return coverage
-    if observed_at is None:
-        coverage["coverage_reason"] = "OBSERVATION_TIMESTAMP_UNUSABLE"
+    if obs_unavailable_reason is not None:
+        coverage["coverage_reason"] = obs_unavailable_reason
         return coverage
 
     refresh_at = _parse_timestamp(last_refresh_at)
@@ -487,14 +670,43 @@ def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
         return coverage
 
     nba_rows = [row for row in observed_rows if is_nba_league(row.get("league"))]
-    already, pending, ineligible = _classify_observed_fixtures(nba_rows, stored_nba)
+    stored_nba_only = [
+        m for m in (stored_nba or ())
+        if isinstance(m, dict)
+        and m.get("sport") in (None, "basketball")
+        and (not m.get("league") or is_nba_league(m.get("league")))
+    ]
+    summary = classify_observed_fixtures(nba_rows, stored_nba_only)
 
+    if summary["identity_unresolved_rows"] > 0:
+        coverage.update(
+            coverage_status=COVERAGE_UNKNOWN,
+            coverage_reason="IDENTITY_UNRESOLVED",
+            classification_status=summary["classification_status"],
+            raw_nba_source_rows=summary["raw_source_rows"],
+            source_nba_fixtures_observed=summary["raw_source_rows"],
+            identity_unresolved_rows=summary["identity_unresolved_rows"],
+            unresolved_reasons=summary["unresolved_reasons"],
+            non_nba_basketball_fixtures=len(observed_rows) - len(nba_rows),
+            post_refresh_ingestion_verified=False,
+        )
+        return coverage
+
+    pending = summary["market_eligible_pending_events"]
     coverage.update(
         coverage_status=COVERAGE_KNOWN,
-        source_nba_fixtures_observed=len(nba_rows),
+        classification_status=summary["classification_status"],
+        raw_nba_source_rows=summary["raw_source_rows"],
+        distinct_established_nba_events=summary["distinct_established_events"],
+        already_ingested_events=summary["already_ingested_events"],
+        market_eligible_pending_events=pending,
+        market_ineligible_events=summary["market_ineligible_events"],
+        identity_unresolved_rows=0,
+        unresolved_reasons=[],
+        source_nba_fixtures_observed=summary["raw_source_rows"],
         source_fixtures_not_yet_ingested=pending,
-        already_ingested_fixtures=already,
-        market_ineligible_fixtures=ineligible,
+        already_ingested_fixtures=summary["already_ingested_events"],
+        market_ineligible_fixtures=summary["market_ineligible_events"],
         non_nba_basketball_fixtures=len(observed_rows) - len(nba_rows),
         post_refresh_ingestion_verified=pending == 0,
     )

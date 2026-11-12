@@ -884,6 +884,38 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.27 多源覆盖分类与进程内观测作用域
+
+- **多观测去重不得先入为主**：`app.classify_observed_fixtures()` 与
+  `app._classify_observed_fixtures()` 必须先按既有 `same_event()` 规则构造
+  连通分量并做团校验；对同一无歧义事件的多条源观测（例如直播无盘口 + 竞彩有盘口），
+  只要至少一条**独立**满足 `has_usable_market_odds()` 即归类为合格，**不得**因
+  无盘口行排在前面而覆盖掉有盘口行，结果必须完全**顺序无关**。
+- **分类绝不合并赔率、绝不改写身份**：只读分类不得把两条各自不完整的赔率合并为
+  可用盘口，不得改写 `same_event()`，不得交换主客队名，不得推断队名别名，
+  不得生成任何合并或写入授权。
+- **已入库事件按事件去重**：同一已入库比赛同时出现在多个源观测中时，
+  `already_ingested_events` 记为 `1` 而非源行数之和。
+- **未决身份显式报告、绝不归零**：若观测包含身份不足（`INADEQUATE_EVENT_IDENTITY`）、
+  非团桥接（`NON_CLIQUE_COMPONENT`）、成员所有者不一致
+  （`COMPONENT_OWNER_INCONSISTENCY`）、多 Canonical 所有者（`MULTIPLE_CANONICAL_OWNERS`）
+  或源 ID 冲突（`SAME_SOURCE_ALIAS_DIFFERENT_EVENT`），`classify_observed_fixtures()`
+  与 `build_nba_coverage()` 必须报告 `IDENTITY_UNRESOLVED` 与
+  `identity_unresolved_rows > 0`，`coverage_status = UNKNOWN`，各事件总数返回
+  `null`（`post_refresh_ingestion_verified = False`），绝不返回误导性 `0`。
+- **原行数与独立事件数分开暴露**：`build_nba_coverage()` 保留既有响应键，同时暴露
+  `raw_nba_source_rows`、`distinct_established_nba_events`、`already_ingested_events`、
+  `market_eligible_pending_events`、`market_ineligible_events` 与
+  `identity_unresolved_rows`。
+- **观测存储是进程内局部状态**：`fetcher_500.last_source_observation()` 是有意的
+  非持久化内存字典；`current_source_observation` 显式声明 `scope = "PROCESS_LOCAL"`、
+  `shared_across_processes = False`、`persistent = False`、`available` 与
+  `unavailable_reason`。一个进程抓取不会同步给另一进程；`/api/status` 不自动触发
+  外网抓取、不写入受保护存储；缓存命中不推进时间戳；单进程只读 CLI 探针不代表所有
+  Web worker 状态。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程
