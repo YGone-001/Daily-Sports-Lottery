@@ -358,6 +358,7 @@ def build_source_health() -> dict:
         "basketball_dates": get_available_dates("basketball")[:7],
         "nba_dates": sorted({m.get("date") for m in nba if m.get("date")}, reverse=True)[:7],
         "coverage": build_nba_coverage(nba, get_meta().get("last_refresh")),
+        "pregame_readiness": build_nba_pregame_readiness(nba),
     }
 
 
@@ -711,6 +712,110 @@ def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
         post_refresh_ingestion_verified=pending == 0,
     )
     return coverage
+
+
+def build_nba_pregame_readiness(nba_matches, now=None) -> dict:
+    """
+    严格只读：统计并分类 NBA 赛前预测快照就绪状态，不创建快照、不写任何存储。
+    """
+    from utils import prediction_snapshots
+    from utils.daily_loader import BEIJING_TZ, get_beijing_now, get_match_datetime
+    from utils.match_identity import build_kickoff_time_provenance
+
+    now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
+    matches = [m for m in (nba_matches or ()) if isinstance(m, dict)]
+
+    # 仅在快照存储已存在时读取只读索引；不存在时保持空集合而不触发文件创建。
+    snap_ids_by_match: dict[str, int] = {}
+    if os.path.exists(prediction_snapshots.store_path()):
+        for m in matches:
+            mid = str(m.get("id") or "")
+            if mid:
+                snap_ids_by_match[mid] = len(prediction_snapshots.get_snapshots_for_match(mid))
+
+    items: list[dict] = []
+    upcoming_total = 0
+    kickoff_known_upcoming = 0
+    kickoff_unknown_upcoming = 0
+    prediction_ready = 0
+    prediction_snapshot_present = 0
+    prediction_blocked_unknown = 0
+    prediction_blocked_ineligible = 0
+
+    for m in matches:
+        mid = str(m.get("id") or "")
+        raw_status = str(m.get("status") or "upcoming").strip().lower() or "upcoming"
+        provenance = build_kickoff_time_provenance(m)
+        kickoff_dt = get_match_datetime(m)
+        snap_count = snap_ids_by_match.get(mid, 0)
+        has_snapshot = snap_count > 0
+        if has_snapshot:
+            prediction_snapshot_present += 1
+
+        if raw_status == "upcoming":
+            upcoming_total += 1
+            if provenance["kickoff_time_known"]:
+                kickoff_known_upcoming += 1
+            else:
+                kickoff_unknown_upcoming += 1
+
+        if raw_status == "live":
+            item_status = (
+                "LIVE_WITH_PREGAME_PREDICTION"
+                if has_snapshot
+                else "LIVE_NO_PREGAME_PREDICTION"
+            )
+            prediction_blocked_ineligible += 1
+        elif raw_status == "finished":
+            item_status = (
+                "FINISHED_WITH_HISTORICAL_PREDICTION"
+                if has_snapshot
+                else "FINISHED_NO_HISTORICAL_PREDICTION"
+            )
+            prediction_blocked_ineligible += 1
+        elif raw_status != "upcoming":
+            item_status = "BLOCKED_INELIGIBLE_STATUS"
+            prediction_blocked_ineligible += 1
+        elif kickoff_dt is None:
+            item_status = "BLOCKED_UNKNOWN_KICKOFF_TIME"
+            prediction_blocked_unknown += 1
+        elif now_bj >= kickoff_dt:
+            item_status = "BLOCKED_PAST_KICKOFF"
+            prediction_blocked_ineligible += 1
+        elif has_snapshot:
+            item_status = "READY_WITH_PREDICTION_SNAPSHOT"
+            prediction_ready += 1
+        else:
+            item_status = "ELIGIBLE_NOT_YET_MATERIALIZED"
+            prediction_ready += 1
+
+        items.append(
+            {
+                "match_id": mid,
+                "date": m.get("date"),
+                "time": m.get("time"),
+                "stored_status": raw_status,
+                "status": item_status,
+                "has_prediction_snapshot": has_snapshot,
+                "prediction_snapshot_count": snap_count,
+                "kickoff_at": kickoff_dt.isoformat() if kickoff_dt is not None else None,
+                **provenance,
+            }
+        )
+
+    return {
+        "read_only": True,
+        "evaluated_at": now_bj.isoformat(),
+        "nba_total": len(items),
+        "upcoming_total": upcoming_total,
+        "kickoff_time_known": kickoff_known_upcoming,
+        "kickoff_time_unknown": kickoff_unknown_upcoming,
+        "prediction_ready": prediction_ready,
+        "prediction_snapshot_present": prediction_snapshot_present,
+        "prediction_blocked_unknown_kickoff": prediction_blocked_unknown,
+        "prediction_blocked_ineligible": prediction_blocked_ineligible,
+        "items": items,
+    }
 
 
 @app.route("/api/history")

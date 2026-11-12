@@ -108,10 +108,19 @@ def resolve_match_update(existing: dict, incoming: dict) -> dict:
         return existing
 
     # existing 未处于终态：执行正常状态流转与合并
-    # 1. 开赛时间更新
-    if is_kickoff_time_known(incoming):
-        inc_time = incoming.get("time") or "00:00"
-        if inc_time != existing.get("time") or not existing.get("kickoff_time_known"):
+    # 检测未决主客反向：同一事件主客恰好互换时，严禁自动互换主客、合并赔率或覆写开赛时间
+    e_home, e_away = existing.get("home"), existing.get("away")
+    i_home, i_away = incoming.get("home"), incoming.get("away")
+    reversed_orientation = bool(
+        e_home and e_away and i_home and i_away
+        and e_home != e_away
+        and i_home == e_away and i_away == e_home
+    )
+
+    # 1. 开赛时间更新（仅在非反向且 incoming 时间权威已知时升级；绝不用未知覆盖已知）
+    if not reversed_orientation and is_kickoff_time_known(incoming):
+        inc_time = str(incoming.get("time") or "").strip()
+        if inc_time != existing.get("time") or not is_kickoff_time_known(existing):
             existing["time"] = inc_time
             existing["kickoff_time_known"] = True
 
@@ -142,7 +151,7 @@ def resolve_match_update(existing: dict, incoming: dict) -> dict:
             existing["status"] = inc_status
 
     # 4. 盘口更新
-    if incoming.get("odds"):
+    if not reversed_orientation and incoming.get("odds"):
         if incoming["odds"] != existing.get("odds"):
             existing["odds"] = incoming["odds"]
             existing["odds_updated_at"] = (
@@ -150,7 +159,7 @@ def resolve_match_update(existing: dict, incoming: dict) -> dict:
             )
 
     # 5. 排期元数据升级
-    if is_kickoff_time_known(incoming):
+    if not reversed_orientation and is_kickoff_time_known(incoming):
         if incoming.get("league") and incoming["league"] != "竞彩":
             existing["league"] = incoming["league"]
         if incoming.get("home") and incoming["home"] != existing.get("home"):

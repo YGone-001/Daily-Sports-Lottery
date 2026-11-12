@@ -916,6 +916,36 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.28 权威开赛时间、赛前就绪门禁与只读诊断
+
+- **不得把缺省或非法开赛时间伪装成 `00:00` 已知**：`utils.match_identity.classify_kickoff_time_value()`
+  区分 `SOURCE_KICKOFF_TIME_PRESENT` / `SOURCE_KICKOFF_TIME_MISSING` /
+  `SOURCE_KICKOFF_TIME_MALFORMED` / `SOURCE_KICKOFF_TIME_AMBIGUOUS`；
+  `_parse_lq` / `_parse_live` / `_parse_wanchang` 在缺失、空串、模糊或格式非法时**不得**
+  将 `kickoff_time_known` 置为 `True`，亦**不得**接受非真实日历日期（如 `2026-02-30`）。
+  源明确写下 `"00:00"` 的真实午夜场保持 `kickoff_time_known = True`。
+- **开赛时间解析与合并 fail-closed**：`utils.match_identity.is_kickoff_time_known()` 与
+  `utils.daily_loader.get_match_datetime()` 禁止空字符串退回 `"00:00"`，并强制校验
+  24 小时 `HH:MM` 与有效日历日期。`utils.match_lifecycle.resolve_match_update()` 与
+  `utils.scraper._merge()` 仅接受无矛盾权威时间升级；单批次内同一目标事件出现互相
+  冲突的已知开赛时间，或两源主客恰好互换时，保持 fail-closed 并不改写既有时间与主客。
+- **赛前预测快照严格门禁**：`utils.prediction_snapshots._create_or_get()` 只对显式未开赛
+  且权威开赛时间已知、`now < kickoff` 的 `upcoming` 赛事生成快照；`status` 为
+  `live` / `finished`（含时间尚未到达的显式状态）或开赛时间未知/非法一律拒绝，
+  且绝不通过补抓或编造时间替已完赛赛事追溯生成历史预测。
+- **赛前赔率快照时序边界**：`utils.odds_snapshots.record_odds_snapshot()` 拒绝
+  `status` 为 `live` / `finished`、已知 `now >= kickoff`、未知开赛时间的篮球赛事处于
+  比赛当天或更晚自然日（`now_bj.date() >= match_date`）、以及其他运动未知开赛时间
+  处于比赛自然日之后（`now_bj.date() > match_date`）的写入；未知开赛时间篮球在严格
+  早于比赛自然日的前日观测仍允许记录。
+- **只读赛前就绪诊断**：`app.build_nba_pregame_readiness()` 与
+  `/api/status["source_health"]["pregame_readiness"]` 严格只读（不建快照、不写存储），
+  显式分离 `upcoming_total`、`kickoff_time_known`、`kickoff_time_unknown`、
+  `prediction_ready`、`prediction_snapshot_present`、
+  `prediction_blocked_unknown_kickoff`、`prediction_blocked_ineligible` 与 B.3 时间溯源。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

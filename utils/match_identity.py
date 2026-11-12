@@ -9,7 +9,79 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
+import re
 from typing import Any
+
+SOURCE_KICKOFF_TIME_PRESENT = "SOURCE_KICKOFF_TIME_PRESENT"
+SOURCE_KICKOFF_TIME_MISSING = "SOURCE_KICKOFF_TIME_MISSING"
+SOURCE_KICKOFF_TIME_MALFORMED = "SOURCE_KICKOFF_TIME_MALFORMED"
+SOURCE_KICKOFF_TIME_AMBIGUOUS = "SOURCE_KICKOFF_TIME_AMBIGUOUS"
+
+_VALID_CLOCK_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_VALID_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CLOCK_FRAGMENT_RE = re.compile(r"\d{1,2}:\d{2}")
+_MISSING_TIME_TOKENS = frozenset({
+    "",
+    "-",
+    "--",
+    "--:--",
+    "tbd",
+    "tba",
+    "pending",
+    "unknown",
+    "null",
+    "none",
+    "n/a",
+    "待定",
+    "未知",
+    "未定",
+})
+
+
+def is_valid_calendar_date(value: Any) -> bool:
+    """校验 YYYY-MM-DD 格式与真实日历日期（拒绝 2026-02-30 等非法日期）。"""
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    if not _VALID_DATE_RE.match(s):
+        return False
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def classify_kickoff_time_value(raw_time: Any) -> tuple[str, str, bool]:
+    """
+    分类源记录的原始开赛时间文本，避免缺省或非法字符串被当作真实 00:00。
+
+    返回 ``(classification, normalized_hhmm, kickoff_time_known)``：
+    - 缺失/占位（""、"--:--"、"待定" 等） -> ``SOURCE_KICKOFF_TIME_MISSING``, "00:00", False
+    - 模糊/多值（含 ?、/、~、约、多个时钟片段） -> ``SOURCE_KICKOFF_TIME_AMBIGUOUS``, "00:00", False
+    - 合法 24 小时 HH:MM（含显式 "00:00"） -> ``SOURCE_KICKOFF_TIME_PRESENT``, HH:MM, True
+    - 其余非法格式（如 "25:99"、"8:30"） -> ``SOURCE_KICKOFF_TIME_MALFORMED``, "00:00", False
+    """
+    if raw_time is None or not isinstance(raw_time, str):
+        return SOURCE_KICKOFF_TIME_MISSING, "00:00", False
+
+    s = raw_time.strip()
+    if s.lower() in _MISSING_TIME_TOKENS:
+        return SOURCE_KICKOFF_TIME_MISSING, "00:00", False
+
+    lower = s.lower()
+    if (
+        any(tok in s for tok in ("?", "？", "/", "~", "或", "约"))
+        or len(_CLOCK_FRAGMENT_RE.findall(s)) > 1
+        or "approx" in lower
+    ):
+        return SOURCE_KICKOFF_TIME_AMBIGUOUS, "00:00", False
+
+    if _VALID_CLOCK_RE.match(s):
+        return SOURCE_KICKOFF_TIME_PRESENT, s, True
+
+    return SOURCE_KICKOFF_TIME_MALFORMED, "00:00", False
 
 
 def normalize_competition_number(value: Any) -> str | None:
@@ -73,29 +145,63 @@ def is_kickoff_time_known(match: dict) -> bool:
     """
     判定该比赛记录的开赛时间是否权威已知。
 
-    - 显式包含 kickoff_time_known 字段时，以其布尔值为准；
-    - 未显式包含时，对同时满足：
-      1. market-fallback 结构（id 以 '500j-' 开头）
-      2. 存在赛事编号
-      3. time == '00:00'
-      的历史记录，判定为 False；
-    - 其余情况视为 True。
+    - 若 kickoff_time_known 显式为 False，直接返回 False；
+    - 历史兼容：500j- 且存在编号且 time == '00:00' 时，判定为 False；
+    - 即便标志位为 True 或缺失，仍需校验 date（若存在）为合法日历日期且
+      time 为合法 24 小时 HH:MM（缺省、空串、模糊值或越界时钟一律 fail-closed）。
     """
     if not isinstance(match, dict):
         return False
 
-    if "kickoff_time_known" in match:
-        return bool(match["kickoff_time_known"])
-
-    mid = str(match.get("id") or "")
-    if (
-        mid.startswith("500j-")
-        and match.get("time") == "00:00"
-        and competition_number_for_match(match) is not None
-    ):
+    if "kickoff_time_known" in match and not bool(match["kickoff_time_known"]):
         return False
 
-    return True
+    if "kickoff_time_known" not in match:
+        mid = str(match.get("id") or "")
+        if (
+            mid.startswith("500j-")
+            and match.get("time") == "00:00"
+            and competition_number_for_match(match) is not None
+        ):
+            return False
+
+    if "date" in match and not is_valid_calendar_date(match.get("date")):
+        return False
+
+    classification, _, known = classify_kickoff_time_value(match.get("time"))
+    return classification == SOURCE_KICKOFF_TIME_PRESENT and known
+
+
+def build_kickoff_time_provenance(match: dict, raw_value: str | None = None) -> dict:
+    """构造 B.3 规定的只读开赛时间溯源诊断字段。"""
+    if not isinstance(match, dict):
+        return {
+            "kickoff_time_source": "unknown",
+            "kickoff_time_raw_value": None,
+            "kickoff_time_known": False,
+            "kickoff_time_timezone": "Asia/Shanghai",
+            "kickoff_time_classification": SOURCE_KICKOFF_TIME_MISSING,
+        }
+
+    mid = str(match.get("id") or "")
+    source = mid.split("-", 1)[0] if "-" in mid else (mid or "unknown")
+    raw_val = raw_value if raw_value is not None else match.get("kickoff_time_raw_value", match.get("time"))
+    known = is_kickoff_time_known(match)
+    classification, _, _ = classify_kickoff_time_value(raw_val)
+
+    if not known and classification == SOURCE_KICKOFF_TIME_PRESENT:
+        if "date" in match and not is_valid_calendar_date(match.get("date")):
+            classification = SOURCE_KICKOFF_TIME_MALFORMED
+        else:
+            classification = SOURCE_KICKOFF_TIME_MISSING
+
+    return {
+        "kickoff_time_source": source,
+        "kickoff_time_raw_value": raw_val,
+        "kickoff_time_known": known,
+        "kickoff_time_timezone": "Asia/Shanghai",
+        "kickoff_time_classification": classification,
+    }
 
 
 def competition_event_key(match: dict) -> str | None:

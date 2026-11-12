@@ -216,3 +216,53 @@ def test_store_file_is_lazy(isolated_data_dir):
     assert not os.path.exists(store_path())
     assert get_snapshots_for_match("nope") == []  # 纯读取不落盘
     assert not os.path.exists(store_path())
+
+
+def test_explicit_live_and_finished_status_rejected_even_before_kickoff(isolated_data_dir, make_match):
+    for bad_status in ("live", "finished"):
+        m = enrich_match(make_match(id=f"500lq-2030-06-01-{bad_status}", date="2030-06-01", time="20:00", kickoff_time_known=True))
+        m["status"] = bad_status
+        early_now = get_match_datetime(m) - timedelta(hours=4)
+        snap, created = capture_snapshot(m, now=early_now)
+        assert snap is None
+        assert created is False
+        assert get_snapshots_for_match(m["id"]) == []
+
+
+def test_unknown_and_malformed_kickoff_blocked(isolated_data_dir, make_match):
+    cases = [
+        {"id": "500j-2030-06-01-4306", "date": "2030-06-01", "time": "00:00", "kickoff_time_known": False},
+        {"id": "500lq-2030-06-01-empty", "date": "2030-06-01", "time": "", "kickoff_time_known": True},
+        {"id": "500lq-2030-06-01-badclock", "date": "2030-06-01", "time": "25:99", "kickoff_time_known": True},
+        {"id": "500lq-2026-02-30-baddate", "date": "2026-02-30", "time": "09:30", "kickoff_time_known": True},
+    ]
+    for overrides in cases:
+        m = enrich_match(make_match(**overrides))
+        snap, created = capture_snapshot(m)
+        assert snap is None
+        assert created is False
+        assert get_snapshots_for_match(m["id"]) == []
+
+
+def test_explicit_midnight_kickoff_allowed_before_start(isolated_data_dir, make_match):
+    m = enrich_match(make_match(id="500lq-2030-06-02-mid", date="2030-06-02", time="00:00", kickoff_time_known=True))
+    kickoff = get_match_datetime(m)
+    assert kickoff is not None
+    blocked, created_late = capture_snapshot(m, now=kickoff)
+    assert blocked is None and created_late is False
+    snap, created = capture_snapshot(m, now=kickoff - timedelta(minutes=30))
+    assert snap is not None and created is True
+
+
+def test_concurrent_capture_snapshot_single_writer(isolated_data_dir, make_match):
+    from concurrent.futures import ThreadPoolExecutor
+
+    m = enrich_match(make_match(id="500lq-2030-06-03-conc", date="2030-06-03", time="10:00", kickoff_time_known=True))
+    early = get_match_datetime(m) - timedelta(hours=2)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: capture_snapshot(dict(m), now=early), range(6)))
+
+    created_flags = [created for _, created in results]
+    assert sum(1 for flag in created_flags if flag) == 1
+    assert len(get_snapshots_for_match(m["id"])) == 1

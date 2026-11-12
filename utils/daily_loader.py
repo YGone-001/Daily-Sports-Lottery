@@ -16,7 +16,12 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import config
-from utils.match_identity import is_kickoff_time_known
+from utils.match_identity import (
+    SOURCE_KICKOFF_TIME_PRESENT,
+    classify_kickoff_time_value,
+    is_kickoff_time_known,
+    is_valid_calendar_date,
+)
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 DAILY_FILE = "daily_matches.json"
@@ -61,15 +66,18 @@ def get_logical_matchday(now: datetime | None = None) -> str:
 
 
 def get_match_datetime(match: dict) -> datetime | None:
-    """解析比赛开赛时间（北京时间）。开赛时间未知时返回 None。"""
+    """解析比赛开赛时间（北京时间）。开赛时间未知或格式非法时返回 None（绝不退回 00:00）。"""
     if not is_kickoff_time_known(match):
         return None
     try:
-        date_str = match.get("date", "")
-        time_str = match.get("time", "00:00") or "00:00"
-        if not date_str:
+        date_str = str(match.get("date") or "").strip()
+        time_str = str(match.get("time") or "").strip()
+        if not is_valid_calendar_date(date_str):
             return None
-        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        classification, hhmm, known = classify_kickoff_time_value(time_str)
+        if classification != SOURCE_KICKOFF_TIME_PRESENT or not known:
+            return None
+        dt = datetime.strptime(f"{date_str} {hhmm}", "%Y-%m-%d %H:%M")
         return dt.replace(tzinfo=BEIJING_TZ)
     except (ValueError, TypeError):
         return None

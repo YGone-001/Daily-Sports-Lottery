@@ -39,7 +39,8 @@ from datetime import datetime
 
 import config
 from utils.atomic_json import atomic_write_json, load_json_file
-from utils.daily_loader import add_time_status, get_beijing_now, get_match_datetime
+from utils.daily_loader import BEIJING_TZ, add_time_status, get_beijing_now, get_match_datetime
+from utils.match_identity import is_valid_calendar_date
 
 # 数据来源标识。当前系统全部盘口来自 500.com 派生数据；
 # 不声称更具体的博彩公司来源（解析器并不知情）。
@@ -237,11 +238,36 @@ def record_odds_snapshot(
     if not normalized:
         return None
 
-    status = add_time_status(dict(match), now).get("status")
+    now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
+
+    # 显式终态/进行中门禁：即便尚未到开赛时间或时间未知，live / finished / 非 upcoming 一律拒绝
+    raw_status = str(match.get("status") or "").strip().lower()
+    if raw_status in ("live", "finished") or (raw_status and raw_status != "upcoming"):
+        return None
+
+    kickoff_dt = get_match_datetime(match)
+    if kickoff_dt is not None:
+        if now_bj >= kickoff_dt:
+            return None
+    else:
+        # 开赛时间未知时：
+        # - 篮球（NBA 主场通常在北京时间当日上午至午间开赛）必须严格早于比赛自然日；
+        # - 其他运动（如足球夜场）禁止在比赛自然日之后补录伪赛前赔率。
+        date_str = str(match.get("date") or "").strip()
+        if not is_valid_calendar_date(date_str):
+            return None
+        match_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        if match.get("sport") == "basketball":
+            if now_bj.date() >= match_date:
+                return None
+        elif now_bj.date() > match_date:
+            return None
+
+    status = add_time_status(dict(match), now_bj).get("status")
     if status != "upcoming":
         return None
 
-    snapshot = build_snapshot(match, captured_at=now, source=source)
+    snapshot = build_snapshot(match, captured_at=now_bj, source=source)
 
     with _LOCK:
         store = _load_store()

@@ -261,3 +261,33 @@ def test_api_empty_for_unknown_match(isolated_data_dir):
     resp = client.get("/api/match/does-not-exist/odds-history")
     assert resp.status_code == 200
     assert resp.get_json() == []
+
+
+def test_odds_timing_boundary_matrix(isolated_data_dir, make_match):
+    from datetime import datetime
+    from utils.daily_loader import BEIJING_TZ
+
+    # 1/2/3: Known kickoff before/exact/after
+    known = make_match(id="500lq-2030-07-05-1", date="2030-07-05", time="10:00", kickoff_time_known=True, odds=dict(ODDS_A))
+    kickoff = datetime(2030, 7, 5, 10, 0, tzinfo=BEIJING_TZ)
+    assert record_odds_snapshot(known, now=kickoff - timedelta(minutes=1)) is not None
+    assert record_odds_snapshot(make_match(id=known["id"], date="2030-07-05", time="10:00", kickoff_time_known=True, odds=dict(ODDS_B)), now=kickoff) is None
+    assert record_odds_snapshot(make_match(id=known["id"], date="2030-07-05", time="10:00", kickoff_time_known=True, odds=dict(ODDS_B)), now=kickoff + timedelta(minutes=1)) is None
+
+    # 4: Explicit live/finished status rejected even before kickoff
+    for bad_status in ("live", "finished"):
+        bad = make_match(id=f"500lq-2030-07-05-{bad_status}", date="2030-07-05", time="10:00", kickoff_time_known=True, status=bad_status, odds=dict(ODDS_A))
+        assert record_odds_snapshot(bad, now=kickoff - timedelta(hours=3)) is None
+
+    # 5/6/7: Unknown kickoff (500j fallback): basketball prior date allowed / same+later rejected; football later rejected
+    unknown_bball = make_match(id="500j-2030-07-05-4306", sport="basketball", league="NBA", date="2030-07-05", time="00:00", kickoff_time_known=False, odds=dict(ODDS_A))
+    assert record_odds_snapshot(unknown_bball, now=datetime(2030, 7, 4, 23, 59, tzinfo=BEIJING_TZ)) is not None
+    assert record_odds_snapshot(make_match(id=unknown_bball["id"], sport="basketball", league="NBA", date="2030-07-05", time="00:00", kickoff_time_known=False, odds=dict(ODDS_B)), now=datetime(2030, 7, 5, 0, 1, tzinfo=BEIJING_TZ)) is None
+    assert record_odds_snapshot(make_match(id=unknown_bball["id"], sport="basketball", league="NBA", date="2030-07-05", time="00:00", kickoff_time_known=False, odds=dict(ODDS_B)), now=datetime(2030, 7, 6, 12, 0, tzinfo=BEIJING_TZ)) is None
+
+    unknown_fball = make_match(id="500j-2030-07-05-007", sport="football", date="2030-07-05", time="00:00", kickoff_time_known=False, odds=dict(ODDS_A))
+    assert record_odds_snapshot(unknown_fball, now=datetime(2030, 7, 6, 0, 1, tzinfo=BEIJING_TZ)) is None
+
+    invalid_date = make_match(id="500j-2026-02-30-4307", sport="basketball", league="NBA", date="2026-02-30", time="00:00", kickoff_time_known=False, odds=dict(ODDS_A))
+    assert record_odds_snapshot(invalid_date, now=datetime(2026, 2, 1, 12, 0, tzinfo=BEIJING_TZ)) is None
+

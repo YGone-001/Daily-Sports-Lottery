@@ -1570,3 +1570,346 @@ def test_bs_48_completed_refresh_and_predating_observation_semantics(isolated_da
     assert newer_gap["coverage_status"] == "KNOWN"
     assert newer_gap["market_eligible_pending_events"] == 1
     assert newer_gap["post_refresh_ingestion_verified"] is False
+
+
+def test_bs_49_lq_kickoff_time_provenance_classification():
+    from utils.match_identity import (
+        SOURCE_KICKOFF_TIME_AMBIGUOUS,
+        SOURCE_KICKOFF_TIME_MALFORMED,
+        SOURCE_KICKOFF_TIME_MISSING,
+        SOURCE_KICKOFF_TIME_PRESENT,
+        build_kickoff_time_provenance,
+        classify_kickoff_time_value,
+    )
+
+    assert classify_kickoff_time_value("08:30")[0] == SOURCE_KICKOFF_TIME_PRESENT
+    assert classify_kickoff_time_value("00:00")[0] == SOURCE_KICKOFF_TIME_PRESENT
+    assert classify_kickoff_time_value("")[0] == SOURCE_KICKOFF_TIME_MISSING
+    assert classify_kickoff_time_value("   ")[0] == SOURCE_KICKOFF_TIME_MISSING
+    assert classify_kickoff_time_value("--:--")[0] == SOURCE_KICKOFF_TIME_MISSING
+    assert classify_kickoff_time_value("待定")[0] == SOURCE_KICKOFF_TIME_MISSING
+    assert classify_kickoff_time_value("25:99")[0] == SOURCE_KICKOFF_TIME_MALFORMED
+    assert classify_kickoff_time_value("8:30")[0] == SOURCE_KICKOFF_TIME_MALFORMED
+    assert classify_kickoff_time_value("08:30?")[0] == SOURCE_KICKOFF_TIME_AMBIGUOUS
+    assert classify_kickoff_time_value("08:30/09:00")[0] == SOURCE_KICKOFF_TIME_AMBIGUOUS
+
+    html = """
+    <script>
+    var matchList=[
+     ["1","300001","x","2026-11-12","08:30","","NBA","","","","","","","洛杉矶湖人","","","","","金州勇士","","","","","","","","6301"],
+     ["1","300002","x","2026-11-12","00:00","","NBA","","","","","","","波士顿凯尔特人","","","","","迈阿密热火","","","","","","","","6302"],
+     ["1","300003","x","2026-11-12","","","NBA","","","","","","","丹佛掘金","","","","","达拉斯独行侠","","","","","","","","6303"],
+     ["1","300004","x","2026-11-12","25:99","","NBA","","","","","","","圣安东尼奥马刺","","","","","菲尼克斯太阳","","","","","","","","6304"],
+     ["1","300005","x","2026-11-12","08:30/09:00","","NBA","","","","","","","休斯顿火箭","","","","","俄克拉荷马城雷霆","","","","","","","","6305"],
+     ["1","300006","x","2026-02-30","09:00","","NBA","","","","","","","纽约尼克斯","","","","","芝加哥公牛","","","","","","","","6306"]
+    ];
+    </script>
+    """
+    rows, errors = fetcher_500._parse_lq(html)
+    assert errors == 1
+    by_id = {r["id"]: r for r in rows}
+    assert "500lq-2026-11-12-6306" not in by_id
+
+    assert by_id["500lq-2026-11-12-6301"]["time"] == "08:30"
+    assert by_id["500lq-2026-11-12-6301"]["kickoff_time_known"] is True
+
+    assert by_id["500lq-2026-11-12-6302"]["time"] == "00:00"
+    assert by_id["500lq-2026-11-12-6302"]["kickoff_time_known"] is True
+
+    for bad_id in ("500lq-2026-11-12-6303", "500lq-2026-11-12-6304", "500lq-2026-11-12-6305"):
+        assert by_id[bad_id]["time"] == "00:00"
+        assert by_id[bad_id]["kickoff_time_known"] is False
+
+    prov = build_kickoff_time_provenance(by_id["500lq-2026-11-12-6301"])
+    assert prov["kickoff_time_source"] == "500lq"
+    assert prov["kickoff_time_raw_value"] == "08:30"
+    assert prov["kickoff_time_known"] is True
+    assert prov["kickoff_time_timezone"] == "Asia/Shanghai"
+    assert prov["kickoff_time_classification"] == SOURCE_KICKOFF_TIME_PRESENT
+
+
+def test_bs_50_live_football_invalid_kickoff_rejected():
+    html = """
+    <table>
+      <tr id="a900001" gy="英超,阿森纳,切尔西" fid="900001" status="0">
+        <td>周一001</td><td>11-12 25:99</td><td>未</td>
+      </tr>
+      <tr id="a900002" gy="英超,利物浦,曼城" fid="900002" status="0">
+        <td>周一002</td><td>11-12 00:00</td><td>未</td>
+      </tr>
+    </table>
+    """
+    rows, errors = fetcher_500._parse_live(html, "a", "football")
+    assert errors == 1
+    assert len(rows) == 1
+    assert rows[0]["time"] == "00:00"
+    assert rows[0]["kickoff_time_known"] is True
+
+
+def test_bs_51_daily_loader_fail_closed_kickoff_validation():
+    from utils.match_identity import is_kickoff_time_known
+
+    assert is_kickoff_time_known({"id": "500lq-1", "date": "2030-05-02", "time": "", "kickoff_time_known": True}) is False
+    assert is_kickoff_time_known({"id": "500lq-2", "date": "2030-05-02", "time": "25:99", "kickoff_time_known": True}) is False
+    assert is_kickoff_time_known({"id": "500lq-3", "date": "2026-02-30", "time": "08:30", "kickoff_time_known": True}) is False
+    assert is_kickoff_time_known({"id": "500lq-4", "date": "2030-05-02", "time": "00:00", "kickoff_time_known": True}) is True
+
+    assert daily_loader.get_match_datetime({"id": "500lq-1", "date": "2030-05-02", "time": "", "kickoff_time_known": True}) is None
+    assert daily_loader.get_match_datetime({"id": "500lq-2", "date": "2030-05-02", "time": "25:99", "kickoff_time_known": True}) is None
+    assert daily_loader.get_match_datetime({"id": "500lq-3", "date": "2026-02-30", "time": "08:30", "kickoff_time_known": True}) is None
+    assert daily_loader.get_match_datetime({"id": "500lq-4", "date": "2030-05-02", "time": "00:00", "kickoff_time_known": True}) is not None
+
+
+def test_bs_52_canonical_time_enrichment_workstream_c(isolated_data_dir):
+    from utils import odds_snapshots, prediction_snapshots
+
+    # Scenario 1 & 8: stored fallback 500j-* receives authoritative time; snapshots preserved & ID unchanged
+    stored_fallback = {
+        "id": "500j-2030-05-10-4306",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "00:00",
+        "kickoff_time_known": False,
+        "status": "upcoming",
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "odds": {"win": 1.65, "loss": 2.15, "matchnum": "4306"},
+        "jczq_no": "4306",
+        "market_tracked": True,
+    }
+    odds_snap = odds_snapshots.record_odds_snapshot(
+        stored_fallback,
+        now=daily_loader.BEIJING_TZ and __import__("datetime").datetime(2030, 5, 9, 15, 0, tzinfo=daily_loader.BEIJING_TZ),
+    )
+    assert odds_snap is not None
+    incoming_auth = {
+        "id": "500lq-2030-05-10-9901",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "09:30",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "jczq_no": "4306",
+    }
+    merged, added, updated = scraper._merge([stored_fallback], [incoming_auth])
+    assert len(merged) == 1
+    assert merged[0]["id"] == "500j-2030-05-10-4306"
+    assert merged[0]["time"] == "09:30"
+    assert merged[0]["kickoff_time_known"] is True
+    assert updated == 1 and added == 0
+    assert len(odds_snapshots.get_odds_history_for_match("500j-2030-05-10-4306")) == 1
+
+    # Now enriched record allows legitimate pregame prediction snapshot; subsequent unknown incoming does NOT downgrade
+    enriched_for_pred = daily_loader.enrich_match(dict(merged[0]))
+    snap, created = prediction_snapshots.capture_snapshot(enriched_for_pred)
+    assert created is True and snap is not None
+
+    # Scenarios 2 & 3: stored known 00:00 or 09:30 + incoming unknown -> remains known
+    incoming_unknown = {
+        "id": "500j-2030-05-10-4306",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "00:00",
+        "kickoff_time_known": False,
+        "status": "upcoming",
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "jczq_no": "4306",
+    }
+    merged2, _, _ = scraper._merge(merged, [incoming_unknown])
+    assert merged2[0]["time"] == "09:30"
+    assert merged2[0]["kickoff_time_known"] is True
+    assert prediction_snapshots.get_snapshots_for_match("500j-2030-05-10-4306")[0]["snapshot_id"] == snap["snapshot_id"]
+
+    # Scenario 4: incoming legitimate reschedule
+    reschedule = dict(incoming_auth, time="10:30")
+    merged3, _, _ = scraper._merge(merged2, [reschedule])
+    assert merged3[0]["time"] == "10:30" and merged3[0]["kickoff_time_known"] is True
+
+    # Scenario 5: reversed home/away live row does NOT merge or auto-swap onto canonical record
+    reversed_row = {
+        "id": "500lq-2030-05-10-9902",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "11:30",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "金州勇士",
+        "away": "洛杉矶湖人",
+        "jczq_no": "4306",
+    }
+    merged_rev, _, _ = scraper._merge([stored_fallback], [reversed_row])
+    # reversed row has no odds & same comp_no on same event? same_event uses comp_no if present, wait:
+    # same_event matches if competition_event_key matches; reversed home/away without competition number stays separate
+    rev_no_comp = {
+        "id": "500lq-2030-05-10-9903",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "11:30",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "金州勇士",
+        "away": "洛杉矶湖人",
+    }
+    merged_sep, added_sep, _ = scraper._merge([stored_fallback], [rev_no_comp])
+    assert added_sep == 1
+    assert merged_sep[0]["time"] == "00:00" and merged_sep[0]["kickoff_time_known"] is False
+
+    # Scenario 9: malformed incoming time rejected even with kickoff_time_known=True
+    malformed_inc = dict(incoming_auth, time="25:99", kickoff_time_known=True)
+    merged_bad, _, _ = scraper._merge([stored_fallback], [malformed_inc])
+    assert merged_bad[0]["time"] == "00:00" and merged_bad[0]["kickoff_time_known"] is False
+
+    # Scenario 10: conflicting known scheduled times for the same upcoming event in one batch -> fail closed
+    conflict_a = dict(incoming_auth, id="500lq-2030-05-10-9910", time="08:30", kickoff_time_known=True)
+    conflict_b = dict(incoming_auth, id="500lq-2030-05-10-9911", time="10:30", kickoff_time_known=True)
+    merged_conf, _, _ = scraper._merge([stored_fallback], [conflict_a, conflict_b])
+    assert merged_conf[0]["time"] == "00:00" and merged_conf[0]["kickoff_time_known"] is False
+
+
+def test_bs_53_nba_pregame_readiness_diagnostics(isolated_data_dir):
+    from datetime import datetime
+    import app as flask_app
+    from utils import prediction_snapshots
+
+    now = datetime(2030, 5, 10, 8, 0, tzinfo=daily_loader.BEIJING_TZ)
+    # 1) READY_WITH_PREDICTION_SNAPSHOT
+    m_ready = daily_loader.enrich_match({
+        "id": "500lq-2030-05-10-1",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "10:00",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "odds": {"win": 1.70, "loss": 2.10, "matchnum": "6301"},
+        "market_tracked": True,
+    })
+
+    # 2) ELIGIBLE_NOT_YET_MATERIALIZED
+    m_unmat = {
+        "id": "500lq-2030-05-10-2",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "11:00",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "波士顿凯尔特人",
+        "away": "迈阿密热火",
+        "odds": {"win": 1.50, "loss": 2.50, "matchnum": "6302"},
+        "market_tracked": True,
+    }
+    # 3) BLOCKED_UNKNOWN_KICKOFF_TIME
+    m_unknown = {
+        "id": "500j-2030-05-10-6303",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "00:00",
+        "kickoff_time_known": False,
+        "status": "upcoming",
+        "home": "丹佛掘金",
+        "away": "菲尼克斯太阳",
+        "odds": {"win": 1.80, "loss": 1.95, "matchnum": "6303"},
+        "market_tracked": True,
+    }
+    # 4) BLOCKED_PAST_KICKOFF (stored upcoming, time already passed)
+    m_past = {
+        "id": "500lq-2030-05-10-4",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "05:00",
+        "kickoff_time_known": True,
+        "status": "upcoming",
+        "home": "圣安东尼奥马刺",
+        "away": "达拉斯独行侠",
+        "odds": {"win": 2.00, "loss": 1.80, "matchnum": "6304"},
+        "market_tracked": True,
+    }
+    # 5) LIVE_NO_PREGAME_PREDICTION
+    m_live = {
+        "id": "500lq-2030-05-10-5",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "07:00",
+        "kickoff_time_known": True,
+        "status": "live",
+        "home": "纽约尼克斯",
+        "away": "芝加哥公牛",
+        "odds": {"win": 1.60, "loss": 2.25, "matchnum": "6305"},
+        "market_tracked": True,
+    }
+    # 6) FINISHED_NO_HISTORICAL_PREDICTION
+    m_fin = {
+        "id": "500j-2030-05-09-6306",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-09",
+        "time": "00:00",
+        "kickoff_time_known": False,
+        "status": "finished",
+        "score": {"home": 110, "away": 102},
+        "home": "休斯顿火箭",
+        "away": "俄克拉荷马城雷霆",
+        "market_tracked": True,
+    }
+    # 7) BLOCKED_INELIGIBLE_STATUS (explicit finished status without snapshot or unknown odd status)
+    m_inelig = {
+        "id": "500lq-2030-05-10-7",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-10",
+        "time": "12:00",
+        "kickoff_time_known": True,
+        "status": "cancelled",
+        "home": "亚特兰大老鹰",
+        "away": "夏洛特黄蜂",
+        "odds": {"win": 1.60, "loss": 2.25, "matchnum": "6307"},
+        "market_tracked": True,
+    }
+
+    nba_rows = [m_ready, m_unmat, m_unknown, m_past, m_live, m_fin, m_inelig]
+    data_dir = write_refresh_stores(str(isolated_data_dir), nba_rows)
+    snap, created = prediction_snapshots.capture_snapshot(m_ready, now=now)
+    assert created and snap is not None
+    before = store_hashes(data_dir)
+
+    readiness = flask_app.build_nba_pregame_readiness(nba_rows, now=now)
+    assert store_hashes(data_dir) == before
+    assert readiness["read_only"] is True
+    assert readiness["upcoming_total"] == 4
+    assert readiness["kickoff_time_known"] == 3
+    assert readiness["kickoff_time_unknown"] == 1
+    assert readiness["prediction_ready"] == 2
+    assert readiness["prediction_snapshot_present"] == 1
+    assert readiness["prediction_blocked_unknown_kickoff"] == 1
+    assert readiness["prediction_blocked_ineligible"] == 4
+
+    by_mid = {item["match_id"]: item for item in readiness["items"]}
+    assert by_mid["500lq-2030-05-10-1"]["status"] == "READY_WITH_PREDICTION_SNAPSHOT"
+    assert by_mid["500lq-2030-05-10-2"]["status"] == "ELIGIBLE_NOT_YET_MATERIALIZED"
+    assert by_mid["500j-2030-05-10-6303"]["status"] == "BLOCKED_UNKNOWN_KICKOFF_TIME"
+    assert by_mid["500lq-2030-05-10-4"]["status"] == "BLOCKED_PAST_KICKOFF"
+    assert by_mid["500lq-2030-05-10-5"]["status"] == "LIVE_NO_PREGAME_PREDICTION"
+    assert by_mid["500j-2030-05-09-6306"]["status"] == "FINISHED_NO_HISTORICAL_PREDICTION"
+    assert by_mid["500lq-2030-05-10-7"]["status"] == "BLOCKED_INELIGIBLE_STATUS"
+    assert by_mid["500lq-2030-05-10-1"]["kickoff_time_source"] == "500lq"
+    assert by_mid["500lq-2030-05-10-1"]["kickoff_time_raw_value"] == "10:00"
+    assert by_mid["500lq-2030-05-10-1"]["kickoff_time_timezone"] == "Asia/Shanghai"
+
+    resp = flask_app.app.test_client().get("/api/status")
+    assert resp.status_code == 200
+    assert "pregame_readiness" in resp.get_json()["source_health"]
+    assert store_hashes(data_dir) == before

@@ -54,6 +54,8 @@ ALLOWED_PATHS = frozenset((
     "utils/fetcher_500.py",
     "utils/scraper.py",
     "utils/daily_loader.py",
+    "utils/match_identity.py",
+    "utils/match_lifecycle.py",
     "app.py",
     "tests/test_basketball_sync_integrity.py",
     "frontend/src/features/DailyView/DailyView.tsx",
@@ -81,6 +83,9 @@ ALLOWED_PATHS = frozenset((
     "tests/test_refresh_ownership_and_evidence.py",
     # cross-process evidence and snapshot write ownership corrections
     "utils/prediction_snapshots.py",
+    "utils/odds_snapshots.py",
+    "tests/test_prediction_snapshots.py",
+    "tests/test_odds_snapshots.py",
     "tests/test_evidence_concurrency_and_consistency.py",
     # persisted evidence reconciliation against the current candidate dataset
     "tests/test_persisted_evidence_reconciliation.py",

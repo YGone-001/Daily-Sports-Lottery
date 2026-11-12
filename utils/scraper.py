@@ -311,6 +311,26 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
         str(m.get("id")): i for i, m in enumerate(result)
     }
 
+    # 预检单批次内部同一目标事件的权威开赛时间是否自相矛盾（顺序无关 fail-closed）
+    known_times_by_target: dict[str, set[tuple[str, str]]] = {}
+    for inc_idx, inc in enumerate(incoming):
+        if not isinstance(inc, dict) or not is_kickoff_time_known(inc):
+            continue
+        owner_pos = plan.owner_index_by_index[inc_idx]
+        target_key = (
+            str(existing[owner_pos].get("id") or "")
+            if owner_pos is not None
+            else (plan.canonical_id_by_index[inc_idx] or "")
+        )
+        if not target_key:
+            continue
+        known_times_by_target.setdefault(target_key, set()).add(
+            (str(inc.get("date") or "").strip(), str(inc.get("time") or "").strip())
+        )
+    conflicted_time_targets = {
+        k for k, vals in known_times_by_target.items() if len(vals) > 1
+    }
+
     for inc_idx, inc in enumerate(incoming):
         if not isinstance(inc, dict):
             raise CanonicalIdentityCollisionError(f"inc_index_{inc_idx}", "MALFORMED_INCOMING_RECORD", "Incoming record is not a dictionary")
@@ -361,8 +381,14 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
         if match_idx >= 0:
             old = result[match_idx]
             before = copy.deepcopy(old)
+            target_key = anchored_id or str(old.get("id") or "")
+            inc_for_update = inc
+            if target_key and target_key in conflicted_time_targets and is_kickoff_time_known(inc):
+                inc_for_update = dict(inc)
+                inc_for_update["time"] = "00:00"
+                inc_for_update["kickoff_time_known"] = False
             try:
-                resolve_match_update(old, inc)
+                resolve_match_update(old, inc_for_update)
             except MatchLifecycleConflict as exc:
                 h_e, a_e = exc.existing_score[0], exc.existing_score[1]
                 h_i, a_i = exc.incoming_score[0], exc.incoming_score[1]
@@ -385,6 +411,10 @@ def _merge(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], int,
             if not mid:
                 mid = f"{m.get('sport','f')}-{m.get('date')}-{len(result) + added}"
             m["id"] = mid
+            target_key = plan.canonical_id_by_index[inc_idx] or str(mid)
+            if target_key in conflicted_time_targets:
+                m["time"] = "00:00"
+                m["kickoff_time_known"] = False
 
             if mid in seen_ids:
                 raise CanonicalIdentityCollisionError(mid, "INCOMING_SHARED_ID", "New event shares existing ID")

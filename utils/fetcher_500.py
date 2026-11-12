@@ -45,6 +45,12 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+from utils.match_identity import (
+    SOURCE_KICKOFF_TIME_PRESENT,
+    classify_kickoff_time_value,
+    is_valid_calendar_date,
+)
+
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 REQUEST_HEADERS = {
@@ -399,10 +405,13 @@ def _parse_live(html: str, prefix: str, sport: str) -> tuple[list[dict], int]:
             errors += 1
             continue
         mdate = _resolve_date(tm.group(1), tm.group(2))
-        if not mdate:
+        if not mdate or not is_valid_calendar_date(mdate):
             errors += 1
             continue
-        hhmm = tm.group(3)
+        k_class, hhmm, kickoff_time_known = classify_kickoff_time_value(tm.group(3))
+        if k_class != SOURCE_KICKOFF_TIME_PRESENT or not kickoff_time_known:
+            errors += 1
+            continue
 
         score = _score_from_cells(cells)
         raw_status = str(attrs.get("status", "0"))
@@ -453,7 +462,7 @@ def _parse_live(html: str, prefix: str, sport: str) -> tuple[list[dict], int]:
                 "round": round_name,
                 "date": mdate,
                 "time": hhmm,
-                "kickoff_time_known": True,
+                "kickoff_time_known": kickoff_time_known,
                 "status": status,
                 "home": home,
                 "away": away,
@@ -628,10 +637,10 @@ def _parse_lq(html: str) -> tuple[list[dict], int]:
             continue
 
         mdate = str(_at(row, _LQ_DATE)).strip()
-        hhmm = str(_at(row, _LQ_TIME)).strip() or "00:00"
-        if not re.match(r"\d{4}-\d{2}-\d{2}", mdate):
+        if not is_valid_calendar_date(mdate):
             errors += 1
             continue
+        _, hhmm, kickoff_time_known = classify_kickoff_time_value(_at(row, _LQ_TIME))
 
         raw_status = str(_at(row, _LQ_STATUS))
         status = _LQ_STATUS_MAP.get(raw_status, "live")
@@ -671,7 +680,7 @@ def _parse_lq(html: str) -> tuple[list[dict], int]:
                 "round": str(_at(row, _LQ_ROUND)).strip(),
                 "date": mdate,
                 "time": hhmm,
-                "kickoff_time_known": True,
+                "kickoff_time_known": kickoff_time_known,
                 "status": status,
                 "home": home,
                 "away": away,
@@ -814,7 +823,10 @@ def _parse_wanchang(html: str) -> list[dict]:
         m = re.match(r"(\d{2})-(\d{2})\s+(\d{2}:\d{2})", dt_raw)
         if not m:
             continue
-        mm, dd, hhmm = m.group(1), m.group(2), m.group(3)
+        mm, dd, raw_hhmm = m.group(1), m.group(2), m.group(3)
+        k_class, hhmm, kickoff_time_known = classify_kickoff_time_value(raw_hhmm)
+        if k_class != SOURCE_KICKOFF_TIME_PRESENT or not kickoff_time_known:
+            continue
 
         mdate = f"{year}-{mm}-{dd}"
         try:
@@ -849,7 +861,7 @@ def _parse_wanchang(html: str) -> list[dict]:
                 "round": round_name,
                 "date": mdate,
                 "time": hhmm,
-                "kickoff_time_known": True,
+                "kickoff_time_known": kickoff_time_known,
                 "status": status,
                 "home": home,
                 "away": away,

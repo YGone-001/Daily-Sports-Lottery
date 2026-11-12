@@ -39,7 +39,7 @@ from datetime import datetime
 import config
 from utils.atomic_json import atomic_write_json, load_json_file
 from utils.concurrency import SidecarLockBusy, acquire_sidecar_lock
-from utils.daily_loader import add_time_status, get_beijing_now, get_match_datetime
+from utils.daily_loader import BEIJING_TZ, add_time_status, get_beijing_now, get_match_datetime
 
 # 赛前快照的「生成槽位」常量。
 # 当前基线规则为「每场每模型版本一条 canonical 赛前快照」，故槽位固定为 prematch；
@@ -293,13 +293,23 @@ def _create_or_get(
 
     snapshot_id = snapshot_id_for(match_id, model_version)
 
-    # 时序门禁：以比赛当前状态为准（upcoming 才允许新建）
-    status = add_time_status(dict(match), now).get("status")
-    if status != "upcoming":
+    # 显式终态/进行中门禁：即便时间尚未到达开赛点，live / finished / 非 upcoming 一律拒绝
+    raw_status = str(match.get("status") or "").strip().lower()
+    if raw_status in ("live", "finished") or (raw_status and raw_status != "upcoming"):
         return get_snapshot(snapshot_id), False
 
-    # 权威开赛时间门禁：开赛时间未知时禁止新建快照（历史已有快照仍可读）
-    if get_match_datetime(match) is None:
+    # 权威开赛时间门禁：开赛时间未知或格式非法时禁止新建快照（历史已有快照仍可读）
+    kickoff_dt = get_match_datetime(match)
+    if kickoff_dt is None:
+        return get_snapshot(snapshot_id), False
+
+    now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
+    if now_bj >= kickoff_dt:
+        return get_snapshot(snapshot_id), False
+
+    # 时序门禁：以比赛当前状态为准（upcoming 才允许新建）
+    status = add_time_status(dict(match), now_bj).get("status")
+    if status != "upcoming":
         return get_snapshot(snapshot_id), False
 
     if prediction is None:
