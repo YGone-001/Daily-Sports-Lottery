@@ -245,8 +245,11 @@ def record_odds_snapshot(
     if not prov_ok or prov_status == PROVENANCE_CONFLICT:
         return None
 
-    now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
     actual_decision_now = get_beijing_now().astimezone(BEIJING_TZ)
+    if now is not None:
+        caller_now_bj = now.astimezone(BEIJING_TZ)
+    else:
+        caller_now_bj = actual_decision_now
 
     # 显式终态/进行中门禁：即便尚未到开赛时间或时间未知，live / finished / 非 upcoming 一律拒绝
     raw_status = str(match.get("status") or "").strip().lower()
@@ -261,7 +264,7 @@ def record_odds_snapshot(
     if kickoff_dt is not None:
         if actual_decision_now >= kickoff_dt:
             return None
-        if now_bj >= kickoff_dt:
+        if now is not None and caller_now_bj >= kickoff_dt:
             return None
     else:
         # 开赛时间未知时：
@@ -272,16 +275,22 @@ def record_odds_snapshot(
             return None
         match_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         if match.get("sport") == "basketball":
-            if actual_decision_now.date() >= match_date or now_bj.date() >= match_date:
+            if actual_decision_now.date() >= match_date or (now is not None and caller_now_bj.date() >= match_date):
                 return None
-        elif actual_decision_now.date() > match_date or now_bj.date() > match_date:
+        elif actual_decision_now.date() > match_date or (now is not None and caller_now_bj.date() > match_date):
             return None
 
-    status = add_time_status(dict(match), now_bj).get("status")
+    status = add_time_status(dict(match), actual_decision_now).get("status")
     if status != "upcoming":
         return None
+    if now is not None:
+        caller_status = add_time_status(dict(match), caller_now_bj).get("status")
+        if caller_status != "upcoming":
+            return None
 
-    snapshot = build_snapshot(match, captured_at=now_bj, source=source)
+    # 真实证据时间戳 (captured_at) 必须源于执行物理/测试捕获的时钟，严禁被调用方传入的 now 篡改/回拨
+    actual_observation_time = get_beijing_now().astimezone(BEIJING_TZ)
+    snapshot = build_snapshot(match, captured_at=actual_observation_time, source=source)
 
     with _LOCK:
         # 门禁：锁获取后终态时间校验（防止排队等锁期间跨越开赛时间，无论 now 是否显式提供）

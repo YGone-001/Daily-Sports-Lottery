@@ -399,118 +399,157 @@ def test_schedule_fetch_explicit_enable_and_mock_injection(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4. Workstream D: NBA 赔率快照真实历史与查询语义核对
+# 4. Workstream D: 赔率快照查询语义与历史查询契约（确定性合成测试）
 # ---------------------------------------------------------------------------
 
-REAL_ODDS = os.path.join(config.DATA_DIR, "odds_snapshots.json")
-REAL_CANONICAL = os.path.join(config.DATA_DIR, "daily_matches.json")
+
+def test_odds_history_query_semantics_synthetic(tmp_path, monkeypatch):
+    """
+    Workstream D / Phase 3-Q-R: 使用隔离合成数据集验证赔率快照查询语义。
+    - 证明 get_odds_history_for_match(match_id) 正确返回按 captured_at 排序的历史列表；
+    - 证明 latest_odds_snapshot(match_id) 正确返回最新一条记录；
+    - 证明 get_odds_snapshot(key) 期望 snapshot_id，若误传 match_id 返回 None；
+    - 证明直接对 store['snapshots']（字典类型）做遍历时获取的是键而非值，
+      解释了此前 Phase 3-P 测量脚本报告 None 的原因。
+    """
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    odds_snapshots._SNAPSHOT_STORE_CACHE = None
+
+    mid = "test-nba-2030-05-15-4306"
+    snap1 = {
+        "snapshot_id": "snap-id-001",
+        "match_id": mid,
+        "captured_at": "2030-05-14T10:00:00+08:00",
+        "odds_fingerprint": "fp001",
+        "odds": {"home_win": 1.5, "away_win": 2.5},
+    }
+    snap2 = {
+        "snapshot_id": "snap-id-002",
+        "match_id": mid,
+        "captured_at": "2030-05-14T15:00:00+08:00",
+        "odds_fingerprint": "fp002",
+        "odds": {"home_win": 1.6, "away_win": 2.4},
+    }
+    snap_other = {
+        "snapshot_id": "snap-id-003",
+        "match_id": "test-nba-other",
+        "captured_at": "2030-05-14T12:00:00+08:00",
+        "odds_fingerprint": "fp003",
+        "odds": {"home_win": 1.8, "away_win": 2.0},
+    }
+
+    initial_store = {
+        "schema_version": "1.0.0",
+        "snapshots": {
+            "snap-id-001": snap1,
+            "snap-id-002": snap2,
+            "snap-id-003": snap_other,
+        },
+    }
+    odds_snapshots._save_store(initial_store)
+
+    # 1. 查询该比赛历史
+    history = odds_snapshots.get_odds_history_for_match(mid)
+    assert len(history) == 2
+    assert history[0]["snapshot_id"] == "snap-id-001"
+    assert history[1]["snapshot_id"] == "snap-id-002"
+
+    # 2. 查询最新一条
+    latest = odds_snapshots.latest_odds_snapshot(mid)
+    assert latest is not None
+    assert latest["snapshot_id"] == "snap-id-002"
+
+    # 3. get_odds_snapshot 区分 snapshot_id 与 match_id
+    assert odds_snapshots.get_odds_snapshot("snap-id-001") is not None
+    assert odds_snapshots.get_odds_snapshot(mid) is None
+
+    # 4. 复现 Phase 3-P 的遍历缺陷：若误用 for s in store['snapshots'] (迭代出的是 str)
+    raw_store = odds_snapshots._load_store()
+    wrongly_filtered = [s for s in raw_store.get("snapshots", []) if isinstance(s, dict)]
+    assert len(wrongly_filtered) == 0  # 证明由于 s 是 str，全部被过滤为 0
 
 
-@pytest.mark.skipif(
-    not os.path.isfile(REAL_ODDS),
-    reason="no local real dataset (git-ignored); synthetic tests only in CI",
-)
-def test_odds_history_query_semantics_and_four_target_reconciliation():
+# ---------------------------------------------------------------------------
+# 5. Workstream E: NBA 时序库存严谨分类算法（确定性合成测试）
+# ---------------------------------------------------------------------------
+
+
+def test_nba_temporal_inventory_partitioning_synthetic(tmp_path, monkeypatch):
     """
-    Workstream D: 核对目标四场比赛在真实 odds_snapshots.json 中的存在性。
-    - 证明 get_odds_history_for_match(match_id) 正确返回历史记录；
-    - 证明之前 Phase 3-P 报告 None 是由于字典键遍历误用而非数据丢失；
-    - 验证 4306~4309 每场均存在 1 条合法且不可变的赛前赔率观察。
+    Workstream E / Phase 3-Q-R: 使用隔离合成比赛验证时序库存五分类算法。
+    - 绝不依赖 CI 环境中不存在的私有真实文件；
+    - 验证 STORED_LIVE / STORED_FINISHED / STORED_UPCOMING 严格互斥；
+    - 验证 STORED_UPCOMING 五分类在任何时钟下的完备性与无缝性。
     """
-    target_ids = [
-        "500j-2026-11-13-4306",
-        "500j-2026-11-13-4307",
-        "500j-2026-11-13-4308",
-        "500j-2026-11-13-4309",
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+
+    fixed_clock = datetime(2030, 5, 15, 12, 0, tzinfo=BEIJING_TZ)
+    today = fixed_clock.date()
+
+    synthetic_matches = [
+        # live
+        {"id": "m-live-1", "sport": "basketball", "league": "NBA", "status": "live", "date": "2030-05-15", "time": "11:00"},
+        # finished
+        {"id": "m-fin-1", "sport": "basketball", "league": "NBA", "status": "finished", "date": "2030-05-15", "time": "09:00"},
+        # upcoming - verified future kickoff (14:00 > 12:00)
+        {"id": "m-up-v-future", "sport": "basketball", "league": "NBA", "status": "upcoming", "date": "2030-05-15", "time": "14:00", "kickoff_time_known": True},
+        # upcoming - verified past kickoff (10:00 <= 12:00)
+        {"id": "m-up-v-past", "sport": "basketball", "league": "NBA", "status": "upcoming", "date": "2030-05-15", "time": "10:00", "kickoff_time_known": True},
+        # upcoming - unknown kickoff, future date (2030-05-16 > 2030-05-15)
+        {"id": "m-up-u-future", "sport": "basketball", "league": "NBA", "status": "upcoming", "date": "2030-05-16", "time": "00:00", "kickoff_time_known": False},
+        # upcoming - unknown kickoff, current date (2030-05-15 == 2030-05-15)
+        {"id": "m-up-u-curr", "sport": "basketball", "league": "NBA", "status": "upcoming", "date": "2030-05-15", "time": "00:00", "kickoff_time_known": False},
+        # upcoming - unknown kickoff, past date (2030-05-14 < 2030-05-15)
+        {"id": "m-up-u-past", "sport": "basketball", "league": "NBA", "status": "upcoming", "date": "2030-05-14", "time": "00:00", "kickoff_time_known": False},
     ]
 
-    for mid in target_ids:
-        # 使用正确的按比赛 ID 查询历史 API
-        history = odds_snapshots.get_odds_history_for_match(mid)
-        assert len(history) == 1, f"Fixture {mid} must have exactly 1 odds snapshot"
-        latest = odds_snapshots.latest_odds_snapshot(mid)
-        assert latest is not None
-        assert latest["match_id"] == mid
-        assert latest["captured_at"] == "2026-11-12T15:05:45.652555+08:00"
-        assert latest["odds_fingerprint"] is not None
+    with override_beijing_now(fixed_clock):
+        now = get_beijing_now()
+        today_eval = now.date()
+        assert today_eval == today
 
-        # 证明如果把 match_id 当作 snapshot_id 传入 get_odds_snapshot，会错误地返回 None
-        wrong_query_result = odds_snapshots.get_odds_snapshot(mid)
-        assert wrong_query_result is None, "get_odds_snapshot expects snapshot_id, not match_id"
+        nba = [m for m in synthetic_matches if m.get("sport") == "basketball" and is_nba_league(m.get("league"))]
+        assert len(nba) == 7
 
+        live_count = sum(1 for m in nba if (m.get("status") or "").strip().lower() == "live")
+        finished_count = sum(1 for m in nba if (m.get("status") or "").strip().lower() == "finished")
+        upcoming = [m for m in nba if (m.get("status") or "upcoming") == "upcoming"]
 
-# ---------------------------------------------------------------------------
-# 5. Workstream E: NBA 时序库存严谨语义对账
-# ---------------------------------------------------------------------------
+        assert live_count == 1
+        assert finished_count == 1
+        assert len(upcoming) == 5
+        assert live_count + finished_count + len(upcoming) == len(nba)
 
+        v_future = 0
+        v_past = 0
+        u_future_date = 0
+        u_current_date = 0
+        u_past_date = 0
 
-@pytest.mark.skipif(
-    not os.path.isfile(REAL_CANONICAL),
-    reason="no local real dataset (git-ignored); synthetic tests only in CI",
-)
-def test_nba_temporal_inventory_exact_reconciliation():
-    """
-    Workstream E: 24 场已存储待赛 NBA 赛事的五分类无缝对账。
-    - STORED_UPCOMING: 24
-    - VERIFIED_FUTURE_KICKOFF: 0
-    - VERIFIED_PAST_KICKOFF: 2 (2026-10-28 11:00 与 2026-11-11 12:00)
-    - UNKNOWN_KICKOFF_FUTURE_DATE: 0
-    - UNKNOWN_KICKOFF_CURRENT_DATE: 4 (2026-11-13 的 4306~4309)
-    - UNKNOWN_KICKOFF_PAST_DATE: 18 (历史 00:00 待赛场次)
-    加上 14 场 live 与 15 场 finished，严格等于 53 场 NBA Canonical 总数。
-    """
-    import json
-    dm_path = os.path.join(config.DATA_DIR, "daily_matches.json")
-    with open(dm_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        for m in upcoming:
+            k_known = is_kickoff_time_known(m)
+            k_dt = get_match_datetime(m)
+            m_date = datetime.strptime(m["date"], "%Y-%m-%d").date()
 
-    matches = data.get("matches", [])
-    nba = [m for m in matches if m.get("sport") == "basketball" and is_nba_league(m.get("league"))]
-    assert len(nba) == 53
-
-    live_count = sum(1 for m in nba if (m.get("status") or "").strip().lower() == "live")
-    finished_count = sum(1 for m in nba if (m.get("status") or "").strip().lower() == "finished")
-    upcoming = [m for m in nba if (m.get("status") or "upcoming") == "upcoming"]
-
-    assert live_count == 14
-    assert finished_count == 15
-    assert len(upcoming) == 24
-    assert live_count + finished_count + len(upcoming) == 53
-
-    # 对账 24 场 upcoming 的时序五分类
-    now = get_beijing_now()
-    today = now.date()
-
-    verified_future = 0
-    verified_past = 0
-    unknown_future_date = 0
-    unknown_current_date = 0
-    unknown_past_date = 0
-
-    for m in upcoming:
-        k_known = is_kickoff_time_known(m)
-        k_dt = get_match_datetime(m)
-        m_date = datetime.strptime(m["date"], "%Y-%m-%d").date()
-
-        if k_known and k_dt is not None:
-            if k_dt > now:
-                verified_future += 1
+            if k_known and k_dt is not None:
+                if k_dt > now:
+                    v_future += 1
+                else:
+                    v_past += 1
             else:
-                verified_past += 1
-        else:
-            if m_date > today:
-                unknown_future_date += 1
-            elif m_date == today:
-                unknown_current_date += 1
-            else:
-                unknown_past_date += 1
+                if m_date > today_eval:
+                    u_future_date += 1
+                elif m_date == today_eval:
+                    u_current_date += 1
+                else:
+                    u_past_date += 1
 
-    assert verified_future == 0
-    assert verified_past == 2
-    assert unknown_future_date == 0
-    assert unknown_current_date == 4
-    assert unknown_past_date == 18
-    assert verified_future + verified_past + unknown_future_date + unknown_current_date + unknown_past_date == 24
+        assert v_future == 1
+        assert v_past == 1
+        assert u_future_date == 1
+        assert u_current_date == 1
+        assert u_past_date == 1
+        assert v_future + v_past + u_future_date + u_current_date + u_past_date == len(upcoming)
 
 
 # ---------------------------------------------------------------------------
@@ -578,3 +617,123 @@ def test_in_memory_cache_contract_and_age_preservation(monkeypatch):
     assert "observation_age_seconds" in diag2
     # 绝不为缓存行伪造新的 observed_at
     assert rows2[0]["observed_at"] == orig_observed_at
+
+
+# ---------------------------------------------------------------------------
+# 7. Workstream C: 快照证据时间戳真实性与防回拨/伪造测试
+# ---------------------------------------------------------------------------
+
+
+def test_prediction_generated_at_records_truthful_actual_clock(tmp_path, monkeypatch):
+    """
+    Workstream C / Phase 3-Q-R: 验证新生成的预测快照 generated_at 必须忠实记录
+    实际物理/测试捕获时钟，严禁被调用方传入的过去或未来逻辑时间 now 伪造或回拨。
+    """
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    prediction_snapshots._SNAPSHOT_STORE_CACHE = None
+
+    actual_clock = datetime(2030, 5, 15, 9, 55, tzinfo=BEIJING_TZ)
+    past_caller_now = datetime(2030, 5, 15, 9, 0, tzinfo=BEIJING_TZ)
+    future_caller_now = datetime(2030, 5, 15, 9, 58, tzinfo=BEIJING_TZ)
+
+    match1 = {
+        "id": "500lq-2030-05-15-truthful-pred-1",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-15",
+        "time": "10:00",
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "status": "upcoming",
+        "kickoff_time_known": True,
+        "odds": {"home_win": 1.75, "away_win": 2.10},
+    }
+
+    match2 = {
+        "id": "500lq-2030-05-15-truthful-pred-2",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-15",
+        "time": "10:00",
+        "home": "波士顿凯尔特人",
+        "away": "迈阿密热火",
+        "status": "upcoming",
+        "kickoff_time_known": True,
+        "odds": {"home_win": 1.50, "away_win": 2.60},
+    }
+
+    with override_beijing_now(actual_clock):
+        # 1. 显式传入过去逻辑时间
+        res1 = prediction_snapshots.capture_snapshot(dict(match1), now=past_caller_now)
+        snap1, created1 = res1
+        assert created1 is True
+        assert snap1 is not None
+        assert snap1["generated_at"] == actual_clock.isoformat()
+        assert snap1["generated_at"] != past_caller_now.isoformat()
+
+        # 2. 显式传入未来逻辑时间
+        res2 = prediction_snapshots.capture_snapshot(dict(match2), now=future_caller_now)
+        snap2, created2 = res2
+        assert created2 is True
+        assert snap2 is not None
+        assert snap2["generated_at"] == actual_clock.isoformat()
+        assert snap2["generated_at"] != future_caller_now.isoformat()
+
+
+def test_odds_captured_at_records_truthful_actual_clock(tmp_path, monkeypatch):
+    """
+    Workstream C / Phase 3-Q-R: 验证新生成的赔率快照 captured_at 必须忠实记录
+    实际物理/测试捕获时钟，严禁被调用方传入的 past/future now 伪造或回拨。
+    同时验证重复观察幂等返回 None。
+    """
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    odds_snapshots._SNAPSHOT_STORE_CACHE = None
+
+    actual_clock = datetime(2030, 5, 15, 9, 55, tzinfo=BEIJING_TZ)
+    past_caller_now = datetime(2030, 5, 15, 9, 0, tzinfo=BEIJING_TZ)
+    future_caller_now = datetime(2030, 5, 15, 9, 58, tzinfo=BEIJING_TZ)
+
+    match1 = {
+        "id": "500lq-2030-05-15-truthful-odds-1",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-15",
+        "time": "10:00",
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "status": "upcoming",
+        "kickoff_time_known": True,
+        "odds": {"home_win": 1.75, "away_win": 2.10},
+    }
+
+    match2 = {
+        "id": "500lq-2030-05-15-truthful-odds-2",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": "2030-05-15",
+        "time": "10:00",
+        "home": "波士顿凯尔特人",
+        "away": "迈阿密热火",
+        "status": "upcoming",
+        "kickoff_time_known": True,
+        "odds": {"home_win": 1.50, "away_win": 2.60},
+    }
+
+    with override_beijing_now(actual_clock):
+        # 1. 显式传入过去逻辑时间
+        res1 = odds_snapshots.record_odds_snapshot(dict(match1), now=past_caller_now)
+        assert res1 is not None
+        assert isinstance(res1, dict)
+        assert res1["captured_at"] == actual_clock.isoformat()
+        assert res1["captured_at"] != past_caller_now.isoformat()
+
+        # 重复记录（未变更赔率）幂等返回 None
+        repeat = odds_snapshots.record_odds_snapshot(dict(match1), now=past_caller_now)
+        assert repeat is None
+
+        # 2. 显式传入未来逻辑时间
+        res2 = odds_snapshots.record_odds_snapshot(dict(match2), now=future_caller_now)
+        assert res2 is not None
+        assert isinstance(res2, dict)
+        assert res2["captured_at"] == actual_clock.isoformat()
+        assert res2["captured_at"] != future_caller_now.isoformat()

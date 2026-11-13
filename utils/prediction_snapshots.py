@@ -352,7 +352,7 @@ def _create_or_get(
     if not prov_ok or prov_status == PROVENANCE_CONFLICT:
         return CaptureResult(None, False, PROVENANCE_CONFLICT)
 
-    # 5. 捕获决策时间校验（Workstream B / Phase 3-Q Workstream A）：
+    # 5. 捕获决策时间校验（Workstream B / Phase 3-Q Workstream A / Phase 3-Q-R Workstream C）：
     # 物理/测试时钟 (actual_decision_now) 与调用方显式传入的逻辑时间 (now) 均受开赛前约束
     actual_decision_now = get_beijing_now().astimezone(BEIJING_TZ)
     if actual_decision_now >= kickoff_dt:
@@ -362,23 +362,32 @@ def _create_or_get(
         caller_now = now.astimezone(BEIJING_TZ)
         if caller_now >= kickoff_dt:
             return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
-        decision_now = caller_now
+        caller_logical_now = caller_now
     else:
-        decision_now = actual_decision_now
+        caller_logical_now = actual_decision_now
 
     if refresh_started_at is not None:
         ref_bj = refresh_started_at.astimezone(BEIJING_TZ)
         if ref_bj >= kickoff_dt:
             return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
 
-    # 6. 时序门禁：以比赛在 decision_now 时刻的状态为准（upcoming 才允许新建）
-    status = add_time_status(dict(match), decision_now).get("status")
+    # 6. 时序门禁：以比赛在物理/测试时钟及逻辑时间下的状态为准（upcoming 才允许新建）
+    status = add_time_status(dict(match), actual_decision_now).get("status")
     if status == "live":
         return CaptureResult(None, False, SOURCE_ALREADY_LIVE)
     if status == "finished":
         return CaptureResult(None, False, SOURCE_ALREADY_FINISHED)
     if status != "upcoming":
         return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
+
+    if now is not None:
+        caller_status = add_time_status(dict(match), caller_logical_now).get("status")
+        if caller_status == "live":
+            return CaptureResult(None, False, SOURCE_ALREADY_LIVE)
+        if caller_status == "finished":
+            return CaptureResult(None, False, SOURCE_ALREADY_FINISHED)
+        if caller_status != "upcoming":
+            return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
 
     # 7. 模型评估阶段
     if prediction is None:
@@ -393,12 +402,13 @@ def _create_or_get(
         )
 
     # 8. 门禁：模型计算完成时刻二次校验（防止耗时模型计算跨越开赛时间）
+    # 真实证据时间戳 (generated_at) 必须源于模型评估完成时的真实捕获时钟，严禁被调用方传入的 now 篡改/回拨
     model_finished_now = get_beijing_now().astimezone(BEIJING_TZ)
     if model_finished_now >= kickoff_dt:
         return CaptureResult(None, False, KICKOFF_REACHED_DURING_MODEL_EVALUATION)
 
     snapshot = build_snapshot(
-        match, prediction, model_version=model_version, generated_at=decision_now
+        match, prediction, model_version=model_version, generated_at=model_finished_now
     )
 
     with _LOCK:

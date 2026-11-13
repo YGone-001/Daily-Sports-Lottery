@@ -1028,6 +1028,26 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   - `nba_schedule` 的赛程缓存属于纯粹的 Python 进程内全局字典（`_SCHEDULE_CACHE`），生命周期受限于进程运行时，带有 300 秒 TTL；
   - 严禁将其描述为持久化磁盘缓存；缓存命中保留原始观测时间戳 `observed_at`，仅暴露 `observation_age_seconds`。
 
+### 4.32 运行时证据完整性、快照时间戳保真与时序状态分离
+
+- **快照证据时间戳保真（Snapshot Timestamp Truthfulness）**：
+  - 新创建快照的真实物理证据时间戳（预测快照的 `generated_at`、赔率快照的 `captured_at`）必须**唯一且权威地源于执行物理/测试捕获的时钟**（`get_beijing_now().astimezone(BEIJING_TZ)`），**严禁**被调用方显式传入的逻辑时间 `now` 所覆盖、伪造或回拨；
+  - 严格区分五个时间维度：`caller_logical_now`（调用方传入的逻辑业务时戳）、`actual_model_completion_time`（模型计算完成物理时间）、`actual_odds_observation_time`（赔率获取物理时间）、`actual_snapshot_precommit_time`（快照持久化前物理时间）与 `refresh_started_at`（批次刷新启动时间）；
+  - 调用方传入的 `now` 仅用作前置合法性与业务时序约束（`caller_now < kickoff_dt`），绝不得将调用方逻辑时间写入快照作为证据生成时间；
+  - 离线单元测试必须通过 `@contextmanager` 机制 `with override_beijing_now(...)` 注入受控的确定性物理时钟，严禁通过传参 `now=...` 试图伪造底层物理生成时间。
+- **快照返回契约与幂等去重语义（Return Contracts & Idempotency）**：
+  - `CaptureResult`：严格为 2 元素元组 `(snapshot, created)`，访问 `result[2]` 确定性抛出 `IndexError`；
+  - `record_odds_snapshot`：返回类型为 `dict | None`。当观察到市场赔率未发生变动（连续重复观察或幂等重放）时，必须**返回 None**（而非既有记录字典），仅当本次调用切实新增并落盘了新快照时才返回快照字典。
+- **生命周期状态的三重正交语义（Three-Way Separation of Lifecycle Status）**：
+  - `STORED_STATUS`（落盘事实状态）：数据库/文件中静态存储的原始字段（`stored_live`、`stored_finished`、`stored_upcoming`），未经最新外部数据源确认前，**严禁**直接等同于现实物理世界的比赛进行状态；
+  - `DERIVED_TEMPORAL_STATUS`（时序推导状态）：依据物理时钟与开赛时间纯函数计算的显示状态（如开赛已过 2 小时推导可能进入 live/finished），该状态仅供展示，**绝不得用于触发结算**或改写存储；
+  - `SOURCE_CONFIRMED_FINAL_STATUS`（源确认终态）：由外部数据提供商明确给出比分、结算标志或完赛标志的状态，只有此类状态才能执行结算与模型评估。
+- **CI 与真实运行时数据的确定性解耦（CI Isolation from Private Runtime Datasets）**：
+  - 所有跟踪于 Git 的自动化测试（包括 `tests/test_snapshot_contract_corrections.py`）**严禁直接断言依赖未受跟踪的本地真实私有文件**（如 `data/daily_matches.json`、`data/odds_snapshots.json`）及其固定条目数（如固定的 53 场、24 场待赛或特定日期）；
+  - 核心逻辑、算法和契约必须在基于 `tmp_path` 的确定性合成数据上进行全面验证；
+  - 针对真实生产数据的诊断与审计必须隔离在本地只读脚本中（如 `reports/` 下），由操作者按需显式调用，不得作为 CI 门禁一部分；
+  - 真实物理文件的 SHA-256 哈希值在报告中必须完整真实记录，严禁截断后凭空补全。
+
 ---
 
 ## 五、本地报告与交付顺序
