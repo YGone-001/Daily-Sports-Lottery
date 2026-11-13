@@ -769,6 +769,36 @@ def _refresh_impl(verbose: bool = True) -> dict:
         expected_total=len(existing) + added,
     )
 
+    # 7c. NBA 外部权威赛程时间补全（严格 time-only：不新增赛事、不改身份与赔率）
+    from utils.fetcher_500 import is_nba_league
+    from utils.nba_schedule import apply_nba_schedule_time_enrichment, fetch_nba_schedule_observations
+
+    upcoming_nba_dates = sorted({
+        str(m.get("date") or "").strip()
+        for m in merged
+        if isinstance(m, dict)
+        and m.get("sport") == "basketball"
+        and is_nba_league(m.get("league"))
+        and (m.get("status") or "upcoming") == "upcoming"
+        and m.get("date")
+    })
+    if upcoming_nba_dates:
+        try:
+            sched_obs, sched_diag = fetch_nba_schedule_observations(upcoming_nba_dates, now=now)
+            sched_res = apply_nba_schedule_time_enrichment(
+                merged,
+                sched_obs,
+                now=now,
+                schedule_available=(sched_diag.get("status") != "unavailable"),
+            )
+            result["sources"]["nba_schedule"] = sched_diag.get("rows", 0)
+            result["nba_schedule_enriched"] = sched_res.get("enriched", 0)
+            result["nba_schedule_rescheduled"] = sched_res.get("rescheduled", 0)
+            if sched_res.get("enriched", 0) or sched_res.get("rescheduled", 0):
+                updated += sched_res.get("enriched", 0) + sched_res.get("rescheduled", 0)
+        except Exception as exc:  # noqa: BLE001
+            result["sources"]["nba_schedule"] = f"error: {exc}"
+
     # 8. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准）
     odds_snapshots_added = _capture_odds_history(merged, now=now)
 

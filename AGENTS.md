@@ -946,6 +946,42 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.29 NBA 赛程时间补全、严格一对一绑定与有效状态诊断
+
+- **合规赛程数据源与接入约束**：`cdn.nba.com` / `data.nba.com` / `stats.nba.com`
+  对 Python 客户端分别返回 HTTP `403` 或读超时，**不得**构造旁路请求头强行抓取；
+  线上可达且零鉴权的公开结构化赛程源为 `site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard`，
+  同时 `utils/nba_schedule.py` 兼容解析 `scheduleLeagueV2` JSON 契约。
+- **纯时间补全语义与标识符隔离**：`utils/nba_schedule.py` 仅作既有 Canonical NBA 记录的
+  `time-only` 开赛时间补全，**不得**新增市场候选、**不得**改动 `same_event()` /
+  `normalize_competition_number()` / `competition_event_key()` / `team_event_key()`，
+  且严禁把 NBA / ESPN 赛事 ID 写入 `jczq_no` 或 Canonical ID。
+- **显式 30 支 NBA 球队与联赛隔离**：通过 `NBA_FRANCHISE_MAPPINGS` 精确映射 30 支球队
+  （禁止模糊匹配与自动互换主客），显式隔离 WNBA / 非 NBA 联赛；任一侧未映射、
+  主客反向（`HOME_AWAY_ORIENTATION_CONFLICT`）、多候选冲突（`MULTIPLE_OFFICIAL_CANDIDATES` /
+  `MULTIPLE_CANONICAL_CANDIDATES`）、日期错配（`BEIJING_EVENT_DATE_MISMATCH`）或
+  已开赛/非排期状态一律 fail closed。
+- **UTC 转北京时间契约**：`convert_utc_to_beijing()` 严格要求显式 UTC / 时区偏移，
+  使用带时区 `datetime.astimezone(BEIJING_TZ)` 转换；无时区偏移、非法日历日期、
+  缺失字段一律拒绝（绝不按假定美国本地时区推算）。
+- **开赛时间真实溯源与防洗白**：`build_kickoff_time_provenance()` 明确分离
+  `canonical_origin_source` 与 `actual_kickoff_time_source` / `kickoff_source_event_id` /
+  `kickoff_source_observed_at` / `kickoff_source_scheduled_start_utc` /
+  `kickoff_time_beijing` / `kickoff_verification_status`；无证据历史记录报告
+  `NOT_ESTABLISHED`，禁止把非直连 NBA CDN 来源或篡改时间戳标记为 `OFFICIAL_NBA_VERIFIED`。
+- **更新范围与不可变历史**：`apply_nba_schedule_time_enrichment()` 仅更新 `time`、
+  `kickoff_time_known` 与 `kickoff_provenance`，保持主客、赔率、比分、结算及既有
+  不可变预测/赔率快照字节不变；`scraper._refresh_impl()` 在现有 writer 锁内执行该补全。
+- **存储状态 vs 有效观测状态**：`app.build_nba_pregame_readiness()` 同时暴露
+  `stored_status`、`effective_status`（区分 `FUTURE_UPCOMING_VERIFIED_KICKOFF`、
+  `UPCOMING_UNKNOWN_KICKOFF`、`PAST_KICKOFF_STORED_UPCOMING`、`HISTORICAL_STATUS_STALE`、
+  `LIVE_SOURCE_CONFIRMED`、`FINISHED_SOURCE_CONFIRMED`、`STATUS_NOT_ESTABLISHED`）、
+  `effective_status_reason` 与 `prediction_capture_eligible_now`，严禁仅因时间流逝自动推断完赛。
+- **真实数据写边界**：未获明确单独操作授权时，禁止向真实 `data/*.json` 与外部人工评审存储写入；
+  隔离预演结论不得冒充真实运行态写入结果。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

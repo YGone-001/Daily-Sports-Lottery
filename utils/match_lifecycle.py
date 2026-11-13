@@ -120,9 +120,19 @@ def resolve_match_update(existing: dict, incoming: dict) -> dict:
     # 1. 开赛时间更新（仅在非反向且 incoming 时间权威已知时升级；绝不用未知覆盖已知）
     if not reversed_orientation and is_kickoff_time_known(incoming):
         inc_time = str(incoming.get("time") or "").strip()
-        if inc_time != existing.get("time") or not is_kickoff_time_known(existing):
+        existing_prov = existing.get("kickoff_provenance")
+        has_verified_schedule_prov = isinstance(existing_prov, dict) and existing_prov.get("actual_kickoff_time_source") in (
+            "nba_official_schedule",
+            "espn_nba_scoreboard",
+        )
+        if has_verified_schedule_prov and existing.get("time") != inc_time:
+            # 既有权威外部赛程时间与常规实时页时间不一致时，保持现有已核验时间，不静默覆盖
+            pass
+        elif inc_time != existing.get("time") or not is_kickoff_time_known(existing):
             existing["time"] = inc_time
             existing["kickoff_time_known"] = True
+            if not has_verified_schedule_prov:
+                existing.pop("kickoff_provenance", None)
 
     # 2. 比分更新
     #    不仅要看 Python 值相等，还要看「有效性质量」：

@@ -716,11 +716,13 @@ def build_nba_coverage(stored_nba, last_refresh_at=None) -> dict:
 
 def build_nba_pregame_readiness(nba_matches, now=None) -> dict:
     """
-    严格只读：统计并分类 NBA 赛前预测快照就绪状态，不创建快照、不写任何存储。
+    严格只读：统计并分类 NBA 赛前预测快照就绪状态，显式区分存储态 status 与
+    观测时刻生效状态（``effective_status``），绝不凭时间流逝自发推断完赛或写存储。
     """
+    from datetime import timedelta
     from utils import prediction_snapshots
     from utils.daily_loader import BEIJING_TZ, get_beijing_now, get_match_datetime
-    from utils.match_identity import build_kickoff_time_provenance
+    from utils.match_identity import build_kickoff_time_provenance, is_valid_calendar_date
 
     now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
     matches = [m for m in (nba_matches or ()) if isinstance(m, dict)]
@@ -741,12 +743,25 @@ def build_nba_pregame_readiness(nba_matches, now=None) -> dict:
     prediction_snapshot_present = 0
     prediction_blocked_unknown = 0
     prediction_blocked_ineligible = 0
+    effective_status_counts: dict[str, int] = {
+        "FUTURE_UPCOMING_VERIFIED_KICKOFF": 0,
+        "UPCOMING_UNKNOWN_KICKOFF": 0,
+        "PAST_KICKOFF_STORED_UPCOMING": 0,
+        "FINISHED_SOURCE_CONFIRMED": 0,
+        "LIVE_SOURCE_CONFIRMED": 0,
+        "HISTORICAL_STATUS_STALE": 0,
+        "STATUS_NOT_ESTABLISHED": 0,
+    }
+    prediction_capture_eligible_now_count = 0
 
     for m in matches:
         mid = str(m.get("id") or "")
         raw_status = str(m.get("status") or "upcoming").strip().lower() or "upcoming"
         provenance = build_kickoff_time_provenance(m)
         kickoff_dt = get_match_datetime(m)
+        m_date_str = str(m.get("date") or "").strip()
+        m_date_obj = datetime.strptime(m_date_str, "%Y-%m-%d").date() if is_valid_calendar_date(m_date_str) else None
+
         snap_count = snap_ids_by_match.get(mid, 0)
         has_snapshot = snap_count > 0
         if has_snapshot:
@@ -759,35 +774,54 @@ def build_nba_pregame_readiness(nba_matches, now=None) -> dict:
             else:
                 kickoff_unknown_upcoming += 1
 
+        eligible_now = False
         if raw_status == "live":
-            item_status = (
-                "LIVE_WITH_PREGAME_PREDICTION"
-                if has_snapshot
-                else "LIVE_NO_PREGAME_PREDICTION"
-            )
+            item_status = "LIVE_WITH_PREGAME_PREDICTION" if has_snapshot else "LIVE_NO_PREGAME_PREDICTION"
+            eff_status = "LIVE_SOURCE_CONFIRMED"
+            eff_reason = "SOURCE_CONFIRMED_LIVE"
             prediction_blocked_ineligible += 1
         elif raw_status == "finished":
-            item_status = (
-                "FINISHED_WITH_HISTORICAL_PREDICTION"
-                if has_snapshot
-                else "FINISHED_NO_HISTORICAL_PREDICTION"
-            )
+            item_status = "FINISHED_WITH_HISTORICAL_PREDICTION" if has_snapshot else "FINISHED_NO_HISTORICAL_PREDICTION"
+            eff_status = "FINISHED_SOURCE_CONFIRMED"
+            eff_reason = "SOURCE_CONFIRMED_FINISHED"
             prediction_blocked_ineligible += 1
         elif raw_status != "upcoming":
             item_status = "BLOCKED_INELIGIBLE_STATUS"
+            eff_status = "STATUS_NOT_ESTABLISHED"
+            eff_reason = "NON_STANDARD_OR_MISSING_STORED_STATUS"
             prediction_blocked_ineligible += 1
         elif kickoff_dt is None:
             item_status = "BLOCKED_UNKNOWN_KICKOFF_TIME"
             prediction_blocked_unknown += 1
+            if m_date_obj is not None and m_date_obj < now_bj.date():
+                eff_status = "HISTORICAL_STATUS_STALE"
+                eff_reason = "PRIOR_DATE_UNKNOWN_KICKOFF_STORED_UPCOMING"
+            else:
+                eff_status = "UPCOMING_UNKNOWN_KICKOFF"
+                eff_reason = "KICKOFF_TIME_UNKNOWN_ON_OR_AFTER_TODAY"
         elif now_bj >= kickoff_dt:
             item_status = "BLOCKED_PAST_KICKOFF"
             prediction_blocked_ineligible += 1
+            if kickoff_dt.date() < now_bj.date() or (now_bj - kickoff_dt) >= timedelta(hours=12):
+                eff_status = "HISTORICAL_STATUS_STALE"
+                eff_reason = "PRIOR_KICKOFF_STORED_UPCOMING_UNCONFIRMED"
+            else:
+                eff_status = "PAST_KICKOFF_STORED_UPCOMING"
+                eff_reason = "RECENT_KICKOFF_ELAPSED_SOURCE_UNCONFIRMED"
         elif has_snapshot:
             item_status = "READY_WITH_PREDICTION_SNAPSHOT"
+            eff_status = "FUTURE_UPCOMING_VERIFIED_KICKOFF"
+            eff_reason = "BEFORE_VERIFIED_KICKOFF_SNAPSHOT_PRESENT"
             prediction_ready += 1
         else:
             item_status = "ELIGIBLE_NOT_YET_MATERIALIZED"
+            eff_status = "FUTURE_UPCOMING_VERIFIED_KICKOFF"
+            eff_reason = "BEFORE_VERIFIED_KICKOFF_ELIGIBLE_FOR_CAPTURE"
+            eligible_now = True
             prediction_ready += 1
+            prediction_capture_eligible_now_count += 1
+
+        effective_status_counts[eff_status] += 1
 
         items.append(
             {
@@ -796,6 +830,11 @@ def build_nba_pregame_readiness(nba_matches, now=None) -> dict:
                 "time": m.get("time"),
                 "stored_status": raw_status,
                 "status": item_status,
+                "effective_status": eff_status,
+                "effective_status_reason": eff_reason,
+                "kickoff_time_verification_status": provenance["kickoff_verification_status"],
+                "prediction_capture_eligible_now": eligible_now,
+                "prediction_snapshot_present": has_snapshot,
                 "has_prediction_snapshot": has_snapshot,
                 "prediction_snapshot_count": snap_count,
                 "kickoff_at": kickoff_dt.isoformat() if kickoff_dt is not None else None,
@@ -811,9 +850,12 @@ def build_nba_pregame_readiness(nba_matches, now=None) -> dict:
         "kickoff_time_known": kickoff_known_upcoming,
         "kickoff_time_unknown": kickoff_unknown_upcoming,
         "prediction_ready": prediction_ready,
+        "prediction_capture_eligible_now_count": prediction_capture_eligible_now_count,
         "prediction_snapshot_present": prediction_snapshot_present,
         "prediction_blocked_unknown_kickoff": prediction_blocked_unknown,
         "prediction_blocked_ineligible": prediction_blocked_ineligible,
+        "historical_status_stale_count": effective_status_counts["HISTORICAL_STATUS_STALE"],
+        "effective_status_counts": effective_status_counts,
         "items": items,
     }
 

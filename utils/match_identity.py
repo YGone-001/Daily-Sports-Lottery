@@ -9,9 +9,11 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import re
 from typing import Any
+
+_BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 SOURCE_KICKOFF_TIME_PRESENT = "SOURCE_KICKOFF_TIME_PRESENT"
 SOURCE_KICKOFF_TIME_MISSING = "SOURCE_KICKOFF_TIME_MISSING"
@@ -172,11 +174,42 @@ def is_kickoff_time_known(match: dict) -> bool:
     return classification == SOURCE_KICKOFF_TIME_PRESENT and known
 
 
+def _parse_verified_utc_to_beijing(utc_str: Any) -> tuple[str | None, str | None]:
+    """仅当输入带明确 UTC/时区偏移且可解析时，转为北京时间 (YYYY-MM-DD, HH:MM)。"""
+    if not isinstance(utc_str, str):
+        return None, None
+    s = utc_str.strip()
+    if not s:
+        return None, None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None, None
+    if dt.tzinfo is None:
+        return None, None
+    bj = dt.astimezone(_BEIJING_TZ)
+    return bj.strftime("%Y-%m-%d"), bj.strftime("%H:%M")
+
+
 def build_kickoff_time_provenance(match: dict, raw_value: str | None = None) -> dict:
-    """构造 B.3 规定的只读开赛时间溯源诊断字段。"""
+    """
+    构造 B.3 及 Workstream C 规定的只读开赛时间溯源诊断字段：
+    明确区分 ``canonical_origin_source``（谁创建 Canonical）与
+    ``actual_kickoff_time_source``（谁提供了权威开赛时间）。
+    未经过授权写入验证的历史记录绝不编造时间来源，统一报告 ``NOT_ESTABLISHED``。
+    """
     if not isinstance(match, dict):
         return {
-            "kickoff_time_source": "unknown",
+            "canonical_origin_source": "unknown",
+            "actual_kickoff_time_source": "NOT_ESTABLISHED",
+            "kickoff_source_event_id": None,
+            "kickoff_source_observed_at": None,
+            "kickoff_source_scheduled_start_utc": None,
+            "kickoff_time_beijing": None,
+            "kickoff_verification_status": "NOT_ESTABLISHED",
+            "kickoff_time_source": "NOT_ESTABLISHED",
             "kickoff_time_raw_value": None,
             "kickoff_time_known": False,
             "kickoff_time_timezone": "Asia/Shanghai",
@@ -184,7 +217,7 @@ def build_kickoff_time_provenance(match: dict, raw_value: str | None = None) -> 
         }
 
     mid = str(match.get("id") or "")
-    source = mid.split("-", 1)[0] if "-" in mid else (mid or "unknown")
+    origin = mid.split("-", 1)[0] if "-" in mid else (mid or "unknown")
     raw_val = raw_value if raw_value is not None else match.get("kickoff_time_raw_value", match.get("time"))
     known = is_kickoff_time_known(match)
     classification, _, _ = classify_kickoff_time_value(raw_val)
@@ -195,8 +228,72 @@ def build_kickoff_time_provenance(match: dict, raw_value: str | None = None) -> 
         else:
             classification = SOURCE_KICKOFF_TIME_MISSING
 
+    m_date = str(match.get("date") or "").strip()
+    m_time = str(match.get("time") or "").strip()
+    beijing_str = f"{m_date} {m_time}" if (known and is_valid_calendar_date(m_date)) else None
+
+    stored_prov = match.get("kickoff_provenance")
+    if isinstance(stored_prov, dict) and stored_prov.get("actual_kickoff_time_source"):
+        actual_source = str(stored_prov.get("actual_kickoff_time_source") or "").strip()
+        src_event_id = stored_prov.get("kickoff_source_event_id")
+        observed_at = stored_prov.get("kickoff_source_observed_at")
+        scheduled_utc = stored_prov.get("kickoff_source_scheduled_start_utc")
+        claimed_status = str(stored_prov.get("kickoff_verification_status") or "").strip()
+
+        conv_date, conv_time = _parse_verified_utc_to_beijing(scheduled_utc)
+        obs_date, _ = _parse_verified_utc_to_beijing(observed_at)
+        utc_matches_record = bool(
+            known and conv_date == m_date and conv_time == m_time and obs_date is not None
+        )
+        valid_source = actual_source in ("nba_official_schedule", "espn_nba_scoreboard", "500lq", "500l", "500w")
+        valid_event_id = isinstance(src_event_id, str) and bool(src_event_id.strip())
+
+        if not (valid_source and valid_event_id and utc_matches_record):
+            ver_status = "UNVERIFIED_PROVENANCE_CONFLICT"
+        elif actual_source == "nba_official_schedule":
+            ver_status = (
+                "OFFICIAL_NBA_VERIFIED"
+                if claimed_status in ("", "OFFICIAL_NBA_VERIFIED")
+                else "UNVERIFIED_PROVENANCE_CONFLICT"
+            )
+        elif actual_source == "espn_nba_scoreboard":
+            if claimed_status == "OFFICIAL_NBA_VERIFIED":
+                # 防止非直连 NBA CDN 来源伪装为 OFFICIAL_NBA_VERIFIED
+                ver_status = "UNVERIFIED_PROVENANCE_CONFLICT"
+            else:
+                ver_status = "SCHEDULE_PROVIDER_VERIFIED"
+        else:
+            if claimed_status in ("OFFICIAL_NBA_VERIFIED", "SCHEDULE_PROVIDER_VERIFIED"):
+                ver_status = "UNVERIFIED_PROVENANCE_CONFLICT"
+            else:
+                ver_status = claimed_status or "LEGACY_SOURCE_VERIFIED"
+
+        return {
+            "canonical_origin_source": origin,
+            "actual_kickoff_time_source": actual_source,
+            "kickoff_source_event_id": src_event_id,
+            "kickoff_source_observed_at": observed_at,
+            "kickoff_source_scheduled_start_utc": scheduled_utc,
+            "kickoff_time_beijing": beijing_str,
+            "kickoff_verification_status": ver_status,
+            "kickoff_time_source": actual_source,
+            "kickoff_time_raw_value": raw_val,
+            "kickoff_time_known": known,
+            "kickoff_time_timezone": "Asia/Shanghai",
+            "kickoff_time_classification": classification,
+        }
+
+    # 无持久化权威时间溯源：绝不把 500j 或未佐证记录伪造成权威源已确认
+    compat_source = origin if (origin in ("500lq", "500l", "500w") and known) else "NOT_ESTABLISHED"
     return {
-        "kickoff_time_source": source,
+        "canonical_origin_source": origin,
+        "actual_kickoff_time_source": "NOT_ESTABLISHED",
+        "kickoff_source_event_id": None,
+        "kickoff_source_observed_at": None,
+        "kickoff_source_scheduled_start_utc": None,
+        "kickoff_time_beijing": beijing_str,
+        "kickoff_verification_status": "NOT_ESTABLISHED",
+        "kickoff_time_source": compat_source,
         "kickoff_time_raw_value": raw_val,
         "kickoff_time_known": known,
         "kickoff_time_timezone": "Asia/Shanghai",
