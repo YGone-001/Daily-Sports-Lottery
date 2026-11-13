@@ -124,6 +124,7 @@ def resolve_match_update(existing: dict, incoming: dict) -> dict:
         has_verified_schedule_prov = isinstance(existing_prov, dict) and existing_prov.get("actual_kickoff_time_source") in (
             "nba_official_schedule",
             "espn_nba_scoreboard",
+            "balldontlie_nba_games",
         )
         if has_verified_schedule_prov and existing.get("time") != inc_time:
             # 既有权威外部赛程时间与常规实时页时间不一致时，保持现有已核验时间，不静默覆盖

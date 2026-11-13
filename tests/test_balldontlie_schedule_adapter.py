@@ -45,6 +45,19 @@ from utils.nba_schedule import (
 )
 
 
+@pytest.fixture(autouse=True)
+def deterministic_provider_pacing(monkeypatch):
+    """Offline requests exercise pacing without physical multi-second sleeps."""
+    clock = [0.0]
+    monkeypatch.setattr(nba_schedule.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(nba_schedule.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(nba_schedule, "_LAST_BDL_REQUEST_MONO", None)
+    monkeypatch.setattr(nba_schedule, "_BDL_RETRY_NOT_BEFORE", 0.0)
+    clear_schedule_cache()
+    yield
+    clear_schedule_cache()
+
+
 def _bdl_payload(games: list[dict], next_cursor: int | None = None, per_page: int = 25) -> dict:
     return {
         "data": games,
@@ -144,9 +157,9 @@ def test_balldontlie_status_mapping_matrix():
     cases = [
         ("scheduled", False, "7:00 PM ET", "scheduled"),
         ("in_progress", False, "Q2 5:20", "live"),
-        ("halftime", False, "Halftime", "live"),
+        ("halftime", False, "Halftime", "unknown"),
         ("final", False, "Final", "final"),
-        ("completed", False, "Final/OT", "final"),
+        ("completed", False, "Final/OT", "unknown"),
         ("postponed", False, "PPD", "postponed"),
         ("scheduled", True, "Postponed", "postponed"),
         ("canceled", False, "Canceled", "canceled"),
@@ -207,7 +220,7 @@ def test_balldontlie_payload_anomalies_and_duplicates():
     g_a = _bdl_game(gid=999, home_id=1, visitor_id=2)
     g_b = _bdl_game(gid=999, home_id=3, visitor_id=4)
     rows_dup, errs_dup = parse_balldontlie_nba_games(_bdl_payload([g_a, g_b]))
-    assert len(rows_dup) == 1
+    assert len(rows_dup) == 0
     assert "CONFLICTING_DUPLICATE_EVENT:999" in errs_dup
 
     # 相同 ID 且内容幂等的重复项
@@ -521,6 +534,7 @@ def test_balldontlie_in_memory_cache_preserves_real_capture_time(monkeypatch):
     assert diag2["cache_hit"] is True
     assert diag2["observation_origin"] == "CACHE"
     assert rows2[0]["observed_at"] == first_obs_at  # 真实时间绝不被缓存时间覆盖
+    assert diag2["checked_at"] == diag1["checked_at"]
 
 
 # ---------------------------------------------------------------------------
@@ -595,9 +609,10 @@ def test_isolated_balldontlie_pregame_prediction_and_settlement_closure(tmp_path
     canonical_file.write_text(json.dumps([enriched_match], ensure_ascii=False), encoding="utf-8")
 
     # Step 2: 捕获赛前预测快照
-    snap_result = prediction_snapshots.capture_snapshot(
-        daily_loader.enrich_match(dict(enriched_match)), now=t_pregame
-    )
+    with daily_loader.override_beijing_now(t_pregame):
+        snap_result = prediction_snapshots.capture_snapshot(
+            daily_loader.enrich_match(dict(enriched_match)), now=t_pregame
+        )
     assert snap_result.created is True
     assert snap_result.snapshot is not None
     snap = snap_result.snapshot
@@ -624,7 +639,7 @@ def test_isolated_balldontlie_pregame_prediction_and_settlement_closure(tmp_path
     assert b_post["decisions"][0]["reason"] == REASON_GAME_ALREADY_STARTED
 
     # Step 5: 完赛结算流转验证 (Workstream F)
-    # 比赛完赛录入真实赛果 (例如 115:108 湖人胜)
+    # 隔离合成赛果（不是现实比赛的已核验结果）
     finished_match = deepcopy(enriched_match)
     finished_match["status"] = "finished"
     finished_match["score"] = {"ft": [115, 108]}

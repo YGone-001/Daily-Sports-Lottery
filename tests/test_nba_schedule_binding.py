@@ -466,10 +466,11 @@ def test_isolated_end_to_end_refresh_enriches_and_captures_prediction_snapshot(i
     monkeypatch.setattr(
         nba_schedule,
         "fetch_nba_schedule_observations",
-        lambda dates, **kw: (obs, {"provider": nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD, "status": "ok", "rows": len(obs)}),
+        lambda dates, **kw: (obs, {"provider": nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD, "status": "ok", "rows": len(obs), "pagination_complete": True}),
     )
 
-    res = scraper.refresh(verbose=False)
+    with daily_loader.override_beijing_now(now):
+        res = scraper.refresh(verbose=False)
     assert res["nba_schedule_enriched"] == 1
     assert res["prediction_snapshots_added"] == 1
 
@@ -495,7 +496,8 @@ def test_isolated_end_to_end_refresh_enriches_and_captures_prediction_snapshot(i
     assert prediction_snapshots.get_snapshots_for_match("500j-2030-05-13-4301") == []
 
     # Second refresh idempotent: zero new snapshots created
-    res2 = scraper.refresh(verbose=False)
+    with daily_loader.override_beijing_now(now):
+        res2 = scraper.refresh(verbose=False)
     assert res2["prediction_snapshots_added"] == 0
 
 

@@ -2,8 +2,8 @@
 NBA 赛程时间补全适配器与严格身份绑定
 ======================================
 职责边界：
-1. 合法访问可直连的公开结构化 NBA 赛程源（ESPN 公开 NBA Scoreboard API）
-   并同时支持解析 NBA 官方 `scheduleLeagueV2` JSON 结构（当环境可达或用于回归夹具）。
+1. 默认使用文档化 BALLDONTLIE NBA Games API（需要凭据与独立网络许可），
+   同时兼容离线 ESPN / NBA 官方 `scheduleLeagueV2` 载荷解析；无隐藏网络回退。
    注意：不绕过 `cdn.nba.com` / `data.nba.com` 的 HTTP 403 访问限制。
 2. 仅作「开赛时间（time-only）补全」：
    - 不得作为新市场候选来源（不向 Canonical 新增赛事）；
@@ -18,6 +18,9 @@ from datetime import datetime, timedelta, timezone
 import os
 import re
 import time
+import threading
+import math
+from email.utils import parsedate_to_datetime
 from typing import Any, Iterable
 
 import requests
@@ -218,25 +221,21 @@ def _map_nba_official_status(raw_status: Any, postponed_status: Any, status_text
 
 
 def _map_balldontlie_status(status_state: Any, postponed: Any, status_text: Any) -> str:
-    post_flag = (
-        bool(postponed)
-        or str(postponed or "").strip().lower() in ("true", "1", "yes")
-        or str(status_state or "").strip().lower() == "postponed"
-        or "postpon" in str(status_text or "").strip().lower()
-    )
-    if post_flag:
+    # status is display text, never positive evidence for a scheduled game.
+    state = str(status_state or "").strip().lower()
+    text = str(status_text or "").strip().lower()
+    if postponed is True or "postpon" in text:
         return "postponed"
-    state_str = str(status_state or "").strip().lower()
-    text_str = str(status_text or "").strip().lower()
-    if state_str in ("canceled", "cancelled") or "cancel" in text_str:
+    if "cancel" in text:
         return "canceled"
-    if state_str in ("scheduled", "in_schedule"):
-        return "scheduled"
-    if state_str in ("in_progress", "live", "halftime") or "live" in text_str:
-        return "live"
-    if state_str in ("final", "completed") or "final" in text_str:
-        return "final"
-    return "unknown"
+    states = {"scheduled", "in_progress", "final", "postponed", "canceled",
+              "delayed", "suspended", "abandoned", "unknown"}
+    if state not in states or type(postponed) is not bool:
+        return "unknown"
+    if state == "scheduled" and any(token in text for token in
+                                     ("final", "live", "halftime", "qtr", "delayed", "suspended", "abandoned")):
+        return "unknown"
+    return "live" if state == "in_progress" else state
 
 
 def parse_espn_nba_scoreboard(
@@ -499,7 +498,10 @@ def parse_balldontlie_nba_games(
             "season": season_str,
             "league_uid": "balldontlie_nba",
             "game_status": game_status,
-            "raw_status": str(g.get("status_state") or g.get("status") or ""),
+            "raw_status": str(g.get("status") or ""),
+            "status_state": g.get("status_state"),
+            "postponed": g.get("postponed"),
+            "source_date": g.get("date"),
             "home_team_identifier": f"bdl:{h_id}",
             "away_team_identifier": f"bdl:{a_id}",
             "home_team_name": str(home_team.get("full_name") or f"{home_team.get('city', '')} {home_team.get('name', '')}".strip()),
@@ -516,12 +518,9 @@ def parse_balldontlie_nba_games(
 
         if gid_str in seen_events:
             prev = seen_events[gid_str]
-            if (
-                prev["home_team_identifier"] != obs_entry["home_team_identifier"]
-                or prev["away_team_identifier"] != obs_entry["away_team_identifier"]
-                or prev["scheduled_start_utc"] != obs_entry["scheduled_start_utc"]
-            ):
+            if prev != obs_entry:
                 errors.append(f"CONFLICTING_DUPLICATE_EVENT:{gid_str}")
+                observations = [r for r in observations if r["provider_game_id"] != gid_str]
                 continue
             continue
 
@@ -535,8 +534,178 @@ def clear_schedule_cache() -> None:
     _SCHEDULE_CACHE.clear()
 
 
-_LAST_BDL_REQUEST_MONO: float = 0.0
-BDL_PACING_INTERVAL: float = float(os.environ.get("DSL_BDL_PACING_INTERVAL", "0.0"))
+_LAST_BDL_REQUEST_MONO: float | None = None
+_BDL_RETRY_NOT_BEFORE = 0.0
+_BDL_REQUEST_LOCK = threading.Lock()
+# Strictly fewer than six starts in any 60-second window, including page/retry starts.
+BDL_PACING_INTERVAL = max(12.1, float(os.environ.get("DSL_BDL_PACING_INTERVAL", "12.1")))
+
+
+def _retry_after_seconds(value: Any, received_at: datetime) -> float:
+    try:
+        if str(value).strip().isdigit():
+            return float(value)
+        parsed = parsedate_to_datetime(str(value))
+        if parsed.tzinfo is not None:
+            return max(0.0, (parsed - received_at).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return 0.0
+
+
+def _pagination_not_attempted(per_page, reason):
+    return {"requested_date_window": [], "requested_page_size": per_page,
+            "pages_fetched": 0, "provider_rows_observed": 0, "unique_games_observed": 0,
+            "duplicates_deduplicated": 0, "conflicting_game_ids": [], "next_cursor_remaining": None,
+            "pagination_complete": False, "pagination_failure_reason": reason, "network_requests_made": 0}
+
+
+def _fetch_bdl_pages(query_days, *, api_key, timeout, per_page, max_requests, max_elapsed_seconds):
+    """Bounded, process-local HTTP dispatch; partial evidence never leaves as usable rows."""
+    from utils.daily_loader import get_beijing_now
+
+    global _LAST_BDL_REQUEST_MONO, _BDL_RETRY_NOT_BEFORE
+    started = time.monotonic()
+    deadline = started + max_elapsed_seconds
+    started_at = get_beijing_now()
+    base_url = BALLDONTLIE_GAMES_URL + "?" + "&".join(f"dates[]={q}" for q in query_days)
+    base_url += f"&per_page={per_page}"
+    by_id, raw_by_id, conflicts = {}, {}, set()
+    cursor, seen_cursors = None, set()
+    pages = observed = duplicates = attempts = 0
+    errors = []
+    failure = None
+    complete = False
+    received_at = started_at
+    while not complete and failure is None:
+        url = base_url + (f"&cursor={cursor}" if cursor is not None else "")
+        response = None
+        for retry in range(3):
+            # Serial dispatch shares quota across calls, pages and retries. Cache clear does not reset it.
+            if not _BDL_REQUEST_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                failure = "TIME_BUDGET_EXHAUSTED"
+                break
+            try:
+                current = time.monotonic()
+                ready = max(current, _BDL_RETRY_NOT_BEFORE,
+                            (_LAST_BDL_REQUEST_MONO + BDL_PACING_INTERVAL)
+                            if _LAST_BDL_REQUEST_MONO is not None else current)
+                if attempts >= max_requests:
+                    failure = "REQUEST_BUDGET_EXHAUSTED"
+                    break
+                if ready >= deadline:
+                    failure = "TIME_BUDGET_EXHAUSTED"
+                    break
+                while time.monotonic() < ready:
+                    time.sleep(ready - time.monotonic())
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = "TIME_BUDGET_EXHAUSTED"
+                    break
+                attempts += 1
+                _LAST_BDL_REQUEST_MONO = time.monotonic()
+                try:
+                    response = requests.get(url, headers={"Authorization": api_key}, timeout=min(timeout, remaining))
+                    received_at = get_beijing_now()
+                except Exception:
+                    # Exception messages/response bodies can echo Authorization: never emit them.
+                    failure = "REQUEST_FAILED"
+                    break
+                if response.status_code == 429:
+                    delay = max(min(2 ** retry, 60), _retry_after_seconds(
+                        getattr(response, "headers", {}).get("Retry-After"), received_at))
+                    _BDL_RETRY_NOT_BEFORE = time.monotonic() + delay
+            finally:
+                _BDL_REQUEST_LOCK.release()
+            if response.status_code != 429:
+                break
+            if retry == 2:
+                failure = "HTTP_429_RATE_LIMITED"
+        if failure:
+            break
+        if response.status_code != 200:
+            failure = {401: "HTTP_401_UNAUTHORIZED", 403: "HTTP_403_FORBIDDEN"}.get(
+                response.status_code, f"HTTP_{response.status_code}")
+            break
+        try:
+            payload = response.json()
+        except Exception:
+            failure = "MALFORMED_JSON"
+            break
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            failure = "MALFORMED_BALLDONTLIE_PAYLOAD"
+            break
+        pages += 1
+        observed += len(payload["data"])
+        rows, parse_errors = parse_balldontlie_nba_games(payload, source_reference=url, observed_at=received_at)
+        if parse_errors:
+            # Do not echo untrusted provider identifiers into diagnostics.
+            failure = "PROVIDER_PARSE_FAILED"
+        row_map = {r["provider_game_id"]: r for r in rows}
+        for raw in payload["data"]:
+            if not isinstance(raw, dict) or type(raw.get("id")) is not int or raw["id"] <= 0:
+                failure = "MALFORMED_GAME_ID"
+                continue
+            gid = str(raw["id"])
+            if gid in raw_by_id:
+                if raw_by_id[gid] != raw:
+                    conflicts.add(gid)
+                    by_id.pop(gid, None)
+                    failure = "CONFLICTING_PROVIDER_GAME_ID"
+                else:
+                    duplicates += 1
+            else:
+                raw_by_id[gid] = raw
+                if gid in row_map:
+                    by_id[gid] = row_map[gid]
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            failure = failure or "MALFORMED_PAGINATION_META"
+            break
+        next_cursor = meta.get("next_cursor")
+        if next_cursor is not None and (type(next_cursor) is not int or next_cursor < 0):
+            failure = failure or "MALFORMED_CURSOR"
+            break
+        if next_cursor is not None and next_cursor in seen_cursors:
+            failure = failure or "CURSOR_CYCLE"
+            cursor = next_cursor
+            break
+        cursor = next_cursor
+        if next_cursor is None:
+            complete = failure is None
+        else:
+            seen_cursors.add(next_cursor)
+        if time.monotonic() >= deadline:
+            failure, complete = "TIME_BUDGET_EXHAUSTED", False
+    if failure:
+        errors.append(failure)
+    complete = complete and failure is None
+    observations = sorted(by_id.values(), key=lambda r: (r.get("beijing_date") or "", r["provider_game_id"])) if complete else []
+    diag = {
+        "provider": PROVIDER_BALLDONTLIE_NBA_GAMES,
+        "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY,
+        "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED,
+        "provider_authorization_status": "API_KEY_CONFIGURED",
+        "automated_provider_operation": AUTOMATED_OPERATION_ENABLED,
+        "status": ("ok" if observations else "empty") if complete else "unavailable",
+        "coverage_status": "COMPLETE_DATE_FETCH" if complete else "PAGINATION_INCOMPLETE",
+        "reachable": pages > 0,
+        "request_started_at": started_at.isoformat(), "response_received_at": received_at.isoformat(),
+        "checked_at": received_at.isoformat(), "observation_origin": "NETWORK", "cache_hit": False,
+        "observation_age_seconds": 0.0,
+        "requested_us_dates": query_days, "queried_us_dates": query_days,
+        "successful_us_dates": query_days if complete else [], "failed_us_dates": [] if complete else query_days,
+        "rows": len(observations), "errors": errors,
+        "requested_date_window": query_days, "requested_page_size": per_page,
+        "pages_fetched": pages, "provider_rows_observed": observed,
+        "unique_games_observed": len(raw_by_id), "duplicates_deduplicated": duplicates,
+        "conflicting_game_ids": sorted(conflicts), "next_cursor_remaining": cursor,
+        "pagination_complete": complete, "pagination_failure_reason": failure,
+        "network_requests_made": attempts, "max_requests": max_requests,
+        "max_elapsed_seconds": max_elapsed_seconds, "rate_limit_scope": "PROCESS_LOCAL",
+        "global_account_limit_guaranteed": False,
+    }
+    return observations, diag
 
 
 def fetch_nba_schedule_observations(
@@ -547,12 +716,22 @@ def fetch_nba_schedule_observations(
     allow_network: bool = False,
     provider: str = PROVIDER_BALLDONTLIE_NBA_GAMES,
     api_key: str | None = None,
+    per_page: int = 100,
+    max_requests: int = 10,
+    max_elapsed_seconds: float = 120.0,
 ) -> tuple[list[dict], dict]:
     """
     通过公开端点获取覆盖指定北京时间日期窗口的 NBA 赛程观测。
     在未经明确授权前，公开端点默认拒绝外网抓取 (Default-Deny, allow_network=False)。
     默认接入文档化的第三方 BALLDONTLIE NBA API，严格区分授权状态与凭据状态。
     """
+    if type(per_page) is not int or not 1 <= per_page <= 100:
+        raise ValueError("per_page must be an integer in [1, 100]")
+    if type(max_requests) is not int or max_requests < 1:
+        raise ValueError("max_requests must be a positive integer")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+               for v in (timeout, max_elapsed_seconds)):
+        raise ValueError("request and elapsed time budgets must be finite and positive")
     now_bj = (now or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ)
     today = now_bj.date()
     min_d = today - timedelta(days=1)
@@ -569,6 +748,7 @@ def fetch_nba_schedule_observations(
         if not dates_set:
             is_bdl = (provider == PROVIDER_BALLDONTLIE_NBA_GAMES)
             return [], {
+                **_pagination_not_attempted(per_page, "EMPTY_DATE_WINDOW"),
                 "provider": provider,
                 "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY if is_bdl else PROVIDER_TYPE_ESPN_THIRD_PARTY,
                 "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED if is_bdl else PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
@@ -592,6 +772,7 @@ def fetch_nba_schedule_observations(
     is_bdl = (provider == PROVIDER_BALLDONTLIE_NBA_GAMES)
     if not allow_network:
         return [], {
+            **_pagination_not_attempted(per_page, "NETWORK_DISABLED"),
             "provider": provider,
             "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY if is_bdl else PROVIDER_TYPE_ESPN_THIRD_PARTY,
             "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED if is_bdl else PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
@@ -615,6 +796,7 @@ def fetch_nba_schedule_observations(
     effective_api_key = api_key or os.environ.get(ENV_BDL_API_KEY)
     if is_bdl and not effective_api_key:
         return [], {
+            **_pagination_not_attempted(per_page, "PROVIDER_CREDENTIALS_MISSING"),
             "provider": PROVIDER_BALLDONTLIE_NBA_GAMES,
             "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY,
             "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED,
@@ -644,7 +826,7 @@ def fetch_nba_schedule_observations(
                 seen_q.add(q)
                 query_days.append(q)
 
-    cache_key = f"{provider}:{','.join(query_days)}"
+    cache_key = f"{provider}:{per_page}:{','.join(query_days)}"
     now_mono = time.monotonic()
     cached = _SCHEDULE_CACHE.get(cache_key)
     if cached and (now_mono - cached[0]) < SCHEDULE_CACHE_TTL:
@@ -653,7 +835,7 @@ def fetch_nba_schedule_observations(
         diag["cache_hit"] = True
         diag["observation_origin"] = "CACHE"
         diag["observation_age_seconds"] = round(now_mono - cached_mono, 3)
-        diag["checked_at"] = now_bj.isoformat()
+        diag["network_requests_made"] = 0
         # 绝不为缓存行伪造新的 observed_at，保留其实际抓取观测时间
         return [dict(item) for item in cached_rows], diag
 
@@ -664,91 +846,12 @@ def fetch_nba_schedule_observations(
     req_started_at = datetime.now(BEIJING_TZ)
 
     if is_bdl:
-        global _LAST_BDL_REQUEST_MONO
-        if BDL_PACING_INTERVAL > 0 and _LAST_BDL_REQUEST_MONO > 0:
-            elapsed = now_mono - _LAST_BDL_REQUEST_MONO
-            if elapsed < BDL_PACING_INTERVAL:
-                time.sleep(BDL_PACING_INTERVAL - elapsed)
-        _LAST_BDL_REQUEST_MONO = time.monotonic()
-
-        url = f"{BALLDONTLIE_GAMES_URL}?" + "&".join(f"dates[]={q}" for q in query_days)
-        headers = {"Authorization": effective_api_key or ""}
-        retries = 0
-        max_retries = 2
-        resp = None
-        while retries <= max_retries:
-            try:
-                resp = requests.get(url, headers=headers, timeout=timeout)
-                if resp.status_code == 429 and retries < max_retries:
-                    retries += 1
-                    time.sleep(0.5 * retries)
-                    continue
-                break
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{type(exc).__name__}:request_failed")
-                break
-
-        if resp is not None:
-            resp_received_at = datetime.now(BEIJING_TZ)
-            if resp.status_code == 200:
-                rows, p_errors = parse_balldontlie_nba_games(
-                    resp.json(),
-                    source_reference=url,
-                    observed_at=resp_received_at,
-                )
-                errors.extend(p_errors)
-                successful_dates = list(query_days)
-                for row in rows:
-                    by_gid[row["provider_game_id"]] = row
-            elif resp.status_code == 401:
-                errors.append("HTTP_401_UNAUTHORIZED")
-                failed_dates = list(query_days)
-            elif resp.status_code == 403:
-                errors.append("HTTP_403_FORBIDDEN")
-                failed_dates = list(query_days)
-            elif resp.status_code == 429:
-                errors.append("HTTP_429_RATE_LIMITED")
-                failed_dates = list(query_days)
-            else:
-                errors.append(f"HTTP_{resp.status_code}")
-                failed_dates = list(query_days)
-        else:
-            failed_dates = list(query_days)
-
-        reachable = len(successful_dates) > 0
-        if not successful_dates:
-            coverage_status = "FAILED_DATE_FETCH"
-        elif failed_dates:
-            coverage_status = "PARTIAL_DATE_FETCH"
-        else:
-            coverage_status = "COMPLETE_DATE_FETCH"
-
-        observations = sorted(by_gid.values(), key=lambda x: (x.get("beijing_date") or "", x.get("provider_game_id") or ""))
-        status = "unavailable" if not reachable else ("ok" if observations else "empty")
-        diag = {
-            "provider": PROVIDER_BALLDONTLIE_NBA_GAMES,
-            "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY,
-            "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED,
-            "provider_authorization_status": "API_KEY_CONFIGURED",
-            "automated_provider_operation": AUTOMATED_OPERATION_ENABLED,
-            "status": status,
-            "coverage_status": coverage_status,
-            "reachable": reachable,
-            "request_started_at": req_started_at.isoformat(),
-            "response_received_at": datetime.now(BEIJING_TZ).isoformat(),
-            "observation_origin": "NETWORK",
-            "cache_hit": False,
-            "observation_age_seconds": 0.0,
-            "requested_us_dates": query_days,
-            "successful_us_dates": successful_dates,
-            "failed_us_dates": failed_dates,
-            "queried_us_dates": query_days,
-            "rows": len(observations),
-            "errors": errors,
-            "checked_at": datetime.now(BEIJING_TZ).isoformat(),
-            "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
-        }
-        _SCHEDULE_CACHE[cache_key] = (now_mono, [dict(item) for item in observations], dict(diag))
+        observations, diag = _fetch_bdl_pages(
+            query_days, api_key=effective_api_key, timeout=timeout, per_page=per_page,
+            max_requests=max_requests, max_elapsed_seconds=max_elapsed_seconds,
+        )
+        if diag["pagination_complete"]:
+            _SCHEDULE_CACHE[cache_key] = (time.monotonic(), [dict(r) for r in observations], dict(diag))
         return observations, diag
 
     for q in query_days:

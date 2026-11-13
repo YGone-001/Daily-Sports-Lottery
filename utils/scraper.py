@@ -515,6 +515,7 @@ def _capture_prediction_snapshots(
     matches: list[dict],
     now=None,
     refresh_started_at=None,
+    blocked_match_ids=None,
 ) -> int:
     """
     为合并后仍「未开赛」的比赛自动固化 canonical 赛前预测快照，
@@ -534,6 +535,8 @@ def _capture_prediction_snapshots(
     for m in matches:
         match_id = m.get("id")
         if not match_id:
+            continue
+        if match_id in (blocked_match_ids or set()):
             continue
         curr_time = get_beijing_now()
         if add_time_status(m, curr_time).get("status") != "upcoming":
@@ -809,7 +812,13 @@ def _refresh_impl(verbose: bool = True) -> dict:
         and (m.get("status") or "upcoming") == "upcoming"
         and m.get("date")
     })
+    schedule_capture_blocked = set()
     if upcoming_nba_dates:
+        # A BDL-derived time alone cannot establish the provider's current scheduled status.
+        schedule_capture_blocked = {
+            m.get("id") for m in merged
+            if (m.get("kickoff_provenance") or {}).get("actual_kickoff_time_source") == PROVIDER_BALLDONTLIE_NBA_GAMES
+        }
         try:
             sched_obs, sched_diag = fetch_nba_schedule_observations(
                 upcoming_nba_dates,
@@ -817,16 +826,23 @@ def _refresh_impl(verbose: bool = True) -> dict:
                 allow_network=getattr(config, "ENABLE_NBA_SCHEDULE_NETWORK", ENABLE_NBA_SCHEDULE_NETWORK),
                 provider=PROVIDER_BALLDONTLIE_NBA_GAMES,
             )
-            sched_available = (str(sched_diag.get("status") or "") not in ("unavailable", "disabled_pending_authorization", "disabled_missing_credentials"))
+            sched_available = (
+                sched_diag.get("status") in ("ok", "empty")
+                and sched_diag.get("pagination_complete") is True
+            )
+            result["nba_schedule_diagnostics"] = sched_diag
             sched_res = apply_nba_schedule_time_enrichment(
                 merged,
                 sched_obs,
-                now=now,
+                now=get_beijing_now(),
                 schedule_available=sched_available,
             )
             result["sources"]["nba_schedule"] = sched_diag.get("status") if str(sched_diag.get("status", "")).startswith("disabled") else sched_diag.get("rows", 0)
             result["nba_schedule_enriched"] = sched_res.get("enriched", 0)
             result["nba_schedule_rescheduled"] = sched_res.get("rescheduled", 0)
+            schedule_capture_blocked.difference_update(
+                d["match_id"] for d in sched_res.get("decisions", []) if d.get("bound")
+            )
             if sched_res.get("enriched", 0) or sched_res.get("rescheduled", 0):
                 updated += sched_res.get("enriched", 0) + sched_res.get("rescheduled", 0)
         except Exception as exc:  # noqa: BLE001
@@ -840,7 +856,9 @@ def _refresh_impl(verbose: bool = True) -> dict:
 
     # 10. 自动固化赛前预测快照（传入刷新启动时间，以当前物理时钟捕获，跨越开赛自动拒绝）
     #     必须在 Elo 校准之后：快照应使用「当前刷新时刻已知」的最新实力。
-    prediction_snapshots_added = _capture_prediction_snapshots(merged, refresh_started_at=now)
+    prediction_snapshots_added = _capture_prediction_snapshots(
+        merged, refresh_started_at=now, blocked_match_ids=schedule_capture_blocked,
+    )
 
     # 11. 结算已完赛比赛（只关联既有预测快照，不回溯生成预测）
     settlements_added = _settle_finished_matches(merged, now=now)
