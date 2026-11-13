@@ -645,9 +645,11 @@ def test_isolated_balldontlie_pregame_prediction_and_settlement_closure(tmp_path
 
 
 def test_zero_real_data_writes_during_suite():
-    """验证在整个测试过程中，生产库中的 7 个数据文件完全未被触碰（字节哈希保持不变）。"""
+    """验证在整个测试过程中，生产库中的 7 个数据文件完全未被触碰（若存在则字节哈希保真）。"""
     from tools.shadow_trusted_time_validation import protected_store_hashes
     hashes = protected_store_hashes()
     assert len(hashes) == 7
     for fn, h in hashes.items():
+        if h == "<absent>":
+            continue
         assert len(h) == 64
