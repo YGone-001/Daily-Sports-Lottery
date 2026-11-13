@@ -483,7 +483,12 @@ def test_schedule_observation_freshness_and_cache(monkeypatch):
     monkeypatch.setattr(nba_schedule.requests, "get", lambda *a, **kw: _MockResp())
 
     # 首次抓取
-    rows1, diag1 = nba_schedule.fetch_nba_schedule_observations(["2026-11-13"], now=t_obs, allow_network=True)
+    rows1, diag1 = nba_schedule.fetch_nba_schedule_observations(
+        ["2026-11-13"],
+        now=t_obs,
+        allow_network=True,
+        provider=nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD,
+    )
     assert diag1["cache_hit"] is False
     assert diag1["observation_origin"] == "NETWORK"
     assert "request_started_at" in diag1
@@ -492,7 +497,12 @@ def test_schedule_observation_freshness_and_cache(monkeypatch):
 
     # 再次抓取（命中缓存）
     t_later = t_obs + timedelta(seconds=15)
-    rows2, diag2 = nba_schedule.fetch_nba_schedule_observations(["2026-11-13"], now=t_later, allow_network=True)
+    rows2, diag2 = nba_schedule.fetch_nba_schedule_observations(
+        ["2026-11-13"],
+        now=t_later,
+        allow_network=True,
+        provider=nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD,
+    )
     assert diag2["cache_hit"] is True
     assert diag2["observation_origin"] == "CACHE"
     assert diag2["observation_age_seconds"] >= 0.0
@@ -528,7 +538,12 @@ def test_partial_date_window_failure_classification(monkeypatch):
 
     monkeypatch.setattr(nba_schedule.requests, "get", _mock_get)
 
-    rows, diag = nba_schedule.fetch_nba_schedule_observations(["2026-11-13"], now=t_obs, allow_network=True)
+    rows, diag = nba_schedule.fetch_nba_schedule_observations(
+        ["2026-11-13"],
+        now=t_obs,
+        allow_network=True,
+        provider=nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD,
+    )
     assert diag["coverage_status"] == "PARTIAL_DATE_FETCH"
     assert len(diag["successful_us_dates"]) > 0
     assert len(diag["failed_us_dates"]) > 0

@@ -62,6 +62,7 @@ ALLOWED_PATHS = frozenset((
     "tests/test_nba_schedule_binding.py",
     "tests/test_capture_time_integrity.py",
     "tests/test_snapshot_contract_corrections.py",
+    "tests/test_balldontlie_schedule_adapter.py",
     "frontend/src/features/DailyView/DailyView.tsx",
     "frontend/src/features/DailyView/dateSelection.ts",
     "frontend/src/features/DailyView/dateSelection.test.ts",

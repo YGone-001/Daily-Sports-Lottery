@@ -245,7 +245,7 @@ def build_kickoff_time_provenance(match: dict, raw_value: str | None = None) -> 
         utc_matches_record = bool(
             known and conv_date == m_date and conv_time == m_time and obs_date is not None
         )
-        valid_source = actual_source in ("nba_official_schedule", "espn_nba_scoreboard", "500lq", "500l", "500w")
+        valid_source = actual_source in ("nba_official_schedule", "espn_nba_scoreboard", "balldontlie_nba_games", "500lq", "500l", "500w")
         valid_event_id = isinstance(src_event_id, str) and bool(src_event_id.strip())
 
         if not (valid_source and valid_event_id and utc_matches_record):
@@ -256,7 +256,7 @@ def build_kickoff_time_provenance(match: dict, raw_value: str | None = None) -> 
                 if claimed_status in ("", "OFFICIAL_NBA_VERIFIED")
                 else "UNVERIFIED_PROVENANCE_CONFLICT"
             )
-        elif actual_source == "espn_nba_scoreboard":
+        elif actual_source in ("espn_nba_scoreboard", "balldontlie_nba_games"):
             if claimed_status == "OFFICIAL_NBA_VERIFIED":
                 # 防止非直连 NBA CDN 来源伪装为 OFFICIAL_NBA_VERIFIED
                 ver_status = "UNVERIFIED_PROVENANCE_CONFLICT"

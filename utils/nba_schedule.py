@@ -30,10 +30,12 @@ BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 PROVIDER_ESPN_NBA_SCOREBOARD = "espn_nba_scoreboard"
 PROVIDER_NBA_OFFICIAL_SCHEDULE = "nba_official_schedule"
+PROVIDER_BALLDONTLIE_NBA_GAMES = "balldontlie_nba_games"
 
 # 数据源分类与接入合规契约 (Workstream D)
 PROVIDER_TYPE_NBA_OFFICIAL = "NBA_OFFICIAL_DIRECT_SOURCE"
 PROVIDER_TYPE_ESPN_THIRD_PARTY = "ESPN_THIRD_PARTY_SCHEDULE_SOURCE"
+PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY = "DOCUMENTED_THIRD_PARTY_NBA_SCHEDULE_API"
 PROVIDER_TYPE_DOCUMENTED_AUTHORIZED = "DOCUMENTED_AUTHORIZED_SOURCE"
 PROVIDER_TYPE_UNSUPPORTED_PUBLIC = "UNSUPPORTED_PUBLIC_ENDPOINT"
 PROVIDER_AUTH_UNVERIFIED = "PROVIDER_USAGE_AUTHORIZATION_UNVERIFIED"
@@ -46,6 +48,9 @@ ENABLE_NBA_SCHEDULE_NETWORK = os.environ.get("DSL_ENABLE_NBA_SCHEDULE_NETWORK", 
 
 ESPN_NBA_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 OFFICIAL_NBA_SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
+BALLDONTLIE_GAMES_URL = "https://api.balldontlie.io/v1/games"
+ENV_BDL_API_KEY = "DSL_BDL_API_KEY"
+DEFAULT_NBA_SCHEDULE_PROVIDER = PROVIDER_BALLDONTLIE_NBA_GAMES
 
 # Workstream B.3: 12 类 fail-closed 绑定拒绝码
 REASON_OFFICIAL_SCHEDULE_UNAVAILABLE = "OFFICIAL_SCHEDULE_UNAVAILABLE"
@@ -81,40 +86,41 @@ class NbaFranchiseMapping:
     nba_team_id: str
     official_name: str
     chinese_names: tuple[str, ...]
+    balldontlie_team_id: str = ""
 
 
-# 严格枚举的 30 支 NBA 球队映射（来源：NBA 官方球队编码与 ESPN NBA Teams API + 库内 500.com 中文队名）
+# 严格枚举的 30 支 NBA 球队映射（来源：NBA 官方球队编码与 ESPN NBA Teams API + 库内 500.com 中文队名 + BALLDONTLIE Team ID）
 NBA_FRANCHISE_MAPPINGS: tuple[NbaFranchiseMapping, ...] = (
-    NbaFranchiseMapping("ATL", "1", "1610612737", "Atlanta Hawks", ("亚特兰大老鹰",)),
-    NbaFranchiseMapping("BOS", "2", "1610612738", "Boston Celtics", ("波士顿凯尔特人",)),
-    NbaFranchiseMapping("BKN", "17", "1610612751", "Brooklyn Nets", ("布鲁克林篮网", "布鲁克林篮网队")),
-    NbaFranchiseMapping("CHA", "30", "1610612766", "Charlotte Hornets", ("夏洛特黄蜂",)),
-    NbaFranchiseMapping("CHI", "4", "1610612741", "Chicago Bulls", ("芝加哥公牛",)),
-    NbaFranchiseMapping("CLE", "5", "1610612739", "Cleveland Cavaliers", ("克利夫兰骑士", "克里夫兰骑士")),
-    NbaFranchiseMapping("DAL", "6", "1610612742", "Dallas Mavericks", ("达拉斯独行侠", "达拉斯小牛")),
-    NbaFranchiseMapping("DEN", "7", "1610612743", "Denver Nuggets", ("丹佛掘金",)),
-    NbaFranchiseMapping("DET", "8", "1610612765", "Detroit Pistons", ("底特律活塞",)),
-    NbaFranchiseMapping("GSW", "9", "1610612744", "Golden State Warriors", ("金州勇士",)),
-    NbaFranchiseMapping("HOU", "10", "1610612745", "Houston Rockets", ("休斯顿火箭",)),
-    NbaFranchiseMapping("IND", "11", "1610612754", "Indiana Pacers", ("印第安纳步行者", "印第安那步行者")),
-    NbaFranchiseMapping("LAC", "12", "1610612746", "LA Clippers", ("洛杉矶快船",)),
-    NbaFranchiseMapping("LAL", "13", "1610612747", "Los Angeles Lakers", ("洛杉矶湖人",)),
-    NbaFranchiseMapping("MEM", "29", "1610612763", "Memphis Grizzlies", ("孟菲斯灰熊",)),
-    NbaFranchiseMapping("MIA", "14", "1610612748", "Miami Heat", ("迈阿密热火",)),
-    NbaFranchiseMapping("MIL", "15", "1610612749", "Milwaukee Bucks", ("密尔沃基雄鹿",)),
-    NbaFranchiseMapping("MIN", "16", "1610612750", "Minnesota Timberwolves", ("明尼苏达森林狼",)),
-    NbaFranchiseMapping("NOP", "3", "1610612740", "New Orleans Pelicans", ("新奥尔良鹈鹕",)),
-    NbaFranchiseMapping("NYK", "18", "1610612752", "New York Knicks", ("纽约尼克斯",)),
-    NbaFranchiseMapping("OKC", "25", "1610612760", "Oklahoma City Thunder", ("俄克拉荷马城雷霆", "俄克拉荷马雷霆")),
-    NbaFranchiseMapping("ORL", "19", "1610612753", "Orlando Magic", ("奥兰多魔术",)),
-    NbaFranchiseMapping("PHI", "20", "1610612755", "Philadelphia 76ers", ("费城76人",)),
-    NbaFranchiseMapping("PHX", "21", "1610612756", "Phoenix Suns", ("菲尼克斯太阳",)),
-    NbaFranchiseMapping("POR", "22", "1610612757", "Portland Trail Blazers", ("波特兰开拓者",)),
-    NbaFranchiseMapping("SAC", "23", "1610612758", "Sacramento Kings", ("萨克拉门托国王",)),
-    NbaFranchiseMapping("SAS", "24", "1610612759", "San Antonio Spurs", ("圣安东尼奥马刺",)),
-    NbaFranchiseMapping("TOR", "28", "1610612761", "Toronto Raptors", ("多伦多猛龙",)),
-    NbaFranchiseMapping("UTA", "26", "1610612762", "Utah Jazz", ("犹他爵士",)),
-    NbaFranchiseMapping("WAS", "27", "1610612764", "Washington Wizards", ("华盛顿奇才",)),
+    NbaFranchiseMapping("ATL", "1", "1610612737", "Atlanta Hawks", ("亚特兰大老鹰",), "1"),
+    NbaFranchiseMapping("BOS", "2", "1610612738", "Boston Celtics", ("波士顿凯尔特人",), "2"),
+    NbaFranchiseMapping("BKN", "17", "1610612751", "Brooklyn Nets", ("布鲁克林篮网", "布鲁克林篮网队"), "3"),
+    NbaFranchiseMapping("CHA", "30", "1610612766", "Charlotte Hornets", ("夏洛特黄蜂",), "4"),
+    NbaFranchiseMapping("CHI", "4", "1610612741", "Chicago Bulls", ("芝加哥公牛",), "5"),
+    NbaFranchiseMapping("CLE", "5", "1610612739", "Cleveland Cavaliers", ("克利夫兰骑士", "克里夫兰骑士"), "6"),
+    NbaFranchiseMapping("DAL", "6", "1610612742", "Dallas Mavericks", ("达拉斯独行侠", "达拉斯小牛"), "7"),
+    NbaFranchiseMapping("DEN", "7", "1610612743", "Denver Nuggets", ("丹佛掘金",), "8"),
+    NbaFranchiseMapping("DET", "8", "1610612765", "Detroit Pistons", ("底特律活塞",), "9"),
+    NbaFranchiseMapping("GSW", "9", "1610612744", "Golden State Warriors", ("金州勇士",), "10"),
+    NbaFranchiseMapping("HOU", "10", "1610612745", "Houston Rockets", ("休斯顿火箭",), "11"),
+    NbaFranchiseMapping("IND", "11", "1610612754", "Indiana Pacers", ("印第安纳步行者", "印第安那步行者"), "12"),
+    NbaFranchiseMapping("LAC", "12", "1610612746", "LA Clippers", ("洛杉矶快船",), "13"),
+    NbaFranchiseMapping("LAL", "13", "1610612747", "Los Angeles Lakers", ("洛杉矶湖人",), "14"),
+    NbaFranchiseMapping("MEM", "29", "1610612763", "Memphis Grizzlies", ("孟菲斯灰熊",), "15"),
+    NbaFranchiseMapping("MIA", "14", "1610612748", "Miami Heat", ("迈阿密热火",), "16"),
+    NbaFranchiseMapping("MIL", "15", "1610612749", "Milwaukee Bucks", ("密尔沃基雄鹿",), "17"),
+    NbaFranchiseMapping("MIN", "16", "1610612750", "Minnesota Timberwolves", ("明尼苏达森林狼",), "18"),
+    NbaFranchiseMapping("NOP", "3", "1610612740", "New Orleans Pelicans", ("新奥尔良鹈鹕",), "19"),
+    NbaFranchiseMapping("NYK", "18", "1610612752", "New York Knicks", ("纽约尼克斯",), "20"),
+    NbaFranchiseMapping("OKC", "25", "1610612760", "Oklahoma City Thunder", ("俄克拉荷马城雷霆", "俄克拉荷马雷霆"), "21"),
+    NbaFranchiseMapping("ORL", "19", "1610612753", "Orlando Magic", ("奥兰多魔术",), "22"),
+    NbaFranchiseMapping("PHI", "20", "1610612755", "Philadelphia 76ers", ("费城76人",), "23"),
+    NbaFranchiseMapping("PHX", "21", "1610612756", "Phoenix Suns", ("菲尼克斯太阳",), "24"),
+    NbaFranchiseMapping("POR", "22", "1610612757", "Portland Trail Blazers", ("波特兰开拓者",), "25"),
+    NbaFranchiseMapping("SAC", "23", "1610612758", "Sacramento Kings", ("萨克拉门托国王",), "26"),
+    NbaFranchiseMapping("SAS", "24", "1610612759", "San Antonio Spurs", ("圣安东尼奥马刺",), "27"),
+    NbaFranchiseMapping("TOR", "28", "1610612761", "Toronto Raptors", ("多伦多猛龙",), "28"),
+    NbaFranchiseMapping("UTA", "26", "1610612762", "Utah Jazz", ("犹他爵士",), "29"),
+    NbaFranchiseMapping("WAS", "27", "1610612764", "Washington Wizards", ("华盛顿奇才",), "30"),
 )
 
 _CHINESE_NAME_TO_FRANCHISE: dict[str, str] = {
@@ -127,6 +133,9 @@ _PROVIDER_TEAM_ID_TO_FRANCHISE: dict[str, str] = {}
 for _entry in NBA_FRANCHISE_MAPPINGS:
     _PROVIDER_TEAM_ID_TO_FRANCHISE[f"espn:{_entry.espn_team_id}"] = _entry.canonical_code
     _PROVIDER_TEAM_ID_TO_FRANCHISE[f"nba:{_entry.nba_team_id}"] = _entry.canonical_code
+    if _entry.balldontlie_team_id:
+        _PROVIDER_TEAM_ID_TO_FRANCHISE[f"bdl:{_entry.balldontlie_team_id}"] = _entry.canonical_code
+        _PROVIDER_TEAM_ID_TO_FRANCHISE[f"balldontlie:{_entry.balldontlie_team_id}"] = _entry.canonical_code
 
 
 def resolve_canonical_team_code(name: Any) -> str | None:
@@ -204,6 +213,28 @@ def _map_nba_official_status(raw_status: Any, postponed_status: Any, status_text
     if raw_status == 2 or str(raw_status) == "2":
         return "live"
     if raw_status == 3 or str(raw_status) == "3":
+        return "final"
+    return "unknown"
+
+
+def _map_balldontlie_status(status_state: Any, postponed: Any, status_text: Any) -> str:
+    post_flag = (
+        bool(postponed)
+        or str(postponed or "").strip().lower() in ("true", "1", "yes")
+        or str(status_state or "").strip().lower() == "postponed"
+        or "postpon" in str(status_text or "").strip().lower()
+    )
+    if post_flag:
+        return "postponed"
+    state_str = str(status_state or "").strip().lower()
+    text_str = str(status_text or "").strip().lower()
+    if state_str in ("canceled", "cancelled") or "cancel" in text_str:
+        return "canceled"
+    if state_str in ("scheduled", "in_schedule"):
+        return "scheduled"
+    if state_str in ("in_progress", "live", "halftime") or "live" in text_str:
+        return "live"
+    if state_str in ("final", "completed") or "final" in text_str:
         return "final"
     return "unknown"
 
@@ -415,8 +446,97 @@ def parse_nba_official_schedule(
     return observations, errors
 
 
+def parse_balldontlie_nba_games(
+    payload: dict,
+    *,
+    source_reference: str = BALLDONTLIE_GAMES_URL,
+    observed_at: datetime | None = None,
+) -> tuple[list[dict], list[str]]:
+    """
+    解析官方文档化的 BALLDONTLIE NBA Games API 响应载荷为标准赛程观测结构。
+    严格保留主客方向（home_team 为主，visitor_team 为客）、UTC 开赛时间与 30 支球队标识。
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return [], ["MALFORMED_BALLDONTLIE_PAYLOAD"]
+
+    obs_iso = (observed_at or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ).isoformat()
+    observations: list[dict] = []
+    errors: list[str] = []
+    seen_events: dict[str, dict] = {}
+
+    for g in payload.get("data", []) or []:
+        if not isinstance(g, dict):
+            errors.append("MALFORMED_GAME")
+            continue
+
+        gid = g.get("id")
+        if gid is None or not str(gid).strip():
+            errors.append("MISSING_GAME_ID")
+            continue
+        gid_str = str(gid).strip()
+
+        home_team = g.get("home_team")
+        visitor_team = g.get("visitor_team")
+        if not isinstance(home_team, dict) or not isinstance(visitor_team, dict):
+            errors.append(f"MISSING_COMPETITORS:{gid_str}")
+            continue
+
+        h_id = str(home_team.get("id") or "").strip()
+        a_id = str(visitor_team.get("id") or "").strip()
+        if not h_id or not a_id or h_id == "0" or a_id == "0":
+            errors.append(f"MISSING_TEAM_ID:{gid_str}")
+            continue
+
+        raw_utc = g.get("datetime")
+        bj_date, bj_time, _, parse_status = convert_utc_to_beijing(raw_utc)
+        game_status = _map_balldontlie_status(g.get("status_state"), g.get("postponed"), g.get("status"))
+        season_val = g.get("season")
+        season_str = str(season_val) if season_val is not None else ""
+
+        obs_entry = {
+            "provider": PROVIDER_BALLDONTLIE_NBA_GAMES,
+            "provider_game_id": gid_str,
+            "season": season_str,
+            "league_uid": "balldontlie_nba",
+            "game_status": game_status,
+            "raw_status": str(g.get("status_state") or g.get("status") or ""),
+            "home_team_identifier": f"bdl:{h_id}",
+            "away_team_identifier": f"bdl:{a_id}",
+            "home_team_name": str(home_team.get("full_name") or f"{home_team.get('city', '')} {home_team.get('name', '')}".strip()),
+            "away_team_name": str(visitor_team.get("full_name") or f"{visitor_team.get('city', '')} {visitor_team.get('name', '')}".strip()),
+            "home_tricode": str(home_team.get("abbreviation") or ""),
+            "away_tricode": str(visitor_team.get("abbreviation") or ""),
+            "scheduled_start_utc": raw_utc.strip() if isinstance(raw_utc, str) and parse_status == "VALID_UTC" else (raw_utc if isinstance(raw_utc, str) else None),
+            "beijing_date": bj_date,
+            "beijing_time": bj_time,
+            "time_parse_status": parse_status,
+            "observed_at": obs_iso,
+            "source_reference": source_reference,
+        }
+
+        if gid_str in seen_events:
+            prev = seen_events[gid_str]
+            if (
+                prev["home_team_identifier"] != obs_entry["home_team_identifier"]
+                or prev["away_team_identifier"] != obs_entry["away_team_identifier"]
+                or prev["scheduled_start_utc"] != obs_entry["scheduled_start_utc"]
+            ):
+                errors.append(f"CONFLICTING_DUPLICATE_EVENT:{gid_str}")
+                continue
+            continue
+
+        seen_events[gid_str] = obs_entry
+        observations.append(obs_entry)
+
+    return observations, errors
+
+
 def clear_schedule_cache() -> None:
     _SCHEDULE_CACHE.clear()
+
+
+_LAST_BDL_REQUEST_MONO: float = 0.0
+BDL_PACING_INTERVAL: float = float(os.environ.get("DSL_BDL_PACING_INTERVAL", "0.0"))
 
 
 def fetch_nba_schedule_observations(
@@ -425,10 +545,13 @@ def fetch_nba_schedule_observations(
     timeout: float = 5.0,
     now: datetime | None = None,
     allow_network: bool = False,
+    provider: str = PROVIDER_BALLDONTLIE_NBA_GAMES,
+    api_key: str | None = None,
 ) -> tuple[list[dict], dict]:
     """
     通过公开端点获取覆盖指定北京时间日期窗口的 NBA 赛程观测。
     在未经明确授权前，公开端点默认拒绝外网抓取 (Default-Deny, allow_network=False)。
+    默认接入文档化的第三方 BALLDONTLIE NBA API，严格区分授权状态与凭据状态。
     """
     now_bj = (now or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ)
     today = now_bj.date()
@@ -444,11 +567,12 @@ def fetch_nba_schedule_observations(
             if min_d <= datetime.strptime(d, "%Y-%m-%d").date() <= max_d
         ]
         if not dates_set:
+            is_bdl = (provider == PROVIDER_BALLDONTLIE_NBA_GAMES)
             return [], {
-                "provider": PROVIDER_ESPN_NBA_SCOREBOARD,
-                "provider_type": PROVIDER_TYPE_ESPN_THIRD_PARTY,
-                "provider_endpoint_type": PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
-                "provider_authorization_status": PROVIDER_AUTH_UNVERIFIED,
+                "provider": provider,
+                "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY if is_bdl else PROVIDER_TYPE_ESPN_THIRD_PARTY,
+                "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED if is_bdl else PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
+                "provider_authorization_status": ("API_KEY_CONFIGURED" if (api_key or os.environ.get(ENV_BDL_API_KEY)) else "PROVIDER_CREDENTIALS_MISSING") if is_bdl else PROVIDER_AUTH_UNVERIFIED,
                 "automated_provider_operation": AUTOMATED_OPERATION_ENABLED if allow_network else AUTOMATED_OPERATION_DISABLED,
                 "status": "empty",
                 "coverage_status": "EMPTY_DATE_WINDOW",
@@ -464,13 +588,14 @@ def fetch_nba_schedule_observations(
                 "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
             }
 
-    # 检查自动化网络请求许可 (Workstream D)
+    # 检查自动化网络请求许可 (Workstream D: Default-Deny)
+    is_bdl = (provider == PROVIDER_BALLDONTLIE_NBA_GAMES)
     if not allow_network:
         return [], {
-            "provider": PROVIDER_ESPN_NBA_SCOREBOARD,
-            "provider_type": PROVIDER_TYPE_ESPN_THIRD_PARTY,
-            "provider_endpoint_type": PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
-            "provider_authorization_status": PROVIDER_AUTH_UNVERIFIED,
+            "provider": provider,
+            "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY if is_bdl else PROVIDER_TYPE_ESPN_THIRD_PARTY,
+            "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED if is_bdl else PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
+            "provider_authorization_status": ("API_KEY_CONFIGURED" if (api_key or os.environ.get(ENV_BDL_API_KEY)) else "PROVIDER_CREDENTIALS_MISSING") if is_bdl else PROVIDER_AUTH_UNVERIFIED,
             "automated_provider_operation": AUTOMATED_OPERATION_DISABLED,
             "status": "disabled_pending_authorization",
             "coverage_status": "UNAUTHORIZED_DATE_FETCH",
@@ -486,17 +611,40 @@ def fetch_nba_schedule_observations(
             "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
         }
 
+    # BALLDONTLIE 凭据检查：若允许联网但缺少 API Key，明确返回 disabled_missing_credentials
+    effective_api_key = api_key or os.environ.get(ENV_BDL_API_KEY)
+    if is_bdl and not effective_api_key:
+        return [], {
+            "provider": PROVIDER_BALLDONTLIE_NBA_GAMES,
+            "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY,
+            "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED,
+            "provider_authorization_status": "PROVIDER_CREDENTIALS_MISSING",
+            "automated_provider_operation": AUTOMATED_OPERATION_DISABLED,
+            "status": "disabled_missing_credentials",
+            "coverage_status": "MISSING_API_KEY",
+            "reachable": False,
+            "requested_us_dates": [],
+            "successful_us_dates": [],
+            "failed_us_dates": [],
+            "queried_us_dates": [],
+            "rows": 0,
+            "errors": ["PROVIDER_CREDENTIALS_MISSING"],
+            "checked_at": now_bj.isoformat(),
+            "note": "BALLDONTLIE_API_KEY_REQUIRED",
+            "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
+        }
+
     query_days: list[str] = []
     seen_q: set[str] = set()
     for d_str in dates_set:
         d_obj = datetime.strptime(d_str, "%Y-%m-%d").date()
         for candidate in (d_obj - timedelta(days=1), d_obj):
-            q = candidate.strftime("%Y%m%d")
+            q = candidate.strftime("%Y-%m-%d") if is_bdl else candidate.strftime("%Y%m%d")
             if q not in seen_q:
                 seen_q.add(q)
                 query_days.append(q)
 
-    cache_key = ",".join(query_days)
+    cache_key = f"{provider}:{','.join(query_days)}"
     now_mono = time.monotonic()
     cached = _SCHEDULE_CACHE.get(cache_key)
     if cached and (now_mono - cached[0]) < SCHEDULE_CACHE_TTL:
@@ -514,6 +662,94 @@ def fetch_nba_schedule_observations(
     successful_dates: list[str] = []
     failed_dates: list[str] = []
     req_started_at = datetime.now(BEIJING_TZ)
+
+    if is_bdl:
+        global _LAST_BDL_REQUEST_MONO
+        if BDL_PACING_INTERVAL > 0 and _LAST_BDL_REQUEST_MONO > 0:
+            elapsed = now_mono - _LAST_BDL_REQUEST_MONO
+            if elapsed < BDL_PACING_INTERVAL:
+                time.sleep(BDL_PACING_INTERVAL - elapsed)
+        _LAST_BDL_REQUEST_MONO = time.monotonic()
+
+        url = f"{BALLDONTLIE_GAMES_URL}?" + "&".join(f"dates[]={q}" for q in query_days)
+        headers = {"Authorization": effective_api_key or ""}
+        retries = 0
+        max_retries = 2
+        resp = None
+        while retries <= max_retries:
+            try:
+                resp = requests.get(url, headers=headers, timeout=timeout)
+                if resp.status_code == 429 and retries < max_retries:
+                    retries += 1
+                    time.sleep(0.5 * retries)
+                    continue
+                break
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{type(exc).__name__}:request_failed")
+                break
+
+        if resp is not None:
+            resp_received_at = datetime.now(BEIJING_TZ)
+            if resp.status_code == 200:
+                rows, p_errors = parse_balldontlie_nba_games(
+                    resp.json(),
+                    source_reference=url,
+                    observed_at=resp_received_at,
+                )
+                errors.extend(p_errors)
+                successful_dates = list(query_days)
+                for row in rows:
+                    by_gid[row["provider_game_id"]] = row
+            elif resp.status_code == 401:
+                errors.append("HTTP_401_UNAUTHORIZED")
+                failed_dates = list(query_days)
+            elif resp.status_code == 403:
+                errors.append("HTTP_403_FORBIDDEN")
+                failed_dates = list(query_days)
+            elif resp.status_code == 429:
+                errors.append("HTTP_429_RATE_LIMITED")
+                failed_dates = list(query_days)
+            else:
+                errors.append(f"HTTP_{resp.status_code}")
+                failed_dates = list(query_days)
+        else:
+            failed_dates = list(query_days)
+
+        reachable = len(successful_dates) > 0
+        if not successful_dates:
+            coverage_status = "FAILED_DATE_FETCH"
+        elif failed_dates:
+            coverage_status = "PARTIAL_DATE_FETCH"
+        else:
+            coverage_status = "COMPLETE_DATE_FETCH"
+
+        observations = sorted(by_gid.values(), key=lambda x: (x.get("beijing_date") or "", x.get("provider_game_id") or ""))
+        status = "unavailable" if not reachable else ("ok" if observations else "empty")
+        diag = {
+            "provider": PROVIDER_BALLDONTLIE_NBA_GAMES,
+            "provider_type": PROVIDER_TYPE_DOCUMENTED_THIRD_PARTY,
+            "provider_endpoint_type": PROVIDER_TYPE_DOCUMENTED_AUTHORIZED,
+            "provider_authorization_status": "API_KEY_CONFIGURED",
+            "automated_provider_operation": AUTOMATED_OPERATION_ENABLED,
+            "status": status,
+            "coverage_status": coverage_status,
+            "reachable": reachable,
+            "request_started_at": req_started_at.isoformat(),
+            "response_received_at": datetime.now(BEIJING_TZ).isoformat(),
+            "observation_origin": "NETWORK",
+            "cache_hit": False,
+            "observation_age_seconds": 0.0,
+            "requested_us_dates": query_days,
+            "successful_us_dates": successful_dates,
+            "failed_us_dates": failed_dates,
+            "queried_us_dates": query_days,
+            "rows": len(observations),
+            "errors": errors,
+            "checked_at": datetime.now(BEIJING_TZ).isoformat(),
+            "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
+        }
+        _SCHEDULE_CACHE[cache_key] = (now_mono, [dict(item) for item in observations], dict(diag))
+        return observations, diag
 
     for q in query_days:
         url = f"{ESPN_NBA_SCOREBOARD_URL}?dates={q}"
@@ -629,6 +865,8 @@ def bind_schedule_observations_to_canonical(
             luid_parts = luid.split("~")
             if "s:40" not in luid_parts or "l:46" not in luid_parts:
                 continue
+        if prov == PROVIDER_BALLDONTLIE_NBA_GAMES and luid and luid != "balldontlie_nba":
+            continue
         valid_nba_obs.append(obs)
 
     for m in nba_canonical:

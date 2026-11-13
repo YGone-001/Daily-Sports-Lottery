@@ -795,6 +795,7 @@ def _refresh_impl(verbose: bool = True) -> dict:
     from utils.fetcher_500 import is_nba_league
     from utils.nba_schedule import (
         ENABLE_NBA_SCHEDULE_NETWORK,
+        PROVIDER_BALLDONTLIE_NBA_GAMES,
         apply_nba_schedule_time_enrichment,
         fetch_nba_schedule_observations,
     )
@@ -814,15 +815,16 @@ def _refresh_impl(verbose: bool = True) -> dict:
                 upcoming_nba_dates,
                 now=now,
                 allow_network=getattr(config, "ENABLE_NBA_SCHEDULE_NETWORK", ENABLE_NBA_SCHEDULE_NETWORK),
+                provider=PROVIDER_BALLDONTLIE_NBA_GAMES,
             )
-            sched_available = (sched_diag.get("status") not in ("unavailable", "disabled_pending_authorization"))
+            sched_available = (str(sched_diag.get("status") or "") not in ("unavailable", "disabled_pending_authorization", "disabled_missing_credentials"))
             sched_res = apply_nba_schedule_time_enrichment(
                 merged,
                 sched_obs,
                 now=now,
                 schedule_available=sched_available,
             )
-            result["sources"]["nba_schedule"] = sched_diag.get("status") if sched_diag.get("status") == "disabled_pending_authorization" else sched_diag.get("rows", 0)
+            result["sources"]["nba_schedule"] = sched_diag.get("status") if str(sched_diag.get("status", "")).startswith("disabled") else sched_diag.get("rows", 0)
             result["nba_schedule_enriched"] = sched_res.get("enriched", 0)
             result["nba_schedule_rescheduled"] = sched_res.get("rescheduled", 0)
             if sched_res.get("enriched", 0) or sched_res.get("rescheduled", 0):

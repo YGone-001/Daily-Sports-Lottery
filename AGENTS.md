@@ -1048,6 +1048,34 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   - 针对真实生产数据的诊断与审计必须隔离在本地只读脚本中（如 `reports/` 下），由操作者按需显式调用，不得作为 CI 门禁一部分；
   - 真实物理文件的 SHA-256 哈希值在报告中必须完整真实记录，严禁截断后凭空补全。
 
+### 4.33 BALLDONTLIE NBA 赛程集成、凭据治理与赛前预测闭环契约
+
+- **BALLDONTLIE 数据源身份与分类（Documented Third-Party Schedule Provider）**：
+  - 数据源标识：`provider = "balldontlie_nba_games"`，`provider_type = "DOCUMENTED_THIRD_PARTY_NBA_SCHEDULE_API"`，端点类型为 `DOCUMENTED_AUTHORIZED_SOURCE`；
+  - 严格区分第三方文档化 API 与 NBA 官方 CDN（`nba_official_schedule`），**严禁**为 BALLDONTLIE 赋予 `OFFICIAL_NBA_VERIFIED` 状态，验证通过后仅赋予 `SCHEDULE_PROVIDER_VERIFIED`；
+  - 严禁将未经授权的公开 ESPN 抓取作为隐藏回退通道。
+- **凭据管理与零泄露硬约束（Credential Boundary & Secret Redaction）**：
+  - 凭据配置：通过安全环境变量 `DSL_BDL_API_KEY` 读取，严禁在代码、日志、异常栈、诊断报告或 CI 产物中明文硬编码或打印 API Key；
+  - 严格遵守 Default-Deny 网络守卫：`allow_network=False` 时确定性返回 `disabled_pending_authorization`；
+  - 缺少凭据时：当 `allow_network=True` 但未配置 `DSL_BDL_API_KEY` 时，确定性返回 `disabled_missing_credentials`，拒绝码为 `PROVIDER_CREDENTIALS_MISSING`，绝不盲目外发无效网络请求。
+- **频控配额与重试边界（Rate Limiting & Bounded Retries）**：
+  - BALLDONTLIE 免费层级硬性限制为 5 req/min；
+  - 赛程请求必须支持日期批量查询（单次请求携带多个 `dates[]` 参数，覆盖北京日与北美对应日），避免逐场逐日轮询；
+  - 遭遇 HTTP 429 时采用有界重试（最多 2 次指数退避），绝不无限循环重试；
+  - 进程内全局缓存带有 90 秒 TTL，命中时严格保留原始 `observed_at`。
+- **30 支 NBA 球队显式编码映射与 ID 隔离（30-Franchise Identity Mapping & Namespace Isolation）**：
+  - 显式一一映射 BALLDONTLIE 数字 ID（1 到 30，严格按地理城市字母序）至规范队名与三字码；
+  - 标识符格式为 `bdl:<id>`，与 `espn:<id>`、`nba:<id>` 完全隔离，严禁将不同源的数字 ID 混用；
+  - 严格保持主客方向：`home_team` 为主，`visitor_team` 为客，方向反转或不匹配时坚决 fail-closed。
+- **严格开赛时间补全边界（Time-Only Canonical Enrichment）**：
+  - 赛程源仅作「开赛时间（time-only）补全」，绝不引入新赛事、绝不改动比赛 ID、队名、主客、比分、盘口赔率与结算；
+  - 只有在比赛未开赛（`now < kickoff_at`）且状态为 `scheduled` 时才允许补全；开赛后一律拒绝并归为 `POST_START_UPDATE_REJECTED`；
+  - 时间补全后 `kickoff_verification_status` 记为 `SCHEDULE_PROVIDER_VERIFIED`，溯源记录完整的提供商、外部赛事 ID 与 UTC 原始时间戳。
+- **独立赛前预测与完赛结算流转（Isolated Pregame & Settlement Closure）**：
+  - 赛前预测快照捕获必须满足：`canonical_fixture_exists`、`market_eligible`、`identity_unambiguous`、`schedule_time_verified`、`generated_at < kickoff_at`；
+  - 真实生产刷新需要操作者明确的单次授权；未获授权时报告 `REAL_NBA_REFRESH_EXECUTED = NO` 与 `REAL_RUNTIME_REFRESH_AUTHORIZATION = NOT_GRANTED`；
+  - 完赛结算只接受带有真实全场比分（`score.ft`）的 `finished` 赛事，未完赛赛事状态保持 `RESULT_PENDING`。
+
 ---
 
 ## 五、本地报告与交付顺序

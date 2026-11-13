@@ -388,7 +388,10 @@ def test_schedule_fetch_explicit_enable_and_mock_injection(monkeypatch):
 
     t_now = datetime(2030, 5, 14, 12, 0, tzinfo=BEIJING_TZ)
     rows, diag = nba_schedule.fetch_nba_schedule_observations(
-        ["2030-05-15"], now=t_now, allow_network=True
+        ["2030-05-15"],
+        now=t_now,
+        allow_network=True,
+        provider=nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD,
     )
 
     assert len(rows) == 1
@@ -604,13 +607,23 @@ def test_in_memory_cache_contract_and_age_preservation(monkeypatch):
     t_obs2 = datetime(2030, 5, 14, 10, 2, tzinfo=BEIJING_TZ)
 
     # 首次抓取：填充缓存
-    rows1, diag1 = nba_schedule.fetch_nba_schedule_observations(["2030-05-15"], now=t_obs1, allow_network=True)
+    rows1, diag1 = nba_schedule.fetch_nba_schedule_observations(
+        ["2030-05-15"],
+        now=t_obs1,
+        allow_network=True,
+        provider=nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD,
+    )
     assert call_count == 2  # queried yesterday + today
     assert diag1.get("cache_hit") is not True
     orig_observed_at = rows1[0]["observed_at"]
 
     # 二次抓取（TTL 300秒内）：命中进程内内存缓存
-    rows2, diag2 = nba_schedule.fetch_nba_schedule_observations(["2030-05-15"], now=t_obs2, allow_network=True)
+    rows2, diag2 = nba_schedule.fetch_nba_schedule_observations(
+        ["2030-05-15"],
+        now=t_obs2,
+        allow_network=True,
+        provider=nba_schedule.PROVIDER_ESPN_NBA_SCOREBOARD,
+    )
     assert call_count == 2  # 未新增 HTTP 请求
     assert diag2["cache_hit"] is True
     assert diag2["observation_origin"] == "CACHE"
