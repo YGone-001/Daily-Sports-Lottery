@@ -402,7 +402,14 @@ def test_schedule_fetch_explicit_enable_and_mock_injection(monkeypatch):
 # 4. Workstream D: NBA 赔率快照真实历史与查询语义核对
 # ---------------------------------------------------------------------------
 
+REAL_ODDS = os.path.join(config.DATA_DIR, "odds_snapshots.json")
+REAL_CANONICAL = os.path.join(config.DATA_DIR, "daily_matches.json")
 
+
+@pytest.mark.skipif(
+    not os.path.isfile(REAL_ODDS),
+    reason="no local real dataset (git-ignored); synthetic tests only in CI",
+)
 def test_odds_history_query_semantics_and_four_target_reconciliation():
     """
     Workstream D: 核对目标四场比赛在真实 odds_snapshots.json 中的存在性。
@@ -437,6 +444,10 @@ def test_odds_history_query_semantics_and_four_target_reconciliation():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not os.path.isfile(REAL_CANONICAL),
+    reason="no local real dataset (git-ignored); synthetic tests only in CI",
+)
 def test_nba_temporal_inventory_exact_reconciliation():
     """
     Workstream E: 24 场已存储待赛 NBA 赛事的五分类无缝对账。
