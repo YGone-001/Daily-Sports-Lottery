@@ -246,6 +246,7 @@ def record_odds_snapshot(
         return None
 
     now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
+    actual_decision_now = get_beijing_now().astimezone(BEIJING_TZ)
 
     # 显式终态/进行中门禁：即便尚未到开赛时间或时间未知，live / finished / 非 upcoming 一律拒绝
     raw_status = str(match.get("status") or "").strip().lower()
@@ -258,6 +259,8 @@ def record_odds_snapshot(
             return None
 
     if kickoff_dt is not None:
+        if actual_decision_now >= kickoff_dt:
+            return None
         if now_bj >= kickoff_dt:
             return None
     else:
@@ -269,9 +272,9 @@ def record_odds_snapshot(
             return None
         match_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         if match.get("sport") == "basketball":
-            if now_bj.date() >= match_date:
+            if actual_decision_now.date() >= match_date or now_bj.date() >= match_date:
                 return None
-        elif now_bj.date() > match_date:
+        elif actual_decision_now.date() > match_date or now_bj.date() > match_date:
             return None
 
     status = add_time_status(dict(match), now_bj).get("status")
@@ -281,10 +284,20 @@ def record_odds_snapshot(
     snapshot = build_snapshot(match, captured_at=now_bj, source=source)
 
     with _LOCK:
-        # 门禁：锁获取后终态时间校验（防止排队等锁期间跨越开赛时间）
+        # 门禁：锁获取后终态时间校验（防止排队等锁期间跨越开赛时间，无论 now 是否显式提供）
         lock_bj = get_beijing_now().astimezone(BEIJING_TZ)
-        if now is None and kickoff_dt is not None and lock_bj >= kickoff_dt:
-            return None
+        if kickoff_dt is not None:
+            if lock_bj >= kickoff_dt:
+                return None
+        else:
+            date_str = str(match.get("date") or "").strip()
+            if is_valid_calendar_date(date_str):
+                match_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if match.get("sport") == "basketball":
+                    if lock_bj.date() >= match_date:
+                        return None
+                elif lock_bj.date() > match_date:
+                    return None
         store = _load_store()
         if snapshot["snapshot_id"] in store["snapshots"]:
             # 精确幂等重放：同 match_id + captured_at + 指纹 的观察已存在，

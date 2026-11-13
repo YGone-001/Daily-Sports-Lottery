@@ -996,6 +996,40 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.31 快照捕获时间权威、二元契约完整性、公共网络默认拒绝与 NBA 证据核对
+
+- **预提交捕获时间权威与时钟源解耦（Precommit Capture-Time Authority）**：快照持久化持久层以 `get_beijing_now()` 作为最终捕获资格的时间权威。调用方显式传入的逻辑时间 `now`、刷新启动时间 `refresh_started_at` 与实际物理时钟（或测试时钟注入 `override_beijing_now()`）三者均必须独立通过开赛门禁校验：
+  - 调用方显式传入的 `now` 仅作为快照元数据 `generated_at` / `captured_at` 的逻辑参考，**绝不能**免除、短路或绕过决策时、模型评估后与锁获取后的真实时钟重验；
+  - 生产物理时钟与隔离测试时钟严格隔离，测试中必须通过显式确定性上下文管理器 `override_beijing_now()` 注入时间，严禁依赖系统当前自然时间或未闭合生成器；
+  - 任何时间权威到达或跨越开赛时刻（`>= kickoff_dt`）的快照请求必须全部 fail-closed 拒绝落盘。
+- **快照捕获结果二元解构真实契约（True Two-Element CaptureResult Contract）**：
+  - `CaptureResult` 严格继承 `tuple` 并保持长度为 2（`len(result) == 2`），完美支持 `snapshot, created = result` 二元解构，`result[0]` 对应 `snapshot`，`result[1]` 对应 `created`；
+  - 状态分类码通过属性 `.classification`、`.reason` 与 `.status` 暴露，**严禁声称或使用** `result[2]` 下标访问（元组下标越界将抛出 `IndexError`）；
+  - 赛前赔率快照落盘函数 `odds_snapshots.record_odds_snapshot()` 的返回契约为 `dict | None`（成功持久化返回完整 `dict`，去重、重放或拒绝返回 `None`），**绝不返回** `(None, False)` 之类的二元元组。
+- **公共赛程获取入口默认拒绝网络（Default-Deny Schedule Networking at Public Boundary）**：
+  - 公共函数 `nba_schedule.fetch_nba_schedule_observations` 参数签名必须设为 `allow_network: bool = False`；
+  - 省略网络权限参数调用、模块默认配置与日常刷新入口均默认拒绝（`OMITTED_NETWORK_PERMISSION = DENY`，`MODULE_DEFAULT_FALSE = DENY`）；
+  - 拒绝时直接返回 `status = "disabled_pending_authorization"` 及 `PROVIDER_AUTOMATED_USE_UNAUTHORIZED` 错误码，严禁触碰底层 HTTP 网络客户端；
+  - 严格区分三项独立权限维度：`PROVIDER_AUTOMATED_USE_PERMISSION`（第三方提供商使用授权）、`APPLICATION_NETWORK_ENABLEMENT`（应用网络开关）与 `REAL_RUNTIME_WRITE_AUTHORIZATION`（本地生产存储写入授权），不得互相替代或混淆。
+- **赔率快照查询语义与真实数据对账（Odds History Query Semantics & Reconciliation）**：
+  - 严格区分按快照 ID 单条读取（`get_odds_snapshot(snapshot_id)`）与按比赛 ID 查询历史序列（`get_odds_history_for_match(match_id)`）；
+  - 严禁将 `match_id` 误传入 `get_odds_snapshot()`，严禁在遍历 `store["snapshots"]` 字典时将键字符串误判为缺失快照；
+  - 生产事实对账证明：`500j-2026-11-13-4306` 至 `4309` 四场 NBA 赛事在真实存储中每场均完整保留 1 条不可变赛前赔率历史记录。
+- **NBA 时序库存五分类无缝对账（NBA Temporal Inventory Mutual Exclusivity）**：
+  - 待赛 NBA 赛事（`stored_upcoming`）必须按开赛时间已知性与自然日严格拆分为五个互斥且完备的集合：
+    1. `VERIFIED_FUTURE_KICKOFF`（开赛时间已知且在当前时钟之后）；
+    2. `VERIFIED_PAST_KICKOFF`（开赛时间已知但在当前时钟之前）；
+    3. `UNKNOWN_KICKOFF_FUTURE_DATE`（开赛时间未知但比赛自然日在当前日期之后）；
+    4. `UNKNOWN_KICKOFF_CURRENT_DATE`（开赛时间未知但比赛自然日为当前日期）；
+    5. `UNKNOWN_KICKOFF_PAST_DATE`（开赛时间未知且比赛自然日在当前日期之前）。
+  - 开赛时间未知（`kickoff_time_known == False` 或 `time == '00:00'`）的赛事**严禁**被归为未来开赛；
+  - 24 场存储待赛 + 14 场已开赛（live）+ 15 场已完赛（finished）必须严格对账至 53 场 NBA Canonical 总数，零遗漏零重叠。
+- **进程内内存 TTL 缓存边界（Process-Local In-Memory TTL Cache）**：
+  - `nba_schedule` 的赛程缓存属于纯粹的 Python 进程内全局字典（`_SCHEDULE_CACHE`），生命周期受限于进程运行时，带有 300 秒 TTL；
+  - 严禁将其描述为持久化磁盘缓存；缓存命中保留原始观测时间戳 `observed_at`，仅暴露 `observation_age_seconds`。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

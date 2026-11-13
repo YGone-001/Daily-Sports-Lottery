@@ -76,7 +76,8 @@ PROVENANCE_CONFLICT = "PROVENANCE_CONFLICT"
 class CaptureResult(tuple):
     """
     快照捕获结果容器，继承 tuple 以完全向后兼容 (snapshot, created) 的二元解构，
-    同时携带 classification / reason 属性暴露细粒度时序与门禁判定状态。
+    同时携带 classification / reason / status 属性暴露细粒度时序与门禁判定状态。
+    注意：本容器严格为二元元组 (len == 2)，不支持 result[2] 下标访问分类码。
     """
     def __new__(cls, snapshot: dict | None, created: bool, classification: str):
         return super().__new__(cls, (snapshot, created))
@@ -86,6 +87,7 @@ class CaptureResult(tuple):
         self.created = created
         self.classification = classification
         self.reason = classification
+        self.status = classification
 
     def __repr__(self) -> str:
         return f"CaptureResult(snapshot={bool(self.snapshot)}, created={self.created}, classification={self.classification!r})"
@@ -350,10 +352,20 @@ def _create_or_get(
     if not prov_ok or prov_status == PROVENANCE_CONFLICT:
         return CaptureResult(None, False, PROVENANCE_CONFLICT)
 
-    # 5. 捕获决策时间校验（Workstream B：严禁以 refresh_started_at 掩盖开赛事实）
-    decision_now = (now or get_beijing_now()).astimezone(BEIJING_TZ)
-    if decision_now >= kickoff_dt:
+    # 5. 捕获决策时间校验（Workstream B / Phase 3-Q Workstream A）：
+    # 物理/测试时钟 (actual_decision_now) 与调用方显式传入的逻辑时间 (now) 均受开赛前约束
+    actual_decision_now = get_beijing_now().astimezone(BEIJING_TZ)
+    if actual_decision_now >= kickoff_dt:
         return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
+
+    if now is not None:
+        caller_now = now.astimezone(BEIJING_TZ)
+        if caller_now >= kickoff_dt:
+            return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
+        decision_now = caller_now
+    else:
+        decision_now = actual_decision_now
+
     if refresh_started_at is not None:
         ref_bj = refresh_started_at.astimezone(BEIJING_TZ)
         if ref_bj >= kickoff_dt:
@@ -382,7 +394,7 @@ def _create_or_get(
 
     # 8. 门禁：模型计算完成时刻二次校验（防止耗时模型计算跨越开赛时间）
     model_finished_now = get_beijing_now().astimezone(BEIJING_TZ)
-    if now is None and model_finished_now >= kickoff_dt:
+    if model_finished_now >= kickoff_dt:
         return CaptureResult(None, False, KICKOFF_REACHED_DURING_MODEL_EVALUATION)
 
     snapshot = build_snapshot(
@@ -413,7 +425,7 @@ def _create_or_get(
 
             # 9. 门禁：锁获取后终态时间校验（防止排队等锁期间跨越开赛时间）
             lock_acquired_now = get_beijing_now().astimezone(BEIJING_TZ)
-            if now is None and lock_acquired_now >= kickoff_dt:
+            if lock_acquired_now >= kickoff_dt:
                 return CaptureResult(None, False, KICKOFF_REACHED_DURING_LOCK_WAIT)
 
             store["snapshots"][snapshot_id] = snapshot

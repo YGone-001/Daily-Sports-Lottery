@@ -424,11 +424,11 @@ def fetch_nba_schedule_observations(
     *,
     timeout: float = 5.0,
     now: datetime | None = None,
-    allow_network: bool = True,
+    allow_network: bool = False,
 ) -> tuple[list[dict], dict]:
     """
     通过公开端点获取覆盖指定北京时间日期窗口的 NBA 赛程观测。
-    在未经明确授权前，自动化外网抓取默认禁用 (Workstream D)。
+    在未经明确授权前，公开端点默认拒绝外网抓取 (Default-Deny, allow_network=False)。
     """
     now_bj = (now or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ)
     today = now_bj.date()

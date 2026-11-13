@@ -207,7 +207,7 @@ def test_fetch_nba_schedule_unavailable_and_non_near_term(monkeypatch):
         status_code = 403
 
     monkeypatch.setattr(nba_schedule.requests, "get", lambda *a, **kw: _FailResp())
-    rows, diag = nba_schedule.fetch_nba_schedule_observations(["2026-11-13"], now=datetime(2026, 11, 12, 18, 0, tzinfo=BEIJING_TZ))
+    rows, diag = nba_schedule.fetch_nba_schedule_observations(["2026-11-13"], now=datetime(2026, 11, 12, 18, 0, tzinfo=BEIJING_TZ), allow_network=True)
     assert rows == []
     assert diag["status"] == "unavailable"
     nba_schedule.clear_schedule_cache()
