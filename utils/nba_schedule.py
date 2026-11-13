@@ -15,12 +15,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import os
 import re
 import time
 from typing import Any, Iterable
 
 import requests
 
+import config
 from utils.fetcher_500 import is_nba_league
 from utils.match_identity import is_kickoff_time_known, is_valid_calendar_date
 
@@ -28,6 +30,19 @@ BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 PROVIDER_ESPN_NBA_SCOREBOARD = "espn_nba_scoreboard"
 PROVIDER_NBA_OFFICIAL_SCHEDULE = "nba_official_schedule"
+
+# 数据源分类与接入合规契约 (Workstream D)
+PROVIDER_TYPE_NBA_OFFICIAL = "NBA_OFFICIAL_DIRECT_SOURCE"
+PROVIDER_TYPE_ESPN_THIRD_PARTY = "ESPN_THIRD_PARTY_SCHEDULE_SOURCE"
+PROVIDER_TYPE_DOCUMENTED_AUTHORIZED = "DOCUMENTED_AUTHORIZED_SOURCE"
+PROVIDER_TYPE_UNSUPPORTED_PUBLIC = "UNSUPPORTED_PUBLIC_ENDPOINT"
+PROVIDER_AUTH_UNVERIFIED = "PROVIDER_USAGE_AUTHORIZATION_UNVERIFIED"
+
+AUTOMATED_OPERATION_ENABLED = "ENABLED_WITH_AUTHORIZATION"
+AUTOMATED_OPERATION_DISABLED = "DISABLED_PENDING_AUTHORIZATION"
+
+# NBA 第三方公开赛程网络抓取控制（自动化生产授权未确立前默认禁用）
+ENABLE_NBA_SCHEDULE_NETWORK = os.environ.get("DSL_ENABLE_NBA_SCHEDULE_NETWORK", "false").lower() in ("true", "1", "yes")
 
 ESPN_NBA_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 OFFICIAL_NBA_SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
@@ -199,27 +214,64 @@ def parse_espn_nba_scoreboard(
     source_reference: str = ESPN_NBA_SCOREBOARD_URL,
     observed_at: datetime | None = None,
 ) -> tuple[list[dict], list[str]]:
-    """解析公开 ESPN NBA Scoreboard API 载荷为标准观测结构；自动过滤非 NBA 赛事。"""
+    """解析公开 ESPN NBA Scoreboard API 载荷为标准观测结构；严格校验 NBA 联赛身份并过滤非 NBA 赛事。"""
     if not isinstance(payload, dict):
         return [], ["MALFORMED_PAYLOAD"]
 
     obs_iso = (observed_at or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ).isoformat()
-    leagues = payload.get("leagues") or []
-    league_uid = str((leagues[0] or {}).get("uid") or "") if leagues else ""
-    league_abbr = str((leagues[0] or {}).get("abbreviation") or "").upper() if leagues else ""
-    if league_uid and "l:46" not in league_uid and league_abbr != "NBA":
-        return [], []
+
+    # 严格联赛标识校验 (Workstream E)
+    leagues = payload.get("leagues")
+    if not isinstance(leagues, list) or not leagues:
+        return [], ["MISSING_LEAGUE_IDENTITY"]
+
+    league_obj = leagues[0]
+    if not isinstance(league_obj, dict):
+        return [], ["MALFORMED_LEAGUE_IDENTITY"]
+
+    league_uid = str(league_obj.get("uid") or "").strip()
+    league_abbr = str(league_obj.get("abbreviation") or "").strip().upper()
+    league_slug = str(league_obj.get("slug") or "").strip().lower()
+
+    if not league_uid or not league_abbr:
+        return [], ["MISSING_LEAGUE_IDENTITY"]
+
+    uid_parts = league_uid.split("~")
+
+    # 1. 矛盾元数据检查（如缩写/slug 是 NBA 但 uid 是非 NBA，或相反）
+    is_nba_uid = ("s:40" in uid_parts and "l:46" in uid_parts)
+    is_nba_abbr = (league_abbr == "NBA" or league_slug == "nba")
+    if is_nba_uid != is_nba_abbr:
+        return [], ["CONTRADICTORY_LEAGUE_METADATA"]
+
+    # 2. 误导性子串检查（如 l:460 或 l:146，虽包含 "46" 但不是真正的 NBA l:46）
+    if "46" in league_uid and "l:46" not in uid_parts:
+        return [], ["MISLEADING_LEAGUE_SUBSTRING"]
+
+    # 3. 显式 WNBA 过滤
+    if league_abbr == "WNBA" or "l:59" in uid_parts or league_slug == "wnba":
+        return [], ["WNBA_LEAGUE_FILTERED"]
+
+    if not is_nba_uid or not is_nba_abbr:
+        return [], ["NON_NBA_LEAGUE"]
 
     observations: list[dict] = []
     errors: list[str] = []
+    seen_events: dict[str, dict] = {}
 
     for ev in payload.get("events", []) or []:
         if not isinstance(ev, dict):
             errors.append("MALFORMED_EVENT")
             continue
-        ev_uid = str(ev.get("uid") or "")
-        if ev_uid and "l:46" not in ev_uid:
-            # 显式拒绝 WNBA / 其它联赛混入
+
+        ev_uid = str(ev.get("uid") or "").strip()
+        if not ev_uid:
+            errors.append("MISSING_EVENT_UID")
+            continue
+
+        ev_parts = ev_uid.split("~")
+        if "s:40" not in ev_parts or "l:46" not in ev_parts:
+            # 显式过滤非 NBA（如 WNBA l:59）赛事事件
             continue
 
         gid = ev.get("id")
@@ -248,32 +300,46 @@ def parse_espn_nba_scoreboard(
         raw_utc = ev.get("date")
         bj_date, bj_time, _, parse_status = convert_utc_to_beijing(raw_utc)
         raw_status_name = ((ev.get("status") or {}).get("type") or {}).get("name")
-        season_obj = ev.get("season") or (leagues[0].get("season") if leagues else {}) or {}
+        season_obj = ev.get("season") or (league_obj.get("season") if isinstance(league_obj, dict) else {}) or {}
         season_year = season_obj.get("year")
         season_label = f"{int(season_year) - 1}-{str(int(season_year))[-2:]}" if isinstance(season_year, int) else str(season_obj.get("displayName") or "")
 
-        observations.append(
-            {
-                "provider": PROVIDER_ESPN_NBA_SCOREBOARD,
-                "provider_game_id": gid_str,
-                "season": season_label,
-                "league_uid": ev_uid or league_uid or "s:40~l:46",
-                "game_status": _map_espn_status(raw_status_name),
-                "raw_status": str(raw_status_name or ""),
-                "home_team_identifier": f"espn:{h_id}",
-                "away_team_identifier": f"espn:{a_id}",
-                "home_team_name": str(h_team.get("displayName") or ""),
-                "away_team_name": str(a_team.get("displayName") or ""),
-                "home_tricode": str(h_team.get("abbreviation") or ""),
-                "away_tricode": str(a_team.get("abbreviation") or ""),
-                "scheduled_start_utc": raw_utc.strip() if isinstance(raw_utc, str) and parse_status == "VALID_UTC" else (raw_utc if isinstance(raw_utc, str) else None),
-                "beijing_date": bj_date,
-                "beijing_time": bj_time,
-                "time_parse_status": parse_status,
-                "observed_at": obs_iso,
-                "source_reference": source_reference,
-            }
-        )
+        obs_entry = {
+            "provider": PROVIDER_ESPN_NBA_SCOREBOARD,
+            "provider_game_id": gid_str,
+            "season": season_label,
+            "league_uid": ev_uid,
+            "game_status": _map_espn_status(raw_status_name),
+            "raw_status": str(raw_status_name or ""),
+            "home_team_identifier": f"espn:{h_id}",
+            "away_team_identifier": f"espn:{a_id}",
+            "home_team_name": str(h_team.get("displayName") or ""),
+            "away_team_name": str(a_team.get("displayName") or ""),
+            "home_tricode": str(h_team.get("abbreviation") or ""),
+            "away_tricode": str(a_team.get("abbreviation") or ""),
+            "scheduled_start_utc": raw_utc.strip() if isinstance(raw_utc, str) and parse_status == "VALID_UTC" else (raw_utc if isinstance(raw_utc, str) else None),
+            "beijing_date": bj_date,
+            "beijing_time": bj_time,
+            "time_parse_status": parse_status,
+            "observed_at": obs_iso,
+            "source_reference": source_reference,
+        }
+
+        # 检查同载荷内重复赛事 ID 及冲突 (Workstream E)
+        if gid_str in seen_events:
+            prev = seen_events[gid_str]
+            if (
+                prev["home_team_identifier"] != obs_entry["home_team_identifier"]
+                or prev["away_team_identifier"] != obs_entry["away_team_identifier"]
+                or prev["scheduled_start_utc"] != obs_entry["scheduled_start_utc"]
+            ):
+                errors.append(f"CONFLICTING_DUPLICATE_EVENT:{gid_str}")
+                continue
+            # 相同内容幂等忽略
+            continue
+
+        seen_events[gid_str] = obs_entry
+        observations.append(obs_entry)
 
     return observations, errors
 
@@ -358,13 +424,11 @@ def fetch_nba_schedule_observations(
     *,
     timeout: float = 5.0,
     now: datetime | None = None,
+    allow_network: bool = True,
 ) -> tuple[list[dict], dict]:
     """
-    通过合规无旁路公开端点获取覆盖指定北京时间日期窗口的 NBA 赛程观测。
-
-    由于北美晚间比赛在北京时间日期 D 的次日上午（即美国自然日 D-1），
-    对每个目标北京日期 D 自动查询 US 日期 `{D-1, D}` 并按 `provider_game_id` 去重。
-    超出当前近端窗口（[今天-1天, 今天+7天]）的合成/历史日期不触发外网请求。
+    通过公开端点获取覆盖指定北京时间日期窗口的 NBA 赛程观测。
+    在未经明确授权前，自动化外网抓取默认禁用 (Workstream D)。
     """
     now_bj = (now or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ)
     today = now_bj.date()
@@ -382,8 +446,16 @@ def fetch_nba_schedule_observations(
         if not dates_set:
             return [], {
                 "provider": PROVIDER_ESPN_NBA_SCOREBOARD,
+                "provider_type": PROVIDER_TYPE_ESPN_THIRD_PARTY,
+                "provider_endpoint_type": PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
+                "provider_authorization_status": PROVIDER_AUTH_UNVERIFIED,
+                "automated_provider_operation": AUTOMATED_OPERATION_ENABLED if allow_network else AUTOMATED_OPERATION_DISABLED,
                 "status": "empty",
+                "coverage_status": "EMPTY_DATE_WINDOW",
                 "reachable": False,
+                "requested_us_dates": [],
+                "successful_us_dates": [],
+                "failed_us_dates": [],
                 "queried_us_dates": [],
                 "rows": 0,
                 "errors": [],
@@ -391,6 +463,28 @@ def fetch_nba_schedule_observations(
                 "note": "NO_NEAR_TERM_DATES",
                 "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
             }
+
+    # 检查自动化网络请求许可 (Workstream D)
+    if not allow_network:
+        return [], {
+            "provider": PROVIDER_ESPN_NBA_SCOREBOARD,
+            "provider_type": PROVIDER_TYPE_ESPN_THIRD_PARTY,
+            "provider_endpoint_type": PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
+            "provider_authorization_status": PROVIDER_AUTH_UNVERIFIED,
+            "automated_provider_operation": AUTOMATED_OPERATION_DISABLED,
+            "status": "disabled_pending_authorization",
+            "coverage_status": "UNAUTHORIZED_DATE_FETCH",
+            "reachable": False,
+            "requested_us_dates": [],
+            "successful_us_dates": [],
+            "failed_us_dates": [],
+            "queried_us_dates": [],
+            "rows": 0,
+            "errors": ["PROVIDER_AUTOMATED_USE_UNAUTHORIZED"],
+            "checked_at": now_bj.isoformat(),
+            "note": "AUTOMATED_NETWORK_FETCH_DISABLED_PENDING_EXPLICIT_AUTHORIZATION",
+            "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
+        }
 
     query_days: list[str] = []
     seen_q: set[str] = set()
@@ -406,40 +500,74 @@ def fetch_nba_schedule_observations(
     now_mono = time.monotonic()
     cached = _SCHEDULE_CACHE.get(cache_key)
     if cached and (now_mono - cached[0]) < SCHEDULE_CACHE_TTL:
-        return [dict(item) for item in cached[1]], dict(cached[2])
+        cached_mono, cached_rows, cached_diag = cached
+        diag = dict(cached_diag)
+        diag["cache_hit"] = True
+        diag["observation_origin"] = "CACHE"
+        diag["observation_age_seconds"] = round(now_mono - cached_mono, 3)
+        diag["checked_at"] = now_bj.isoformat()
+        # 绝不为缓存行伪造新的 observed_at，保留其实际抓取观测时间
+        return [dict(item) for item in cached_rows], diag
 
     by_gid: dict[str, dict] = {}
     errors: list[str] = []
-    reachable = False
+    successful_dates: list[str] = []
+    failed_dates: list[str] = []
+    req_started_at = datetime.now(BEIJING_TZ)
+
     for q in query_days:
         url = f"{ESPN_NBA_SCOREBOARD_URL}?dates={q}"
         try:
             resp = requests.get(url, timeout=timeout)
+            resp_received_at = datetime.now(BEIJING_TZ)
             if resp.status_code != 200:
                 errors.append(f"HTTP_{resp.status_code}:{q}")
+                failed_dates.append(q)
                 continue
-            reachable = True
             rows, p_errors = parse_espn_nba_scoreboard(
                 resp.json(),
                 source_reference=url,
-                observed_at=now_bj,
+                observed_at=resp_received_at,
             )
             errors.extend(p_errors)
+            successful_dates.append(q)
             for row in rows:
                 by_gid[row["provider_game_id"]] = row
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{type(exc).__name__}:{q}")
+            failed_dates.append(q)
+
+    reachable = len(successful_dates) > 0
+    if not successful_dates:
+        coverage_status = "FAILED_DATE_FETCH"
+    elif failed_dates:
+        coverage_status = "PARTIAL_DATE_FETCH"
+    else:
+        coverage_status = "COMPLETE_DATE_FETCH"
 
     observations = sorted(by_gid.values(), key=lambda x: (x.get("beijing_date") or "", x.get("provider_game_id") or ""))
     status = "unavailable" if not reachable else ("ok" if observations else "empty")
     diag = {
         "provider": PROVIDER_ESPN_NBA_SCOREBOARD,
+        "provider_type": PROVIDER_TYPE_ESPN_THIRD_PARTY,
+        "provider_endpoint_type": PROVIDER_TYPE_UNSUPPORTED_PUBLIC,
+        "provider_authorization_status": PROVIDER_AUTH_UNVERIFIED,
+        "automated_provider_operation": AUTOMATED_OPERATION_ENABLED,
         "status": status,
+        "coverage_status": coverage_status,
         "reachable": reachable,
+        "request_started_at": req_started_at.isoformat(),
+        "response_received_at": datetime.now(BEIJING_TZ).isoformat(),
+        "observation_origin": "NETWORK",
+        "cache_hit": False,
+        "observation_age_seconds": 0.0,
+        "requested_us_dates": query_days,
+        "successful_us_dates": successful_dates,
+        "failed_us_dates": failed_dates,
         "queried_us_dates": query_days,
         "rows": len(observations),
         "errors": errors,
-        "checked_at": now_bj.isoformat(),
+        "checked_at": datetime.now(BEIJING_TZ).isoformat(),
         "official_nba_cdn_status": "http_403_not_accessible_without_bypass",
     }
     _SCHEDULE_CACHE[cache_key] = (now_mono, [dict(item) for item in observations], dict(diag))
@@ -494,11 +622,13 @@ def bind_schedule_observations_to_canonical(
         if not isinstance(obs, dict):
             continue
         prov = obs.get("provider")
-        luid = str(obs.get("league_uid") or "")
+        luid = str(obs.get("league_uid") or "").strip()
         if prov == PROVIDER_NBA_OFFICIAL_SCHEDULE and luid and luid != "00":
             continue
-        if prov == PROVIDER_ESPN_NBA_SCOREBOARD and luid and "l:46" not in luid:
-            continue
+        if prov == PROVIDER_ESPN_NBA_SCOREBOARD:
+            luid_parts = luid.split("~")
+            if "s:40" not in luid_parts or "l:46" not in luid_parts:
+                continue
         valid_nba_obs.append(obs)
 
     for m in nba_canonical:

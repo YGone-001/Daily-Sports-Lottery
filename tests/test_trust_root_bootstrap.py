@@ -60,6 +60,7 @@ ALLOWED_PATHS = frozenset((
     "app.py",
     "tests/test_basketball_sync_integrity.py",
     "tests/test_nba_schedule_binding.py",
+    "tests/test_capture_time_integrity.py",
     "frontend/src/features/DailyView/DailyView.tsx",
     "frontend/src/features/DailyView/dateSelection.ts",
     "frontend/src/features/DailyView/dateSelection.test.ts",

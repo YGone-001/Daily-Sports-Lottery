@@ -49,8 +49,30 @@ def save_json(filename: str, data: dict) -> None:
     atomic_write_json(filepath, data)
 
 
+_CLOCK_OVERRIDE = None
+
+
 def get_beijing_now() -> datetime:
+    if _CLOCK_OVERRIDE is not None:
+        val = _CLOCK_OVERRIDE() if callable(_CLOCK_OVERRIDE) else _CLOCK_OVERRIDE
+        if isinstance(val, datetime):
+            return val.astimezone(BEIJING_TZ) if val.tzinfo is not None else val.replace(tzinfo=BEIJING_TZ)
     return datetime.now(BEIJING_TZ)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def override_beijing_now(dt_or_callable):
+    """用于测试的确定性北京时间时钟注入上下文管理器。"""
+    global _CLOCK_OVERRIDE
+    prev = _CLOCK_OVERRIDE
+    _CLOCK_OVERRIDE = dt_or_callable
+    try:
+        yield
+    finally:
+        _CLOCK_OVERRIDE = prev
 
 
 # ---------------------------------------------------------------------------

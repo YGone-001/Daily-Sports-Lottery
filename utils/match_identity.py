@@ -301,6 +301,45 @@ def build_kickoff_time_provenance(match: dict, raw_value: str | None = None) -> 
     }
 
 
+PROVENANCE_CONSISTENT = "PROVENANCE_CONSISTENT"
+PROVENANCE_NOT_ESTABLISHED = "PROVENANCE_NOT_ESTABLISHED"
+PROVENANCE_CONFLICT = "PROVENANCE_CONFLICT"
+PROVIDER_AUTHORIZATION_NOT_ESTABLISHED = "PROVIDER_AUTHORIZATION_NOT_ESTABLISHED"
+
+
+def validate_kickoff_provenance_consistency(match: dict) -> tuple[bool, str]:
+    """
+    持久化快照写入边界的开赛时间溯源一致性门禁。
+
+    返回 (is_valid, classification)：
+    - 无结构化 kickoff_provenance 时：
+      - 返回 (True, PROVENANCE_NOT_ESTABLISHED) [兼容合法存量记录]
+    - 有结构化 kickoff_provenance 时：
+      - 执行严格内部一致性校验（UTC 换算对齐、ID 非空、源合法、状态未篡改）
+      - 若检测出矛盾/伪造凭证 -> (False, PROVENANCE_CONFLICT)
+      - 若完全自洽 -> (True, PROVENANCE_CONSISTENT)
+    """
+    if not isinstance(match, dict):
+        return False, PROVENANCE_CONFLICT
+
+    stored_prov = match.get("kickoff_provenance")
+    if not isinstance(stored_prov, dict) or not stored_prov:
+        return True, PROVENANCE_NOT_ESTABLISHED
+
+    prov = build_kickoff_time_provenance(match)
+    ver_status = prov.get("kickoff_verification_status")
+    if ver_status == "UNVERIFIED_PROVENANCE_CONFLICT":
+        return False, PROVENANCE_CONFLICT
+
+    if ver_status in ("OFFICIAL_NBA_VERIFIED", "SCHEDULE_PROVIDER_VERIFIED", "LEGACY_SOURCE_VERIFIED"):
+        return True, PROVENANCE_CONSISTENT
+
+    if ver_status == "NOT_ESTABLISHED":
+        return True, PROVENANCE_NOT_ESTABLISHED
+
+    return False, PROVENANCE_CONFLICT
+
+
 def competition_event_key(match: dict) -> str | None:
     """
     构造强赛事编号键：sport|date|jczq|cno。

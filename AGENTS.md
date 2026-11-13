@@ -982,6 +982,20 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.30 赛前证据捕获时效性、溯源冲突落盘阻断与赛程提供商门禁
+
+- **赛前捕获时效性与时间旅行漏洞阻断（Capture-Time Integrity）**：长耗时刷新过程（`scraper.refresh()`）中，必须严格区分刷新启动时刻 `refresh_started_at` 与真实的快照捕获决策时刻 `actual_capture_decision_at`；严禁使用过去的启动时间作为赛前快照的生成时间戳。`prediction_snapshots.capture_snapshot()` 与 `odds_snapshots.record_odds_snapshot()` 强制建立三重时效校验防线：
+  1. **入场决策重验**：`refresh_started_at < kickoff_dt` 且 `decision_now < kickoff_dt`，任一超时即以 `KICKOFF_REACHED_BEFORE_CAPTURE` 拒绝；
+  2. **模型评估后重验**：耗时模型计算完成后、进入持久化前，重新采样当前时间，若已达开赛时间则以 `KICKOFF_REACHED_DURING_MODEL_EVALUATION` 拒绝；
+  3. **锁等待后重验**：获取持久化文件锁后、执行最终落盘前，再次重新采样当前时间，若已达开赛时间则以 `KICKOFF_REACHED_DURING_LOCK_WAIT` 拒绝。
+  严禁向已达开赛时间或完赛的赛事补发虚假赛前快照，杜绝倒填快照（Backdating）与时间旅行证据洗白。
+- **开赛时间溯源冲突落盘硬阻断（Provenance Conflict Enforcement at Write Boundary）**：`utils/match_identity.validate_kickoff_provenance_consistency()` 在不可变赛前快照与赔率快照落盘边界严格强制执行；凡记录内部存在相互矛盾的赛程主张（例如已记录非直连第三方来源却声称 `OFFICIAL_NBA_VERIFIED`、或溯源声明时间与 Canonical 开赛时间冲突）者，一律返回 `(False, PROVENANCE_CONFLICT)` 并硬阻断快照落盘。无结构化溯源的历史遗留记录（`PROVENANCE_NOT_ESTABLISHED`）保持只读兼容，不得误杀。
+- **第三方赛程提供商契约与安全操作门禁（Provider Contract & Operational Gating）**：明确分类公开 ESPN Scoreboard 接口为第三方非官方、未授权公开端点（`PROVIDER_TYPE_ESPN_THIRD_PARTY`、`UNSUPPORTED_PUBLIC_ENDPOINT`、`PROVIDER_AUTH_UNVERIFIED`）；在未获得操作者或提供商显式自动化生产授权前，系统实施安全默认门禁（`nba_schedule.ENABLE_NBA_SCHEDULE_NETWORK = False`，操作状态暴露 `DISABLED_PENDING_AUTHORIZATION`），阻止自动化刷新发起未经授权的网络轮询；离线回归、缓存观测、足球及篮球彩票基础市场完全不受影响。
+- **严格 NBA 联赛身份校验与误导性子串阻断**：赛程载荷解析严格基于联赛 UID 路径分段（`"s:40"` 与 `"l:46"`），彻底消除 `"s:40~l:46"` 缺省回退漏洞；显式拦截 WNBA（`"l:59"`）、缺失 UID、误导性子串（如 `l:460`）、矛盾联赛元数据、缺失球队 ID 及相互冲突的重复事件 ID。
+- **赛程观测新鲜度、真实时空元数据与部分日期抓取分类**：网络抓取显式记录 `request_started_at` 与 `response_received_at`；命中缓存时暴露 `cache_hit=True` 与 `observation_age_seconds`，严禁在命中缓存时用当前时间刷新行内 `observed_at`；多日期抓取遇部分日期失败时，显式归类为 `PARTIAL_DATE_FETCH`，禁止静默掩盖部分缺失。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

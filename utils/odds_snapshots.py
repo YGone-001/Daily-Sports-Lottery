@@ -213,6 +213,7 @@ def record_odds_snapshot(
     match: dict,
     *,
     now: datetime | None = None,
+    refresh_started_at: datetime | None = None,
     source: str = ODDS_SOURCE,
 ) -> dict | None:
     """
@@ -238,6 +239,12 @@ def record_odds_snapshot(
     if not normalized:
         return None
 
+    # 开赛时间溯源一致性门禁（Workstream C）
+    from utils.match_identity import validate_kickoff_provenance_consistency, PROVENANCE_CONFLICT
+    prov_ok, prov_status = validate_kickoff_provenance_consistency(match)
+    if not prov_ok or prov_status == PROVENANCE_CONFLICT:
+        return None
+
     now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
 
     # 显式终态/进行中门禁：即便尚未到开赛时间或时间未知，live / finished / 非 upcoming 一律拒绝
@@ -246,6 +253,10 @@ def record_odds_snapshot(
         return None
 
     kickoff_dt = get_match_datetime(match)
+    if refresh_started_at is not None and kickoff_dt is not None:
+        if refresh_started_at.astimezone(BEIJING_TZ) >= kickoff_dt:
+            return None
+
     if kickoff_dt is not None:
         if now_bj >= kickoff_dt:
             return None
@@ -270,6 +281,10 @@ def record_odds_snapshot(
     snapshot = build_snapshot(match, captured_at=now_bj, source=source)
 
     with _LOCK:
+        # 门禁：锁获取后终态时间校验（防止排队等锁期间跨越开赛时间）
+        lock_bj = get_beijing_now().astimezone(BEIJING_TZ)
+        if now is None and kickoff_dt is not None and lock_bj >= kickoff_dt:
+            return None
         store = _load_store()
         if snapshot["snapshot_id"] in store["snapshots"]:
             # 精确幂等重放：同 match_id + captured_at + 指纹 的观察已存在，

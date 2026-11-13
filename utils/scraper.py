@@ -16,6 +16,7 @@ import copy
 import json
 from datetime import datetime
 
+import config
 from utils.concurrency import acquire_refresh_lock, RefreshBusyError
 from utils import fetcher_500
 from utils import refresh_state
@@ -477,7 +478,11 @@ def _calibrate_from_finished(matches: list[dict]) -> int:
     return count
 
 
-def _capture_odds_history(matches: list[dict], now=None) -> int:
+def _capture_odds_history(
+    matches: list[dict],
+    now=None,
+    refresh_started_at=None,
+) -> int:
     """
     为仍可投注的比赛捕获赛前盘口历史，返回本次**实际新增**的历史观察条数。
 
@@ -488,11 +493,16 @@ def _capture_odds_history(matches: list[dict], now=None) -> int:
     的正常落盘——赔率历史是附加层，其故障不应破坏主数据。
     """
     added = 0
+    ref_start = refresh_started_at or now
     for m in matches:
         if not m.get("odds"):
             continue
         try:
-            snapshot = record_odds_snapshot(m, now=now)
+            snapshot = record_odds_snapshot(
+                m,
+                now=None if refresh_started_at is not None else now,
+                refresh_started_at=ref_start,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[Auto-Sync] 赔率历史写入失败 {m.get('id')}: {exc}")
             continue
@@ -501,7 +511,11 @@ def _capture_odds_history(matches: list[dict], now=None) -> int:
     return added
 
 
-def _capture_prediction_snapshots(matches: list[dict], now=None) -> int:
+def _capture_prediction_snapshots(
+    matches: list[dict],
+    now=None,
+    refresh_started_at=None,
+) -> int:
     """
     为合并后仍「未开赛」的比赛自动固化 canonical 赛前预测快照，
     返回本次**实际新增**的快照条数。
@@ -516,15 +530,23 @@ def _capture_prediction_snapshots(matches: list[dict], now=None) -> int:
     绝不阻断 daily_matches.json 的落盘。
     """
     added = 0
+    ref_start = refresh_started_at or now
     for m in matches:
         match_id = m.get("id")
         if not match_id:
             continue
-        if add_time_status(m, now).get("status") != "upcoming":
+        curr_time = get_beijing_now()
+        if add_time_status(m, curr_time).get("status") != "upcoming":
+            continue
+        if ref_start and add_time_status(m, ref_start).get("status") != "upcoming":
             continue
         try:
-            enriched = enrich_match(m, now)
-            _snapshot, created = capture_snapshot(enriched, now=now)
+            enriched = enrich_match(m, curr_time)
+            _snapshot, created = capture_snapshot(
+                enriched,
+                now=None if refresh_started_at is not None else now,
+                refresh_started_at=ref_start,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[Auto-Sync] 预测快照写入失败 {match_id}: {exc}")
             continue
@@ -771,7 +793,11 @@ def _refresh_impl(verbose: bool = True) -> dict:
 
     # 7c. NBA 外部权威赛程时间补全（严格 time-only：不新增赛事、不改身份与赔率）
     from utils.fetcher_500 import is_nba_league
-    from utils.nba_schedule import apply_nba_schedule_time_enrichment, fetch_nba_schedule_observations
+    from utils.nba_schedule import (
+        ENABLE_NBA_SCHEDULE_NETWORK,
+        apply_nba_schedule_time_enrichment,
+        fetch_nba_schedule_observations,
+    )
 
     upcoming_nba_dates = sorted({
         str(m.get("date") or "").strip()
@@ -784,14 +810,19 @@ def _refresh_impl(verbose: bool = True) -> dict:
     })
     if upcoming_nba_dates:
         try:
-            sched_obs, sched_diag = fetch_nba_schedule_observations(upcoming_nba_dates, now=now)
+            sched_obs, sched_diag = fetch_nba_schedule_observations(
+                upcoming_nba_dates,
+                now=now,
+                allow_network=getattr(config, "ENABLE_NBA_SCHEDULE_NETWORK", ENABLE_NBA_SCHEDULE_NETWORK),
+            )
+            sched_available = (sched_diag.get("status") not in ("unavailable", "disabled_pending_authorization"))
             sched_res = apply_nba_schedule_time_enrichment(
                 merged,
                 sched_obs,
                 now=now,
-                schedule_available=(sched_diag.get("status") != "unavailable"),
+                schedule_available=sched_available,
             )
-            result["sources"]["nba_schedule"] = sched_diag.get("rows", 0)
+            result["sources"]["nba_schedule"] = sched_diag.get("status") if sched_diag.get("status") == "disabled_pending_authorization" else sched_diag.get("rows", 0)
             result["nba_schedule_enriched"] = sched_res.get("enriched", 0)
             result["nba_schedule_rescheduled"] = sched_res.get("rescheduled", 0)
             if sched_res.get("enriched", 0) or sched_res.get("rescheduled", 0):
@@ -799,15 +830,15 @@ def _refresh_impl(verbose: bool = True) -> dict:
         except Exception as exc:  # noqa: BLE001
             result["sources"]["nba_schedule"] = f"error: {exc}"
 
-    # 8. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准）
-    odds_snapshots_added = _capture_odds_history(merged, now=now)
+    # 8. 捕获赛前赔率历史（以合并后的 canonical 比赛 id 为准；传入刷新启动时间防时间回溯）
+    odds_snapshots_added = _capture_odds_history(merged, refresh_started_at=now)
 
     # 9. 校准 Elo（用本轮新完赛结果更新实力）
     calibrated = _calibrate_from_finished(merged)
 
-    # 10. 自动固化赛前预测快照
+    # 10. 自动固化赛前预测快照（传入刷新启动时间，以当前物理时钟捕获，跨越开赛自动拒绝）
     #     必须在 Elo 校准之后：快照应使用「当前刷新时刻已知」的最新实力。
-    prediction_snapshots_added = _capture_prediction_snapshots(merged, now=now)
+    prediction_snapshots_added = _capture_prediction_snapshots(merged, refresh_started_at=now)
 
     # 11. 结算已完赛比赛（只关联既有预测快照，不回溯生成预测）
     settlements_added = _settle_finished_matches(merged, now=now)

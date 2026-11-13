@@ -59,6 +59,37 @@ _LOCK = threading.RLock()
 SNAPSHOT_LOCK_NAME = ".snapshots.lock"
 SNAPSHOT_LOCK_TIMEOUT_SECONDS = 10.0
 
+# ---------------------------------------------------------------------------
+# 赛前预测快照捕获状态与结果契约 (Workstream B / C)
+# ---------------------------------------------------------------------------
+CAPTURED_BEFORE_KICKOFF = "CAPTURED_BEFORE_KICKOFF"
+KICKOFF_REACHED_BEFORE_CAPTURE = "KICKOFF_REACHED_BEFORE_CAPTURE"
+KICKOFF_REACHED_DURING_MODEL_EVALUATION = "KICKOFF_REACHED_DURING_MODEL_EVALUATION"
+KICKOFF_REACHED_DURING_LOCK_WAIT = "KICKOFF_REACHED_DURING_LOCK_WAIT"
+UNKNOWN_KICKOFF = "UNKNOWN_KICKOFF"
+SOURCE_ALREADY_LIVE = "SOURCE_ALREADY_LIVE"
+SOURCE_ALREADY_FINISHED = "SOURCE_ALREADY_FINISHED"
+EXISTING_IMMUTABLE_SNAPSHOT = "EXISTING_IMMUTABLE_SNAPSHOT"
+PROVENANCE_CONFLICT = "PROVENANCE_CONFLICT"
+
+
+class CaptureResult(tuple):
+    """
+    快照捕获结果容器，继承 tuple 以完全向后兼容 (snapshot, created) 的二元解构，
+    同时携带 classification / reason 属性暴露细粒度时序与门禁判定状态。
+    """
+    def __new__(cls, snapshot: dict | None, created: bool, classification: str):
+        return super().__new__(cls, (snapshot, created))
+
+    def __init__(self, snapshot: dict | None, created: bool, classification: str):
+        self.snapshot = snapshot
+        self.created = created
+        self.classification = classification
+        self.reason = classification
+
+    def __repr__(self) -> str:
+        return f"CaptureResult(snapshot={bool(self.snapshot)}, created={self.created}, classification={self.classification!r})"
+
 
 # ---------------------------------------------------------------------------
 # 存储位置与读写
@@ -279,11 +310,12 @@ def _create_or_get(
     *,
     model_version: str,
     now: datetime | None,
-) -> tuple[dict | None, bool]:
+    refresh_started_at: datetime | None = None,
+) -> CaptureResult:
     """
     内部持久化原语：在同一把锁内完成「检查 + 写入」，不存在 check-then-write 竞态。
 
-    返回 (snapshot, created)：
+    返回 CaptureResult(snapshot, created, classification)：
         created=True  -> 本次调用确实新增并落盘了一条记录，snapshot 为写入内容
         created=False -> 本次未新增；snapshot 为既有记录，或被时序门禁拒绝时为 None
     """
@@ -293,25 +325,50 @@ def _create_or_get(
 
     snapshot_id = snapshot_id_for(match_id, model_version)
 
-    # 显式终态/进行中门禁：即便时间尚未到达开赛点，live / finished / 非 upcoming 一律拒绝
-    raw_status = str(match.get("status") or "").strip().lower()
-    if raw_status in ("live", "finished") or (raw_status and raw_status != "upcoming"):
-        return get_snapshot(snapshot_id), False
+    # 1. 幂等：若已有不可变快照，直接原样返回
+    existing = get_snapshot(snapshot_id)
+    if isinstance(existing, dict):
+        return CaptureResult(existing, False, EXISTING_IMMUTABLE_SNAPSHOT)
 
-    # 权威开赛时间门禁：开赛时间未知或格式非法时禁止新建快照（历史已有快照仍可读）
+    # 2. 显式终态/进行中门禁：即便时间尚未到达开赛点，live / finished / 非 upcoming 一律拒绝
+    raw_status = str(match.get("status") or "").strip().lower()
+    if raw_status == "live":
+        return CaptureResult(None, False, SOURCE_ALREADY_LIVE)
+    if raw_status == "finished":
+        return CaptureResult(None, False, SOURCE_ALREADY_FINISHED)
+    if raw_status and raw_status != "upcoming":
+        return CaptureResult(None, False, SOURCE_ALREADY_LIVE)
+
+    # 3. 权威开赛时间门禁：开赛时间未知或格式非法时禁止新建快照
     kickoff_dt = get_match_datetime(match)
     if kickoff_dt is None:
-        return get_snapshot(snapshot_id), False
+        return CaptureResult(None, False, UNKNOWN_KICKOFF)
 
-    now_bj = (now or get_beijing_now()).astimezone(BEIJING_TZ)
-    if now_bj >= kickoff_dt:
-        return get_snapshot(snapshot_id), False
+    # 4. 开赛时间溯源一致性门禁（Workstream C）
+    from utils.match_identity import validate_kickoff_provenance_consistency, PROVENANCE_CONFLICT
+    prov_ok, prov_status = validate_kickoff_provenance_consistency(match)
+    if not prov_ok or prov_status == PROVENANCE_CONFLICT:
+        return CaptureResult(None, False, PROVENANCE_CONFLICT)
 
-    # 时序门禁：以比赛当前状态为准（upcoming 才允许新建）
-    status = add_time_status(dict(match), now_bj).get("status")
+    # 5. 捕获决策时间校验（Workstream B：严禁以 refresh_started_at 掩盖开赛事实）
+    decision_now = (now or get_beijing_now()).astimezone(BEIJING_TZ)
+    if decision_now >= kickoff_dt:
+        return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
+    if refresh_started_at is not None:
+        ref_bj = refresh_started_at.astimezone(BEIJING_TZ)
+        if ref_bj >= kickoff_dt:
+            return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
+
+    # 6. 时序门禁：以比赛在 decision_now 时刻的状态为准（upcoming 才允许新建）
+    status = add_time_status(dict(match), decision_now).get("status")
+    if status == "live":
+        return CaptureResult(None, False, SOURCE_ALREADY_LIVE)
+    if status == "finished":
+        return CaptureResult(None, False, SOURCE_ALREADY_FINISHED)
     if status != "upcoming":
-        return get_snapshot(snapshot_id), False
+        return CaptureResult(None, False, KICKOFF_REACHED_BEFORE_CAPTURE)
 
+    # 7. 模型评估阶段
     if prediction is None:
         from models.predictor import predict_match
 
@@ -323,12 +380,16 @@ def _create_or_get(
             league=match.get("league", ""),
         )
 
+    # 8. 门禁：模型计算完成时刻二次校验（防止耗时模型计算跨越开赛时间）
+    model_finished_now = get_beijing_now().astimezone(BEIJING_TZ)
+    if now is None and model_finished_now >= kickoff_dt:
+        return CaptureResult(None, False, KICKOFF_REACHED_DURING_MODEL_EVALUATION)
+
     snapshot = build_snapshot(
-        match, prediction, model_version=model_version, generated_at=now
+        match, prediction, model_version=model_version, generated_at=decision_now
     )
 
     with _LOCK:
-        # 跨进程单写者：刷新进程与 HTTP GET 物化路径都会走到这里。
         try:
             lease = acquire_sidecar_lock(
                 SNAPSHOT_LOCK_NAME,
@@ -337,23 +398,30 @@ def _create_or_get(
             )
             lease.__enter__()
         except SidecarLockBusy:
-            # 显式降级：不写、不谎报 created=True；只返回当前既有记录。
             fallback = _load_store()["snapshots"].get(snapshot_id)
-            return (fallback if isinstance(fallback, dict) else None), False
+            return CaptureResult(
+                fallback if isinstance(fallback, dict) else None,
+                False,
+                EXISTING_IMMUTABLE_SNAPSHOT if fallback else KICKOFF_REACHED_DURING_LOCK_WAIT,
+            )
 
         try:
-            # 必须在跨进程锁内重新读取，否则会用锁外的旧视图覆盖别人的新增。
             store = _load_store()
             existing = store["snapshots"].get(snapshot_id)
             if isinstance(existing, dict):
-                # 不可变：已有快照一律原样返回，绝不用新状态覆盖。
-                return existing, False
+                return CaptureResult(existing, False, EXISTING_IMMUTABLE_SNAPSHOT)
+
+            # 9. 门禁：锁获取后终态时间校验（防止排队等锁期间跨越开赛时间）
+            lock_acquired_now = get_beijing_now().astimezone(BEIJING_TZ)
+            if now is None and lock_acquired_now >= kickoff_dt:
+                return CaptureResult(None, False, KICKOFF_REACHED_DURING_LOCK_WAIT)
+
             store["snapshots"][snapshot_id] = snapshot
             _save_store(store)
         finally:
             lease.__exit__(None, None, None)
 
-    return snapshot, True
+    return CaptureResult(snapshot, True, CAPTURED_BEFORE_KICKOFF)
 
 
 def create_snapshot(
@@ -362,6 +430,7 @@ def create_snapshot(
     *,
     model_version: str | None = None,
     now: datetime | None = None,
+    refresh_started_at: datetime | None = None,
 ) -> dict | None:
     """
     为一场比赛创建 canonical 赛前快照。
@@ -373,13 +442,14 @@ def create_snapshot(
     - 幂等：同 match_id + 同 model_version 若已有快照，直接返回既有记录，不覆盖。
     - 返回值：该场该模型版本的快照记录（新建或既有），或在被拒绝时返回 None。
     """
-    snapshot, _created = _create_or_get(
+    res = _create_or_get(
         match,
         prediction,
         model_version=resolve_model_version(model_version, match.get("sport")),
         now=now,
+        refresh_started_at=refresh_started_at,
     )
-    return snapshot
+    return res.snapshot
 
 
 def capture_snapshot(
@@ -388,13 +458,14 @@ def capture_snapshot(
     *,
     model_version: str | None = None,
     now: datetime | None = None,
-) -> tuple[dict | None, bool]:
+    refresh_started_at: datetime | None = None,
+) -> CaptureResult:
     """
     与 `create_snapshot` 行为一致，但额外返回「本次是否新增并持久化」的精确标志。
 
-    返回 (snapshot, created)：
-        created=True  -> 本次调用确实新增并落盘了一条记录
-        created=False -> 本次未新增（既有快照 / live-finished 时序拒绝）
+    返回 CaptureResult(snapshot, created, classification)：
+        支持二元解构: (snapshot, created)
+        亦支持属性访问: res.classification / res.reason
 
     供抓取器的自动捕获统计使用：不能用 `is not None` 近似判断，因为既有快照
     同样会返回 dict。检查与写入由 `_create_or_get` 在同一把锁内完成。
@@ -404,6 +475,7 @@ def capture_snapshot(
         prediction,
         model_version=resolve_model_version(model_version, match.get("sport")),
         now=now,
+        refresh_started_at=refresh_started_at,
     )
 
 
