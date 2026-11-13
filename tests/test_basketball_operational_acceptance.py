@@ -367,8 +367,8 @@ def test_oa_13_derived_display_status_does_not_rewrite_stored_or_settlement_hist
 # OA-14 … OA-16: read-only safety and no activation
 # ---------------------------------------------------------------------------
 
-#: 读取路径**按设计**会物化的两个存储（赛前快照 + 球队库），不属于本阶段可改范围。
-MATERIALIZED_BY_DESIGN = {"team_strength.json", "prediction_snapshots.json"}
+#: 非 HTTP 的 enrich_match 辅助函数保持球队档案物化兼容；HTTP GET 必须七库不变。
+MATERIALIZED_BY_DESIGN = {"team_strength.json"}  # Pure helper compatibility; HTTP GET permits no stores.
 #: 读取路径绝不允许改写的存储（Canonical / 赔率历史 / 结算 / 评估）。
 NEVER_WRITTEN_BY_READER = (
     "daily_matches.json", "calibrated.json", "odds_snapshots.json",
@@ -392,7 +392,7 @@ def test_oa_14_reader_endpoints_do_not_write_canonical_or_historical_stores(api_
     for name in NEVER_WRITTEN_BY_READER:
         assert after[name] == before[name], f"reader endpoint rewrote {name}"
     changed = {name for name in after if after[name] != before[name]}
-    assert changed <= MATERIALIZED_BY_DESIGN, changed
+    assert changed == set(), changed
 
 
 def test_oa_14b_view_snapshot_materialization_is_idempotent(api_dataset):

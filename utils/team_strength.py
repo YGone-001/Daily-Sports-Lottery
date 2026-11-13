@@ -23,6 +23,21 @@ import json
 import math
 import os
 
+from contextvars import ContextVar
+from contextlib import contextmanager
+from copy import deepcopy
+
+_READ_ONLY_PROFILES = ContextVar("read_only_team_profiles", default=False)
+
+@contextmanager
+def read_only_profiles():
+    """Request-local profile estimates without disk or shared-cache mutation."""
+    token = _READ_ONLY_PROFILES.set(True)
+    try:
+        yield
+    finally:
+        _READ_ONLY_PROFILES.reset(token)
+
 import config
 from utils.daily_loader import load_json, save_json
 
@@ -90,7 +105,7 @@ def _load() -> dict:
 
 
 def _save() -> None:
-    if _CACHE is not None:
+    if _CACHE is not None and not _READ_ONLY_PROFILES.get():
         save_json(STRENGTH_FILE, {"teams": _CACHE})
 
 
@@ -276,7 +291,7 @@ def get_team_profile(
     if not name:
         name = "未知球队"
 
-    teams = _load()
+    teams = deepcopy(_load()) if _READ_ONLY_PROFILES.get() else _load()
     key = f"{sport}|{name}"
 
     if key in teams:

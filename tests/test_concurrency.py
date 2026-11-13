@@ -25,6 +25,12 @@ from utils.evaluation_rows import get_all_evaluation_rows, capture_evaluation_ro
 from utils.match_lifecycle import valid_full_time_score
 from utils.team_strength import expected_result
 
+@pytest.fixture(autouse=True)
+def isolated_http_write_permission(monkeypatch):
+    monkeypatch.setitem(app.config, "RUNTIME_WRITES_ENABLED", True)
+    monkeypatch.setitem(app.config, "BACKGROUND_REFRESH_ENABLED", True)
+    monkeypatch.setitem(app.config, "RUNTIME_WRITE_TOKEN", "isolated-concurrency")
+
 class NetworkViolationError(RuntimeError):
     pass
 
@@ -86,13 +92,13 @@ def test_t01_simultaneous_http_requests(isolated_data_dir):
 
     with mock.patch("utils.scraper._refresh_impl", side_effect=mocked_refresh):
         def worker1():
-            try: results.append(client.post("/api/refresh").status_code)
+            try: results.append(client.post("/api/refresh", headers={"X-Refresh-Token": "isolated-concurrency"}).status_code)
             except Exception as e: exceptions.append(e)
 
         def worker2():
             try:
                 barrier_entry.wait(timeout=5)
-                results.append(client.post("/api/refresh").status_code)
+                results.append(client.post("/api/refresh", headers={"X-Refresh-Token": "isolated-concurrency"}).status_code)
                 barrier_exit.wait(timeout=5)
             except Exception as e: exceptions.append(e)
 
@@ -141,7 +147,7 @@ def test_t02_http_and_scheduler_overlap(isolated_data_dir, monkeypatch):
             t1 = threading.Thread(target=run_scheduler_a)
             t1.start()
             assert scheduler_entry.wait(timeout=5)
-            resp = client.post("/api/refresh")
+            resp = client.post("/api/refresh", headers={"X-Refresh-Token": "isolated-concurrency"})
             assert resp.status_code == 409
             scheduler_exit.set()
             t1.join(timeout=5)
@@ -155,7 +161,7 @@ def test_t02_http_and_scheduler_overlap(isolated_data_dir, monkeypatch):
         return {"added": 0, "total": 0}
 
     with mock.patch("utils.scraper._refresh_impl", side_effect=mocked_refresh_b):
-        def http_job(): client.post("/api/refresh")
+        def http_job(): client.post("/api/refresh", headers={"X-Refresh-Token": "isolated-concurrency"})
         t2 = threading.Thread(target=http_job)
         t2.start()
         assert http_entry.wait(timeout=5)
@@ -679,7 +685,7 @@ def test_t13_no_writes_on_busy(isolated_data_dir, make_match, monkeypatch):
 
     with acquire_refresh_lock():
         client = app.test_client()
-        resp = client.post("/api/refresh")
+        resp = client.post("/api/refresh", headers={"X-Refresh-Token": "isolated-concurrency"})
         assert resp.status_code == 409
 
     fps_after = {f: fp_file(f) for f in files}

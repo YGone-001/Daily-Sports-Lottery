@@ -14,6 +14,16 @@ def _write_daily(match: dict) -> None:
         json.dump({"meta": {}, "matches": [match]}, fh, ensure_ascii=False)
 
 
+def _seed_persisted_prediction(match):
+    from datetime import timedelta
+    from utils.daily_loader import enrich_match, get_match_datetime, override_beijing_now
+    from utils.prediction_snapshots import capture_snapshot
+    with override_beijing_now(get_match_datetime(match) - timedelta(hours=2)):
+        snapshot, created = capture_snapshot(enrich_match(match))
+    assert created and snapshot
+    return snapshot
+
+
 def test_snapshot_api_returns_persisted_record(isolated_data_dir, make_match):
     match = make_match(id="500w-2030-06-01-7")
     _write_daily(match)
@@ -22,7 +32,8 @@ def test_snapshot_api_returns_persisted_record(isolated_data_dir, make_match):
 
     client = app_module.app.test_client()
 
-    # 触发一次预测 -> 自动固化快照
+    # 已有赛前持久化记录，GET 只读取并展示
+    _seed_persisted_prediction(match)
     assert client.get(f"/api/match/{match['id']}").status_code == 200
 
     resp = client.get(f"/api/match/{match['id']}/snapshots")
@@ -54,6 +65,7 @@ def test_snapshot_api_does_not_duplicate(isolated_data_dir, make_match):
 
     import app as app_module
 
+    _seed_persisted_prediction(match)
     client = app_module.app.test_client()
     for _ in range(3):
         client.get(f"/api/match/{match['id']}")

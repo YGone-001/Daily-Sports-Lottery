@@ -14,10 +14,17 @@ from utils.odds_snapshots import (
     latest_odds_snapshot,
     normalize_odds,
     odds_fingerprint,
-    record_odds_snapshot,
+    record_odds_snapshot as _record_odds_snapshot,
     snapshot_id_for,
     store_path,
 )
+
+def record_odds_snapshot(match, *, now):
+    """Inject the physical capture clock for this module's simulated observations."""
+    from utils.daily_loader import override_beijing_now
+    with override_beijing_now(now):
+        return _record_odds_snapshot(match, now=now)
+
 
 ODDS_A = {"home_win": 2.10, "draw": 3.20, "away_win": 3.40, "matchnum": "3001"}
 ODDS_B = {"home_win": 1.95, "draw": 3.30, "away_win": 3.80, "matchnum": "3001"}

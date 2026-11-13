@@ -114,3 +114,8 @@ LEAGUE_STRENGTH = {
     "NBA": 1900, "CBA": 1700, "欧冠篮球": 1850, "欧篮联": 1820,
 }
 DEFAULT_LEAGUE_ELO = 1600
+
+# Runtime write capability is opt-in; enabling it is not operator approval.
+RUNTIME_WRITES_ENABLED = os.environ.get("DSL_RUNTIME_WRITES_ENABLED", "false").lower() in ("true", "1", "yes")
+BACKGROUND_REFRESH_ENABLED = os.environ.get("DSL_BACKGROUND_REFRESH_ENABLED", "false").lower() in ("true", "1", "yes")
+RUNTIME_WRITE_TOKEN = os.environ.get("DSL_RUNTIME_WRITE_TOKEN", "")

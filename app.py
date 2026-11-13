@@ -18,19 +18,20 @@ API：
   /api/match/<id>/settlements   该场结算记录（只读）
   /api/dates                    可用日期
   /api/strategy                 策略推荐
-  /api/refresh                  手动触发抓取
+  /api/refresh                  受写开关与令牌保护的 POST 刷新
   /api/status                   系统状态
   /api/history                  历史复盘的不可变证据视图（只读）
 """
 from __future__ import annotations
 
 import os
+import hmac
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, g, jsonify, render_template, request, send_from_directory
 
 import config
 from models.predictor import predict_match
@@ -50,11 +51,27 @@ from utils.daily_loader import (
 )
 from utils.history_evidence import build_history_view_data
 from utils.odds_snapshots import get_odds_history_for_match
-from utils.prediction_snapshots import ensure_snapshot, get_snapshots_for_match
+from utils.prediction_snapshots import get_snapshots_for_match
 from utils.settlements import get_settlements_for_match
 
 app = Flask(__name__)
 app.config.from_object(config)
+
+@app.before_request
+def readonly_get_profiles():
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        from utils.team_strength import read_only_profiles
+        context = read_only_profiles()
+        context.__enter__()
+        g.readonly_profiles = context
+
+
+@app.teardown_request
+def release_readonly_profiles(error):
+    context = g.pop("readonly_profiles", None)
+    if context is not None:
+        context.__exit__(None, None, None)
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _FRONTEND_DIST = _PROJECT_ROOT / "frontend" / "dist"
@@ -90,10 +107,6 @@ def index():
     display_date = date or get_default_date()
 
     groups = get_matches_grouped(display_date, sport)
-    # 为列表中已生成预测的未开赛比赛固化赛前快照（幂等，不覆盖既有记录）
-    for group in groups:
-        for m in group["matches"]:
-            ensure_snapshot(m, m.get("prediction"))
     stats = get_daily_stats(display_date, sport)
     dates = get_available_dates()
 
@@ -127,8 +140,6 @@ def match_detail(match_id):
         league=m.get("league", ""),
     )
     m["prediction"] = pred
-    # 未开赛比赛：固化赛前快照（已存在则原样保留）
-    ensure_snapshot(m, pred)
     return render_template("match.html", match=m, active_page="index")
 
 
@@ -185,7 +196,6 @@ def api_today():
             m["home_team"], m["away_team"],
             odds=m.get("odds"), sport=m.get("sport", "football"), league=m.get("league", ""),
         )
-        ensure_snapshot(m, m["prediction"])
         out.append(m)
     return jsonify(out)
 
@@ -204,7 +214,6 @@ def api_matches():
             m["home_team"], m["away_team"],
             odds=m.get("odds"), sport=m.get("sport", "football"), league=m.get("league", ""),
         )
-        ensure_snapshot(m, m["prediction"])
         out.append(m)
     return jsonify(out)
 
@@ -219,7 +228,6 @@ def api_match(match_id):
         m["home_team"], m["away_team"],
         odds=m.get("odds"), sport=m.get("sport", "football"), league=m.get("league", ""),
     )
-    ensure_snapshot(m, m["prediction"])
     return jsonify(m)
 
 
@@ -275,8 +283,14 @@ def api_strategy():
     return jsonify(result)
 
 
-@app.route("/api/refresh", methods=["GET", "POST"])
+@app.route("/api/refresh", methods=["POST"])
 def api_refresh():
+    if not app.config.get("RUNTIME_WRITES_ENABLED", False):
+        return jsonify({"error": "RUNTIME_WRITES_DISABLED"}), 403
+    expected = app.config.get("RUNTIME_WRITE_TOKEN") or ""
+    supplied = request.headers.get("X-Refresh-Token", "")
+    if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
+        return jsonify({"error": "REFRESH_AUTHORIZATION_REQUIRED"}), 403
     try:
         stats = scraper.refresh(verbose=False)
         return jsonify(stats)
@@ -914,6 +928,10 @@ def _compare(match: dict, pred: dict) -> dict:
 def start_background_scraper():
     """后台守护线程：定时抓取 500.com 赛事"""
 
+    if not (app.config.get("RUNTIME_WRITES_ENABLED", False)
+            and app.config.get("BACKGROUND_REFRESH_ENABLED", False)):
+        return False
+
     def job():
         print("\n[Auto-Sync] 后台抓取线程启动")
         print(f"[Auto-Sync] 间隔 {config.SCRAPE_INTERVAL_SECONDS} 秒")
@@ -943,6 +961,8 @@ def start_background_scraper():
     if __import__("os").environ.get("WERKZEUG_RUN_MAIN") == "true" or not config.DEBUG:
         t = threading.Thread(target=job, daemon=True)
         t.start()
+        return True
+    return False
 
 
 if __name__ == "__main__":
