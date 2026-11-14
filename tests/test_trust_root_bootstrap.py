@@ -119,7 +119,9 @@ ALLOWED_PATHS = frozenset((
     "tools/nba_model_comparison.py",
     "tests/test_nba_history_pipeline.py",
     "tests/test_nba_strength_and_shadow.py",
-    "docs/nba-model-v2-shadow.md"))
+    "docs/nba-model-v2-shadow.md",
+    # NBA competition eligibility and prospective evidence corrections
+    "tests/test_nba_competition_and_prospective.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

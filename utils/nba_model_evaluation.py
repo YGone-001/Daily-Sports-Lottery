@@ -94,16 +94,26 @@ def walk_forward_backtest(
     games: Iterable[dict],
     *,
     params: dict | None = None,
+    v2_params: dict | None = None,
     include_v1: bool = True,
     league_label: str = REAL_NBA_LEAGUE_LABEL,
     min_history_games: int = 0,
 ) -> dict:
-    """按北京比赛日分块的扩张窗口走查回测（V2 影子，可选 V1 冷启动对照）。"""
+    """按北京比赛日分块的扩张窗口走查回测（V2 影子，可选 V1 冷启动对照）。
+
+    ``params`` 调整实力引擎参数；``v2_params`` 调整 V2 影子模型参数（用于消融实验，
+    例如 ``form_weight=0`` 得 Elo-only，再把 rest 参数置 0 得 Elo+form）。
+    始终在**同一批合格比赛**上计算 V1 / V2 / 基线；非常规赛资格比赛被排除并计数。
+    """
     from models.basketball_model_v2 import predict_from_inventory, STATUS_OK
 
     valid = []
+    excluded_competition = 0
     for g in games:
         if not isinstance(g, dict):
+            continue
+        if g.get("regular_season_eligible") is False:
+            excluded_competition += 1
             continue
         if g.get("home_code") and g.get("away_code") and g.get("beijing_date") \
                 and type(g.get("home_final_score")) is int and type(g.get("away_final_score")) is int:
@@ -114,19 +124,25 @@ def walk_forward_backtest(
     for g in valid:
         by_date.setdefault(g["beijing_date"], []).append(g)
 
-    v2_rows, v1_rows, per_date = [], [], []
+    v2_rows, v1_rows, base50_rows, homeprior_rows, per_date = [], [], [], [], []
     insufficient = 0
     evaluated_games = 0
+    target_in_features = False
     for d in sorted(by_date):
         day_start = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=BEIJING_TZ)
         prior = [g for g in valid if (game_end_utc(g) or day_start) < day_start]
         if len(prior) < min_history_games:
             continue
         inventory = compute_team_strength(prior, as_of=day_start, params=params)
-        date_v2, date_v1 = [], []
+        prior_home_wins = sum(1 for g in prior if g["home_final_score"] > g["away_final_score"])
+        home_prior_rate = (prior_home_wins / len(prior)) if prior else 0.5
+        date_v2, date_v1, date_b50, date_hp = [], [], [], []
         for g in by_date[d]:
+            # 目标比赛结束时刻 >= 当日 00:00，绝不进入 prior（结构性无目标泄漏）。
+            if (game_end_utc(g) or day_start) < day_start:
+                target_in_features = True
             y = 1 if g["home_final_score"] > g["away_final_score"] else 0
-            pred = predict_from_inventory(inventory, g["home_code"], g["away_code"])
+            pred = predict_from_inventory(inventory, g["home_code"], g["away_code"], params=v2_params)
             if pred.get("status") != STATUS_OK:
                 insufficient += 1
                 continue
@@ -136,6 +152,14 @@ def walk_forward_backtest(
             v2_rows.append(row)
             date_v2.append(row)
             evaluated_games += 1
+            b50 = {"p_home": 0.5, "y": y, "market_home": None,
+                   "provider_game_id": g["provider_game_id"], "beijing_date": d}
+            hp = {"p_home": home_prior_rate, "y": y, "market_home": None,
+                  "provider_game_id": g["provider_game_id"], "beijing_date": d}
+            base50_rows.append(b50)
+            date_b50.append(b50)
+            homeprior_rows.append(hp)
+            date_hp.append(hp)
             if include_v1:
                 p1 = _v1_coldstart_probability(g["home_code"], g["away_code"], league_label)
                 if p1 is not None:
@@ -145,8 +169,11 @@ def walk_forward_backtest(
                     date_v1.append(r1)
         per_date.append({"beijing_date": d, "history_games": len(prior),
                          "evaluated": len(date_v2),
+                         "home_win_prior_rate": round(home_prior_rate, 4),
                          "v2": evaluate_rows(date_v2),
-                         "v1": evaluate_rows(date_v1) if include_v1 else None})
+                         "v1": evaluate_rows(date_v1) if include_v1 else None,
+                         "baseline_fixed_50": evaluate_rows(date_b50),
+                         "baseline_home_win_prior": evaluate_rows(date_hp)})
 
     return {
         "research_label": "RETROSPECTIVE_WALK_FORWARD_RESEARCH",
@@ -154,13 +181,22 @@ def walk_forward_backtest(
         "split_strategy": "CHRONOLOGICAL_DATE_BLOCK_EXPANDING_WINDOW",
         "same_date_leakage": False,
         "future_result_leakage": False,
+        "no_target_result_in_features": not target_in_features,
         "random_shuffled_cv": False,
         "total_input_games": len(valid),
+        "eligible_game_count": evaluated_games,
         "evaluated_games": evaluated_games,
+        "excluded_competition_count": excluded_competition,
+        "insufficient_history_count": insufficient,
         "insufficient_coverage_skipped": insufficient,
         "game_dates_evaluated": len(per_date),
+        "v1_v2_identical_cohort": (len(v1_rows) == len(v2_rows)) if include_v1 else None,
         "v2_shadow": evaluate_rows(v2_rows),
         "v1_coldstart": evaluate_rows(v1_rows) if include_v1 else None,
+        "baselines": {
+            "fixed_50_percent": evaluate_rows(base50_rows),
+            "expanding_home_win_prior": evaluate_rows(homeprior_rows),
+        },
         "per_date": per_date,
         "promotion_authorized": False,
         "profitability_claimed": False,

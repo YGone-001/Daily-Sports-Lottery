@@ -1195,6 +1195,63 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.39 NBA 竞赛类型资格、真实前瞻门禁与获取完整性边界
+
+- **常规赛资格按竞赛类型判定**：`utils.nba_history.classify_nba_competition()` 是确定性纯函数，
+  优先级为显式 `season_type` → `postseason` 布尔 → `ist_stage` → 常规赛末日日期边界 → 默认常规赛。
+  NBA Cup 小组赛与淘汰赛（除 Championship）**计入**常规赛战绩予以保留（`NBA_CUP_REGULAR`）；
+  Championship（`NBA_CUP_CHAMPIONSHIP`）、Play-In（`PLAY_IN`）、Playoffs（`PLAYOFF`）**不计入**，
+  排除但保留原始证据。未知 `season_type`、无法识别的 `ist_stage`、自相矛盾分类一律 fail closed
+  （`UNSUPPORTED_COMPETITION` / `AMBIGUOUS_CLASSIFICATION`）。**不得**为凑 1230 场而任意删除比赛，
+  **不得**改写原始比分或身份来满足赛季计数。
+- **BALLDONTLIE Games 响应不含 `season_type` 字段**（它只是查询参数）；实际分类依赖
+  `postseason` + `ist_stage` + 常规赛末日日期边界。`NBA_REGULAR_SEASON_END_DATES` 记录已文档化的
+  常规赛末日（2025 赛季 = `2026-04-12`）；Play-In 落在该日之后且无 IST/postseason 标记。
+  日期边界是**已文档化规则**，不是对提供商排序的假设。
+- **1230/82 结构不变式是独立覆盖证明**：2025-26 常规赛合格集合必须满足 30 队 × 82 场 = 1230，
+  每队恰好 82 场（`games_per_team_histogram == {82: 30}`）。该证明**不依赖**分页完成或游标排序，
+  可独立认证 2025 常规赛窗口完整。`assemble_historical_dataset(regular_season_only=True)`
+  分离合格/排除集合并保留 `excluded_competitions` 证据；`compute_team_strength` 与
+  `walk_forward_backtest` 对 `regular_season_eligible is False` 的比赛防御性跳过并计数。
+- **四个完整性属性互不等价**，不得混同：`CAPTURED_PAGE_CURSOR_CHAIN_CONTIGUOUS`（已捕获页连续）、
+  `CAPTURED_RECORDS_VALID`（已捕获记录解析有效）、`CAPTURED_WINDOW_COMPLETE`（请求scope覆盖）、
+  `PROVIDER_PAGINATION_COMPLETE`（提供商分页耗尽）。本地提供商契约**未文档化日期排序保证**，
+  因此「最大捕获日期超出截止日」**不**足以证明未捕获尾页不含截止日内比赛；既有
+  `cutoff_window_complete=true` 属过度声明，已更正。2026 进行中赛季无结构不变式且分页未完成 →
+  覆盖 `UNRESOLVED`；整体 `HISTORICAL_CUTOFF_WINDOW_COMPLETE = UNRESOLVED`、
+  `DATASET_COMPLETENESS = UNRESOLVED`。有界日期界定重抓需**新鲜操作者授权**，
+  无授权记 `LIVE_REACQUISITION = NOT_EXECUTED`，**不得**为凑报告重试真实请求。
+- **真实前瞻门禁**：`tools.nba_model_comparison.classify_fixture_eligibility()` 要求
+  Canonical/球队身份已确立、主客方向已确立、带时区权威开赛时间已知、`prediction_as_of < verified_kickoff`。
+  存储为 `upcoming` **不**等于真实前瞻。六类分离：`STORED_UPCOMING` / `VERIFIED_FUTURE_FIXTURE` /
+  `STALE_STORED_UPCOMING`（开赛已过）/ `KICKOFF_UNKNOWN` / `IDENTITY_UNRESOLVED` /
+  `POSTGAME_RETROSPECTIVE_COMPARISON`。只有 `VERIFIED_FUTURE_FIXTURE` 可作前瞻对比。
+  `500lq` 显示第一位非已核验场地主队 → `DISPLAY_ORDER_UNVERIFIED`，方向未决，
+  **绝不**自动交换主客、**绝不**自动归并反向候选、**绝不**未经单独授权改动生产 Canonical 状态。
+- **对比语义三分类**：`PROSPECTIVE_SHADOW_COMPARISON`（权威开赛晚于 as_of）/
+  `RETROSPECTIVE_MODEL_DIAGNOSTIC`（过期/历史，仅作诊断，**不**冒充实时赛前预测）/
+  `PROSPECTIVE_COMPARISON_BLOCKED`（开赛未知或身份/方向未决）。**计算出 V2 概率不足以标记前瞻**。
+  必备字段含 `provider_game_id` / `stored_status` / `derived_temporal_status` / `verified_kickoff` /
+  `time_to_kickoff_seconds` / `home_away_binding_status` / `fixture_eligibility` /
+  `comparison_classification` / `disqualification_reason`。
+- **校正回测诚实修订**：走查回测保持按北京比赛日分块扩张窗口，`no_same_date_result_leakage` /
+  `no_future_result_leakage` / `no_target_result_in_features` 必须为真，标注
+  `RETROSPECTIVE_WALK_FORWARD_RESEARCH`，**不**冒充原始实时快照。V1/V2 必须在**同一批合格比赛**上对比，
+  并报告固定 50% 与扩张主胜先验基线；历史无赔率时市场对照保持 `N/A`，**绝不**伪造历史 odds。
+  数据集整体未认证时回测标注 **PROVISIONAL** 而非 accepted；既有研究值（1404 样本）作
+  `SUPERSEDED_RESEARCH_ESTIMATES`，**不得**强行让新结果匹配旧值，V2 变差也如实报告。
+- **有界消融不调参**：V1 冷启动 / V2-Elo-only / V2-Elo+form / V2-complete 在同一队列上对比，
+  经 `v2_params` 隔离（`form_weight=0` 得 Elo-only；rest 参数置 0 得 Elo+form）。
+  走查回测不传 `fixture_kickoff` → `_rest_days` 返回 `None` → rest 分量恒 0，
+  故 Elo+form 与 complete 在回溯队列上指标相同；休息/背靠背贡献仅在已知开赛时刻的真实前瞻中激活，
+  回溯研究无法度量，**如实陈述**。**不得**为提升报告而调参，**不得**把影子模型升级为生产。
+- **红线不变**：`basketball-margin-1` 与 `basketball-margin-2-shadow` 数学不改、
+  `same_event()` / `normalize_competition_number()` / Canonical ID / 彩票编号不改、
+  七个受保护存储字节不变、历史快照/结算不可改写、生产 Canonical 归并仍 `NO-GO`。
+  详见 `docs/nba-model-v2-shadow.md` 与 `reports/phase3x-r/`（本机工件）。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

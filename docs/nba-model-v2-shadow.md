@@ -117,3 +117,58 @@ V1/V2 主客概率、市场主客概率、V1/V2 对市场差距、主客真实�
 最大 HTTP 预算、本机证据目的地（`reports/phase3x/`）、只读网络、不写运行库、
 不未授权回退。无批准时真实采集记 `NOT_EXECUTED_AUTHORIZATION_REQUIRED`，
 **绝不**以虚构实力数据替代缺失证据。
+
+## 八、竞赛类型资格与校正回测（Phase 3-X-R）
+
+### 竞赛类型分类
+
+`classify_nba_competition(raw, regular_season_end_date=...)` 判定单场常规赛资格，优先级：
+显式 `season_type` → `postseason` 布尔 → `ist_stage` → 常规赛末日日期边界 → 默认常规赛。
+
+| 类型 | 计入常规赛 | 处理 |
+| --- | --- | --- |
+| `NORMAL_REGULAR` | 是 | 保留 |
+| `NBA_CUP_REGULAR`（小组/淘汰赛，除决赛） | 是 | 保留 |
+| `NBA_CUP_CHAMPIONSHIP` | 否 | 排除，保留证据 |
+| `PLAY_IN` | 否 | 排除，保留证据 |
+| `PLAYOFF` | 否 | 排除，保留证据 |
+| `UNSUPPORTED_COMPETITION` / `AMBIGUOUS_CLASSIFICATION` | — | fail closed 拒绝 |
+
+BALLDONTLIE Games 响应**不含** `season_type` 字段（仅查询参数），实际依赖
+`postseason` + `ist_stage` + 常规赛末日（2025 赛季 = `2026-04-12`，已文档化）。
+Play-In 落在常规赛末日之后且无 IST/postseason 标记。`assemble_historical_dataset`
+默认 `regular_season_only=True`，分离合格/排除集合并保留 `excluded_competitions`；
+`compute_team_strength` 与 `walk_forward_backtest` 对 `regular_season_eligible is False` 防御性跳过。
+
+> **不得**为凑 1230 场任意删除比赛，**不得**改写原始比分或身份。2025-26 的 7 场额外比赛
+> 经分类确认为 1 场 NBA Cup Championship + 6 场 Play-In（见 `reports/phase3x-r/`）。
+
+### 获取完整性边界
+
+四个属性互不等价：`CAPTURED_PAGE_CURSOR_CHAIN_CONTIGUOUS` / `CAPTURED_RECORDS_VALID` /
+`CAPTURED_WINDOW_COMPLETE` / `PROVIDER_PAGINATION_COMPLETE`。本地提供商契约**未文档化日期排序保证**，
+「最大捕获日期超出截止日」**不**足以证明截止窗口完整。2025 常规赛窗口由**独立结构不变式**
+（30 队 × 82 场 = 1230，每队恰好 82 场）认证，不依赖分页；2026 进行中赛季无不变式且分页未完成 →
+`UNRESOLVED`。整体 `HISTORICAL_CUTOFF_WINDOW_COMPLETE = UNRESOLVED`。有界日期界定重抓需新鲜授权，
+无授权记 `LIVE_REACQUISITION = NOT_EXECUTED`。
+
+### 真实前瞻门禁与对比语义
+
+`classify_fixture_eligibility(m, as_of)` 要求身份/方向已确立、带时区权威开赛时间已知、
+`prediction_as_of < verified_kickoff`。六类：`STORED_UPCOMING` / `VERIFIED_FUTURE_FIXTURE` /
+`STALE_STORED_UPCOMING` / `KICKOFF_UNKNOWN` / `IDENTITY_UNRESOLVED` / `POSTGAME_RETROSPECTIVE_COMPARISON`。
+只有 `VERIFIED_FUTURE_FIXTURE` 可作前瞻对比。对比三分类：`PROSPECTIVE_SHADOW_COMPARISON` /
+`RETROSPECTIVE_MODEL_DIAGNOSTIC` / `PROSPECTIVE_COMPARISON_BLOCKED`。**计算出 V2 概率不足以标记前瞻**。
+`500lq` 显示第一位方向未决（`DISPLAY_ORDER_UNVERIFIED`），绝不自动交换主客或归并。
+
+### 校正回测与消融
+
+走查回测保持按北京比赛日分块扩张窗口、无同日/未来/目标泄漏，标注
+`RETROSPECTIVE_WALK_FORWARD_RESEARCH`。V1/V2 在**同一批合格比赛**上对比，报告固定 50% 与
+扩张主胜先验基线；历史无赔率时市场对照 `N/A`，绝不伪造。数据集整体未认证 → 回测 **PROVISIONAL**。
+既有 1404 样本研究值作 `SUPERSEDED_RESEARCH_ESTIMATES`，不强行匹配。
+
+有界消融经 `v2_params` 隔离：V1 冷启动 / V2-Elo-only（`form_weight=0` 且 rest 参数 0）/
+V2-Elo+form（rest 参数 0）/ V2-complete。走查回测不传 `fixture_kickoff` → rest 分量恒 0，
+故 Elo+form 与 complete 在回溯队列上指标相同；休息贡献仅在真实前瞻中激活，回溯无法度量，如实陈述。
+**不为提升报告调参，不升级影子模型为生产。**

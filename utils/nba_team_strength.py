@@ -115,6 +115,8 @@ def compute_team_strength(
         hc, ac = g.get("home_code"), g.get("away_code")
         if not gid or hc not in ALL_NBA_CODES or ac not in ALL_NBA_CODES or hc == ac:
             continue
+        if g.get("regular_season_eligible") is False:
+            continue
         hs, aws = g.get("home_final_score"), g.get("away_final_score")
         if type(hs) is not int or type(aws) is not int or hs < 0 or aws < 0 or hs == aws:
             continue

@@ -323,8 +323,11 @@ def test_schedule_fetch_default_deny_when_omitted(monkeypatch):
 
     monkeypatch.setattr(nba_schedule.requests, "get", mock_get)
 
-    # 省略 allow_network 参数直接调用
-    rows, diag = nba_schedule.fetch_nba_schedule_observations(["2026-11-13"])
+    # 省略 allow_network 参数直接调用；冻结 now 使硬编码日期落在近端窗口内，
+    # 否则真实时钟前进后该日期会被 EMPTY_DATE_WINDOW 提前拦截，测不到默认拒绝守卫。
+    rows, diag = nba_schedule.fetch_nba_schedule_observations(
+        ["2026-11-13"], now=datetime(2026, 11, 13, 12, 0, tzinfo=BEIJING_TZ)
+    )
 
     assert rows == []
     assert http_called is False

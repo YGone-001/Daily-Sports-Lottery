@@ -51,6 +51,11 @@ def _load_dataset(path: str | None) -> dict:
 
 
 def _read_upcoming_nba_fixtures() -> list[dict]:
+    """读取存储为 upcoming 的 NBA 赛事（只读）。
+
+    保留身份未决（队名无法映射）的赛事，交由资格门禁分类为 IDENTITY_UNRESOLVED，
+    而不是静默丢弃——「存储为 upcoming」本身**不**等于真实前瞻赛事。
+    """
     path = Path(config.DATA_DIR) / "daily_matches.json"
     if not path.exists():
         return []
@@ -63,11 +68,95 @@ def _read_upcoming_nba_fixtures() -> list[dict]:
             continue
         hc = resolve_canonical_team_code(m.get("home"))
         ac = resolve_canonical_team_code(m.get("away"))
-        if not hc or not ac:
-            continue
         out.append(dict(m, _home_code=hc, _away_code=ac))
     out.sort(key=lambda m: (m.get("date") or "", m.get("id") or ""))
     return out
+
+
+# 赛事资格分类（Workstream D）
+FIXTURE_STORED_UPCOMING = "STORED_UPCOMING"
+FIXTURE_VERIFIED_FUTURE = "VERIFIED_FUTURE_FIXTURE"
+FIXTURE_STALE = "STALE_STORED_UPCOMING"
+FIXTURE_KICKOFF_UNKNOWN = "KICKOFF_UNKNOWN"
+FIXTURE_IDENTITY_UNRESOLVED = "IDENTITY_UNRESOLVED"
+FIXTURE_POSTGAME = "POSTGAME_RETROSPECTIVE_COMPARISON"
+
+# 对比语义分类（Workstream E）
+CLASS_PROSPECTIVE = "PROSPECTIVE_SHADOW_COMPARISON"
+CLASS_RETROSPECTIVE = "RETROSPECTIVE_MODEL_DIAGNOSTIC"
+CLASS_BLOCKED = "PROSPECTIVE_COMPARISON_BLOCKED"
+
+
+def classify_fixture_eligibility(m: dict, as_of: datetime) -> dict:
+    """对单场存储赛事判定真实前瞻资格（纯函数，只读，不改动任何存储）。
+
+    真实前瞻赛事必须同时满足：Canonical/球队身份已确立、主客方向已确立、
+    带时区的权威开赛时间已知、``prediction_as_of < verified_kickoff``。
+    存储为 upcoming 但开赛时间已过 → STALE_STORED_UPCOMING；开赛时间未知 →
+    KICKOFF_UNKNOWN；身份/方向未决 → IDENTITY_UNRESOLVED。绝不自动交换主客、
+    绝不自动归并反向候选。
+    """
+    stored_status = str(m.get("status") or "upcoming").lower()
+    hc, ac = m.get("_home_code"), m.get("_away_code")
+    identity_ok = bool(hc and ac)
+    known = is_kickoff_time_known(m)
+    kickoff = get_match_datetime(m) if known else None
+    mid = m.get("id") or ""
+    source = mid.split("-", 1)[0] if "-" in mid else ""
+    # 500lq 的 home 字段是显示第一位（§4.13.6），非已核验场地主队；方向未决。
+    if not identity_ok:
+        binding = "IDENTITY_UNRESOLVED"
+    elif source == "500lq":
+        binding = "DISPLAY_ORDER_UNVERIFIED"
+    else:
+        binding = "PROVIDER_ORDER"
+    orientation_ok = binding == "PROVIDER_ORDER"
+
+    if kickoff is not None:
+        temporal = "FUTURE" if kickoff > as_of else "PAST"
+        ttk = int((kickoff - as_of).total_seconds())
+    else:
+        temporal, ttk = "UNKNOWN", None
+
+    prov = m.get("kickoff_provenance") or {}
+    provider_game_id = prov.get("kickoff_source_event_id") if isinstance(prov, dict) else None
+
+    if stored_status in ("finished", "live"):
+        eligibility = FIXTURE_POSTGAME
+        classification = CLASS_RETROSPECTIVE
+        reason = "STORED_STATUS_NOT_UPCOMING"
+    elif not identity_ok:
+        eligibility = FIXTURE_IDENTITY_UNRESOLVED
+        classification = CLASS_BLOCKED
+        reason = "TEAM_IDENTITY_UNRESOLVED"
+    elif kickoff is None:
+        eligibility = FIXTURE_KICKOFF_UNKNOWN
+        classification = CLASS_BLOCKED
+        reason = "KICKOFF_TIME_UNKNOWN"
+    elif kickoff <= as_of:
+        eligibility = FIXTURE_STALE
+        classification = CLASS_RETROSPECTIVE
+        reason = "VERIFIED_KICKOFF_AT_OR_BEFORE_AS_OF"
+    elif not orientation_ok:
+        eligibility = FIXTURE_IDENTITY_UNRESOLVED
+        classification = CLASS_BLOCKED
+        reason = "REVERSED_ORIENTATION_UNRESOLVED"
+    else:
+        eligibility = FIXTURE_VERIFIED_FUTURE
+        classification = CLASS_PROSPECTIVE
+        reason = None
+
+    return {
+        "stored_status": stored_status,
+        "derived_temporal_status": temporal,
+        "verified_kickoff": kickoff.isoformat() if kickoff else None,
+        "time_to_kickoff_seconds": ttk,
+        "home_away_binding_status": binding,
+        "fixture_eligibility": eligibility,
+        "comparison_classification": classification,
+        "disqualification_reason": reason,
+        "provider_game_id": provider_game_id,
+    }
 
 
 def _v1_for_fixture(m: dict) -> dict:
@@ -97,9 +186,10 @@ def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], pa
     inventory = compute_team_strength(games, as_of=as_of, params=params)
     rows = []
     for m in fixtures:
+        gate = classify_fixture_eligibility(m, as_of)
         kickoff = get_match_datetime(m) if is_kickoff_time_known(m) else None
         v1 = _v1_for_fixture(m)
-        v2 = predict_from_inventory(inventory, m["_home_code"], m["_away_code"],
+        v2 = predict_from_inventory(inventory, m.get("_home_code"), m.get("_away_code"),
                                     odds=m.get("odds"), fixture_kickoff=kickoff)
         market_home = _market_home(m.get("odds"))
         v1_raw = v1["model_probabilities"]["home_win"] / 100.0
@@ -107,21 +197,32 @@ def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], pa
         v2_raw = v2["raw_model_probabilities"]["home_win"] if eligible else None
         rows.append({
             "canonical_match_id": m.get("id"),
+            "provider_game_id": gate["provider_game_id"],
             "fixture_date": m.get("date"),
             "home_team": m.get("home"),
             "away_team": m.get("away"),
-            "home_code": m["_home_code"],
-            "away_code": m["_away_code"],
-            "verified_kickoff": kickoff.isoformat() if kickoff else None,
+            "home_code": m.get("_home_code"),
+            "away_code": m.get("_away_code"),
+            "stored_status": gate["stored_status"],
+            "derived_temporal_status": gate["derived_temporal_status"],
+            "verified_kickoff": gate["verified_kickoff"],
             "prediction_as_of": as_of.isoformat(),
+            "time_to_kickoff_seconds": gate["time_to_kickoff_seconds"],
+            "home_away_binding_status": gate["home_away_binding_status"],
+            "fixture_eligibility": gate["fixture_eligibility"],
+            "comparison_classification": gate["comparison_classification"],
+            "disqualification_reason": gate["disqualification_reason"],
             "v1_model_version": config.MODEL_VERSIONS["basketball"],
             "v1_home_probability": round(v1_raw, 4),
             "v1_away_probability": round(1 - v1_raw, 4),
+            "v1_probability": round(v1_raw, 4),
             "v2_shadow_version": V2_VERSION,
             "v2_home_probability": round(v2_raw, 4) if v2_raw is not None else None,
             "v2_away_probability": round(1 - v2_raw, 4) if v2_raw is not None else None,
+            "v2_shadow_probability": round(v2_raw, 4) if v2_raw is not None else None,
             "market_home_probability": round(market_home, 4) if market_home is not None else None,
             "market_away_probability": round(1 - market_home, 4) if market_home is not None else None,
+            "market_probability": round(market_home, 4) if market_home is not None else None,
             "v1_vs_market_gap": round(v1_raw - market_home, 4) if market_home is not None else None,
             "v2_vs_market_gap": round(v2_raw - market_home, 4) if (v2_raw is not None and market_home is not None) else None,
             "home_real_games_used": v2.get("home_games_used"),
@@ -130,6 +231,10 @@ def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], pa
             "shadow_eligibility": "ELIGIBLE" if eligible else "INSUFFICIENT_REAL_TEAM_DATA",
             "v2_status": v2.get("status"),
         })
+
+    def _count(key, value):
+        return sum(1 for r in rows if r[key] == value)
+
     return {
         "workflow": "NBA_V1_V2_READONLY_COMPARISON",
         "as_of": as_of.isoformat(),
@@ -139,6 +244,18 @@ def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], pa
         "stable_team_count": inventory["stable_team_count"],
         "eligible_fixture_count": sum(1 for r in rows if r["shadow_eligibility"] == "ELIGIBLE"),
         "insufficient_fixture_count": sum(1 for r in rows if r["shadow_eligibility"] != "ELIGIBLE"),
+        "genuine_future_fixture_count": _count("fixture_eligibility", FIXTURE_VERIFIED_FUTURE),
+        "prospective_comparison_count": _count("comparison_classification", CLASS_PROSPECTIVE),
+        "retrospective_diagnostic_count": _count("comparison_classification", CLASS_RETROSPECTIVE),
+        "prospective_blocked_count": _count("comparison_classification", CLASS_BLOCKED),
+        "stale_stored_upcoming_count": _count("fixture_eligibility", FIXTURE_STALE),
+        "kickoff_unknown_count": _count("fixture_eligibility", FIXTURE_KICKOFF_UNKNOWN),
+        "identity_unresolved_count": _count("fixture_eligibility", FIXTURE_IDENTITY_UNRESOLVED),
+        "fixture_eligibility_breakdown": {
+            k: _count("fixture_eligibility", k) for k in (
+                FIXTURE_VERIFIED_FUTURE, FIXTURE_STALE, FIXTURE_KICKOFF_UNKNOWN,
+                FIXTURE_IDENTITY_UNRESOLVED, FIXTURE_POSTGAME)
+        },
         "comparison": rows,
         "production_model_unchanged": True,
         "writes_protected_stores": False,
@@ -153,19 +270,28 @@ def _markdown(comparison: dict) -> str:
              f"- 历史数据集比赛数: {comparison['dataset_game_count']}",
              f"- 真实实力覆盖: **{comparison['real_team_strength_coverage']}** "
              f"(稳定 {comparison['stable_team_count']})",
-             f"- 合格赛事: {comparison['eligible_fixture_count']} / "
+             f"- 真实前瞻赛事 (VERIFIED_FUTURE_FIXTURE): **{comparison['genuine_future_fixture_count']}**",
+             f"- 前瞻对比: {comparison['prospective_comparison_count']} / "
+             f"回溯诊断: {comparison['retrospective_diagnostic_count']} / "
+             f"前瞻被阻: {comparison['prospective_blocked_count']}",
+             f"- 存储 upcoming 但已过期: {comparison['stale_stored_upcoming_count']} / "
+             f"开赛时间未知: {comparison['kickoff_unknown_count']} / "
+             f"身份未决: {comparison['identity_unresolved_count']}",
+             f"- V2 可计算 (ELIGIBLE): {comparison['eligible_fixture_count']} / "
              f"不足: {comparison['insufficient_fixture_count']}", "",
-             "| 赛事 | 日期 | 主 vs 客 | V1 主胜 | V2 主胜 | 市场主胜 | V2-市场 | 主/客真实场次 | 影子资格 |",
+             "| 赛事 | 日期 | 主 vs 客 | 资格 | 对比分类 | V1 主胜 | V2 主胜 | 市场主胜 | 主/客真实场次 |",
              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for r in comparison["comparison"]:
         v2h = f"{r['v2_home_probability']:.3f}" if r["v2_home_probability"] is not None else "—"
         mh = f"{r['market_home_probability']:.3f}" if r["market_home_probability"] is not None else "—"
-        gap = f"{r['v2_vs_market_gap']:+.3f}" if r["v2_vs_market_gap"] is not None else "—"
         lines.append(
             f"| {r['canonical_match_id']} | {r['fixture_date']} | {r['home_team']} vs {r['away_team']} | "
-            f"{r['v1_home_probability']:.3f} | {v2h} | {mh} | {gap} | "
-            f"{r['home_real_games_used']}/{r['away_real_games_used']} | {r['shadow_eligibility']} |")
+            f"{r['fixture_eligibility']} | {r['comparison_classification']} | "
+            f"{r['v1_home_probability']:.3f} | {v2h} | {mh} | "
+            f"{r['home_real_games_used']}/{r['away_real_games_used']} |")
     lines += ["", "> V1 = `basketball-margin-1`（冷启动，未改动）；V2 = `basketball-margin-2-shadow`（真实历史实力）。",
+              "> 仅 `VERIFIED_FUTURE_FIXTURE`（权威开赛时间晚于 as_of）才是真实前瞻对比；",
+              "> 过期/历史赛事仅作 `RETROSPECTIVE_MODEL_DIAGNOSTIC`，开赛时间未知或身份未决为 `PROSPECTIVE_COMPARISON_BLOCKED`。",
               "> 影子模型不替换生产模型、不改写历史快照/结算；不足时显式 `INSUFFICIENT_REAL_TEAM_DATA`。"]
     return "\n".join(lines) + "\n"
 

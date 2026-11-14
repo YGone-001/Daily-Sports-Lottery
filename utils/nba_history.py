@@ -55,6 +55,8 @@ REASON_MALFORMED_PERIOD = "MALFORMED_PERIOD"
 REASON_MALFORMED_SEASON = "MALFORMED_SEASON"
 REASON_INVALID_TIMESTAMP = "INVALID_EVENT_TIMESTAMP"
 REASON_CONFLICTING_DUPLICATE = "CONFLICTING_DUPLICATE_GAME_ID"
+REASON_UNSUPPORTED_COMPETITION = "UNSUPPORTED_COMPETITION"
+REASON_AMBIGUOUS_CLASSIFICATION = "AMBIGUOUS_CLASSIFICATION"
 
 # 数据集 / 获取门禁状态
 STATUS_OK = "ok"
@@ -65,6 +67,121 @@ STATUS_DISABLED_CREDS = "disabled_missing_credentials"
 
 _MIN_SEASON = 1946
 _MAX_SEASON = 2100
+
+# NBA 竞赛类型分类（常规赛资格）。标准常规赛 = 30 队 × 82 场 / 2 = 1230 场。
+COMP_NORMAL_REGULAR = "NORMAL_REGULAR"
+COMP_NBA_CUP_REGULAR = "NBA_CUP_REGULAR"
+COMP_NBA_CUP_CHAMPIONSHIP = "NBA_CUP_CHAMPIONSHIP"
+COMP_PLAY_IN = "PLAY_IN"
+COMP_PLAYOFF = "PLAYOFF"
+COMP_UNSUPPORTED = "UNSUPPORTED_COMPETITION"
+COMP_AMBIGUOUS = "AMBIGUOUS_CLASSIFICATION"
+
+# 官方 NBA 常规赛最后一日（美方当地日期）。Play-In 紧随其后，不计入常规赛战绩。
+# 该映射人工维护、按官方赛历 grounding；新增**已完赛**赛季前必须补充其末日，
+# 否则该赛季的 Play-In 无法被日期边界识别（早期赛季比赛不受影响）。
+NBA_REGULAR_SEASON_END_DATES: dict[int, str] = {
+    2025: "2026-04-12",
+}
+
+_IST_REGULAR_MARKERS = ("group", "quarterfinal", "quarter-final", "semifinal", "semi-final", "knockout")
+
+_OFFICIAL_RULES: dict[str, str] = {
+    COMP_NORMAL_REGULAR: "NBA regular season: 30 teams x 82 games / 2 = 1230 unique games",
+    COMP_NBA_CUP_REGULAR: "NBA Cup group stage and knockout rounds (except the Championship) count toward regular-season standings",
+    COMP_NBA_CUP_CHAMPIONSHIP: "NBA Cup Championship is a standalone final that does not count toward regular-season standings",
+    COMP_PLAY_IN: "NBA Play-In Tournament determines playoff seeding and is not part of the regular season",
+    COMP_PLAYOFF: "NBA Playoffs are postseason and not part of the regular season",
+    COMP_UNSUPPORTED: "unsupported competition type",
+    COMP_AMBIGUOUS: "ambiguous competition classification",
+}
+
+
+def _ist_is_regular_stage(ist_norm: str) -> bool:
+    return any(marker in ist_norm for marker in _IST_REGULAR_MARKERS)
+
+
+def _classification(competition_type: str, eligible: bool, source: str, reason: str, *, reject: bool) -> dict:
+    return {
+        "competition_type": competition_type,
+        "counts_as_regular_season": eligible,
+        "classification_source": source,
+        "classification_reason": reason,
+        "official_rule": _OFFICIAL_RULES[competition_type],
+        "reject": reject,
+    }
+
+
+def classify_nba_competition(raw: dict, *, regular_season_end_date: str | None = None) -> dict:
+    """对单场提供商记录判定 NBA 竞赛类型与常规赛资格（纯函数，只读，确定性）。
+
+    优先级：显式 ``season_type``（若存在）→ ``postseason`` 布尔 → ``ist_stage`` →
+    常规赛末日日期边界（识别 Play-In）→ 默认常规赛。
+
+    - NBA Cup 小组赛与淘汰赛（除 Championship）**计入**常规赛战绩，予以保留。
+    - NBA Cup Championship、Play-In、Playoffs **不计入**常规赛，排除但保留原始证据。
+    - 未知 ``season_type`` / 无法识别的 ``ist_stage`` / 自相矛盾的分类一律拒绝（fail closed）。
+
+    当前 BALLDONTLIE Games 响应**不含** ``season_type`` 字段（它只是查询参数），
+    因此实际分类依赖 ``postseason`` + ``ist_stage`` + 常规赛末日日期边界。
+    ``regular_season_end_date`` 为美方当地日期字符串（``YYYY-MM-DD``）；缺省时
+    日期边界检测不可用，无标记比赛按默认常规赛处理（仅对早期赛季比赛成立）。
+    """
+    if not isinstance(raw, dict):
+        return _classification(COMP_AMBIGUOUS, False, "malformed", "raw record is not a dict", reject=True)
+
+    st = raw.get("season_type")
+    st_norm = st.strip().lower() if isinstance(st, str) and st.strip() else None
+    postseason = raw.get("postseason")
+    ist = raw.get("ist_stage")
+    ist_norm = ist.strip().lower() if isinstance(ist, str) and ist.strip() else None
+    game_date = str(raw.get("date") or "")
+
+    if st_norm is not None:
+        if st_norm in ("playoffs", "playoff"):
+            return _classification(COMP_PLAYOFF, False, "season_type",
+                                   "season_type=playoffs is postseason", reject=False)
+        if st_norm in ("playin", "play-in", "play_in"):
+            return _classification(COMP_PLAY_IN, False, "season_type",
+                                   "season_type=playin is the Play-In Tournament", reject=False)
+        if st_norm == "regular":
+            if ist_norm and "championship" in ist_norm:
+                return _classification(COMP_AMBIGUOUS, False, "season_type",
+                                       "season_type=regular contradicts ist_stage=Championship", reject=True)
+            if ist_norm:
+                if _ist_is_regular_stage(ist_norm):
+                    return _classification(COMP_NBA_CUP_REGULAR, True, "season_type",
+                                           "season_type=regular with NBA Cup stage counts toward standings", reject=False)
+                return _classification(COMP_AMBIGUOUS, False, "season_type",
+                                       f"unrecognized ist_stage={ist_norm} with season_type=regular", reject=True)
+            return _classification(COMP_NORMAL_REGULAR, True, "season_type",
+                                   "season_type=regular standard game", reject=False)
+        if st_norm != "ist":
+            return _classification(COMP_UNSUPPORTED, False, "season_type",
+                                   f"unsupported season_type={st_norm}", reject=True)
+        # season_type=ist：继续走 ist_stage 判定。
+
+    if postseason is True:
+        return _classification(COMP_PLAYOFF, False, "postseason_flag",
+                               "postseason=true is postseason", reject=False)
+
+    if ist_norm:
+        if "championship" in ist_norm:
+            return _classification(COMP_NBA_CUP_CHAMPIONSHIP, False, "ist_stage",
+                                   "NBA Cup Championship does not count toward standings", reject=False)
+        if _ist_is_regular_stage(ist_norm):
+            return _classification(COMP_NBA_CUP_REGULAR, True, "ist_stage",
+                                   "NBA Cup group/knockout stage counts toward standings", reject=False)
+        return _classification(COMP_AMBIGUOUS, False, "ist_stage",
+                               f"unrecognized ist_stage={ist_norm}", reject=True)
+
+    if regular_season_end_date and game_date and game_date > regular_season_end_date:
+        return _classification(COMP_PLAY_IN, False, "regular_season_date_boundary",
+                               "game date after documented regular-season final day with no IST/postseason marker => Play-In",
+                               reject=False)
+
+    return _classification(COMP_NORMAL_REGULAR, True, "default_regular",
+                           "no postseason/IST marker and within the regular-season window", reject=False)
 
 
 def _content_digest(value: Any) -> str:
@@ -81,12 +198,14 @@ def parse_historical_games(
     *,
     source_reference: str = BALLDONTLIE_GAMES_URL,
     observed_at: datetime | None = None,
+    regular_season_end_dates: dict[int, str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """解析 BALLDONTLIE Games 载荷为**已确认完赛**的历史比赛观测。
 
     支持列表响应（``data`` 为 list）与单场响应（``data`` 为 dict）。
     严格保留主客方向（``home_team`` 为主、``visitor_team`` 为客）、UTC 开赛时间、
     提供商赛季约定与 30 支球队标识；按提供商 ``id`` 去重，内容冲突拒绝该 ID。
+    每场附带 NBA 竞赛类型分类与常规赛资格；未知/矛盾分类拒绝该场（fail closed）。
     返回 (games, errors)；games 按 (scheduled_start_utc, provider_game_id) 确定性排序。
     """
     if not isinstance(payload, dict):
@@ -96,6 +215,10 @@ def parse_historical_games(
         data = [data]
     if not isinstance(data, list):
         return [], [REASON_MALFORMED_PAYLOAD]
+
+    end_dates = dict(NBA_REGULAR_SEASON_END_DATES)
+    if regular_season_end_dates:
+        end_dates.update(regular_season_end_dates)
 
     obs_iso = (observed_at or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ).isoformat()
     games: list[dict] = []
@@ -185,10 +308,24 @@ def parse_historical_games(
             "overtime_periods": max(0, period - 4),
             "postseason_flag": postseason,
             "ist_stage": raw.get("ist_stage") if isinstance(raw.get("ist_stage"), str) else None,
+            "season_type": raw.get("season_type") if isinstance(raw.get("season_type"), str) else None,
             "source_observed_at": obs_iso,
             "source_reference": source_reference,
             "source_content_digest": _content_digest(raw),
         }
+
+        classification = classify_nba_competition(raw, regular_season_end_date=end_dates.get(season))
+        if classification["reject"]:
+            code = (REASON_UNSUPPORTED_COMPETITION
+                    if classification["competition_type"] == COMP_UNSUPPORTED
+                    else REASON_AMBIGUOUS_CLASSIFICATION)
+            errors.append(f"{code}:{gid_str}")
+            continue
+        game["competition_type"] = classification["competition_type"]
+        game["regular_season_eligible"] = classification["counts_as_regular_season"]
+        game["classification_source"] = classification["classification_source"]
+        game["classification_reason"] = classification["classification_reason"]
+        game["official_rule"] = classification["official_rule"]
 
         if gid_str in seen:
             if seen[gid_str]["source_content_digest"] != game["source_content_digest"]:
@@ -209,12 +346,16 @@ def assemble_historical_dataset(
     *,
     requested_seasons: Iterable[int] | None = None,
     cutoff_utc: datetime | None = None,
+    regular_season_only: bool = True,
 ) -> dict:
     """把已解析的历史比赛装配为确定性只读分析数据集。
 
     - 全局按 ``provider_game_id`` 去重；内容冲突的 ID 被剔除并计数。
     - 若提供 ``cutoff_utc``，剔除 ``scheduled_start_utc >= cutoff`` 的比赛（防未来泄漏）。
-    - 区分常规赛与季后赛；赛季按提供商约定（``season`` 字段），不按日历年。
+    - 按 NBA 竞赛类型分类区分常规赛资格；``regular_season_only=True``（默认）时
+      ``games`` 仅含常规赛资格比赛，NBA Cup Championship / Play-In / Playoffs 被排除
+      但**完整保留**在 ``excluded_competitions`` 中作为原始证据。
+    - 赛季按提供商约定（``season`` 字段），不按日历年。
     - 绝不写入任何受保护存储；返回纯数据结构。
     """
     by_id: dict[str, dict] = {}
@@ -237,17 +378,31 @@ def assemble_historical_dataset(
         by_id[gid] = g
 
     ordered = sorted(by_id.values(), key=lambda g: (g["scheduled_start_utc"] or "", g["provider_game_id"]))
-    seasons = sorted({g["season"] for g in ordered})
-    teams = sorted({g["home_code"] for g in ordered} | {g["away_code"] for g in ordered})
-    regular = [g for g in ordered if not g["postseason_flag"]]
-    playoff = [g for g in ordered if g["postseason_flag"]]
-    dates = [g["game_date"] for g in ordered if g.get("game_date")]
+    eligible: list[dict] = []
+    excluded: list[dict] = []
+    breakdown: dict[str, int] = {}
+    for g in ordered:
+        ctype = g.get("competition_type", "UNCLASSIFIED")
+        breakdown[ctype] = breakdown.get(ctype, 0) + 1
+        flag = g.get("regular_season_eligible")
+        is_eligible = (not g.get("postseason_flag", False)) if flag is None else bool(flag)
+        (eligible if is_eligible else excluded).append(g)
+
+    selected = eligible if regular_season_only else ordered
+    seasons = sorted({g["season"] for g in selected})
+    teams = sorted({g["home_code"] for g in selected} | {g["away_code"] for g in selected})
+    playoff_count = sum(1 for g in ordered if g.get("postseason_flag"))
+    dates = [g["game_date"] for g in selected if g.get("game_date")]
     return {
         "provider": PROVIDER,
         "dataset_kind": "NBA_HISTORICAL_COMPLETED_GAMES",
-        "game_count": len(ordered),
-        "regular_season_count": len(regular),
-        "postseason_count": len(playoff),
+        "regular_season_only": regular_season_only,
+        "game_count": len(selected),
+        "regular_season_count": len(eligible),
+        "postseason_count": playoff_count,
+        "excluded_competition_count": len(excluded),
+        "total_completed_games": len(ordered),
+        "competition_breakdown": dict(sorted(breakdown.items())),
         "seasons": seasons,
         "season_labels": [f"{s}-{str(s + 1)[-2:]}" for s in seasons],
         "requested_seasons": sorted(requested_seasons) if requested_seasons else seasons,
@@ -257,7 +412,8 @@ def assemble_historical_dataset(
         "cutoff_utc": cutoff_utc.astimezone(BEIJING_TZ).isoformat() if cutoff_utc else None,
         "excluded_post_cutoff": post_cutoff,
         "conflicting_game_ids": sorted(conflicts),
-        "games": ordered,
+        "games": selected,
+        "excluded_competitions": excluded,
         "production_store_write": False,
         "canonical_market_modified": False,
     }
@@ -305,13 +461,15 @@ def _not_attempted(reason: str, *, seasons, start_date, end_date, per_page) -> d
     }
 
 
-def _build_query(seasons, start_date, end_date, per_page, postseason) -> str:
+def _build_query(seasons, start_date, end_date, per_page, postseason, season_type=None) -> str:
     parts = [f"seasons[]={s}" for s in seasons]
     if start_date:
         parts.append(f"start_date={start_date}")
     if end_date:
         parts.append(f"end_date={end_date}")
     parts.append(f"postseason={'true' if postseason else 'false'}")
+    if season_type:
+        parts.append(f"season_type={season_type}")
     parts.append(f"per_page={per_page}")
     return BALLDONTLIE_GAMES_URL + "?" + "&".join(parts)
 
@@ -322,6 +480,7 @@ def fetch_historical_games(
     start_date: str | None = None,
     end_date: str | None = None,
     postseason: bool = False,
+    season_type: str | None = None,
     allow_network: bool = False,
     api_key: str | None = None,
     timeout: float = 5.0,
@@ -330,6 +489,7 @@ def fetch_historical_games(
     max_elapsed_seconds: float = 120.0,
     cutoff_utc: datetime | None = None,
     now: datetime | None = None,
+    regular_season_end_dates: dict[int, str] | None = None,
 ) -> tuple[list[dict], dict]:
     """有界、默认拒绝网络的 BALLDONTLIE 历史完赛获取。
 
@@ -368,7 +528,7 @@ def fetch_historical_games(
         diag["checked_at"] = now_bj.isoformat()
         return [], diag
 
-    base_url = _build_query(seasons, start_date, end_date, per_page, postseason)
+    base_url = _build_query(seasons, start_date, end_date, per_page, postseason, season_type)
     started_mono = time.monotonic()
     deadline = started_mono + max_elapsed_seconds
     started_at = now_bj
@@ -442,7 +602,8 @@ def fetch_historical_games(
             break
         pages += 1
         observed += len(payload["data"])
-        rows, parse_errors = parse_historical_games(payload, source_reference=url, observed_at=received_at)
+        rows, parse_errors = parse_historical_games(payload, source_reference=url, observed_at=received_at,
+                                                    regular_season_end_dates=regular_season_end_dates)
         if parse_errors:
             errors.extend(parse_errors)
         row_map = {r["provider_game_id"]: r for r in rows}
@@ -507,6 +668,7 @@ def fetch_historical_games(
         "start_date": start_date,
         "end_date": end_date,
         "postseason": postseason,
+        "season_type": season_type,
         "requested_page_size": per_page,
         "pages_fetched": pages,
         "provider_rows_observed": observed,

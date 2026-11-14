@@ -157,14 +157,19 @@ def test_dataset_cutoff_excludes_future_games():
 
 
 def test_dataset_regular_postseason_split_and_seasons():
+    # 常规赛资格按竞赛类型判定：season=2025 的常规赛必须落在该赛季常规赛窗口内
+    # （末日 2026-04-12 之前），否则会被日期边界识别为 Play-In。
     games, _ = parse_historical_games({"data": [
-        _final_game(gid=1, postseason=False, season=2025),
-        _final_game(gid=2, postseason=True, season=2025),
+        _final_game(gid=1, postseason=False, season=2025, utc="2025-11-01T23:00:00.000Z"),
+        _final_game(gid=2, postseason=True, season=2025, utc="2026-04-20T23:00:00.000Z"),
     ]})
     ds = assemble_historical_dataset(games, requested_seasons=[2025, 2026])
     assert ds["regular_season_count"] == 1 and ds["postseason_count"] == 1
     assert ds["seasons"] == [2025] and ds["requested_seasons"] == [2025, 2026]
     assert ds["distinct_team_count"] == 2
+    assert ds["excluded_competition_count"] == 1
+    assert ds["games"][0]["competition_type"] == "NORMAL_REGULAR"
+    assert ds["excluded_competitions"][0]["competition_type"] == "PLAYOFF"
 
 
 def test_dataset_global_conflict_removed():
