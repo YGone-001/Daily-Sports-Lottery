@@ -76,8 +76,9 @@ def bulls_hawks(scene, *, home_scores=(33, 27, 24, 26, 15), away_scores=(24, 29,
     m["kickoff_provenance"]["kickoff_source_event_id"] = "124"
     s.update(match_id=m["id"], home_team=m["home"], away_team=m["away"])
     s["snapshot_id"] = prediction_snapshots.snapshot_id_for(m["id"], s["model_version"])
+    final_text = "Final" if period <= 4 else ("Final/OT" if period == 5 else f"Final/{period - 4}OT")
     o.update(gameId="0022600037", period=period,
-             gameStatus=3 if final else 2, gameStatusText="Final" if final else "OT1")
+             gameStatus=3 if final else 2, gameStatusText=final_text if final else "OT1")
     o["homeTeam"] = {"teamId": 1610612741, "teamTricode": "CHI", "score": sum(home_scores),
                      "periods": _official_periods(home_scores)}
     o["awayTeam"] = {"teamId": 1610612737, "teamTricode": "ATL", "score": sum(away_scores),
@@ -203,6 +204,29 @@ def test_conflicting_final_sources_rejected(scene):
     m, s, o, b, kw = bulls_hawks(scene)
     b["visitor_team_score"] = 118
     with pytest.raises(ValueError, match="SCORE_CONFLICT"):
+        tool.bind_result(m, s, o, b, **kw)
+
+
+@pytest.mark.parametrize("period,text,home_scores,away_scores", [
+    (4, "Final", (33, 27, 24, 26), (24, 29, 30, 20)),
+    (5, "Final/OT", (33, 27, 24, 26, 15), (24, 29, 30, 27, 7)),
+    (6, "Final/2OT", (33, 27, 24, 26, 15, 10), (24, 29, 30, 27, 7, 8)),
+])
+def test_official_final_text_variants_accepted(scene, period, text, home_scores, away_scores):
+    m, s, o, b, kw = bulls_hawks(scene, home_scores=home_scores, away_scores=away_scores, period=period)
+    o["gameStatusText"] = text
+    resolved = tool.bind_result(m, s, o, b, **kw)
+    assert resolved["status"] == "finished"
+    assert resolved["score"] == {"ft": [sum(home_scores), sum(away_scores)]}
+    assert resolved["result_provenance"]["final_period"] == period
+    assert resolved["result_provenance"]["overtime"] is (period > 4)
+
+
+@pytest.mark.parametrize("text", ["OT1", "Q4", "End of Q4", "Halftime", "Final/OT ", "Final/OTX", "final"])
+def test_non_final_or_malformed_status_text_rejected(scene, text):
+    m, s, o, b, kw = bulls_hawks(scene)
+    o["gameStatusText"] = text
+    with pytest.raises(ValueError):
         tool.bind_result(m, s, o, b, **kw)
 
 

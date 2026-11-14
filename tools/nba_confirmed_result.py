@@ -87,8 +87,11 @@ def bind_result(canonical, snapshot, official, bdl, *, observed_at, source_refer
     _require(isinstance(gid, str) and re.fullmatch(r"[0-9]{10}", gid) is not None,
              "OFFICIAL_GAME_ID_MALFORMED")
     period = official.get("period")
+    # 官方加时终场写作 "Final/OT" / "Final/2OT"，而非 "Final"；gameStatus==3 才是终场权威码。
+    status_text = official.get("gameStatusText")
     is_final = (type(official.get("gameStatus")) is int and official["gameStatus"] == 3
-                and official.get("gameStatusText") == "Final"
+                and isinstance(status_text, str)
+                and re.fullmatch(r"Final(?:/[0-9]*OT)?", status_text) is not None
                 and bdl.get("status_state") == "final" and bdl.get("status") == "Final"
                 and bdl.get("postponed") is False)
     if not is_final:

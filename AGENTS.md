@@ -1134,6 +1134,11 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   `REGULATION_TIE_NOT_FINAL` 拒绝；`period >= 5` 但任一来源未明确 Final 时
   `OVERTIME_IN_PROGRESS` 拒绝。绝不把平局自动转成终场比分，绝不估算或补齐加时得分。
   被拒绝的平局候选（如 500lq 的 110-110）只作为诊断证据留存，不得升级为赛果。
+- **终场文字必须识别加时写法**：终场权威码是官方 `gameStatus == 3`；`gameStatusText`
+  接受 `Final` 与 `Final/OT` / `Final/2OT`（正则 `Final(?:/[0-9]*OT)?`）。真实官方加时页
+  写作 `Final/OT` 而非 `Final`，仅按字面 `Final` 匹配会把已确认加时终场误判为
+  `OVERTIME_IN_PROGRESS`（真实数据已暴露此缺陷并修正）。进行中文字（`Q4` / `OT1` /
+  `Halftime` / `End of Q4`）与畸形文字一律拒绝，不得放宽 `gameStatus == 3` 与逐节对账。
 - **逐节对账是硬门禁**：两源 `period` 必须同为不小于 4 的整数且一致；官方 `periods`
   数组（前四节 `REGULAR`、加时 `OVERTIME`）与 BDL `q1..q4`/`ot1..ot3` 必须各自加总
   等于该源总分。缺节、类型错误、加总不符分别拒绝（`PERIOD_STRUCTURE_REQUIRED` /

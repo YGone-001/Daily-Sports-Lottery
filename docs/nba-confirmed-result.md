@@ -19,6 +19,11 @@ tricode；官方引用 URL 必须由该锚定队码与官方赛事 ID 构造
 NBA 官方与 BDL 必须均明确 Final，非平局的整数比分必须完全一致。缺失、反向、竞争绑定或
 已存在的不同结果一律拒绝。不修改 `same_event()`，不解释彩票星期，不交换500侧主客或比分。
 
+终场判定以官方 `gameStatus == 3` 为权威码，`gameStatusText` 接受 `Final` 与加时写法
+`Final/OT` / `Final/2OT`（正则 `Final(?:/[0-9]*OT)?`）。**真实官方加时页写作 `Final/OT`
+而非 `Final`**，仅按字面 `Final` 匹配会把已确认的加时终场误判为 `OVERTIME_IN_PROGRESS`。
+进行中文字（`Q4` / `OT1` / `Halftime` / `End of Q4`）与畸形文字一律拒绝。
+
 ## 加时赛果危害防护
 
 - 常规时间结束（`period == 4`）的平局**不是终场**：`REGULATION_TIE_NOT_FINAL` 拒绝；
