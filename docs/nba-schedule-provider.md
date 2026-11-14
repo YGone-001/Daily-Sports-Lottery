@@ -112,3 +112,12 @@ no_Canonical_reconciliation = true
 Canonical ID、provider game ID、主客、盘口、快照 ID 和模型版本。
 赛果未确认时只可标记 `RESULT_PENDING`；后续真实结算写入须另获授权，
 不能用经过时间推断完赛或伪造全场比分。
+
+## 历史窗口获取范围
+
+历史完赛窗口（`utils.nba_history.plan_history_window`）按文档化参数构造：
+`seasons[]` + `start_date` + `end_date` + `per_page=100`，**省略** `season_type`
+（文档：省略时返回全部非季前赛类型），**不发送**未文档化的 `postseason`。
+可选的 `season_type=ist` 分区只做 NBA Cup 子集核验、按 ID 去重。请求预算含重试与核验分区并共享；
+任何新的真实请求都需操作者对精确规划（`plan_sha256`）单独批准，旧批准不可复用。
+详见 `docs/nba-model-v2-shadow.md` 第九章。

@@ -121,7 +121,10 @@ ALLOWED_PATHS = frozenset((
     "tests/test_nba_strength_and_shadow.py",
     "docs/nba-model-v2-shadow.md",
     # NBA competition eligibility and prospective evidence corrections
-    "tests/test_nba_competition_and_prospective.py"))
+    "tests/test_nba_competition_and_prospective.py",
+    # current-season window certification and immutable prospective shadow capture
+    "tools/nba_shadow_capture.py",
+    "tests/test_nba_prospective_shadow_capture.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

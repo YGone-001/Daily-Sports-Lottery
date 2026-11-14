@@ -249,13 +249,44 @@ def _fixture(mid="500j-2026-11-15-9999", date="2026-11-15", time="08:00", known=
             "odds": {"home_win": 1.5, "away_win": 2.5}, "_home_code": hc, "_away_code": ac}
 
 
+# 2026-11-15 08:00 北京 = 2026-11-15T00:00Z；BDL 主队 BOS = bdl:2，客队 NYK = bdl:20。
+_KICKOFF_UTC = "2026-11-15T00:00:00.000Z"
+
+
+def _verified_fixture(**kw):
+    f = _fixture(**kw)
+    f.update({"market_tracked": True, "jczq_no": "7301", "kickoff_provenance": {
+        "actual_kickoff_time_source": "balldontlie_nba_games",
+        "kickoff_source_event_id": "21718200",
+        "kickoff_source_observed_at": "2026-11-14T11:00:00+08:00",
+        "kickoff_source_scheduled_start_utc": _KICKOFF_UTC,
+        "kickoff_verification_status": "SCHEDULE_PROVIDER_VERIFIED"}})
+    return f
+
+
+def _observation(**kw):
+    o = {"provider": "balldontlie_nba_games", "provider_game_id": "21718200",
+         "status_state": "scheduled", "postponed": False, "game_status": "scheduled",
+         "home_team_identifier": "bdl:2", "away_team_identifier": "bdl:20",
+         "scheduled_start_utc": _KICKOFF_UTC, "observed_at": "2026-11-14T11:55:00+08:00"}
+    o.update(kw)
+    return o
+
+
 def test_verified_future_fixture_accepted():
-    gate = classify_fixture_eligibility(_fixture(), AS_OF)
+    gate = classify_fixture_eligibility(_verified_fixture(), AS_OF, provider_observation=_observation(),
+                                        provider_binding_count=1)
     assert gate["fixture_eligibility"] == FIXTURE_VERIFIED_FUTURE
     assert gate["comparison_classification"] == CLASS_PROSPECTIVE
     assert gate["derived_temporal_status"] == "FUTURE"
     assert gate["time_to_kickoff_seconds"] > 0
     assert gate["disqualification_reason"] is None
+
+
+def test_future_fixture_without_provider_evidence_blocked():
+    gate = classify_fixture_eligibility(_fixture(), AS_OF)
+    assert gate["fixture_eligibility"] != FIXTURE_VERIFIED_FUTURE
+    assert gate["comparison_classification"] == CLASS_BLOCKED
 
 
 def test_past_kickoff_not_prospective():
@@ -316,7 +347,8 @@ _MANDATORY = [
 def test_comparison_mandatory_fields_and_prospective():
     games = [_g(1, "BOS", "NYK", 110, 100, "2026-10-20T23:00:00.000Z"),
              _g(2, "BOS", "NYK", 105, 100, "2026-10-22T23:00:00.000Z")]
-    comp = build_comparison({"games": games, "game_count": 2}, as_of=AS_OF, fixtures=[_fixture()])
+    comp = build_comparison({"games": games, "game_count": 2}, as_of=AS_OF, fixtures=[_verified_fixture()],
+                            observations={"500j-2026-11-15-9999": _observation()})
     row = comp["comparison"][0]
     for field in _MANDATORY:
         assert field in row, field
@@ -330,12 +362,13 @@ def test_comparison_mixed_cohort_summary():
     games = [_g(1, "BOS", "NYK", 110, 100, "2026-10-20T23:00:00.000Z"),
              _g(2, "BOS", "NYK", 105, 100, "2026-10-22T23:00:00.000Z")]
     fixtures = [
-        _fixture(),                                                   # future
+        _verified_fixture(),                                          # future
         _fixture(mid="500lq-2026-11-14-周五306", date="2026-11-14"),    # stale
         _fixture(mid="500j-2026-11-15-1", time="00:00", known=False),  # unknown
         _fixture(mid="500j-2026-11-15-2", hc=None),                   # identity
     ]
-    comp = build_comparison({"games": games, "game_count": 2}, as_of=AS_OF, fixtures=fixtures)
+    comp = build_comparison({"games": games, "game_count": 2}, as_of=AS_OF, fixtures=fixtures,
+                            observations={"500j-2026-11-15-9999": _observation()})
     assert comp["genuine_future_fixture_count"] == 1
     assert comp["stale_stored_upcoming_count"] == 1
     assert comp["kickoff_unknown_count"] == 1

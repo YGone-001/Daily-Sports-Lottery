@@ -172,3 +172,80 @@ Play-In 落在常规赛末日之后且无 IST/postseason 标记。`assemble_hist
 V2-Elo+form（rest 参数 0）/ V2-complete。走查回测不传 `fixture_kickoff` → rest 分量恒 0，
 故 Elo+form 与 complete 在回溯队列上指标相同；休息贡献仅在真实前瞻中激活，回溯无法度量，如实陈述。
 **不为提升报告调参，不升级影子模型为生产。**
+## 九、当前赛季窗口认证与首个真实前瞻影子捕获
+
+### 获取范围（不假设 `season_type=regular` 完整）
+
+[提供商文档](https://docs.balldontlie.io/#games)规定 Games 的 `season_type` 取值
+`preseason` / `regular` / `ist` / `playin` / `playoffs`，**省略时返回全部非季前赛类型**；
+`postseason` **不是**文档化参数。`regular` 是否包含计入常规赛战绩的 NBA Cup 比赛未被文档化，
+因此不得假设它完整。
+
+| 分区 | `season_type` | 作用 |
+| --- | --- | --- |
+| `ALL_NON_PRESEASON_TYPES` | 省略 | 主覆盖：常规赛 + NBA Cup 全阶段 + Play-In + Playoffs，由分类器排除非常规赛 |
+| `NBA_CUP_IST_CROSSCHECK` | `ist` | 子集核验：每个返回 ID 必须已在主分区出现且内容一致；按 ID 去重，**只计一次** |
+
+- 分类器新增 `PRESEASON`：显式 `season_type=preseason` 或比赛日早于已文档化揭幕日
+  （`NBA_REGULAR_SEASON_START_DATES`：2025 = `2025-10-21`，2026 = `2026-10-20`），排除但保留证据。
+- 本机既有授权证据（`postseason=false`、无 `season_type`）实测返回 NBA Cup 小组/淘汰/决赛与
+  Play-In，且无季前赛；这与文档一致，但不再依赖未文档化参数。
+
+### 日期边界与预算
+
+`plan_history_window(season, cutoff)` 是纯函数，不联网：
+
+- 起始日 = 揭幕日前一日；结束日 = cutoff 在 UTC 与北京时区下的较晚日期
+  （美方当地日期不晚于 UTC 日期）。日期过滤的时区语义未文档化，因此再按
+  `scheduled_start_utc < cutoff` 严格过滤，任何语义下都不漏零点附近比赛。
+- 请求预算（默认 10，含重试与交叉核验分区）在所有分区间**共享**；任一分区失败后不再发起后续分区。
+- 规划带 `plan_sha256`；获取结果必须携带同一摘要，否则 `PLAN_DIGEST_MISMATCH`。
+
+### 认证与对账
+
+`fetch_history_window(plan, allow_network=...)` 默认拒绝网络，逐页保留 `request_cursor` /
+`next_cursor` / `received_at` / `payload_sha256`。`certify_history_window(plan, fetched, previous_games=...)`
+只有在下列条件**全部**成立时给出 `CURRENT_SEASON_WINDOW_COMPLETE = VERIFIED`：
+
+- 每个分区游标耗尽（`next_cursor` 缺省）且无冲突 ID；
+- 截止前比赛全部确认完赛（延期单列 `pre_cutoff_postponed_ids`；其余未完赛 → `PRE_CUTOFF_GAME_NOT_FINAL`）；
+- 截止前无解析拒绝（含未知竞赛类型）；
+- NBA Cup 交叉核验无缺口（`NBA_CUP_SCOPE_GAP`）、无内容矛盾（`OVERLAPPING_CATEGORY_CONFLICT`）；
+- 既有捕获全部被重新确认（`PREVIOUS_EVIDENCE_NOT_RECONFIRMED`）且关键字段无冲突（`PREVIOUS_EVIDENCE_CONFLICT`）。
+
+对账输出 `old_provider_game_ids` / `new_provider_game_ids` / `missing_old_ids` /
+`newly_discovered_ids` / `conflicting_ids` / `existing_scores_changed` / `new_regular_season_games`；
+冲突记录**并列保留**两份证据，绝不覆盖。2025-26 已认证数据与 2026-27 数据分开陈述。
+
+### 提供商支撑的前瞻门禁
+
+`classify_fixture_eligibility(m, as_of, provider_observation=..., provider_binding_count=...)`：
+`VERIFIED_FUTURE_FIXTURE` 要求存储 `upcoming`、`market_tracked=true` + Canonical ID + 彩票编号、
+双方球队身份、有效且**唯一绑定**的 BALLDONTLIE 赛事 ID、溯源
+`balldontlie_nba_games` / `SCHEDULE_PROVIDER_VERIFIED` 且开赛时刻一致、带时区开赛晚于 `as_of`、
+`as_of` 之前 900 秒内取得的观测仍为 `scheduled` 且未延期、观测主客与存储主客**完全一致**、
+胜负盘价格有效、无 Canonical 归属冲突。新增 `SCHEDULE_STATUS_UNVERIFIED` 与 `MARKET_UNAVAILABLE`；
+`source_status` / `identity_confidence` / `temporal_eligibility` / `market_status` 分别输出。
+存储的历史排期观测**不**证明比赛当前仍按期进行；缺当前观测一律不予前瞻。
+
+### 不可变影子工件（`tools/nba_shadow_capture.py`）
+
+```bash
+python -m tools.nba_shadow_capture capture --dataset <certified-dataset.json> \
+    --match-id <canonical_id> --output-dir reports/phase3y/prospective-shadow [--allow-network]
+python -m tools.nba_shadow_capture verify <artifact.json>
+```
+
+- 前置：数据集 `certification.REGULAR_SEASON_DATASET_CERTIFIED` 与
+  `CURRENT_SEASON_WINDOW_COMPLETE` 均为 `VERIFIED`；门禁 `VERIFIED_FUTURE_FIXTURE`；
+  `prediction_as_of <= generated_at < verified_kickoff`；市场观测早于 `as_of`；V2 真实场次充足。
+- 提供商绑定复用 `apply_nba_schedule_time_enrichment`，但**只作用于内存副本**，绝不回写七库。
+- V2 只用 `game_end < prediction_as_of` 的完赛；工件记录 `temporal_input_verification`，
+  `capture_mode = CONTEMPORANEOUS_PROSPECTIVE_CAPTURE`，与回溯研究分开。
+- 工件按 `snapshot_identity = sha256(canonical_id|bdl_id|v1|v2|as_of)` **独占创建**；
+  内容相同重复写入为 `IDEMPOTENT_EXISTING`，内容不同 `SHADOW_ARTIFACT_IMMUTABLE` 拒绝；
+  输出目录位于 `DATA_DIR` 内一律拒绝。`content_sha256` 覆盖除自身外的全部字段。
+- `evaluate_shadow_artifact(artifact, final_result)` 是只读评估契约：同一 Canonical ID +
+  BDL 赛事 ID 连接、要求官方确认终场、校验工件摘要；**不**结算、**不**写库、**不**自动运行。
+
+> 前瞻队列目标 ≥100 场、跨多个比赛日，是**未来目标**；不为累积样本创建周期性生产写入者。

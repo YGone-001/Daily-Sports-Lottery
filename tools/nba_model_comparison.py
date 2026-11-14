@@ -31,7 +31,13 @@ import config
 from utils.fetcher_500 import is_nba_league
 from utils.match_identity import is_kickoff_time_known
 from utils.daily_loader import get_beijing_now, get_match_datetime
-from utils.nba_schedule import BEIJING_TZ, resolve_canonical_team_code
+from utils.market_coverage import basketball_has_moneyline
+from utils.nba_schedule import (
+    BEIJING_TZ,
+    PROVIDER_BALLDONTLIE_NBA_GAMES,
+    resolve_canonical_team_code,
+    resolve_provider_team_code,
+)
 from utils.nba_team_strength import compute_team_strength
 from utils.nba_model_evaluation import walk_forward_backtest
 from models.basketball_model import predict_basketball
@@ -80,21 +86,73 @@ FIXTURE_STALE = "STALE_STORED_UPCOMING"
 FIXTURE_KICKOFF_UNKNOWN = "KICKOFF_UNKNOWN"
 FIXTURE_IDENTITY_UNRESOLVED = "IDENTITY_UNRESOLVED"
 FIXTURE_POSTGAME = "POSTGAME_RETROSPECTIVE_COMPARISON"
+FIXTURE_SCHEDULE_UNVERIFIED = "SCHEDULE_STATUS_UNVERIFIED"
+FIXTURE_MARKET_UNAVAILABLE = "MARKET_UNAVAILABLE"
 
 # 对比语义分类（Workstream E）
 CLASS_PROSPECTIVE = "PROSPECTIVE_SHADOW_COMPARISON"
 CLASS_RETROSPECTIVE = "RETROSPECTIVE_MODEL_DIAGNOSTIC"
 CLASS_BLOCKED = "PROSPECTIVE_COMPARISON_BLOCKED"
 
+# 本轮决策时刻之前多久以内的提供商观测才算「当前」排期证据。
+FRESH_OBSERVATION_MAX_AGE_SECONDS = 900
 
-def classify_fixture_eligibility(m: dict, as_of: datetime) -> dict:
+_CLASS_FOR = {
+    FIXTURE_VERIFIED_FUTURE: CLASS_PROSPECTIVE,
+    FIXTURE_STALE: CLASS_RETROSPECTIVE,
+    FIXTURE_POSTGAME: CLASS_RETROSPECTIVE,
+    FIXTURE_KICKOFF_UNKNOWN: CLASS_BLOCKED,
+    FIXTURE_IDENTITY_UNRESOLVED: CLASS_BLOCKED,
+    FIXTURE_SCHEDULE_UNVERIFIED: CLASS_BLOCKED,
+    FIXTURE_MARKET_UNAVAILABLE: CLASS_BLOCKED,
+}
+
+
+def _parse_aware(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _valid_provider_game_id(value) -> bool:
+    return isinstance(value, str) and value.isdigit() and int(value) > 0
+
+
+def provider_binding_counts(fixtures: list[dict]) -> dict[str, int]:
+    """每个 BALLDONTLIE 赛事 ID 被多少条 Canonical 赛事声明（用于唯一绑定判定）。"""
+    counts: dict[str, int] = {}
+    for m in fixtures:
+        prov = m.get("kickoff_provenance")
+        gid = prov.get("kickoff_source_event_id") if isinstance(prov, dict) else None
+        if gid:
+            counts[str(gid)] = counts.get(str(gid), 0) + 1
+    return counts
+
+
+def classify_fixture_eligibility(
+    m: dict,
+    as_of: datetime,
+    *,
+    provider_observation: dict | None = None,
+    provider_binding_count: int | None = None,
+    canonical_owner_conflict: bool = False,
+    max_observation_age_seconds: int = FRESH_OBSERVATION_MAX_AGE_SECONDS,
+) -> dict:
     """对单场存储赛事判定真实前瞻资格（纯函数，只读，不改动任何存储）。
 
-    真实前瞻赛事必须同时满足：Canonical/球队身份已确立、主客方向已确立、
-    带时区的权威开赛时间已知、``prediction_as_of < verified_kickoff``。
-    存储为 upcoming 但开赛时间已过 → STALE_STORED_UPCOMING；开赛时间未知 →
-    KICKOFF_UNKNOWN；身份/方向未决 → IDENTITY_UNRESOLVED。绝不自动交换主客、
-    绝不自动归并反向候选。
+    ``VERIFIED_FUTURE_FIXTURE`` 要求全部满足：存储 upcoming、市场跟踪身份（Canonical ID +
+    彩票编号 + ``market_tracked``）、双方球队身份、BALLDONTLIE 赛事 ID 有效且唯一绑定、
+    溯源为 ``balldontlie_nba_games`` / ``SCHEDULE_PROVIDER_VERIFIED``、带时区开赛时间晚于
+    ``as_of``、``as_of`` 之前不久取得的提供商观测仍为 ``scheduled`` 且未延期、观测主客与
+    存储主客**完全一致**、胜负盘价格有效、无 Canonical 归属冲突。
+
+    存储的历史排期观测**不**证明比赛在当前决策时刻仍按期进行；缺少当前观测时归为
+    ``SCHEDULE_STATUS_UNVERIFIED`` 而不是默认已排期。绝不自动交换主客、绝不自动归并反向候选。
     """
     stored_status = str(m.get("status") or "upcoming").lower()
     hc, ac = m.get("_home_code"), m.get("_away_code")
@@ -103,14 +161,36 @@ def classify_fixture_eligibility(m: dict, as_of: datetime) -> dict:
     kickoff = get_match_datetime(m) if known else None
     mid = m.get("id") or ""
     source = mid.split("-", 1)[0] if "-" in mid else ""
-    # 500lq 的 home 字段是显示第一位（§4.13.6），非已核验场地主队；方向未决。
+
+    prov = m.get("kickoff_provenance") if isinstance(m.get("kickoff_provenance"), dict) else {}
+    provider_game_id = prov.get("kickoff_source_event_id")
+    provenance_ok = (prov.get("actual_kickoff_time_source") == PROVIDER_BALLDONTLIE_NBA_GAMES
+                     and prov.get("kickoff_verification_status") == "SCHEDULE_PROVIDER_VERIFIED")
+    provenance_kickoff = _parse_aware(prov.get("kickoff_source_scheduled_start_utc"))
+
+    market_identity_ok = (m.get("market_tracked") is True and bool(mid)
+                          and isinstance(m.get("jczq_no"), str) and bool(m["jczq_no"].strip()))
+    odds = m.get("odds") if isinstance(m.get("odds"), dict) else {}
+    market_ok = basketball_has_moneyline(odds)
+
+    obs = provider_observation if isinstance(provider_observation, dict) else None
+    obs_observed = _parse_aware(obs.get("observed_at")) if obs else None
+    obs_kickoff = _parse_aware(obs.get("scheduled_start_utc")) if obs else None
+    obs_hc = resolve_provider_team_code(obs.get("home_team_identifier")) if obs else None
+    obs_ac = resolve_provider_team_code(obs.get("away_team_identifier")) if obs else None
+    orientation_exact = bool(obs and identity_ok and obs_hc == hc and obs_ac == ac)
+
     if not identity_ok:
         binding = "IDENTITY_UNRESOLVED"
     elif source == "500lq":
+        # 500lq 的 home 字段是显示第一位（§4.13.6），非已核验场地主队；方向未决。
         binding = "DISPLAY_ORDER_UNVERIFIED"
+    elif orientation_exact:
+        binding = "PROVIDER_VERIFIED"
+    elif obs and identity_ok and obs_hc == ac and obs_ac == hc:
+        binding = "PROVIDER_REVERSED"
     else:
-        binding = "PROVIDER_ORDER"
-    orientation_ok = binding == "PROVIDER_ORDER"
+        binding = "PROVIDER_ORDER_UNVERIFIED"
 
     if kickoff is not None:
         temporal = "FUTURE" if kickoff > as_of else "PAST"
@@ -118,45 +198,79 @@ def classify_fixture_eligibility(m: dict, as_of: datetime) -> dict:
     else:
         temporal, ttk = "UNKNOWN", None
 
-    prov = m.get("kickoff_provenance") or {}
-    provider_game_id = prov.get("kickoff_source_event_id") if isinstance(prov, dict) else None
-
-    if stored_status in ("finished", "live"):
-        eligibility = FIXTURE_POSTGAME
-        classification = CLASS_RETROSPECTIVE
-        reason = "STORED_STATUS_NOT_UPCOMING"
-    elif not identity_ok:
-        eligibility = FIXTURE_IDENTITY_UNRESOLVED
-        classification = CLASS_BLOCKED
-        reason = "TEAM_IDENTITY_UNRESOLVED"
-    elif kickoff is None:
-        eligibility = FIXTURE_KICKOFF_UNKNOWN
-        classification = CLASS_BLOCKED
-        reason = "KICKOFF_TIME_UNKNOWN"
-    elif kickoff <= as_of:
-        eligibility = FIXTURE_STALE
-        classification = CLASS_RETROSPECTIVE
-        reason = "VERIFIED_KICKOFF_AT_OR_BEFORE_AS_OF"
-    elif not orientation_ok:
-        eligibility = FIXTURE_IDENTITY_UNRESOLVED
-        classification = CLASS_BLOCKED
-        reason = "REVERSED_ORIENTATION_UNRESOLVED"
+    obs_age = int((as_of - obs_observed).total_seconds()) if obs_observed else None
+    if obs is None:
+        source_status = "NO_CURRENT_PROVIDER_OBSERVATION"
+    elif obs.get("postponed") is True or str(obs.get("status_state") or "").lower() == "postponed":
+        source_status = "PROVIDER_POSTPONED"
+    elif str(obs.get("status_state") or "").lower() != "scheduled" or obs.get("postponed") is not False:
+        source_status = "PROVIDER_NOT_SCHEDULED"
+    elif obs_observed is None or obs_age < 0:
+        source_status = "PROVIDER_OBSERVATION_AFTER_AS_OF"
+    elif obs_age > max_observation_age_seconds:
+        source_status = "PROVIDER_OBSERVATION_STALE"
     else:
-        eligibility = FIXTURE_VERIFIED_FUTURE
-        classification = CLASS_PROSPECTIVE
-        reason = None
+        source_status = "PROVIDER_SCHEDULED_CURRENT"
 
+    def verdict():
+        if stored_status in ("finished", "live"):
+            return FIXTURE_POSTGAME, "STORED_STATUS_NOT_UPCOMING"
+        if stored_status != "upcoming":
+            return FIXTURE_SCHEDULE_UNVERIFIED, "STORED_STATUS_NOT_UPCOMING"
+        if not identity_ok:
+            return FIXTURE_IDENTITY_UNRESOLVED, "TEAM_IDENTITY_UNRESOLVED"
+        if kickoff is None:
+            return FIXTURE_KICKOFF_UNKNOWN, "KICKOFF_TIME_UNKNOWN"
+        if kickoff <= as_of:
+            return FIXTURE_STALE, "VERIFIED_KICKOFF_AT_OR_BEFORE_AS_OF"
+        if binding == "DISPLAY_ORDER_UNVERIFIED":
+            return FIXTURE_IDENTITY_UNRESOLVED, "REVERSED_ORIENTATION_UNRESOLVED"
+        if not market_identity_ok:
+            return FIXTURE_IDENTITY_UNRESOLVED, "MARKET_IDENTITY_UNESTABLISHED"
+        if canonical_owner_conflict:
+            return FIXTURE_IDENTITY_UNRESOLVED, "CANONICAL_OWNERSHIP_CONFLICT"
+        if not _valid_provider_game_id(provider_game_id):
+            return FIXTURE_SCHEDULE_UNVERIFIED, "PROVIDER_GAME_ID_MISSING"
+        if not provenance_ok:
+            return FIXTURE_SCHEDULE_UNVERIFIED, "SCHEDULE_PROVENANCE_UNVERIFIED"
+        if provenance_kickoff is None or provenance_kickoff.astimezone(BEIJING_TZ) != kickoff:
+            return FIXTURE_SCHEDULE_UNVERIFIED, "KICKOFF_PROVENANCE_MISMATCH"
+        if provider_binding_count is None:
+            return FIXTURE_IDENTITY_UNRESOLVED, "PROVIDER_BINDING_UNIQUENESS_UNVERIFIED"
+        if provider_binding_count != 1:
+            return FIXTURE_IDENTITY_UNRESOLVED, "DUPLICATE_PROVIDER_BINDING"
+        if obs is None:
+            return FIXTURE_SCHEDULE_UNVERIFIED, "FRESH_PROVIDER_OBSERVATION_UNAVAILABLE"
+        if obs.get("provider") != PROVIDER_BALLDONTLIE_NBA_GAMES or str(obs.get("provider_game_id")) != provider_game_id:
+            return FIXTURE_SCHEDULE_UNVERIFIED, "PROVIDER_OBSERVATION_EVENT_MISMATCH"
+        if source_status != "PROVIDER_SCHEDULED_CURRENT":
+            return FIXTURE_SCHEDULE_UNVERIFIED, source_status
+        if binding != "PROVIDER_VERIFIED":
+            return FIXTURE_IDENTITY_UNRESOLVED, "HOME_AWAY_ORIENTATION_UNVERIFIED"
+        if obs_kickoff is None or obs_kickoff.astimezone(BEIJING_TZ) != kickoff:
+            return FIXTURE_SCHEDULE_UNVERIFIED, "KICKOFF_CHANGED_SINCE_PROVENANCE"
+        if not market_ok:
+            return FIXTURE_MARKET_UNAVAILABLE, "MARKET_ODDS_INVALID"
+        return FIXTURE_VERIFIED_FUTURE, None
+
+    eligibility, reason = verdict()
     return {
         "stored_status": stored_status,
         "derived_temporal_status": temporal,
+        "temporal_eligibility": temporal,
         "verified_kickoff": kickoff.isoformat() if kickoff else None,
         "time_to_kickoff_seconds": ttk,
         "home_away_binding_status": binding,
+        "identity_confidence": "PROVIDER_VERIFIED" if binding == "PROVIDER_VERIFIED" else "UNVERIFIED",
+        "source_status": source_status,
+        "provider_observation_age_seconds": obs_age,
+        "market_status": "VALID_MONEYLINE" if market_ok else "MONEYLINE_UNAVAILABLE",
         "fixture_eligibility": eligibility,
-        "comparison_classification": classification,
+        "comparison_classification": _CLASS_FOR[eligibility],
         "disqualification_reason": reason,
         "provider_game_id": provider_game_id,
     }
+
 
 
 def _v1_for_fixture(m: dict) -> dict:
@@ -181,12 +295,19 @@ def _market_home(odds: dict | None) -> float | None:
     return ih / (ih + ia)
 
 
-def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], params: dict | None = None) -> dict:
+def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], params: dict | None = None,
+                     observations: dict[str, dict] | None = None) -> dict:
+    """``observations`` 按 Canonical match_id 提供本轮只读取得的提供商观测；缺省时无赛事可前瞻。"""
     games = dataset.get("games", [])
     inventory = compute_team_strength(games, as_of=as_of, params=params)
+    counts = provider_binding_counts(fixtures)
     rows = []
     for m in fixtures:
-        gate = classify_fixture_eligibility(m, as_of)
+        prov = m.get("kickoff_provenance") if isinstance(m.get("kickoff_provenance"), dict) else {}
+        gid = prov.get("kickoff_source_event_id")
+        gate = classify_fixture_eligibility(
+            m, as_of, provider_observation=(observations or {}).get(m.get("id")),
+            provider_binding_count=counts.get(str(gid)) if gid else None)
         kickoff = get_match_datetime(m) if is_kickoff_time_known(m) else None
         v1 = _v1_for_fixture(m)
         v2 = predict_from_inventory(inventory, m.get("_home_code"), m.get("_away_code"),
@@ -209,6 +330,9 @@ def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], pa
             "prediction_as_of": as_of.isoformat(),
             "time_to_kickoff_seconds": gate["time_to_kickoff_seconds"],
             "home_away_binding_status": gate["home_away_binding_status"],
+            "identity_confidence": gate["identity_confidence"],
+            "source_status": gate["source_status"],
+            "market_status": gate["market_status"],
             "fixture_eligibility": gate["fixture_eligibility"],
             "comparison_classification": gate["comparison_classification"],
             "disqualification_reason": gate["disqualification_reason"],
@@ -251,10 +375,13 @@ def build_comparison(dataset: dict, *, as_of: datetime, fixtures: list[dict], pa
         "stale_stored_upcoming_count": _count("fixture_eligibility", FIXTURE_STALE),
         "kickoff_unknown_count": _count("fixture_eligibility", FIXTURE_KICKOFF_UNKNOWN),
         "identity_unresolved_count": _count("fixture_eligibility", FIXTURE_IDENTITY_UNRESOLVED),
+        "schedule_status_unverified_count": _count("fixture_eligibility", FIXTURE_SCHEDULE_UNVERIFIED),
+        "market_unavailable_count": _count("fixture_eligibility", FIXTURE_MARKET_UNAVAILABLE),
         "fixture_eligibility_breakdown": {
             k: _count("fixture_eligibility", k) for k in (
                 FIXTURE_VERIFIED_FUTURE, FIXTURE_STALE, FIXTURE_KICKOFF_UNKNOWN,
-                FIXTURE_IDENTITY_UNRESOLVED, FIXTURE_POSTGAME)
+                FIXTURE_IDENTITY_UNRESOLVED, FIXTURE_SCHEDULE_UNVERIFIED,
+                FIXTURE_MARKET_UNAVAILABLE, FIXTURE_POSTGAME)
         },
         "comparison": rows,
         "production_model_unchanged": True,
@@ -276,7 +403,9 @@ def _markdown(comparison: dict) -> str:
              f"前瞻被阻: {comparison['prospective_blocked_count']}",
              f"- 存储 upcoming 但已过期: {comparison['stale_stored_upcoming_count']} / "
              f"开赛时间未知: {comparison['kickoff_unknown_count']} / "
-             f"身份未决: {comparison['identity_unresolved_count']}",
+             f"身份未决: {comparison['identity_unresolved_count']} / "
+             f"排期状态未核验: {comparison['schedule_status_unverified_count']} / "
+             f"盘口不可用: {comparison['market_unavailable_count']}",
              f"- V2 可计算 (ELIGIBLE): {comparison['eligible_fixture_count']} / "
              f"不足: {comparison['insufficient_fixture_count']}", "",
              "| 赛事 | 日期 | 主 vs 客 | 资格 | 对比分类 | V1 主胜 | V2 主胜 | 市场主胜 | 主/客真实场次 |",
@@ -290,7 +419,7 @@ def _markdown(comparison: dict) -> str:
             f"{r['v1_home_probability']:.3f} | {v2h} | {mh} | "
             f"{r['home_real_games_used']}/{r['away_real_games_used']} |")
     lines += ["", "> V1 = `basketball-margin-1`（冷启动，未改动）；V2 = `basketball-margin-2-shadow`（真实历史实力）。",
-              "> 仅 `VERIFIED_FUTURE_FIXTURE`（权威开赛时间晚于 as_of）才是真实前瞻对比；",
+              "> 仅 `VERIFIED_FUTURE_FIXTURE`（BALLDONTLIE 唯一绑定 + 已核验溯源 + 当前 scheduled 观测 + 主客完全一致 + 有效盘口 + 开赛晚于 as_of）才是真实前瞻对比；",
               "> 过期/历史赛事仅作 `RETROSPECTIVE_MODEL_DIAGNOSTIC`，开赛时间未知或身份未决为 `PROSPECTIVE_COMPARISON_BLOCKED`。",
               "> 影子模型不替换生产模型、不改写历史快照/结算；不足时显式 `INSUFFICIENT_REAL_TEAM_DATA`。"]
     return "\n".join(lines) + "\n"

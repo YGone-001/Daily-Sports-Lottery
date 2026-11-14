@@ -1252,6 +1252,45 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.40 当前赛季窗口认证、提供商支撑前瞻门禁与不可变影子捕获
+
+- **不得假设 `season_type=regular` 完整**：文档只说明省略 `season_type` 时返回全部非季前赛类型，
+  未说明 `regular` 是否含计入常规赛战绩的 NBA Cup 比赛。历史窗口主分区**省略** `season_type`，
+  由 `classify_nba_competition` 排除 Championship / Play-In / Playoffs / 季前赛；
+  `season_type=ist` 分区只做子集核验并按 ID 去重，**不得**作为额外来源叠加计数。
+  **不得**发送未文档化的 `postseason` 参数作为范围依据。
+- **季前赛必须显式排除**：响应不带 `season_type`，早于 `NBA_REGULAR_SEASON_START_DATES`
+  揭幕日（官方赛程 grounding）的无标记记录分类为 `PRESEASON`，排除但保留证据；
+  新赛季接入前必须补充其揭幕日。
+- **日期边界**：起始 = 揭幕日前一日；结束 = cutoff 在 UTC 与北京时区下的较晚日期；
+  再按 `scheduled_start_utc < cutoff` 严格过滤。**不得**用可能在零点附近漏场的单一时区日期过滤。
+- **网络需按精确规划单独批准**：`plan_history_window` 不联网并给出 `plan_sha256`；
+  操作者须批准提供商、赛季、cutoff、起止日期、`season_type` 覆盖、`max_requests`（含重试与核验分区）、
+  `per_page`、`max_elapsed_seconds`、≥12.1 秒间隔与只读用途。预算不够时报告限制，**不得**超额。
+  缺凭据记 `BLOCKED_CREDENTIALS`；旧批准、旧规划摘要不可复用。
+- **窗口认证 fail closed**：`certify_history_window` 只有全部分区游标耗尽、截止前全部确认完赛、
+  无冲突、NBA Cup 核验无缺口、既有捕获全部被重新确认时才 `VERIFIED`；否则 `UNRESOLVED` 并列原因。
+  对账冲突**并列保留**，绝不覆盖；**不得**用摘要重建缺失观测，**不得**以「最大日期超出 cutoff」推断完整。
+- **前瞻门禁必须有提供商证据**：`VERIFIED_FUTURE_FIXTURE` 要求市场跟踪身份、唯一 BDL 绑定、
+  `balldontlie_nba_games` / `SCHEDULE_PROVIDER_VERIFIED` 溯源且开赛一致、`as_of` 前 900 秒内的
+  `scheduled` 且未延期观测、观测主客与存储主客完全一致、有效胜负盘与 `as_of < kickoff`。
+  历史存储观测**不**证明当前仍按期；缺当前观测记 `SCHEDULE_STATUS_UNVERIFIED`，**不得**默认已排期。
+  `as_of` 之后取得的观测**不得**当作 `as_of` 之前可得的信息。
+- **影子工件只在本机且不可变**：`tools/nba_shadow_capture` 只写 `reports/` 或仓库外目录，
+  `DATA_DIR` 内一律拒绝；按 `snapshot_identity` 独占创建，内容不同即 `SHADOW_ARTIFACT_IMMUTABLE`；
+  **不得**写 `prediction_snapshots.json`、**不得**赛后重建或改写概率。提供商绑定只作用于内存副本。
+- **前置门禁**：历史数据集 `REGULAR_SEASON_DATASET_CERTIFIED` 与 `CURRENT_SEASON_WINDOW_COMPLETE`
+  均为 `VERIFIED`；`prediction_as_of <= generated_at < verified_kickoff`；V2 只用
+  `game_end < prediction_as_of` 的真实完赛。任一缺失即 `REAL_PROSPECTIVE_SHADOW_SNAPSHOT = BLOCKED`，
+  **不得**以合成夹具、回溯重建或新基础设施替代真实前瞻证据。
+- **评估只读**：`evaluate_shadow_artifact` 按同一 Canonical ID + BDL 赛事 ID 连接、要求官方确认终场与
+  工件摘要一致；**不**结算、**不**写库、**不**自动运行赛后写入者。≥100 场前瞻队列是未来目标，
+  不得为累积样本创建周期性生产任务。
+- **红线不变**：V1 数学与 `config.MODEL_VERSIONS`、`same_event()`、Canonical 身份、彩票编号、
+  七个受保护存储均不改；V2 不升级生产；Canonical 归并 `NO-GO`。详见 `docs/nba-model-v2-shadow.md` 第九章。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

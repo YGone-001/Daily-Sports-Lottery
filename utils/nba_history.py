@@ -22,7 +22,7 @@ import hashlib
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import requests
@@ -74,6 +74,7 @@ COMP_NBA_CUP_REGULAR = "NBA_CUP_REGULAR"
 COMP_NBA_CUP_CHAMPIONSHIP = "NBA_CUP_CHAMPIONSHIP"
 COMP_PLAY_IN = "PLAY_IN"
 COMP_PLAYOFF = "PLAYOFF"
+COMP_PRESEASON = "PRESEASON"
 COMP_UNSUPPORTED = "UNSUPPORTED_COMPETITION"
 COMP_AMBIGUOUS = "AMBIGUOUS_CLASSIFICATION"
 
@@ -84,6 +85,14 @@ NBA_REGULAR_SEASON_END_DATES: dict[int, str] = {
     2025: "2026-04-12",
 }
 
+# 官方 NBA 常规赛揭幕日（美方当地日期，按官方赛程公告 grounding）。早于该日且无
+# 季后赛 / NBA Cup 标记的记录是季前赛：响应不携带 season_type，缺少此边界时季前赛会被
+# 默认判成常规赛。
+NBA_REGULAR_SEASON_START_DATES: dict[int, str] = {
+    2025: "2025-10-21",
+    2026: "2026-10-20",
+}
+
 _IST_REGULAR_MARKERS = ("group", "quarterfinal", "quarter-final", "semifinal", "semi-final", "knockout")
 
 _OFFICIAL_RULES: dict[str, str] = {
@@ -92,6 +101,7 @@ _OFFICIAL_RULES: dict[str, str] = {
     COMP_NBA_CUP_CHAMPIONSHIP: "NBA Cup Championship is a standalone final that does not count toward regular-season standings",
     COMP_PLAY_IN: "NBA Play-In Tournament determines playoff seeding and is not part of the regular season",
     COMP_PLAYOFF: "NBA Playoffs are postseason and not part of the regular season",
+    COMP_PRESEASON: "NBA preseason games are exhibitions and not part of the regular season",
     COMP_UNSUPPORTED: "unsupported competition type",
     COMP_AMBIGUOUS: "ambiguous competition classification",
 }
@@ -112,11 +122,16 @@ def _classification(competition_type: str, eligible: bool, source: str, reason: 
     }
 
 
-def classify_nba_competition(raw: dict, *, regular_season_end_date: str | None = None) -> dict:
+def classify_nba_competition(
+    raw: dict,
+    *,
+    regular_season_end_date: str | None = None,
+    regular_season_start_date: str | None = None,
+) -> dict:
     """对单场提供商记录判定 NBA 竞赛类型与常规赛资格（纯函数，只读，确定性）。
 
     优先级：显式 ``season_type``（若存在）→ ``postseason`` 布尔 → ``ist_stage`` →
-    常规赛末日日期边界（识别 Play-In）→ 默认常规赛。
+    常规赛揭幕日边界（识别季前赛）→ 常规赛末日日期边界（识别 Play-In）→ 默认常规赛。
 
     - NBA Cup 小组赛与淘汰赛（除 Championship）**计入**常规赛战绩，予以保留。
     - NBA Cup Championship、Play-In、Playoffs **不计入**常规赛，排除但保留原始证据。
@@ -144,6 +159,9 @@ def classify_nba_competition(raw: dict, *, regular_season_end_date: str | None =
         if st_norm in ("playin", "play-in", "play_in"):
             return _classification(COMP_PLAY_IN, False, "season_type",
                                    "season_type=playin is the Play-In Tournament", reject=False)
+        if st_norm == "preseason":
+            return _classification(COMP_PRESEASON, False, "season_type",
+                                   "season_type=preseason is an exhibition game", reject=False)
         if st_norm == "regular":
             if ist_norm and "championship" in ist_norm:
                 return _classification(COMP_AMBIGUOUS, False, "season_type",
@@ -175,6 +193,11 @@ def classify_nba_competition(raw: dict, *, regular_season_end_date: str | None =
         return _classification(COMP_AMBIGUOUS, False, "ist_stage",
                                f"unrecognized ist_stage={ist_norm}", reject=True)
 
+    if regular_season_start_date and game_date and game_date < regular_season_start_date:
+        return _classification(COMP_PRESEASON, False, "regular_season_date_boundary",
+                               "game date before documented regular-season opening day with no IST/postseason marker => preseason",
+                               reject=False)
+
     if regular_season_end_date and game_date and game_date > regular_season_end_date:
         return _classification(COMP_PLAY_IN, False, "regular_season_date_boundary",
                                "game date after documented regular-season final day with no IST/postseason marker => Play-In",
@@ -199,6 +222,7 @@ def parse_historical_games(
     source_reference: str = BALLDONTLIE_GAMES_URL,
     observed_at: datetime | None = None,
     regular_season_end_dates: dict[int, str] | None = None,
+    regular_season_start_dates: dict[int, str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """解析 BALLDONTLIE Games 载荷为**已确认完赛**的历史比赛观测。
 
@@ -219,6 +243,9 @@ def parse_historical_games(
     end_dates = dict(NBA_REGULAR_SEASON_END_DATES)
     if regular_season_end_dates:
         end_dates.update(regular_season_end_dates)
+    start_dates = dict(NBA_REGULAR_SEASON_START_DATES)
+    if regular_season_start_dates:
+        start_dates.update(regular_season_start_dates)
 
     obs_iso = (observed_at or datetime.now(BEIJING_TZ)).astimezone(BEIJING_TZ).isoformat()
     games: list[dict] = []
@@ -314,7 +341,8 @@ def parse_historical_games(
             "source_content_digest": _content_digest(raw),
         }
 
-        classification = classify_nba_competition(raw, regular_season_end_date=end_dates.get(season))
+        classification = classify_nba_competition(raw, regular_season_end_date=end_dates.get(season),
+                                                  regular_season_start_date=start_dates.get(season))
         if classification["reject"]:
             code = (REASON_UNSUPPORTED_COMPETITION
                     if classification["competition_type"] == COMP_UNSUPPORTED
@@ -467,11 +495,152 @@ def _build_query(seasons, start_date, end_date, per_page, postseason, season_typ
         parts.append(f"start_date={start_date}")
     if end_date:
         parts.append(f"end_date={end_date}")
-    parts.append(f"postseason={'true' if postseason else 'false'}")
+    # postseason 不是 Games 端点的文档化参数；None 时不发送。
+    if postseason is not None:
+        parts.append(f"postseason={'true' if postseason else 'false'}")
     if season_type:
         parts.append(f"season_type={season_type}")
     parts.append(f"per_page={per_page}")
     return BALLDONTLIE_GAMES_URL + "?" + "&".join(parts)
+
+
+def _paginate_games(base_url: str, *, api_key: str, timeout: float, max_requests: int, deadline: float) -> dict:
+    """跟随 ``meta.next_cursor`` 直到明确结束；共享进程内频控；保留逐页证据。
+
+    返回逐页载荷（含规范 JSON 摘要与接收时刻）、首次出现页、冲突 ID、失败原因与请求数。
+    ``complete`` 只在游标明确结束且无任何失败时为真。
+    """
+    pages: list[dict] = []
+    raw_by_id: dict[str, dict] = {}
+    first_page: dict[str, int] = {}
+    conflicts: set[str] = set()
+    cursor, seen_cursors = None, set()
+    observed = duplicates = attempts = 0
+    failure = None
+    complete = False
+    received_at: datetime | None = None
+
+    while not complete and failure is None:
+        url = base_url + (f"&cursor={cursor}" if cursor is not None else "")
+        response = None
+        for retry in range(3):
+            if not _ns._BDL_REQUEST_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                failure = "TIME_BUDGET_EXHAUSTED"
+                break
+            try:
+                current = time.monotonic()
+                ready = max(current, _ns._BDL_RETRY_NOT_BEFORE,
+                            (_ns._LAST_BDL_REQUEST_MONO + _ns.BDL_PACING_INTERVAL)
+                            if _ns._LAST_BDL_REQUEST_MONO is not None else current)
+                if attempts >= max_requests:
+                    failure = "REQUEST_BUDGET_EXHAUSTED"
+                    break
+                if ready >= deadline:
+                    failure = "TIME_BUDGET_EXHAUSTED"
+                    break
+                while time.monotonic() < ready:
+                    time.sleep(ready - time.monotonic())
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = "TIME_BUDGET_EXHAUSTED"
+                    break
+                attempts += 1
+                _ns._LAST_BDL_REQUEST_MONO = time.monotonic()
+                try:
+                    response = requests.get(url, headers={"Authorization": api_key},
+                                            timeout=min(timeout, remaining))
+                    received_at = datetime.now(BEIJING_TZ)
+                except Exception:
+                    failure = "REQUEST_FAILED"
+                    break
+                if response.status_code == 429:
+                    delay = max(min(2 ** retry, 60), _ns._retry_after_seconds(
+                        getattr(response, "headers", {}).get("Retry-After"), received_at))
+                    _ns._BDL_RETRY_NOT_BEFORE = time.monotonic() + delay
+            finally:
+                _ns._BDL_REQUEST_LOCK.release()
+            if response.status_code != 429:
+                break
+            if retry == 2:
+                failure = "HTTP_429_RATE_LIMITED"
+        if failure:
+            break
+        if response.status_code != 200:
+            failure = {401: "HTTP_401_UNAUTHORIZED", 403: "HTTP_403_FORBIDDEN"}.get(
+                response.status_code, f"HTTP_{response.status_code}")
+            break
+        try:
+            payload = response.json()
+        except Exception:
+            failure = "MALFORMED_JSON"
+            break
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            failure = "MALFORMED_BALLDONTLIE_PAYLOAD"
+            break
+        meta = payload.get("meta")
+        page_index = len(pages)
+        pages.append({
+            "page_index": page_index,
+            "url": url,
+            "request_cursor": cursor,
+            "status_code": response.status_code,
+            "received_at": received_at.isoformat(),
+            "row_count": len(payload["data"]),
+            "next_cursor": meta.get("next_cursor") if isinstance(meta, dict) else None,
+            "payload_sha256": _content_digest(payload),
+            "payload": payload,
+        })
+        observed += len(payload["data"])
+        for raw in payload["data"]:
+            if not isinstance(raw, dict) or not _is_int(raw.get("id")) or raw["id"] <= 0:
+                failure = "MALFORMED_GAME_ID"
+                continue
+            gid = str(raw["id"])
+            if gid in raw_by_id:
+                if raw_by_id[gid] != raw:
+                    conflicts.add(gid)
+                    failure = "CONFLICTING_PROVIDER_GAME_ID"
+                else:
+                    duplicates += 1
+            else:
+                raw_by_id[gid] = raw
+                first_page[gid] = page_index
+        if not isinstance(meta, dict):
+            failure = failure or "MALFORMED_PAGINATION_META"
+            break
+        next_cursor = meta.get("next_cursor")
+        if next_cursor is not None and (type(next_cursor) is not int or next_cursor < 0):
+            failure = failure or "MALFORMED_CURSOR"
+            break
+        if next_cursor is not None and next_cursor in seen_cursors:
+            failure = failure or "CURSOR_CYCLE"
+            cursor = next_cursor
+            break
+        cursor = next_cursor
+        if next_cursor is None:
+            complete = failure is None
+        else:
+            seen_cursors.add(next_cursor)
+        if time.monotonic() >= deadline:
+            failure, complete = "TIME_BUDGET_EXHAUSTED", False
+
+    return {
+        "pages": pages,
+        "raw_by_id": raw_by_id,
+        "first_page": first_page,
+        "conflicts": conflicts,
+        "observed": observed,
+        "duplicates": duplicates,
+        "attempts": attempts,
+        "failure": failure,
+        "complete": complete and failure is None,
+        "next_cursor_remaining": cursor,
+        "received_at": received_at,
+    }
+
+
+def _page_evidence(pages: list[dict]) -> list[dict]:
+    return [{k: v for k, v in p.items() if k != "payload"} for p in pages]
 
 
 def fetch_historical_games(
@@ -479,7 +648,7 @@ def fetch_historical_games(
     seasons: Iterable[int],
     start_date: str | None = None,
     end_date: str | None = None,
-    postseason: bool = False,
+    postseason: bool | None = False,
     season_type: str | None = None,
     allow_network: bool = False,
     api_key: str | None = None,
@@ -529,123 +698,28 @@ def fetch_historical_games(
         return [], diag
 
     base_url = _build_query(seasons, start_date, end_date, per_page, postseason, season_type)
-    started_mono = time.monotonic()
-    deadline = started_mono + max_elapsed_seconds
     started_at = now_bj
-    received_at = started_at
+    run = _paginate_games(base_url, api_key=effective_key, timeout=timeout, max_requests=max_requests,
+                          deadline=time.monotonic() + max_elapsed_seconds)
+    received_at = run["received_at"] or started_at
 
-    by_id: dict[str, dict] = {}
-    raw_by_id: dict[str, dict] = {}
-    conflicts: set[str] = set()
-    cursor, seen_cursors = None, set()
-    pages = observed = duplicates = attempts = 0
     errors: list[str] = []
-    failure = None
-    complete = False
+    by_id: dict[str, dict] = {}
+    for page in run["pages"]:
+        rows, parse_errors = parse_historical_games(
+            page["payload"], source_reference=page["url"],
+            observed_at=datetime.fromisoformat(page["received_at"]),
+            regular_season_end_dates=regular_season_end_dates)
+        errors.extend(parse_errors)
+        for r in rows:
+            gid = r["provider_game_id"]
+            if gid not in run["conflicts"] and run["first_page"].get(gid) == page["page_index"]:
+                by_id[gid] = r
 
-    while not complete and failure is None:
-        url = base_url + (f"&cursor={cursor}" if cursor is not None else "")
-        response = None
-        for retry in range(3):
-            if not _ns._BDL_REQUEST_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
-                failure = "TIME_BUDGET_EXHAUSTED"
-                break
-            try:
-                current = time.monotonic()
-                ready = max(current, _ns._BDL_RETRY_NOT_BEFORE,
-                            (_ns._LAST_BDL_REQUEST_MONO + _ns.BDL_PACING_INTERVAL)
-                            if _ns._LAST_BDL_REQUEST_MONO is not None else current)
-                if attempts >= max_requests:
-                    failure = "REQUEST_BUDGET_EXHAUSTED"
-                    break
-                if ready >= deadline:
-                    failure = "TIME_BUDGET_EXHAUSTED"
-                    break
-                while time.monotonic() < ready:
-                    time.sleep(ready - time.monotonic())
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    failure = "TIME_BUDGET_EXHAUSTED"
-                    break
-                attempts += 1
-                _ns._LAST_BDL_REQUEST_MONO = time.monotonic()
-                try:
-                    response = requests.get(url, headers={"Authorization": effective_key},
-                                            timeout=min(timeout, remaining))
-                    received_at = datetime.now(BEIJING_TZ)
-                except Exception:
-                    failure = "REQUEST_FAILED"
-                    break
-                if response.status_code == 429:
-                    delay = max(min(2 ** retry, 60), _ns._retry_after_seconds(
-                        getattr(response, "headers", {}).get("Retry-After"), received_at))
-                    _ns._BDL_RETRY_NOT_BEFORE = time.monotonic() + delay
-            finally:
-                _ns._BDL_REQUEST_LOCK.release()
-            if response.status_code != 429:
-                break
-            if retry == 2:
-                failure = "HTTP_429_RATE_LIMITED"
-        if failure:
-            break
-        if response.status_code != 200:
-            failure = {401: "HTTP_401_UNAUTHORIZED", 403: "HTTP_403_FORBIDDEN"}.get(
-                response.status_code, f"HTTP_{response.status_code}")
-            break
-        try:
-            payload = response.json()
-        except Exception:
-            failure = "MALFORMED_JSON"
-            break
-        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-            failure = "MALFORMED_BALLDONTLIE_PAYLOAD"
-            break
-        pages += 1
-        observed += len(payload["data"])
-        rows, parse_errors = parse_historical_games(payload, source_reference=url, observed_at=received_at,
-                                                    regular_season_end_dates=regular_season_end_dates)
-        if parse_errors:
-            errors.extend(parse_errors)
-        row_map = {r["provider_game_id"]: r for r in rows}
-        for raw in payload["data"]:
-            if not isinstance(raw, dict) or not _is_int(raw.get("id")) or raw["id"] <= 0:
-                failure = "MALFORMED_GAME_ID"
-                continue
-            gid = str(raw["id"])
-            if gid in raw_by_id:
-                if raw_by_id[gid] != raw:
-                    conflicts.add(gid)
-                    by_id.pop(gid, None)
-                    failure = "CONFLICTING_PROVIDER_GAME_ID"
-                else:
-                    duplicates += 1
-            else:
-                raw_by_id[gid] = raw
-                if gid in row_map:
-                    by_id[gid] = row_map[gid]
-        meta = payload.get("meta")
-        if not isinstance(meta, dict):
-            failure = failure or "MALFORMED_PAGINATION_META"
-            break
-        next_cursor = meta.get("next_cursor")
-        if next_cursor is not None and (type(next_cursor) is not int or next_cursor < 0):
-            failure = failure or "MALFORMED_CURSOR"
-            break
-        if next_cursor is not None and next_cursor in seen_cursors:
-            failure = failure or "CURSOR_CYCLE"
-            cursor = next_cursor
-            break
-        cursor = next_cursor
-        if next_cursor is None:
-            complete = failure is None
-        else:
-            seen_cursors.add(next_cursor)
-        if time.monotonic() >= deadline:
-            failure, complete = "TIME_BUDGET_EXHAUSTED", False
-
+    failure = run["failure"]
     if failure:
         errors.append(failure)
-    complete = complete and failure is None
+    complete = run["complete"]
     games = sorted(by_id.values(), key=lambda g: (g["scheduled_start_utc"] or "", g["provider_game_id"])) if complete else []
     if complete and cutoff_utc is not None:
         games = [g for g in games if (_parse_utc(g["scheduled_start_utc"]) or cutoff_utc) < cutoff_utc]
@@ -658,7 +732,7 @@ def fetch_historical_games(
         "automated_provider_operation": _ns.AUTOMATED_OPERATION_ENABLED,
         "status": (STATUS_OK if games else STATUS_EMPTY) if complete else STATUS_UNAVAILABLE,
         "coverage_status": "COMPLETE_SEASON_FETCH" if complete else "PAGINATION_INCOMPLETE",
-        "reachable": pages > 0,
+        "reachable": len(run["pages"]) > 0,
         "request_started_at": started_at.isoformat(),
         "response_received_at": received_at.isoformat(),
         "checked_at": received_at.isoformat(),
@@ -670,20 +744,332 @@ def fetch_historical_games(
         "postseason": postseason,
         "season_type": season_type,
         "requested_page_size": per_page,
-        "pages_fetched": pages,
-        "provider_rows_observed": observed,
-        "unique_games_observed": len(raw_by_id),
+        "pages_fetched": len(run["pages"]),
+        "provider_rows_observed": run["observed"],
+        "unique_games_observed": len(run["raw_by_id"]),
         "final_games_accepted": len(games),
-        "duplicates_deduplicated": duplicates,
-        "conflicting_game_ids": sorted(conflicts),
-        "next_cursor_remaining": cursor,
+        "duplicates_deduplicated": run["duplicates"],
+        "conflicting_game_ids": sorted(run["conflicts"]),
+        "next_cursor_remaining": run["next_cursor_remaining"],
         "pagination_complete": complete,
         "pagination_failure_reason": failure,
-        "network_requests_made": attempts,
+        "network_requests_made": run["attempts"],
         "max_requests": max_requests,
         "max_elapsed_seconds": max_elapsed_seconds,
+        "page_evidence": _page_evidence(run["pages"]),
         "errors": errors,
         "rate_limit_scope": "PROCESS_LOCAL",
         "global_account_limit_guaranteed": False,
     }
     return games, diag
+
+
+# ---------------------------------------------------------------------------
+# 当前赛季历史窗口：有界日期分区规划、共享预算获取与认证对账
+# ---------------------------------------------------------------------------
+
+WINDOW_VERIFIED = "VERIFIED"
+WINDOW_UNRESOLVED = "UNRESOLVED"
+
+PARTITION_ALL_NON_PRESEASON = "ALL_NON_PRESEASON_TYPES"
+PARTITION_IST_CROSSCHECK = "NBA_CUP_IST_CROSSCHECK"
+
+_MATERIAL_FIELDS = ("nba_home_team_id", "nba_away_team_id", "home_final_score", "away_final_score",
+                    "scheduled_start_utc", "season", "period", "postseason_flag", "ist_stage")
+
+
+def plan_history_window(
+    *,
+    season: int,
+    cutoff: datetime,
+    season_start_date: str | None = None,
+    include_ist_crosscheck: bool = True,
+    per_page: int = 100,
+    max_requests: int = 10,
+    max_elapsed_seconds: float = 120.0,
+    expected_primary_games: int | None = None,
+) -> dict:
+    """规划覆盖「开赛早于 cutoff 的全部比赛」的有界日期分区（纯函数，不联网）。
+
+    - 主分区**省略** ``season_type``：提供商文档规定省略时返回全部非季前赛类型，
+      因此 NBA Cup 小组/淘汰赛不会因 ``season_type=regular`` 的未知语义被静默漏掉；
+      Championship / Play-In / Playoffs 由竞赛分类器排除。不发送未文档化的 ``postseason``。
+    - 可选 ``season_type=ist`` 交叉核验分区只用于证明主分区未漏 NBA Cup 比赛，
+      其结果按 ID 去重、**不**作为额外来源叠加计数。
+    - 日期过滤时区语义未文档化：起始日取揭幕日前一日，结束日取 cutoff 在 UTC 与北京
+      时区下的较晚日期（美方当地日期不晚于 UTC 日期），再按 ``scheduled_start_utc < cutoff``
+      严格过滤，任何语义下都不会漏掉零点附近的比赛。
+    - 请求预算含重试与交叉核验分区，在所有分区间共享。
+    """
+    if cutoff.tzinfo is None:
+        raise ValueError("cutoff must be timezone-aware")
+    if type(per_page) is not int or not 1 <= per_page <= 100:
+        raise ValueError("per_page must be an integer in [1, 100]")
+    start = season_start_date or NBA_REGULAR_SEASON_START_DATES.get(season)
+    if not start:
+        raise ValueError(f"no documented regular-season start date for season {season}")
+    start_date = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    cutoff_utc = cutoff.astimezone(timezone.utc)
+    end_date = max(cutoff_utc.date(), cutoff.astimezone(BEIJING_TZ).date()).isoformat()
+
+    partitions = [{
+        "partition_id": PARTITION_ALL_NON_PRESEASON,
+        "role": "PRIMARY_COVERAGE",
+        "season_type": None,
+        "coverage_semantics": "season_type omitted: provider documents that all non-preseason game types are returned",
+        "url": _build_query([season], start_date, end_date, per_page, None, None),
+    }]
+    if include_ist_crosscheck:
+        partitions.append({
+            "partition_id": PARTITION_IST_CROSSCHECK,
+            "role": "SUBSET_CROSSCHECK",
+            "season_type": "ist",
+            "coverage_semantics": "NBA Cup games only; every returned ID must already appear in the primary partition",
+            "url": _build_query([season], start_date, end_date, per_page, None, "ist"),
+        })
+
+    def _pages_for(n: int | None) -> int:
+        # 满页可能带回游标而下一页为空，因此整除时多算一页。
+        return 1 if not n else n // per_page + 1
+
+    estimated = _pages_for(expected_primary_games) + (1 if include_ist_crosscheck else 0)
+    min_elapsed = max(0, estimated - 1) * _ns.BDL_PACING_INTERVAL
+    plan = {
+        "provider": "BALLDONTLIE",
+        "provider_id": PROVIDER,
+        "season": season,
+        "season_label": f"{season}-{str(season + 1)[-2:]}",
+        "historical_cutoff": cutoff.isoformat(),
+        "historical_cutoff_utc": cutoff_utc.isoformat(),
+        "regular_season_start_date": start,
+        "start_date": start_date,
+        "end_date": end_date,
+        "season_type_coverage": [p["partition_id"] + ":" + (p["season_type"] or "omitted") for p in partitions],
+        "partitions": partitions,
+        "max_requests": max_requests,
+        "per_page": per_page,
+        "max_elapsed_seconds": max_elapsed_seconds,
+        "pacing_interval": _ns.BDL_PACING_INTERVAL,
+        "estimated_requests_without_retries": estimated,
+        "retry_headroom": max_requests - estimated,
+        "minimum_elapsed_seconds": round(min_elapsed, 1),
+        "budget_feasible": estimated <= max_requests and min_elapsed <= max_elapsed_seconds,
+        "operation": "READ_ONLY_HISTORICAL_COLLECTION",
+        "real_production_writes": "PROHIBITED",
+    }
+    plan["plan_sha256"] = _content_digest(plan)
+    return plan
+
+
+def fetch_history_window(
+    plan: dict,
+    *,
+    allow_network: bool = False,
+    api_key: str | None = None,
+    timeout: float = 5.0,
+) -> dict:
+    """按已批准的规划逐分区获取（默认拒绝网络）；请求与耗时预算在分区间共享。
+
+    任一分区失败后不再发起后续分区请求；失败分区绝不标记为完整。
+    """
+    base = {"plan_sha256": plan.get("plan_sha256"), "partitions": [], "network_requests_made": 0,
+            "rate_limit_scope": "PROCESS_LOCAL", "global_account_limit_guaranteed": False}
+    effective_key = api_key or os.environ.get(ENV_BDL_API_KEY)
+    if not allow_network:
+        return dict(base, status=STATUS_DISABLED_AUTH, errors=["PROVIDER_AUTOMATED_USE_UNAUTHORIZED"])
+    if not effective_key:
+        return dict(base, status=STATUS_DISABLED_CREDS, errors=["PROVIDER_CREDENTIALS_MISSING"])
+
+    deadline = time.monotonic() + float(plan["max_elapsed_seconds"])
+    remaining = int(plan["max_requests"])
+    results: list[dict] = []
+    halted = None
+    for part in plan["partitions"]:
+        if halted is not None:
+            results.append({"partition_id": part["partition_id"], "season_type": part["season_type"],
+                            "complete": False, "failure": "NOT_ATTEMPTED_AFTER_" + halted, "attempts": 0,
+                            "pages": [], "conflicting_game_ids": [], "next_cursor_remaining": None})
+            continue
+        if remaining <= 0:
+            halted = "REQUEST_BUDGET_EXHAUSTED"
+            results.append({"partition_id": part["partition_id"], "season_type": part["season_type"],
+                            "complete": False, "failure": halted, "attempts": 0, "pages": [],
+                            "conflicting_game_ids": [], "next_cursor_remaining": None})
+            continue
+        run = _paginate_games(part["url"], api_key=effective_key, timeout=timeout,
+                              max_requests=remaining, deadline=deadline)
+        remaining -= run["attempts"]
+        results.append({
+            "partition_id": part["partition_id"],
+            "season_type": part["season_type"],
+            "complete": run["complete"],
+            "failure": run["failure"],
+            "attempts": run["attempts"],
+            "pages": run["pages"],
+            "unique_games_observed": len(run["raw_by_id"]),
+            "duplicates_deduplicated": run["duplicates"],
+            "conflicting_game_ids": sorted(run["conflicts"]),
+            "next_cursor_remaining": run["next_cursor_remaining"],
+        })
+        if not run["complete"]:
+            halted = run["failure"] or "PAGINATION_INCOMPLETE"
+    total = sum(r["attempts"] for r in results)
+    ok = all(r["complete"] for r in results) and len(results) == len(plan["partitions"])
+    return dict(base, status=STATUS_OK if ok else STATUS_UNAVAILABLE, partitions=results,
+                network_requests_made=total, errors=[r["failure"] for r in results if r["failure"]])
+
+
+def _material(game: dict) -> dict:
+    return {k: game.get(k) for k in _MATERIAL_FIELDS}
+
+
+def certify_history_window(plan: dict, fetched: dict, *, previous_games: Iterable[dict] | None = None) -> dict:
+    """认证当前赛季历史窗口并与既有捕获对账（纯函数，只读，不联网）。
+
+    只有全部分区游标耗尽、截止前比赛全部确认完赛、无冲突、NBA Cup 交叉核验无缺口、
+    既有捕获全部被重新确认时才给出 ``VERIFIED``；否则 ``UNRESOLVED`` 并列出原因。
+    冲突证据并列保留，绝不覆盖。
+    """
+    season = plan["season"]
+    cutoff = _parse_utc(plan["historical_cutoff_utc"])
+    reasons: list[str] = []
+    parts = {p["partition_id"]: p for p in fetched.get("partitions", [])}
+    for planned in plan["partitions"]:
+        got = parts.get(planned["partition_id"])
+        if got is None or not got.get("complete"):
+            reasons.append(f"PARTITION_INCOMPLETE:{planned['partition_id']}")
+        elif got.get("conflicting_game_ids"):
+            reasons.append(f"CONFLICTING_PROVIDER_GAME_ID:{planned['partition_id']}")
+    if fetched.get("plan_sha256") != plan.get("plan_sha256"):
+        reasons.append("PLAN_DIGEST_MISMATCH")
+
+    primary = parts.get(PARTITION_ALL_NON_PRESEASON) or {"pages": []}
+    primary_raw: dict[str, dict] = {}
+    for page in primary["pages"]:
+        for raw in page["payload"].get("data", []):
+            if isinstance(raw, dict) and _is_int(raw.get("id")):
+                primary_raw.setdefault(str(raw["id"]), raw)
+
+    post_cutoff = 0
+    postponed: list[str] = []
+    not_final: list[str] = []
+    pre_cutoff_ids: set[str] = set()
+    for gid, raw in primary_raw.items():
+        if raw.get("season") != season:
+            reasons.append(f"UNEXPECTED_SEASON:{gid}")
+            continue
+        kickoff = _parse_utc(raw.get("datetime"))
+        if kickoff is None:
+            reasons.append(f"INVALID_EVENT_TIMESTAMP:{gid}")
+            continue
+        if kickoff >= cutoff:
+            post_cutoff += 1
+            continue
+        pre_cutoff_ids.add(gid)
+        state = str(raw.get("status_state") or "").strip().lower()
+        if raw.get("postponed") is True or state in ("postponed", "canceled"):
+            postponed.append(gid)
+        elif state != "final":
+            not_final.append(gid)
+    if not_final:
+        reasons.append("PRE_CUTOFF_GAME_NOT_FINAL")
+
+    games: list[dict] = []
+    for page in primary["pages"]:
+        rows, errs = parse_historical_games(page["payload"], source_reference=page["url"],
+                                            observed_at=datetime.fromisoformat(page["received_at"]))
+        for e in errs:
+            gid = e.rsplit(":", 1)[-1]
+            if gid in pre_cutoff_ids and gid not in postponed and not e.startswith(REASON_NOT_FINAL):
+                reasons.append(f"PRE_CUTOFF_PARSE_REJECTED:{e}")
+        games.extend(r for r in rows if r["provider_game_id"] in pre_cutoff_ids)
+    dataset = assemble_historical_dataset(games, requested_seasons=[season], cutoff_utc=cutoff)
+    if dataset["conflicting_game_ids"]:
+        reasons.append("DATASET_CONFLICTING_GAME_IDS")
+
+    crosscheck = None
+    ist = parts.get(PARTITION_IST_CROSSCHECK)
+    if ist is not None:
+        ist_raw: dict[str, dict] = {}
+        for page in ist["pages"]:
+            for raw in page["payload"].get("data", []):
+                if isinstance(raw, dict) and _is_int(raw.get("id")):
+                    ist_raw.setdefault(str(raw["id"]), raw)
+        missing = sorted(set(ist_raw) - set(primary_raw))
+        mismatched = sorted(g for g in set(ist_raw) & set(primary_raw) if ist_raw[g] != primary_raw[g])
+        if missing:
+            reasons.append("NBA_CUP_SCOPE_GAP")
+        if mismatched:
+            reasons.append("OVERLAPPING_CATEGORY_CONFLICT")
+        crosscheck = {
+            "ist_ids_observed": len(ist_raw),
+            "overlap_deduplicated": len(set(ist_raw) & set(primary_raw)),
+            "ist_ids_missing_from_primary": missing,
+            "ist_ids_content_mismatch": mismatched,
+            "counted_once": True,
+        }
+
+    certified = {g["provider_game_id"]: g for g in dataset["games"] + dataset["excluded_competitions"]}
+    reconciliation = None
+    if previous_games is not None:
+        old = {}
+        for g in previous_games:
+            if not isinstance(g, dict) or g.get("season") != season:
+                continue
+            kickoff = _parse_utc(g.get("scheduled_start_utc"))
+            if kickoff is not None and kickoff < cutoff:
+                old[str(g["provider_game_id"])] = g
+        old_ids, new_ids = set(old), set(certified)
+        conflicting = sorted(g for g in old_ids & new_ids if _material(old[g]) != _material(certified[g]))
+        scores_changed = sorted(
+            g for g in old_ids & new_ids
+            if (old[g].get("home_final_score"), old[g].get("away_final_score"))
+            != (certified[g].get("home_final_score"), certified[g].get("away_final_score")))
+        missing_old = sorted(old_ids - new_ids)
+        if missing_old:
+            reasons.append("PREVIOUS_EVIDENCE_NOT_RECONFIRMED")
+        if conflicting:
+            reasons.append("PREVIOUS_EVIDENCE_CONFLICT")
+        reconciliation = {
+            "old_provider_game_ids": sorted(old_ids),
+            "new_provider_game_ids": sorted(new_ids),
+            "missing_old_ids": missing_old,
+            "newly_discovered_ids": sorted(new_ids - old_ids),
+            "conflicting_ids": conflicting,
+            "conflicting_records": [{"provider_game_id": g, "previous": _material(old[g]),
+                                     "certified": _material(certified[g])} for g in conflicting],
+            "existing_scores_changed": scores_changed,
+            "content_digest_changed_ids": sorted(
+                g for g in old_ids & new_ids
+                if old[g].get("source_content_digest") != certified[g].get("source_content_digest")),
+            "new_regular_season_games": sorted(
+                g for g in new_ids - old_ids if certified[g].get("regular_season_eligible")),
+        }
+
+    complete = not reasons
+    return {
+        "season": season,
+        "season_label": plan.get("season_label"),
+        "historical_cutoff": plan["historical_cutoff"],
+        "plan_sha256": plan.get("plan_sha256"),
+        "CURRENT_SEASON_WINDOW_COMPLETE": WINDOW_VERIFIED if complete else WINDOW_UNRESOLVED,
+        "window_complete": complete,
+        "reasons": sorted(set(reasons)),
+        "page_completion_evidence": [
+            {"partition_id": p["partition_id"], "complete": p.get("complete"), "failure": p.get("failure"),
+             "next_cursor_remaining": p.get("next_cursor_remaining"),
+             "pages": _page_evidence(p.get("pages", []))}
+            for p in fetched.get("partitions", [])],
+        "primary_unique_games": len(primary_raw),
+        "pre_cutoff_games": len(pre_cutoff_ids),
+        "post_cutoff_games_excluded": post_cutoff,
+        "pre_cutoff_postponed_ids": sorted(postponed),
+        "pre_cutoff_not_final_ids": sorted(not_final),
+        "regular_season_games": dataset["regular_season_count"],
+        "excluded_competition_count": dataset["excluded_competition_count"],
+        "competition_breakdown": dataset["competition_breakdown"],
+        "ist_crosscheck": crosscheck,
+        "reconciliation": reconciliation,
+        "dataset": dataset,
+        "production_store_write": False,
+    }
