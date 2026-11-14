@@ -1160,6 +1160,41 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.38 真实历史实力与隔离影子模型 V2
+
+- **生产模型不变**：`basketball-margin-1` 的数学、`config.MODEL_VERSIONS`、`same_event()`、
+  `normalize_competition_number()`、Canonical ID 与彩票编号**一律不改**。
+  `basketball-margin-2-shadow` 是严格隔离的实验候选，`production_model_unchanged=True`、
+  `writes_production_stores=False`；不替换生产版本、不改写历史快照/结算、
+  不从 HTTP GET 物化影子预测、不未经批准更新生产球队库。
+- **真实历史采集**：`utils.nba_history` 复用 `nba_schedule` 的 30 队映射与进程内共享频控，
+  但用独立的带比分解析器。仅接受 `status_state==final`、非延期、整数非负比分、`period>=4`、
+  主客不同、已知球队 ID、唯一身份、合法赛季与带时区 UTC 的比赛；冲突重复 ID 拒绝。
+  默认拒绝网络、缺凭据 `disabled_missing_credentials`、分页不完整返回零条、绝不回退 ESPN/付费端点。
+  凭据只从 `DSL_BDL_API_KEY` 读取，绝不进入源码/报告/参数/日志/Git。
+- **时间完整性**：`source_observed_at` 是检索时刻，不证明历史预测时刻已观测；前瞻只用
+  `scheduled_start_utc < cutoff` 的输入。回溯研究标注 `RETROSPECTIVE_WALK_FORWARD_RESEARCH`，
+  不冒充原始实时快照，不倒填历史预测。
+- **实力引擎**：`utils.nba_team_strength.compute_team_strength` 是确定性纯函数，共同先验
+  `prior_elo=1500`、`K=20`、主场 Elo 加成 50、赛季过渡收缩 0.25；仅 `game_end_utc < as_of`
+  的比赛更新，按时间升序、去重、拒绝平局。**不用队名哈希作为实力信号**。
+  `average_point_differential` 是场均净胜分，**不是** possession-adjusted 净效率；
+  `game_end_utc` 用「开赛+150 分钟+15 分钟×加时」估算（Free 无精确结束时刻，显式假设）。
+  30 队全列出，`supported_team_count` 如实报告；空表/合成表不构成真实覆盖。
+- **V2 概率契约**：保持 raw/display/market 三层语义；`0≤p≤1` 且 `home+away=1`；
+  任一队 0 场 → `INSUFFICIENT_REAL_TEAM_DATA`，绝不伪造改进。参数为 documented 固定先验，
+  **不从原始八场队列拟合**；未来拟合须用按时间切分的历史训练区间，禁止同日泄漏。
+- **评估防泄漏**：走查回测按北京比赛日分块、扩张窗口（`as_of=D 当日 00:00`），
+  `same_date_leakage=False`、`future_result_leakage=False`、`random_shuffled_cv=False`。
+  指标始终在同一批合格比赛上计算。八场队列不支撑校准/盈利/正 EV 声明；
+  前瞻 ≥100 场是未来目标，不自动创建周期性生产写入者。
+- **只读对比工作流**：`tools.nba_model_comparison` 只读 `data/daily_matches.json` 与本地数据集，
+  报告写 `reports/`，不写七库、不发起网络。真实采集须操作者单独批准提供商、赛季/日期范围、
+  HTTP 预算、本机证据目的地、只读网络、不写运行库；无批准记 `NOT_EXECUTED_AUTHORIZATION_REQUIRED`，
+  绝不以虚构实力替代缺失证据。详见 `docs/nba-model-v2-shadow.md`。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

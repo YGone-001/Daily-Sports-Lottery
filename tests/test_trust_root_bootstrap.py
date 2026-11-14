@@ -25,7 +25,7 @@ from utils.trust_root_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "4f4da993a27dc0c5362f38bc228b463ba364999b"
-SCOPE_VERSION = "offline-root-pilot-v9-review-evidence-hardening"
+SCOPE_VERSION = "offline-root-pilot-v10-nba-evidence-strength-shadow"
 ALLOWED_PATHS = frozenset((
     # trust-root pilot scope (unchanged)
     "utils/trust_root_bootstrap.py",
@@ -110,7 +110,16 @@ ALLOWED_PATHS = frozenset((
     # evidence local-date vs Beijing-date conversion regression
     "tests/test_evidence_date_semantics.py",
     # refresh-readiness and durable nba supply diagnostics
-    "docs/ingestion-identity-preflight.md"))
+    "docs/ingestion-identity-preflight.md",
+    # evidence-backed NBA team strength and isolated shadow model V2
+    "utils/nba_history.py",
+    "utils/nba_team_strength.py",
+    "utils/nba_model_evaluation.py",
+    "models/basketball_model_v2.py",
+    "tools/nba_model_comparison.py",
+    "tests/test_nba_history_pipeline.py",
+    "tests/test_nba_strength_and_shadow.py",
+    "docs/nba-model-v2-shadow.md"))
 
 
 @pytest.fixture(scope="session", autouse=True)
