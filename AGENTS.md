@@ -1128,6 +1128,33 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.37 加时赛果防护、通用赛事绑定与同批执行
+
+- **常规时间平局不是终场**：`period == 4` 且两源比分相同时一律
+  `REGULATION_TIE_NOT_FINAL` 拒绝；`period >= 5` 但任一来源未明确 Final 时
+  `OVERTIME_IN_PROGRESS` 拒绝。绝不把平局自动转成终场比分，绝不估算或补齐加时得分。
+  被拒绝的平局候选（如 500lq 的 110-110）只作为诊断证据留存，不得升级为赛果。
+- **逐节对账是硬门禁**：两源 `period` 必须同为不小于 4 的整数且一致；官方 `periods`
+  数组（前四节 `REGULAR`、加时 `OVERTIME`）与 BDL `q1..q4`/`ot1..ot3` 必须各自加总
+  等于该源总分。缺节、类型错误、加总不符分别拒绝（`PERIOD_STRUCTURE_REQUIRED` /
+  `PERIOD_MISMATCH` / `PERIOD_DATA_INCOMPLETE` / `PERIOD_SCORE_RECONCILIATION_FAILED`）。
+  结果溯源必须记录 `final_period` 与 `overtime`。
+- **通用身份锚定**：球队身份以 Canonical 队名为锚，经 30 队显式映射同时核对 `nba:` 与
+  `bdl:` ID 及官方 tricode；不得硬编码特定对阵。官方引用 URL 必须由锚定队码与官方
+  赛事 ID 构造（`https://www.nba.com/game/<away>-vs-<home>-<gameId>`），任意域名、
+  错误队码、错误赛事 ID、附加查询串一律 `OFFICIAL_REFERENCE_MISMATCH`。
+- **同批多场单一引擎**：计划格式为 `targets` 列表 + 共享 `store_hashes` / `generation` /
+  `write_scope` / `preview_sha256`；单场是同批一场的特例。同批目标不得重复
+  （`DUPLICATE_TARGET`）。一次明确批准可覆盖**事先完整可见**的目标集合；
+  对单场的批准绝不延伸到其余场次，旧回执与旧授权不可复用。
+- **一次执行 = 一次锁段 = 一次代号递增 = 一份回执**；整批预检（快照摘要 + 身份不变）
+  先于任何写入，任一目标失配即零写入失败。部分失败写 FAILED 并在回执列出已完成目标，
+  不自动重试、不回滚、不隐藏失败；跨文件仍非事务。
+- 其余约束（§4.36 的三库写范围、其余四库字节不变、不广域刷新、不 Canonical 归并、
+  自动核对不得伪称 HUMAN_REVIEWED）全部不变。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程
