@@ -70,6 +70,10 @@ ALLOWED_PATHS = frozenset((
     "tests/test_balldontlie_schedule_adapter.py",
     "tests/test_nba_schedule_completeness.py",
     "docs/nba-schedule-provider.md",
+    # explicit single-fixture confirmed result workflow (no production identity repair)
+    "tools/nba_confirmed_result.py",
+    "tests/test_nba_confirmed_result.py",
+    "docs/nba-confirmed-result.md",
     "frontend/src/features/DailyView/DailyView.tsx",
     "frontend/src/features/DailyView/dateSelection.ts",
     "frontend/src/features/DailyView/dateSelection.test.ts",
