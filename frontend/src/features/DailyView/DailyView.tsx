@@ -215,7 +215,14 @@ export const DailyView: React.FC = () => {
 
               <div className={styles.matchList}>
                 {group.matches.map((match) => (
-                  <MatchRow key={match.id} match={match} />
+                  <MatchRow
+                    key={match.id}
+                    match={
+                      match.kickoff_time_known === false
+                        ? { ...match, time: '待定' }
+                        : match
+                    }
+                  />
                 ))}
               </div>
             </section>

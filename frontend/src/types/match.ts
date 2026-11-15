@@ -23,6 +23,7 @@ export interface Match {
   away_team?: TeamInfo
   jczq_no?: string
   market_tracked?: boolean
+  kickoff_time_known?: boolean
 }
 
 export interface MatchScore {

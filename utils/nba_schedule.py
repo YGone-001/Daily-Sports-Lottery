@@ -104,7 +104,7 @@ NBA_FRANCHISE_MAPPINGS: tuple[NbaFranchiseMapping, ...] = (
     NbaFranchiseMapping("DEN", "7", "1610612743", "Denver Nuggets", ("丹佛掘金",), "8"),
     NbaFranchiseMapping("DET", "8", "1610612765", "Detroit Pistons", ("底特律活塞",), "9"),
     NbaFranchiseMapping("GSW", "9", "1610612744", "Golden State Warriors", ("金州勇士",), "10"),
-    NbaFranchiseMapping("HOU", "10", "1610612745", "Houston Rockets", ("休斯顿火箭",), "11"),
+    NbaFranchiseMapping("HOU", "10", "1610612745", "Houston Rockets", ("休斯顿火箭", "休斯敦火箭"), "11"),
     NbaFranchiseMapping("IND", "11", "1610612754", "Indiana Pacers", ("印第安纳步行者", "印第安那步行者"), "12"),
     NbaFranchiseMapping("LAC", "12", "1610612746", "LA Clippers", ("洛杉矶快船",), "13"),
     NbaFranchiseMapping("LAL", "13", "1610612747", "Los Angeles Lakers", ("洛杉矶湖人",), "14"),

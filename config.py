@@ -12,6 +12,17 @@ if os.path.exists(env_path):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
+# 从 .DSL_BDL_API_KEY 读取 BDL 凭据（若环境变量未设置且存在该文件）
+bdl_key_path = os.path.join(BASE_DIR, ".DSL_BDL_API_KEY")
+if os.path.exists(bdl_key_path) and not os.environ.get("DSL_BDL_API_KEY"):
+    try:
+        with open(bdl_key_path, "r", encoding="utf-8") as f:
+            _bdl_key = f.read().strip()
+            if _bdl_key:
+                os.environ.setdefault("DSL_BDL_API_KEY", _bdl_key)
+    except OSError:
+        pass
+
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 # Flask
@@ -120,3 +131,7 @@ RUNTIME_WRITES_ENABLED = os.environ.get("DSL_RUNTIME_WRITES_ENABLED", "false").l
 BACKGROUND_REFRESH_ENABLED = os.environ.get("DSL_BACKGROUND_REFRESH_ENABLED", "false").lower() in ("true", "1", "yes")
 RUNTIME_WRITE_TOKEN = os.environ.get("DSL_RUNTIME_WRITE_TOKEN", "")
 LOCAL_UI_REFRESH_ENABLED = os.environ.get("DSL_LOCAL_UI_REFRESH_ENABLED", "true").lower() in ("true", "1", "yes")
+ENABLE_NBA_SCHEDULE_NETWORK = os.environ.get(
+    "DSL_ENABLE_NBA_SCHEDULE_NETWORK",
+    "true" if os.environ.get("DSL_LOCAL_UI_REFRESH_ENABLED", "true").lower() in ("true", "1", "yes") and os.environ.get("DSL_BDL_API_KEY") else "false",
+).lower() in ("true", "1", "yes")
