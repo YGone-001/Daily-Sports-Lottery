@@ -24,6 +24,7 @@ def stores(isolated_data_dir, monkeypatch):
     monkeypatch.setitem(server.app.config, "RUNTIME_WRITES_ENABLED", False)
     monkeypatch.setitem(server.app.config, "BACKGROUND_REFRESH_ENABLED", False)
     monkeypatch.setitem(server.app.config, "RUNTIME_WRITE_TOKEN", "")
+    monkeypatch.setitem(server.app.config, "LOCAL_UI_REFRESH_ENABLED", False)
     monkeypatch.delenv("SERVE_FRONTEND", raising=False)
     monkeypatch.setattr(nba_schedule.requests, "get", lambda *a, **k: pytest.fail("GET attempted network"))
     return isolated_data_dir, m
@@ -86,6 +87,46 @@ def test_authorized_post_runs_normal_isolated_refresh(stores, monkeypatch):
     snapshot = prediction_snapshots.get_snapshots_for_match(m['id'])[0]
     assert snapshot['generated_at'] == NOW.isoformat()
     assert snapshot['model_version']
+
+
+def test_local_ui_refresh_contract(stores, monkeypatch):
+    directory, m = stores
+    monkeypatch.setitem(server.app.config, "LOCAL_UI_REFRESH_ENABLED", True)
+    refreshed = []
+    monkeypatch.setattr(scraper, "refresh", lambda **kw: refreshed.append(True) or {"status": "ok", "added": 1})
+
+    # 1. 本地回环但无 Web UI 头（普通 API/curl 调用）：被拒绝 403
+    resp_api = server.app.test_client().post("/api/refresh")
+    assert resp_api.status_code == 403
+    assert resp_api.json["error"] == "RUNTIME_WRITES_DISABLED"
+    assert len(refreshed) == 0
+
+    # 2. 本地回环且携带 Web UI 专用头（X-Requested-With）：允许同步 200
+    resp_ui = server.app.test_client().post("/api/refresh", headers={"X-Requested-With": "XMLHttpRequest"})
+    assert resp_ui.status_code == 200
+    assert resp_ui.json["status"] == "ok"
+    assert len(refreshed) == 1
+
+    # 3. 本地回环且携带 Web UI 浏览器 Referer：允许同步 200
+    resp_ref = server.app.test_client().post("/api/refresh", headers={"Referer": "http://127.0.0.1:5000/"})
+    assert resp_ref.status_code == 200
+    assert len(refreshed) == 2
+
+    # 4. 非本地回环（远程伪造 Web UI 头）：严禁通过，必须拒绝 403
+    resp_remote = server.app.test_client().post(
+        "/api/refresh",
+        environ_base={"REMOTE_ADDR": "192.168.1.100"},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    assert resp_remote.status_code == 403
+    assert resp_remote.json["error"] == "RUNTIME_WRITES_DISABLED"
+    assert len(refreshed) == 2
+
+    # 5. 开关关闭时（LOCAL_UI_REFRESH_ENABLED=False）：即使带 UI 头亦被拒绝 403
+    monkeypatch.setitem(server.app.config, "LOCAL_UI_REFRESH_ENABLED", False)
+    resp_disabled = server.app.test_client().post("/api/refresh", headers={"X-Requested-With": "XMLHttpRequest"})
+    assert resp_disabled.status_code == 403
+    assert len(refreshed) == 2
 
 
 @pytest.mark.parametrize('debug,reloader',[(False,''),(True,''),(True,'true')])

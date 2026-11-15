@@ -285,12 +285,24 @@ def api_strategy():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    if not app.config.get("RUNTIME_WRITES_ENABLED", False):
+    is_loopback = request.remote_addr in ("127.0.0.1", "::1", "localhost")
+    local_ui_allowed = (
+        app.config.get("LOCAL_UI_REFRESH_ENABLED", False)
+        and is_loopback
+        and (
+            bool(request.headers.get("X-Requested-With"))
+            or (request.headers.get("Sec-Fetch-Site") in ("same-origin", "same-site"))
+            or bool(request.referrer and ("127.0.0.1" in request.referrer or "localhost" in request.referrer))
+            or bool(request.origin and ("127.0.0.1" in request.origin or "localhost" in request.origin))
+        )
+    )
+    if not (app.config.get("RUNTIME_WRITES_ENABLED", False) or local_ui_allowed):
         return jsonify({"error": "RUNTIME_WRITES_DISABLED"}), 403
-    expected = app.config.get("RUNTIME_WRITE_TOKEN") or ""
-    supplied = request.headers.get("X-Refresh-Token", "")
-    if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
-        return jsonify({"error": "REFRESH_AUTHORIZATION_REQUIRED"}), 403
+    if not local_ui_allowed:
+        expected = app.config.get("RUNTIME_WRITE_TOKEN") or ""
+        supplied = request.headers.get("X-Refresh-Token", "")
+        if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
+            return jsonify({"error": "REFRESH_AUTHORIZATION_REQUIRED"}), 403
     try:
         stats = scraper.refresh(verbose=False)
         return jsonify(stats)

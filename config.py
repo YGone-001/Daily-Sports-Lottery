@@ -119,3 +119,4 @@ DEFAULT_LEAGUE_ELO = 1600
 RUNTIME_WRITES_ENABLED = os.environ.get("DSL_RUNTIME_WRITES_ENABLED", "false").lower() in ("true", "1", "yes")
 BACKGROUND_REFRESH_ENABLED = os.environ.get("DSL_BACKGROUND_REFRESH_ENABLED", "false").lower() in ("true", "1", "yes")
 RUNTIME_WRITE_TOKEN = os.environ.get("DSL_RUNTIME_WRITE_TOKEN", "")
+LOCAL_UI_REFRESH_ENABLED = os.environ.get("DSL_LOCAL_UI_REFRESH_ENABLED", "true").lower() in ("true", "1", "yes")
