@@ -244,7 +244,10 @@ python -m tools.nba_shadow_capture verify <artifact.json>
   `capture_mode = CONTEMPORANEOUS_PROSPECTIVE_CAPTURE`，与回溯研究分开。
 - 工件按 `snapshot_identity = sha256(canonical_id|bdl_id|v1|v2|as_of)` **独占创建**；
   内容相同重复写入为 `IDEMPOTENT_EXISTING`，内容不同 `SHADOW_ARTIFACT_IMMUTABLE` 拒绝；
+  若磁盘已有工件内容遭外部篡改（`content_sha256` 不匹配），拒绝 `EXISTING_ARTIFACT_TAMPERED`；
   输出目录位于 `DATA_DIR` 内一律拒绝。`content_sha256` 覆盖除自身外的全部字段。
+- **单场赔率历史溯源**：拒绝全局刷新时间戳 `meta.last_refresh` 作为赔率证据，必须从 `odds_snapshots.json` 或独立验证的市场观测获取，严格比对 Canonical ID、彩票编号、双方球队、玩法与价格，缺失报 `MISSING_MATCH_ODDS_PROVENANCE`。
+- **全量 Canonical 归属唯一性**：跨全部状态（包括完赛与已结算记录）核验 BDL 比赛 ID 拥有者数量必须唯一（`count == 1`），存在未决主客反向候选即拒绝 `REVERSED_HOME_AWAY_REJECTED`，存在重复绑定即拒绝 `CANONICAL_OWNER_CONFLICT`。
 - `evaluate_shadow_artifact(artifact, final_result)` 是只读评估契约：同一 Canonical ID +
   BDL 赛事 ID 连接、要求官方确认终场、校验工件摘要；**不**结算、**不**写库、**不**自动运行。
 

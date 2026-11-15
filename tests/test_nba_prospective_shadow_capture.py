@@ -547,11 +547,37 @@ GEN = datetime(2026, 11, 16, 6, 0, 30, tzinfo=BJ)
 MARKET_AT = "2026-11-16T05:30:00+08:00"
 
 
+def _market_obs(f=None, **kw):
+    f = f or _fixture()
+    odds = f.get("odds") or {}
+    obs = {
+        "canonical_match_id": f.get("id"),
+        "lottery_competition_number": f.get("jczq_no"),
+        "home_team": f.get("home"),
+        "away_team": f.get("away"),
+        "market_type": "sf",
+        "home_win_odds": odds.get("home_win"),
+        "away_win_odds": odds.get("away_win"),
+        "market_source": "500.com",
+        "market_observed_at": MARKET_AT,
+    }
+    obs.update(kw)
+    obs["market_content_digest"] = cap._digest({k: v for k, v in obs.items() if k != "market_content_digest"})
+    return obs
+
+
 def _artifact(**kw):
     kw.setdefault("generated_at", GEN)
-    kw.setdefault("market_observed_at", MARKET_AT)
-    kw.setdefault("provider_binding_count", 1)
     fixture = kw.pop("fixture", _fixture())
+    if "market_observation" not in kw and "market_observed_at" not in kw:
+        kw["market_observation"] = _market_obs(fixture)
+    elif "market_observed_at" in kw and "market_observation" not in kw:
+        m_at = kw.pop("market_observed_at")
+        if m_at is not None:
+            kw["market_observation"] = _market_obs(fixture, market_observed_at=m_at)
+        else:
+            kw["market_observation"] = None
+    kw.setdefault("provider_binding_count", 1)
     obs = kw.pop("observation", _obs())
     dataset = kw.pop("dataset", _dataset())
     return cap.build_shadow_artifact(fixture, obs, dataset, as_of=kw.pop("as_of", AS_OF), **kw)
@@ -586,8 +612,8 @@ def test_prospective_capture_requires_generation_before_kickoff():
 
 @pytest.mark.parametrize("kw,reason", [
     ({"observation": None}, "SCHEDULE_STATUS_UNVERIFIED:FRESH_PROVIDER_OBSERVATION_UNAVAILABLE"),
-    ({"market_observed_at": "2026-11-16T06:10:00+08:00"}, "MARKET_OBSERVATION_NOT_BEFORE_AS_OF"),
-    ({"market_observed_at": None}, "MARKET_OBSERVATION_NOT_BEFORE_AS_OF"),
+    ({"market_observed_at": "2026-11-16T06:10:00+08:00"}, "MARKET_OBSERVATION_AFTER_PREDICTION"),
+    ({"market_observed_at": None}, "MISSING_MATCH_ODDS_PROVENANCE"),
 ])
 def test_capture_blocked_preconditions(kw, reason):
     with pytest.raises(cap.ShadowCaptureBlocked) as exc:
@@ -698,6 +724,20 @@ def test_cli_capture_binds_in_memory_and_writes_only_artifact(isolated_data_dir,
     daily = {"meta": {"last_refresh": MARKET_AT}, "matches": [dict(stored, sport="basketball")]}
     for name in STORES:
         (isolated_data_dir / name).write_text(json.dumps({"seed": name}), encoding="utf-8")
+    odds_snap = {
+        "match_id": "500j-2026-11-16-1301",
+        "jczq_no": "1301",
+        "home_team": "波士顿凯尔特人",
+        "away_team": "纽约尼克斯",
+        "captured_at": MARKET_AT,
+        "source": "500.com",
+        "odds": {"home_win": 1.55, "away_win": 2.35},
+        "odds_fingerprint": "fake",
+        "snapshot_id": "fake_odds_snap",
+    }
+    (isolated_data_dir / "odds_snapshots.json").write_text(
+        json.dumps({"version": 1, "snapshots": {"fake_odds_snap": odds_snap}}, ensure_ascii=False),
+        encoding="utf-8")
     (isolated_data_dir / "daily_matches.json").write_text(json.dumps(daily, ensure_ascii=False), encoding="utf-8")
     before = {n: (isolated_data_dir / n).read_bytes() for n in STORES}
     observation = _obs(beijing_date="2026-11-16", time_parse_status="VALID_UTC", league_uid="balldontlie_nba")
@@ -753,3 +793,136 @@ def test_evaluation_join_contract():
     assert cap.evaluate_shadow_artifact(a, _result(away_score=108))["reason"] == "MALFORMED_FINAL_SCORE"
     tampered = dict(a, original_probabilities={"v1_raw": {"home_win": 0.9, "away_win": 0.1}})
     assert cap.evaluate_shadow_artifact(tampered, _result())["reason"] == "ARTIFACT_CONTENT_DIGEST_MISMATCH"
+
+
+# ---------------------------------------------------------------------------
+# 三项最小捕获修正回归用例（Workstream B & Section 8）
+# ---------------------------------------------------------------------------
+
+def test_per_fixture_odds_provenance():
+    # 1. 缺失单场市场观察直接拒绝
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(market_observation=None)
+    assert exc.value.reason == "MISSING_MATCH_ODDS_PROVENANCE"
+
+    # 2. Canonical ID 不匹配拒绝
+    bad_id_obs = _market_obs(canonical_match_id="other-match-id")
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(market_observation=bad_id_obs)
+    assert exc.value.reason == "MARKET_EVENT_IDENTITY_MISMATCH"
+
+    # 3. 双方球队不匹配拒绝
+    bad_teams_obs = _market_obs(home_team="金州勇士")
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(market_observation=bad_teams_obs)
+    assert exc.value.reason == "MARKET_EVENT_IDENTITY_MISMATCH"
+
+    # 4. 盘口赔率不一致拒绝
+    bad_odds_obs = _market_obs(home_win_odds=9.99)
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(market_observation=bad_odds_obs)
+    assert exc.value.reason == "ODDS_VALUES_DO_NOT_MATCH_OBSERVATION"
+
+    # 5. 观察时刻晚于预测 as_of 拒绝
+    late_obs = _market_obs(market_observed_at="2026-11-16T06:10:00+08:00")
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(market_observation=late_obs)
+    assert exc.value.reason == "MARKET_OBSERVATION_AFTER_PREDICTION"
+
+
+def test_global_refresh_timestamp_not_accepted_as_odds_evidence(monkeypatch):
+    monkeypatch.setattr(cap, "latest_odds_snapshot", lambda match_id: None)
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        cap.build_shadow_artifact(_fixture(), _obs(), _dataset(), as_of=AS_OF, generated_at=GEN,
+                                  market_observed_at="2026-11-16T05:30:00+08:00", provider_binding_count=1)
+    assert exc.value.reason == "MISSING_MATCH_ODDS_PROVENANCE"
+
+
+def test_canonical_owner_uniqueness_across_statuses():
+    canonical_matches = [
+        _fixture(id="500j-2026-11-16-1301", status="upcoming"),
+        _fixture(id="500j-2026-11-15-1200", status="finished", jczq_no="1200"),
+    ]
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(all_canonical_matches=canonical_matches)
+    assert exc.value.reason == "CANONICAL_OWNER_CONFLICT"
+
+
+def test_reversed_home_away_rejected():
+    reversed_match = dict(_fixture(id="500lq-2026-11-16-1301"))
+    reversed_match["home"] = _fixture()["away"]
+    reversed_match["away"] = _fixture()["home"]
+    canonical_matches = [_fixture(), reversed_match]
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(all_canonical_matches=canonical_matches)
+    assert exc.value.reason == "REVERSED_HOME_AWAY_REJECTED"
+
+
+def test_existing_shadow_artifact_content_rehashed(tmp_path_factory):
+    out = tmp_path_factory.mktemp("shadow-rehash")
+    a = _artifact()
+    path, outcome = cap.write_shadow_artifact(a, out)
+    assert outcome == "CREATED"
+
+    # 未篡改的幂等写入
+    again, outcome = cap.write_shadow_artifact(a, out)
+    assert outcome == "IDEMPOTENT_EXISTING"
+
+    # 篡改落盘文件内容
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["original_probabilities"]["v2_raw"]["home_win"] = 0.999
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        cap.write_shadow_artifact(a, out)
+    assert exc.value.reason == "EXISTING_ARTIFACT_TAMPERED"
+
+
+def test_certified_historical_input_bound():
+    ds = _dataset()
+    ds["certification"] = {"REGULAR_SEASON_DATASET_CERTIFIED": "PARTIAL", "CURRENT_SEASON_WINDOW_COMPLETE": "VERIFIED"}
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(dataset=ds)
+    assert exc.value.reason == "HISTORICAL_DATASET_NOT_CERTIFIED"
+
+
+def test_current_season_cutoff_not_overstated():
+    ds = _dataset()
+    ds["cutoff_utc"] = "2026-11-17T00:00:00+00:00"
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(dataset=ds)
+    assert exc.value.reason == "HISTORICAL_WINDOW_CUTOFF_INVALID"
+
+
+def test_verified_future_fixture_required():
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(as_of=datetime(2026, 11, 16, 9, 0, tzinfo=BJ))
+    assert exc.value.reason.startswith("STALE_STORED_UPCOMING")
+
+
+def test_real_pregame_timestamp_order():
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(generated_at=datetime(2026, 11, 16, 5, 59, tzinfo=BJ))
+    assert exc.value.reason == "AS_OF_AFTER_GENERATION_TIME"
+
+
+def test_no_postgame_reconstruction():
+    with pytest.raises(cap.ShadowCaptureBlocked) as exc:
+        _artifact(generated_at=datetime(2026, 11, 16, 8, 30, tzinfo=BJ))
+    assert exc.value.reason == "PREDICTION_NOT_BEFORE_KICKOFF"
+
+
+# 规范全大写测试场景映射
+test_PER_FIXTURE_ODDS_PROVENANCE = test_per_fixture_odds_provenance
+test_GLOBAL_REFRESH_TIMESTAMP_NOT_ACCEPTED_AS_ODDS_EVIDENCE = test_global_refresh_timestamp_not_accepted_as_odds_evidence
+test_CANONICAL_OWNER_UNIQUENESS_ACROSS_STATUSES = test_canonical_owner_uniqueness_across_statuses
+test_REVERSED_HOME_AWAY_REJECTED = test_reversed_home_away_rejected
+test_EXISTING_SHADOW_ARTIFACT_CONTENT_REHASHED = test_existing_shadow_artifact_content_rehashed
+test_CERTIFIED_HISTORICAL_INPUT_BOUND = test_certified_historical_input_bound
+test_CURRENT_SEASON_CUTOFF_NOT_OVERSTATED = test_current_season_cutoff_not_overstated
+test_VERIFIED_FUTURE_FIXTURE_REQUIRED = test_verified_future_fixture_required
+test_REAL_PREGAME_TIMESTAMP_ORDER = test_real_pregame_timestamp_order
+test_NO_POSTGAME_RECONSTRUCTION = test_no_postgame_reconstruction
+test_PRODUCTION_V1_UNCHANGED = test_v1_production_model_unchanged
+test_SHADOW_OUTPUT_OUTSIDE_PRODUCTION_STORES = test_shadow_capture_no_production_writes
+
