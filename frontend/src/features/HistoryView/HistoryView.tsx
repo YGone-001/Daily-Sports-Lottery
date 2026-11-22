@@ -1,7 +1,7 @@
 import React from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
 import { useHistory, useEvaluationSummary } from '@/hooks';
-import type { HistoryComparison, HistorySportStats } from '@/types/match';
+import type { HistoryMatch, HistorySportStats } from '@/types/match';
 import { SportFilter } from '@/components/SportFilter';
 import { EmptyState } from '@/components/EmptyState';
 import { Skeleton } from '@/components/Skeleton';
@@ -61,43 +61,87 @@ function renderScopeMetrics(sport: Sport, football: HistorySportStats, basketbal
   );
 }
 
-function Verdict({ comparison }: { comparison: HistoryComparison }) {
-  if (comparison.evidence_status === 'verified') {
-    return (
-      <div className={`${styles.hrVerdict} ${comparison.correct ? styles.ok : styles.bad}`}>
-        <span>{comparison.correct ? '✓ 命中' : '✗ 偏差'}</span>
+function Verdict({ match }: { match: HistoryMatch }) {
+  const comparison = match.comparison;
+  const lifecycleWarning =
+    match.state_inconsistency_warning && match.lifecycle_presentation ? (
+      <div className={`${styles.hrVerdict} ${styles.ambiguous}`}>
+        <span>状态不一致：落盘状态与终场证据并存</span>
         <em>
-          预测{comparison.predicted_label} · 置信{comparison.confidence}%
-          {comparison.score_eligible && ` · 比分${comparison.score_hit ? '覆盖' : '未覆盖'}`}
+          {match.lifecycle_presentation === 'HISTORICAL_EVIDENCE_CONFLICT'
+            ? '结算/评估比分与落盘比分冲突，结果不可信'
+            : '落盘状态为进行中，但存在终场比分与结算证据；证据仅供只读查看'}
         </em>
       </div>
-    );
-  }
+    ) : null;
 
-  if (comparison.evidence_status === 'historical_version') {
+  const verdict = (() => {
+    if (comparison.evidence_status === 'verified') {
+      return (
+        <div className={`${styles.hrVerdict} ${comparison.correct ? styles.ok : styles.bad}`}>
+          <span>{comparison.correct ? '✓ 命中' : '✗ 偏差'}</span>
+          <em>
+            预测{comparison.predicted_label} · 置信{comparison.confidence}%
+            {comparison.score_eligible && ` · 比分${comparison.score_hit ? '覆盖' : '未覆盖'}`}
+          </em>
+        </div>
+      );
+    }
+
+    if (comparison.evidence_status === 'historical_version') {
+      return (
+        <div className={`${styles.hrVerdict} ${styles.historical}`}>
+          <span>历史版本 ({comparison.model_version})</span>
+          <em>预测{comparison.predicted_label} · 置信{comparison.confidence}%</em>
+        </div>
+      );
+    }
+
+    if (comparison.evidence_status === 'ambiguous' || comparison.evidence_status === 'invalid') {
+      const isInvalid = comparison.evidence_status === 'invalid';
+      return (
+        <div className={`${styles.hrVerdict} ${styles.ambiguous}`}>
+          <span>{isInvalid ? '证据无效 / 排除' : '证据冲突 / 排除'}</span>
+          <em>{isInvalid ? '证据校验未通过' : '多条不一致记录'}</em>
+        </div>
+      );
+    }
+
+    // no_evidence：按缺失证据的具体形态区分措辞（Workstream C.4），
+    // 不得把「快照存在但链条未建立」误报成「未采集赛前快照」。
+    const noEvidenceCopy: Record<string, { title: string; detail: string }> = {
+      NO_SNAPSHOT_EVIDENCE: { title: '无赛前验证预测', detail: '未采集赛前快照' },
+      SETTLEMENT_WITHOUT_SNAPSHOT: {
+        title: '证据不完整',
+        detail: '存在结算记录但其引用的赛前快照不在证据库中，链条无法建立',
+      },
+      SNAPSHOT_PRESENT_SETTLEMENT_MISSING: {
+        title: '证据不完整',
+        detail: '赛前快照存在，但尚无源确认赛果的结算记录',
+      },
+      SETTLEMENT_PRESENT_EVALUATION_UNVERIFIED: {
+        title: '证据不完整',
+        detail: '结算存在，但评估链未通过完整性校验（不重建历史）',
+      },
+    };
+    const copy =
+      (comparison.no_evidence_reason && noEvidenceCopy[comparison.no_evidence_reason]) || {
+        title: '无赛前验证预测',
+        detail: '未采集赛前快照',
+      };
     return (
-      <div className={`${styles.hrVerdict} ${styles.historical}`}>
-        <span>历史版本 ({comparison.model_version})</span>
-        <em>预测{comparison.predicted_label} · 置信{comparison.confidence}%</em>
+      <div className={`${styles.hrVerdict} ${styles.unverified}`}>
+        <span>{copy.title}</span>
+        <em>{copy.detail}</em>
       </div>
     );
-  }
-
-  if (comparison.evidence_status === 'ambiguous' || comparison.evidence_status === 'invalid') {
-    const isInvalid = comparison.evidence_status === 'invalid';
-    return (
-      <div className={`${styles.hrVerdict} ${styles.ambiguous}`}>
-        <span>{isInvalid ? '证据无效 / 排除' : '证据冲突 / 排除'}</span>
-        <em>{isInvalid ? '证据校验未通过' : '多条不一致记录'}</em>
-      </div>
-    );
-  }
+  })();
 
   return (
-    <div className={`${styles.hrVerdict} ${styles.unverified}`}>
-      <span>无赛前验证预测</span>
-      <em>未采集赛前快照</em>
-    </div>
+    <>
+      {lifecycleWarning}
+      {verdict}
+    </>
   );
 }
 
@@ -147,7 +191,7 @@ export const HistoryView: React.FC = () => {
                   <span className={styles.hrLeague}>{match.league}</span>
                 </div>
                 <div className={`${styles.hrScore} mono`}>{match.comparison.actual_score}</div>
-                <Verdict comparison={match.comparison} />
+                <Verdict match={match} />
               </Link>
             ))}
           </div>

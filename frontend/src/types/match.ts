@@ -245,6 +245,14 @@ export interface SportFreshness {
   stored_upcoming_count: number
   verified_future_count: number
   stale_upcoming_count: number
+  /** Workstream D：互斥且完备的待赛四分区 + 提供商核实二分。 */
+  known_future_kickoff: number
+  future_kickoff_unknown: number
+  past_kickoff_stored_upcoming: number
+  unknown_kickoff_past_date: number
+  /** 仅统计携带 kickoff_provenance = SCHEDULE_PROVIDER_VERIFIED 的记录。 */
+  provider_schedule_verified: number
+  provider_schedule_unverified: number
   latest_market_event_date: string | null
 }
 
@@ -291,11 +299,26 @@ export type HistoryEvidenceStatus =
   | 'ambiguous'
   | 'invalid'
 
+export type HistoryNoEvidenceReason =
+  | 'NO_SNAPSHOT_EVIDENCE'
+  | 'SETTLEMENT_WITHOUT_SNAPSHOT'
+  | 'SNAPSHOT_PRESENT_SETTLEMENT_MISSING'
+  | 'SETTLEMENT_PRESENT_EVALUATION_UNVERIFIED'
+
+export type LifecyclePresentation =
+  | 'SOURCE_CONFIRMED_FINISHED'
+  | 'LIVE_WITH_TERMINAL_RESULT_EVIDENCE'
+  | 'LIVE_WITHOUT_TERMINAL_RESULT_EVIDENCE'
+  | 'FINAL_RESULT_UNVERIFIED'
+  | 'HISTORICAL_EVIDENCE_CONFLICT'
+
 export interface HistoryComparison {
   actual_score: string
   actual_outcome: string
   actual_label: string
   evidence_status: HistoryEvidenceStatus
+  /** no_evidence 时的缺失证据形态（Workstream C.4 区分措辞）。 */
+  no_evidence_reason?: HistoryNoEvidenceReason
   is_verified: boolean
   model_name: string
   model_version: string
@@ -314,6 +337,8 @@ export interface HistoryMatch extends Match {
   comparison: HistoryComparison
   evidence_status: HistoryEvidenceStatus
   is_verified: boolean
+  lifecycle_presentation?: LifecyclePresentation
+  state_inconsistency_warning?: boolean
 }
 
 export interface HistorySportStats {

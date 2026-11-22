@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import hmac
+import math
 import threading
 import time
 from datetime import datetime
@@ -112,43 +113,70 @@ def _frontend_build_identity() -> dict | None:
 
 def _freshness_summary() -> dict:
     """
-    只读：按运动汇总数据新鲜度（Workstream B 的口径）。
+    只读：按运动汇总数据新鲜度（Workstream D 的口径）。
 
-    - ``verified_future``：开赛时间已知且在当前时钟之前的待赛赛事；
-    - ``stale_upcoming``：落盘仍为 upcoming 但已不属于 verified_future 的记录
-      （含未知开赛时间与已过开赛时刻两种），绝不把过期记录当作未来赛事；
-    - ``latest_market_event_date``：仍有有效盘口覆盖的最新比赛日。
-    源侧的在线状态见既有 ``source_health``；本块只描述**已落盘数据**的时效。
+    「已知未来开赛时间」只是**落盘字段**的函数，不等于提供商侧的实时核实；
+    只有携带 ``kickoff_provenance.kickoff_verification_status =
+    SCHEDULE_PROVIDER_VERIFIED`` 的记录才计入 provider_schedule_verified，
+    其余计入 provider_schedule_unverified。源侧无新观测时不编造核实数
+    （计数永远来自已落盘证据，未知即如实落在本档）。
+    兼容字段 ``verified_future_count`` / ``stale_upcoming_count`` 保持原语义。
     """
     from utils.market_coverage import has_usable_market_odds
     from utils.match_identity import is_kickoff_time_known
 
     now = get_beijing_now()
+    today = now.date().isoformat()
     per_sport = {}
     for sport in ("football", "basketball"):
         sub = [m for m in daily_loader.get_all_matches() if m.get("sport") == sport]
         upcoming = [m for m in sub if m.get("status") == "upcoming"]
-        verified = [
-            m
-            for m in upcoming
-            if is_kickoff_time_known(m)
-            and (kick := daily_loader.get_match_datetime(m))
-            and now < kick
-        ]
+        known_future, past_stored, unknown_future, unknown_past = [], [], [], []
+        for m in upcoming:
+            known = is_kickoff_time_known(m)
+            kick = daily_loader.get_match_datetime(m) if known else None
+            if known and kick is not None and now < kick:
+                known_future.append(m)
+            elif known:
+                past_stored.append(m)
+            elif (m.get("date") or "") >= today:
+                unknown_future.append(m)
+            else:
+                unknown_past.append(m)
+
+        def provider_verified(ms: list[dict]) -> int:
+            count = 0
+            for m in ms:
+                prov = m.get("kickoff_provenance") or {}
+                if prov.get("kickoff_verification_status") == "SCHEDULE_PROVIDER_VERIFIED":
+                    count += 1
+            return count
+
+        pv = provider_verified(known_future)
         market_dates = sorted(
             {m.get("date") for m in sub if has_usable_market_odds(m) and m.get("date")},
             reverse=True,
         )
         per_sport[sport] = {
             "stored_upcoming_count": len(upcoming),
-            "verified_future_count": len(verified),
-            "stale_upcoming_count": len(upcoming) - len(verified),
+            # 兼容字段（语义同 4-B）：verified_future = known_future_kickoff；
+            # stale = 其余全部待赛记录。
+            "verified_future_count": len(known_future),
+            "stale_upcoming_count": len(upcoming) - len(known_future),
+            # Workstream D：互斥且完备的四分区 + 提供商核实二分。
+            "known_future_kickoff": len(known_future),
+            "future_kickoff_unknown": len(unknown_future),
+            "past_kickoff_stored_upcoming": len(past_stored),
+            "unknown_kickoff_past_date": len(unknown_past),
+            "provider_schedule_verified": pv,
+            "provider_schedule_unverified": len(known_future) - pv,
             "latest_market_event_date": market_dates[0] if market_dates else None,
         }
     return {
         "generated_at": now.isoformat(),
         "per_sport": per_sport,
-        "note": "刷新完成不等于源覆盖新鲜；源侧在线状态见 source_health",
+        "provider_evidence": "FROM_STORED_PROVENANCE",
+        "note": "已知未来开赛时间不等于提供商实时核实；刷新完成不等于源覆盖新鲜；源侧在线状态见 source_health",
     }
 
 
@@ -1015,17 +1043,39 @@ def api_evaluation_summary():
         for s in calibration
     }
 
-    def market_baseline(rows, sport):
+    def market_baseline(rows, sport, model_name, model_version):
+        """同**模型组**的市场基线：与分类指标消费完全一致的 (sport, model_name,
+        model_version) 行集合，不得跨组借用样本（Workstream A 分组修正）。
+
+        市场证据有效性对齐分类模块语义：数值（bool 不算）、有限、逐类别 > 0。
+        模型与市场逐行（同一 match_id / evaluation_id）配对比较。
+        """
         classes = classes_for_sport(sport)
-        same = []
-        for r in rows:
-            if r.get("sport") != sport:
-                continue
-            imp = r.get("market_implied_probabilities") or {}
-            if all(isinstance(imp.get(c), (int, float)) and imp.get(c) > 0 for c in classes):
-                same.append(r)
+
+        def valid_implied(row):
+            imp = row.get("market_implied_probabilities") or {}
+            for c in classes:
+                v = imp.get(c)
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    return False
+                if not math.isfinite(float(v)) or float(v) <= 0:
+                    return False
+            return True
+
+        same = [
+            r
+            for r in rows
+            if r.get("sport") == sport
+            and r.get("model_name") == model_name
+            and r.get("model_version") == model_version
+            and valid_implied(r)
+        ]
         if not same:
-            return {"status": "MARKET_BASELINE_NOT_AVAILABLE", "same_fixture_samples": 0}
+            return {
+                "status": "MARKET_BASELINE_NOT_AVAILABLE",
+                "same_fixture_samples": 0,
+                "cohort": {"sport": sport, "model_name": model_name, "model_version": model_version},
+            }
         model_correct = market_correct = 0
         model_brier = market_brier = 0.0
         for r in same:
@@ -1042,6 +1092,7 @@ def api_evaluation_summary():
         return {
             "status": "VERIFIED",
             "same_fixture_samples": n,
+            "cohort": {"sport": sport, "model_name": model_name, "model_version": model_version},
             "model_direction_accuracy": model_correct / n,
             "market_direction_accuracy": market_correct / n,
             "model_brier": model_brier / n,
@@ -1071,7 +1122,9 @@ def api_evaluation_summary():
                 "macro_expected_calibration_error": ece_by_key.get(key),
                 "snapshot_date_from": lo,
                 "snapshot_date_to": hi,
-                "market_baseline": market_baseline(rows, s["sport"]),
+                "market_baseline": market_baseline(
+                    rows, s["sport"], s["model_name"], s["model_version"]
+                ),
             }
         )
 

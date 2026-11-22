@@ -25,6 +25,7 @@ Key Invariants:
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import datetime
 from typing import Sequence
 
@@ -40,7 +41,7 @@ from utils.evaluation_rows import (
     get_all_evaluation_rows,
     _as_dict,
 )
-from utils.match_lifecycle import valid_full_time_score
+from utils.match_lifecycle import valid_full_time_score, is_finalized_match
 from utils.prediction_snapshots import (
     MODEL_NAMES,
     snapshot_id_for,
@@ -361,13 +362,75 @@ def build_history_view_data(
             if mid:
                 evals_by_match.setdefault(mid, []).append(r)
 
-    # 2. Filter finished matches
-    finished = [
-        m for m in matches
-        if isinstance(m, dict) and m.get("status") == "finished" and m.get("score")
-    ]
+    # 2. Terminal-evidence inclusion with lifecycle presentation (Workstream C).
+    #    Stored-finished matches and stored-live records carrying a valid full-time
+    #    score are presented with an explicit lifecycle label; stored-live records
+    #    WITHOUT terminal evidence remain excluded. Read-only classification that
+    #    reuses existing integrity helpers; nothing here infers finality from
+    #    elapsed time or treats a raw score as source-confirmed finality.
+    settlement_match_ids = {
+        s.get("match_id")
+        for s in settlements_dict.values()
+        if isinstance(s, dict) and s.get("match_id")
+    }
+    matches_by_id = {m.get("id"): m for m in matches if isinstance(m, dict)}
+
+    def _stored_ft(match: dict):
+        ft = (match.get("score") or {}).get("ft")
+        if isinstance(ft, (list, tuple)) and len(ft) >= 2:
+            try:
+                return (int(ft[0]), int(ft[1]))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _evidence_score_tuples(match_id: str):
+        stored = _stored_ft((matches_by_id.get(match_id) or {}))
+        tuples = []
+        for s in settlements_dict.values():
+            if isinstance(s, dict) and s.get("match_id") == match_id:
+                fs = s.get("final_score") or {}
+                if fs.get("home") is not None and fs.get("away") is not None:
+                    tuples.append((int(fs["home"]), int(fs["away"])))
+        for r in evals_by_match.get(match_id, []):
+            fs = r.get("final_score") or {}
+            if fs.get("home") is not None and fs.get("away") is not None:
+                tuples.append((int(fs["home"]), int(fs["away"])))
+        return stored, tuples
+
+    def lifecycle_presentation(m: dict) -> str:
+        if m.get("status") == "finished":
+            # 落盘完赛记录一律保持呈现：比分合法 → 源确认终态；
+            # 比分畸形 → 终场结果不可信（FINAL_RESULT_UNVERIFIED），由既有合同
+            # 安全排除出命中分母，绝不因呈现层重构而丢弃可见性。
+            return (
+                "SOURCE_CONFIRMED_FINISHED"
+                if is_finalized_match(m)
+                else "FINAL_RESULT_UNVERIFIED"
+            )
+        if m.get("status") in ("live", "upcoming") and valid_full_time_score(m.get("score")):
+            stored, evidence_scores = _evidence_score_tuples(m.get("id", ""))
+            if any(t != stored for t in evidence_scores):
+                return "HISTORICAL_EVIDENCE_CONFLICT"
+            mid = m.get("id", "")
+            if mid in settlement_match_ids or mid in evals_by_match:
+                return "LIVE_WITH_TERMINAL_RESULT_EVIDENCE"
+            return "FINAL_RESULT_UNVERIFIED"
+        return "LIVE_WITHOUT_TERMINAL_RESULT_EVIDENCE"
+
+    matches_by_id = {m.get("id"): m for m in matches if isinstance(m, dict)}
+    included: list[dict] = []
+    lifecycle_map: dict[str, str] = {}
+    for m in matches:
+        if not isinstance(m, dict) or not m.get("score"):
+            continue
+        pres = lifecycle_presentation(m)
+        if pres == "LIVE_WITHOUT_TERMINAL_RESULT_EVIDENCE":
+            continue
+        lifecycle_map[m.get("id", "")] = pres
+        included.append(m)
     # Fully deterministic reverse sort by (date, time, id)
-    finished.sort(
+    included.sort(
         key=lambda x: (
             x.get("date", ""),
             x.get("time", ""),
@@ -376,7 +439,22 @@ def build_history_view_data(
         reverse=True,
     )
 
-    visible_matches = finished[:max_display]
+    visible_matches = included[:max_display]
+
+    def _no_evidence_reason(match_id: str) -> str:
+        snap_present = any(
+            isinstance(s, dict) and s.get("match_id") == match_id
+            for s in snapshots_dict.values()
+        )
+        settle_present = match_id in settlement_match_ids
+        eval_present = match_id in evals_by_match
+        if settle_present and not snap_present:
+            return "SETTLEMENT_WITHOUT_SNAPSHOT"
+        if snap_present and not settle_present:
+            return "SNAPSHOT_PRESENT_SETTLEMENT_MISSING"
+        if settle_present or eval_present:
+            return "SETTLEMENT_PRESENT_EVALUATION_UNVERIFIED"
+        return "NO_SNAPSHOT_EVIDENCE"
 
     processed_matches = []
     for m in visible_matches:
@@ -511,10 +589,21 @@ def build_history_view_data(
                 if eval_actual:
                     comparison["correct"] = (pred_out == eval_actual)
 
+        if evidence_status == "no_evidence":
+            comparison["no_evidence_reason"] = _no_evidence_reason(m_id)
+
         m_copy = dict(m)
         m_copy["comparison"] = comparison
         m_copy["evidence_status"] = comparison["evidence_status"]
         m_copy["is_verified"] = comparison["is_verified"]
+        # 生命周期呈现（Workstream C）：落盘状态保持原样，只添加展示层标签与警告。
+        pres = lifecycle_map.get(m_id, "SOURCE_CONFIRMED_FINISHED")
+        m_copy["lifecycle_presentation"] = pres
+        m_copy["state_inconsistency_warning"] = pres in (
+            "LIVE_WITH_TERMINAL_RESULT_EVIDENCE",
+            "HISTORICAL_EVIDENCE_CONFLICT",
+            "FINAL_RESULT_UNVERIFIED",
+        )
         processed_matches.append(m_copy)
 
     # 3. Calculate Reconciled Summary Metrics over visible matches
@@ -522,9 +611,10 @@ def build_history_view_data(
 
     return {
         "matches": processed_matches,
-        "total_finished": len(finished),
+        "total_finished": len(included),
         "visible_count": len(visible_matches),
         "current_sport": sport or "all",
+        "lifecycle_counts": dict(Counter(lifecycle_map.values())),
         "stats": stats,
     }
 

@@ -142,7 +142,10 @@ ALLOWED_PATHS = frozenset((
     "frontend/src/features/HistoryView/HistoryView.module.css",
     "frontend/src/api/matches.ts",
     "frontend/src/hooks/useMatches.ts",
-    "tests/test_product_acceptance_surfaces.py"))
+    "tests/test_product_acceptance_surfaces.py",
+    # market cohort integrity and historical lifecycle presentation corrections
+    "utils/history_evidence.py",
+    "tests/test_historical_lifecycle_presentation.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

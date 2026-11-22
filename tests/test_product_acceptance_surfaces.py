@@ -14,7 +14,8 @@ from test_nba_schedule_completeness import NOW, canonical
 from utils.daily_loader import override_beijing_now
 
 
-def _eval_row(evaluation_id, *, sport="football", outcome="home_win", implied=None):
+def _eval_row(evaluation_id, *, sport="football", outcome="home_win", implied=None,
+              model_version=None, match_id=None):
     probs = (
         {"home_win": 55, "draw": 25, "away_win": 20}
         if sport == "football"
@@ -23,13 +24,13 @@ def _eval_row(evaluation_id, *, sport="football", outcome="home_win", implied=No
     score = {"home": 2, "away": 1} if outcome == "home_win" else {"home": 0, "away": 0}
     row = {
         "evaluation_id": evaluation_id,
-        "match_id": f"m-{evaluation_id[:6]}",
+        "match_id": match_id or f"m-{evaluation_id[:6]}",
         "sport": sport,
         "league": "英超",
         "home_team": "主队",
         "away_team": "客队",
         "model_name": "elo-poisson-dixon-coles" if sport == "football" else "elo-normal-points",
-        "model_version": (
+        "model_version": model_version or (
             "football-coldstart-1" if sport == "football" else "basketball-margin-1"
         ),
         "model_probabilities": probs,
@@ -149,8 +150,159 @@ def test_status_freshness_block_distinguishes_verified_and_stale(isolated_app):
     foot = fresh["per_sport"]["football"]
     assert foot["verified_future_count"] == 0
 
+    # Workstream D：互斥四分区 + 提供商核实二分
+    assert bb["known_future_kickoff"] == 1
+    assert bb["past_kickoff_stored_upcoming"] == 0
+    assert bb["future_kickoff_unknown"] == 1  # 4307 的日期(05-15)在 NOW(05-15)当天 → 未定
+    assert bb["unknown_kickoff_past_date"] == 0
+    # 未携带提供商溯源 → 核实数不得编造
+    assert bb["provider_schedule_verified"] == 0
+    assert bb["provider_schedule_unverified"] == 1
+    assert fresh["provider_evidence"] == "FROM_STORED_PROVENANCE"
+
+
+def test_status_freshness_provider_verification_and_beijing_boundary(isolated_app):
+    """北京日期边界：未知开赛 + 当日 → FUTURE_KICKOFF_UNKNOWN；昨日 → UNKNOWN_KICKOFF_PAST_DATE。
+
+    提供商核实只认 kickoff_provenance = SCHEDULE_PROVIDER_VERIFIED。
+    """
+    from test_nba_schedule_completeness import NOW
+
+    today = canonical()
+    today.update(id="500j-2030-05-15-4301", jczq_no="4301", round="4301",
+                 kickoff_time_known=False, time="00:00")
+    yesterday = canonical()
+    yesterday.update(id="500j-2030-05-14-4302", date="2030-05-14",
+                     jczq_no="4302", round="4302",
+                     kickoff_time_known=False, time="00:00")
+    proven_future = canonical()
+    proven_future.update(id="500j-2030-05-16-4306", date="2030-05-16", time="10:00",
+                         kickoff_time_known=True, market_tracked=True,
+                         odds={"home_win": 1.8, "away_win": 2.0},
+                         kickoff_provenance={
+                             "actual_kickoff_time_source": "balldontlie_nba_games",
+                             "kickoff_source_event_id": "21718096",
+                             "kickoff_source_observed_at": "2030-05-14T00:00:00+08:00",
+                             "kickoff_source_scheduled_start_utc": "2030-05-16T02:00:00Z",
+                             "kickoff_verification_status": "SCHEDULE_PROVIDER_VERIFIED",
+                         })
+    write_stores(isolated_app, [today, yesterday, proven_future])
+
+    with override_beijing_now(NOW):
+        resp = server.app.test_client().get("/api/status")
+    assert resp.status_code == 200
+    bb = resp.get_json()["freshness"]["per_sport"]["basketball"]
+    assert bb["future_kickoff_unknown"] == 1        # 当日未定 → 未定（不是过去）
+    assert bb["unknown_kickoff_past_date"] == 1     # 昨日未定 → 过期
+    assert bb["past_kickoff_stored_upcoming"] == 0
+    assert bb["known_future_kickoff"] == 1
+    assert bb["provider_schedule_verified"] == 1    # 携带 SCHEDULE_PROVIDER_VERIFIED
+    assert bb["provider_schedule_unverified"] == 0
+    # 兼容字段不变式：verified + stale = 存储待赛总数
+    assert bb["verified_future_count"] + bb["stale_upcoming_count"] == bb["stored_upcoming_count"]
+
 
 def test_evaluation_summary_endpoint_is_get_only(isolated_app):
     client = server.app.test_client()
     resp = client.post("/api/evaluation-summary")
     assert resp.status_code == 405
+
+
+def _seed_rows(directory, rows):
+    import json as _json
+    import os
+
+    with open(os.path.join(str(directory), "evaluation_rows.json"), "w", encoding="utf-8") as fh:
+        _json.dump({"rows": {r["evaluation_id"]: r for r in rows}, "version": 1},
+                   fh, ensure_ascii=False, sort_keys=True)
+    return rows
+
+
+def _summary_models():
+    resp = server.app.test_client().get("/api/evaluation-summary")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    return data, {(m["sport"], m["model_version"]): m for m in data["models"]}
+
+
+IMPLIED_OK = {"home_win": 50, "draw": 28, "away_win": 22}
+
+
+def test_market_baseline_isolates_multiple_model_versions(isolated_app):
+    """MULTIPLE_MODEL_VERSIONS_ISOLATED：每个模型版本只消费自己的市场可比样本。"""
+    # v1：2 行；v2：1 行。两版本同为足球但样本集不同。
+    rows = [
+        _eval_row("mv-1", implied=IMPLIED_OK, model_version="football-coldstart-1"),
+        _eval_row("mv-2", implied=IMPLIED_OK, model_version="football-coldstart-1"),
+        _eval_row("mv-3", implied=IMPLIED_OK, outcome="draw",
+                  model_version="football-shadow-x"),
+    ]
+    _seed_rows(isolated_app, rows)
+    before = store_hashes(isolated_app)
+
+    data, models = _summary_models()
+    assert store_hashes(isolated_app) == before  # EVALUATION_ENDPOINT_READ_ONLY
+
+    v1 = models[("football", "football-coldstart-1")]
+    v2 = models[("football", "football-shadow-x")]
+    assert v1["sample_count"] == 2 and v1["market_baseline"]["same_fixture_samples"] == 2
+    assert v2["sample_count"] == 1 and v2["market_baseline"]["same_fixture_samples"] == 1
+    assert v1["market_baseline"]["cohort"]["model_version"] == "football-coldstart-1"
+    assert v2["market_baseline"]["cohort"]["model_version"] == "football-shadow-x"
+
+
+def test_market_baseline_excludes_missing_and_invalid_market_probabilities(isolated_app):
+    """MISSING_MARKET_ODDS_EXCLUDED + INVALID_MARKET_PROBABILITIES_REJECTED。
+
+    分类指标仍然统计全部 5 行；市场基线只吃有效隐含概率的行。
+    """
+    rows = [
+        _eval_row("mk-1", implied=IMPLIED_OK),
+        _eval_row("mk-2", implied=None),                                   # 缺失
+        _eval_row("mk-3", implied={"home_win": True, "draw": 28, "away_win": 22}),  # bool
+        _eval_row("mk-4", implied={"home_win": 0, "draw": 28, "away_win": 22}),     # 非正
+        _eval_row("mk-5", implied={"home_win": "50", "draw": 28, "away_win": 22}),  # 字符串
+    ]
+    _seed_rows(isolated_app, rows)
+
+    data, models = _summary_models()
+    foot = models[("football", "football-coldstart-1")]
+    assert foot["sample_count"] == 5          # 分类口径不受影响
+    assert foot["market_baseline"]["same_fixture_samples"] == 1  # 只有 mk-1 合格
+
+
+def test_market_baseline_paired_on_identical_fixture_identity(isolated_app):
+    """SAME_FIXTURE_MODEL_MARKET_ALIGNMENT：模型与市场在完全相同的行上配对计分。"""
+    # 两行：第一行模型与市场同选主胜且正确；第二行模型选主胜(正确)、市场选客胜(错误)。
+    rows = [
+        _eval_row("pa-1", implied={"home_win": 60, "draw": 20, "away_win": 20}),
+        _eval_row("pa-2", implied={"home_win": 20, "draw": 20, "away_win": 60},
+                  outcome="home_win"),
+    ]
+    _seed_rows(isolated_app, rows)
+
+    data, models = _summary_models()
+    mb = models[("football", "football-coldstart-1")]["market_baseline"]
+    # 模型：2/2 = 1.0；市场：1/2 = 0.5 —— 同一组行、逐行配对
+    assert mb["model_direction_accuracy"] == 1.0
+    assert mb["market_direction_accuracy"] == 0.5
+    assert mb["same_fixture_samples"] == 2
+    assert mb["status"] == "VERIFIED"
+
+
+def test_market_baseline_football_basketball_cohorts_isolated(isolated_app):
+    """FOOTBALL_BASKETBALL_COHORTS_ISOLATED：跨运动不借样本。"""
+    rows = [
+        _eval_row("cb-1", implied=IMPLIED_OK),
+        _eval_row("cb-2", sport="basketball", outcome="home_win",
+                  implied={"home_win": 60, "away_win": 40}),
+    ]
+    _seed_rows(isolated_app, rows)
+
+    data, models = _summary_models()
+    foot = models[("football", "football-coldstart-1")]["market_baseline"]
+    bb = models[("basketball", "basketball-margin-1")]["market_baseline"]
+    assert foot["same_fixture_samples"] == 1
+    assert bb["same_fixture_samples"] == 1
+    assert foot["cohort"]["sport"] == "football"
+    assert bb["cohort"]["sport"] == "basketball"
