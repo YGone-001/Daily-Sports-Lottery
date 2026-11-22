@@ -145,7 +145,9 @@ ALLOWED_PATHS = frozenset((
     "tests/test_product_acceptance_surfaces.py",
     # market cohort integrity and historical lifecycle presentation corrections
     "utils/history_evidence.py",
-    "tests/test_historical_lifecycle_presentation.py"))
+    "tests/test_historical_lifecycle_presentation.py",
+    # evaluation baselines and market provenance status separation
+    "utils/evaluation_baselines.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

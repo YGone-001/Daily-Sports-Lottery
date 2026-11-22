@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import app as server
@@ -306,3 +308,81 @@ def test_market_baseline_football_basketball_cohorts_isolated(isolated_app):
     assert bb["same_fixture_samples"] == 1
     assert foot["cohort"]["sport"] == "football"
     assert bb["cohort"]["sport"] == "basketball"
+
+
+def test_market_baseline_computation_vs_provenance_status(isolated_app):
+    """MARKET_COMPUTATION_VS_PROVENANCE_STATUS：计算完成与方向核实必须分开陈述。"""
+    rows = [_eval_row("pv-1", implied=IMPLIED_OK)]
+    _seed_rows(isolated_app, rows)
+
+    resp = server.app.test_client().get("/api/evaluation-summary")
+    assert resp.status_code == 200
+    mb = resp.get_json()["models"][0]["market_baseline"]
+    assert mb["status"] == "VERIFIED"  # 指计算完成
+    assert mb["computation_status"] == "CALCULATION_COMPLETE"
+    # 方向核实是另一维度：当前未获独立证据，必须如实标 UNRESOLVED / PENDING
+    assert mb["market_source_identity"] == "MARKET_SOURCE_IDENTITY_UNRESOLVED"
+    assert mb["independent_orientation_check"] == "INDEPENDENT_ORIENTATION_CHECK_PENDING"
+
+
+def test_unverified_market_not_promoted(isolated_app):
+    """UNVERIFIED_MARKET_NOT_PROMOTED：响应中不得出现「方向已核实」或模型优越声明。"""
+    rows = [
+        _eval_row("up-1", implied=IMPLIED_OK),
+        _eval_row("up-2", implied=None),  # 无市场证据 → NOT_AVAILABLE 分支
+    ]
+    _seed_rows(isolated_app, rows)
+    # 让两个版本各自成组，覆盖可用与不可用两个分支
+    rows[1]["model_version"] = "football-shadow-x"
+    rows[1]["evaluation_id"] = "up-2"
+    _seed_rows(isolated_app, rows)
+
+    resp = server.app.test_client().get("/api/evaluation-summary")
+    assert resp.status_code == 200
+    text = json.dumps(resp.get_json(), ensure_ascii=False)
+    assert "MARKET_SOURCE_IDENTITY_VERIFIED" not in text
+    assert "MARKET_SOURCE_IDENTITY_UNRESOLVED" in text
+    assert "INDEPENDENT_ORIENTATION_CHECK_PENDING" in text
+    # 不得出现模型优越的市场对比结论字段
+    for forbidden in ("model_beats_market", "beats_market", "superior_to_market"):
+        assert forbidden not in text
+    for m in resp.get_json()["models"]:
+        assert m["market_baseline"]["market_source_identity"] != "MARKET_SOURCE_IDENTITY_VERIFIED"
+
+
+def test_expanding_baseline_no_historical_result_leakage():
+    """NO_HISTORICAL_RESULT_LEAKAGE：扩展频率基线只使用严格早于当前行的观测。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _eval_row("lk-1", outcome="away_win"),
+        _eval_row("lk-2", outcome="home_win"),
+        _eval_row("lk-3", outcome="home_win"),
+    ]
+    # 各行 kickoff 依次递增；若存在泄漏，首行概率会被后两行的主胜"污染"
+    rows[0]["kickoff_at"] = "2030-01-01T20:00:00+08:00"
+    rows[1]["kickoff_at"] = "2030-01-02T20:00:00+08:00"
+    rows[2]["kickoff_at"] = "2030-01-03T20:00:00+08:00"
+
+    result = expanding_frequency_baseline(rows)
+    per_row = result["per_row"]
+    # 首行：0 个先验观测 → Laplace 均匀（对后续结果完全无知）
+    assert per_row[0]["prior_observation_count"] == 0
+    assert per_row[0]["probabilities"] == {"home_win": 1 / 3, "draw": 1 / 3, "away_win": 1 / 3}
+    # 末行：恰好 2 个先验观测（不含自身结果）
+    assert per_row[2]["prior_observation_count"] == 2
+    # 第二行只见过 lk-1 的 away_win：主胜概率 = 1/4 而非被后行主胜推高
+    assert abs(per_row[1]["probabilities"]["home_win"] - 0.25) < 1e-9
+
+
+def test_baseline_class_integrity_uniform_values():
+    """FOOTBALL_THREE_CLASS / BASKETBALL_TWO_CLASS：均匀基线解析值必须精确。"""
+    from utils.evaluation_baselines import uniform_baseline
+
+    foot = uniform_baseline([_eval_row("u-1")])
+    assert foot["multiclass_brier"] == pytest.approx(2 / 3)
+    assert foot["log_loss"] == pytest.approx(__import__("math").log(3))
+
+    bb = uniform_baseline([_eval_row("u-2", sport="basketball", outcome="home_win")])
+    assert bb["multiclass_brier"] == pytest.approx(0.5)
+    assert bb["log_loss"] == pytest.approx(__import__("math").log(2))

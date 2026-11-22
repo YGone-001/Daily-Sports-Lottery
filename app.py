@@ -1074,6 +1074,9 @@ def api_evaluation_summary():
             return {
                 "status": "MARKET_BASELINE_NOT_AVAILABLE",
                 "same_fixture_samples": 0,
+                "computation_status": "NO_ELIGIBLE_ROWS",
+                "market_source_identity": "MARKET_SOURCE_IDENTITY_UNRESOLVED",
+                "independent_orientation_check": "INDEPENDENT_ORIENTATION_CHECK_PENDING",
                 "cohort": {"sport": sport, "model_name": model_name, "model_version": model_version},
             }
         model_correct = market_correct = 0
@@ -1091,6 +1094,12 @@ def api_evaluation_summary():
         n = len(same)
         return {
             "status": "VERIFIED",
+            # Workstream D.1：计算完成 ≠ 方向已独立核实。市场方向未经独立证据裁定前
+            # （4-C 取证 PARTIAL / 4-D 仲裁 BLOCKED_AUTHORIZATION），对比仅供参考，
+            # 绝不表述为「模型优于市场」。
+            "computation_status": "CALCULATION_COMPLETE",
+            "market_source_identity": "MARKET_SOURCE_IDENTITY_UNRESOLVED",
+            "independent_orientation_check": "INDEPENDENT_ORIENTATION_CHECK_PENDING",
             "same_fixture_samples": n,
             "cohort": {"sport": sport, "model_name": model_name, "model_version": model_version},
             "model_direction_accuracy": model_correct / n,

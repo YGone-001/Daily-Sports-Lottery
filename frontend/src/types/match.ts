@@ -264,6 +264,10 @@ export interface FreshnessSummary {
 
 export interface MarketBaselineComparison {
   status: 'VERIFIED' | 'MARKET_BASELINE_NOT_AVAILABLE'
+  /** Workstream D.1：计算完成 ≠ 历史市场方向已独立核实。 */
+  computation_status?: 'CALCULATION_COMPLETE' | 'NO_ELIGIBLE_ROWS'
+  market_source_identity?: 'MARKET_SOURCE_IDENTITY_VERIFIED' | 'MARKET_SOURCE_IDENTITY_UNRESOLVED'
+  independent_orientation_check?: 'INDEPENDENT_ORIENTATION_CHECK_PENDING' | 'COMPLETED'
   same_fixture_samples: number
   model_direction_accuracy?: number
   market_direction_accuracy?: number

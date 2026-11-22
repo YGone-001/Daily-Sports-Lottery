@@ -266,6 +266,10 @@ const EvaluationSummaryPanel: React.FC = () => {
       </table>
       <p className={styles.evalNote}>
         指标口径：概率源 model_probabilities；多分类 Brier = mean(Σ(p−y)²)，足球三分类、篮球二分类口径不同，不跨运动比较。
+        {data.models.some(
+          (m) => m.market_baseline.market_source_identity === 'MARKET_SOURCE_IDENTITY_UNRESOLVED',
+        ) &&
+          ' 市场基线的历史主客方向尚未经独立证据核实（INDEPENDENT_ORIENTATION_CHECK_PENDING），市场对比仅供参考，不得解读为「模型优于市场」。'}
         {data.models.some((m) => m.market_baseline.status === 'VERIFIED') &&
           ' 市场基线仅在两方概率齐全的同样本上比较，样本数不同属正常。'}
         模型估计的价值不是已验证的盈利能力；小样本不构成模型优劣结论。
