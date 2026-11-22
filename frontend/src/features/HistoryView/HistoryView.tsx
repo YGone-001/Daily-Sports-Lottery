@@ -1,6 +1,6 @@
 import React from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { useHistory } from '@/hooks';
+import { useHistory, useEvaluationSummary } from '@/hooks';
 import type { HistoryComparison, HistorySportStats } from '@/types/match';
 import { SportFilter } from '@/components/SportFilter';
 import { EmptyState } from '@/components/EmptyState';
@@ -137,6 +137,7 @@ export const HistoryView: React.FC = () => {
           <div className={styles.calibBar}>
             {renderScopeMetrics(currentSport, stats.football, stats.basketball)}
           </div>
+          <EvaluationSummaryPanel />
           <div className={styles.historyList}>
             {matches.map((match) => (
               <Link key={match.id} to={`/match/${match.id}`} className={styles.historyRow}>
@@ -155,6 +156,77 @@ export const HistoryView: React.FC = () => {
         <EmptyState title="暂无历史赛果" subtitle="等待赛事完赛后自动归档" icon="◈" />
       )}
     </div>
+  );
+};
+
+/**
+ * 只读模型质量摘要（Workstream D.5）：直接呈现后端 /api/evaluation-summary
+ * 按 (sport, model_version) 分组的既有不可变样本指标。
+ * 足球三分类与篮球二分类的 Brier 口径不同，绝不并排比较；
+ * 小样本（尤其篮球）不构成模型优劣或盈利结论。
+ */
+const pct = (v: number | undefined | null): string =>
+  v == null ? '—' : `${(Math.round(v * 1000) / 10).toFixed(1)}%`
+
+const num = (v: number | undefined | null, digits = 3): string =>
+  v == null ? '—' : v.toFixed(digits)
+
+const EvaluationSummaryPanel: React.FC = () => {
+  const { data, isLoading, isError } = useEvaluationSummary();
+  if (isLoading) return <p className={styles.evalNote}>正在加载评估摘要…</p>;
+  if (isError || !data || data.models.length === 0) return null;
+  return (
+    <section className={styles.evalPanel} aria-label="模型评估摘要">
+      <h2 className={styles.evalTitle}>模型评估摘要（不可变样本 · 只读）</h2>
+      <table className={styles.evalTable}>
+        <thead>
+          <tr>
+            <th>运动 / 模型版本</th>
+            <th>样本</th>
+            <th>快照日期范围</th>
+            <th>方向命中率</th>
+            <th>Brier</th>
+            <th>LogLoss</th>
+            <th>校准 ECE</th>
+            <th>市场基线（同样本）</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.models.map((m) => (
+            <tr key={`${m.sport}-${m.model_version}`}>
+              <td className="mono">
+                {m.sport === 'football' ? '足球' : '篮球'} · {m.model_version}
+              </td>
+              <td>{m.sample_count}</td>
+              <td className="mono">
+                {m.snapshot_date_from.slice(0, 10)} ~ {m.snapshot_date_to.slice(0, 10)}
+              </td>
+              <td>{pct(m.accuracy)}</td>
+              <td>{num(m.brier_score)}</td>
+              <td>{num(m.multiclass_log_loss)}</td>
+              <td>{num(m.macro_expected_calibration_error)}</td>
+              <td>
+                {m.market_baseline.status === 'VERIFIED' ? (
+                  <>
+                    模型 {pct(m.market_baseline.model_direction_accuracy)} vs 市场{' '}
+                    {pct(m.market_baseline.market_direction_accuracy)}（n=
+                    {m.market_baseline.same_fixture_samples}）
+                  </>
+                ) : (
+                  'MARKET_BASELINE_NOT_AVAILABLE'
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className={styles.evalNote}>
+        指标口径：概率源 model_probabilities；多分类 Brier = mean(Σ(p−y)²)，足球三分类、篮球二分类口径不同，不跨运动比较。
+        {data.models.some((m) => m.market_baseline.status === 'VERIFIED') &&
+          ' 市场基线仅在两方概率齐全的同样本上比较，样本数不同属正常。'}
+        模型估计的价值不是已验证的盈利能力；小样本不构成模型优劣结论。
+      </p>
+    </section>
   );
 };
 

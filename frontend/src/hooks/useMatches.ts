@@ -13,6 +13,7 @@ import {
   fetchMatchSettlements,
   fetchStatus,
   fetchHistory,
+  fetchEvaluationSummary,
 } from '@/api/matches'
 import type {
   Match,
@@ -22,6 +23,7 @@ import type {
   SettlementRecord,
   SystemStatus,
   HistoryResponse,
+  EvaluationSummary,
 } from '@/types/match'
 
 /**
@@ -40,6 +42,7 @@ export const matchKeys = {
   dates: ['dates'] as const,
   status: ['status'] as const,
   history: (sport?: string) => ['history', { sport }] as const,
+  evaluationSummary: ['evaluation-summary'] as const,
 }
 
 /**
@@ -137,5 +140,14 @@ export function useHistory(sport?: string) {
     queryFn: () => fetchHistory(sport),
     staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: true,
+  })
+}
+
+/** 只读：既有不可变评估样本的模型质量摘要（分类 + 校准 + 市场基线可用性）。 */
+export function useEvaluationSummary() {
+  return useQuery<EvaluationSummary, Error>({
+    queryKey: matchKeys.evaluationSummary,
+    queryFn: fetchEvaluationSummary,
+    staleTime: 10 * 60 * 1000,
   })
 }

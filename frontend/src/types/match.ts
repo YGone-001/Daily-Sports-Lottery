@@ -238,6 +238,50 @@ export interface SystemStatus {
     index_sha256: string
     entry_asset: string | null
   } | null
+  freshness?: FreshnessSummary
+}
+
+export interface SportFreshness {
+  stored_upcoming_count: number
+  verified_future_count: number
+  stale_upcoming_count: number
+  latest_market_event_date: string | null
+}
+
+export interface FreshnessSummary {
+  generated_at: string
+  per_sport: Record<string, SportFreshness>
+  note?: string
+}
+
+export interface MarketBaselineComparison {
+  status: 'VERIFIED' | 'MARKET_BASELINE_NOT_AVAILABLE'
+  same_fixture_samples: number
+  model_direction_accuracy?: number
+  market_direction_accuracy?: number
+  model_brier?: number
+  market_brier?: number
+}
+
+export interface EvaluationModelSummary {
+  sport: 'football' | 'basketball'
+  model_name: string
+  model_version: string
+  sample_count: number
+  accuracy: number
+  brier_score: number
+  multiclass_log_loss: number
+  macro_expected_calibration_error: number | null
+  snapshot_date_from: string
+  snapshot_date_to: string
+  market_baseline: MarketBaselineComparison
+}
+
+export interface EvaluationSummary {
+  generated_at: string
+  probability_source: string
+  convention: { brier: string; logloss: string; note: string }
+  models: EvaluationModelSummary[]
 }
 
 export type HistoryEvidenceStatus =

@@ -53,7 +53,6 @@ from utils.history_evidence import build_history_view_data
 from utils.odds_snapshots import get_odds_history_for_match
 from utils.prediction_snapshots import get_snapshots_for_match
 from utils.settlements import get_settlements_for_match
-
 app = Flask(__name__)
 app.config.from_object(config)
 
@@ -109,6 +108,48 @@ def _frontend_build_identity() -> dict | None:
         }
     except OSError:
         return None
+
+
+def _freshness_summary() -> dict:
+    """
+    只读：按运动汇总数据新鲜度（Workstream B 的口径）。
+
+    - ``verified_future``：开赛时间已知且在当前时钟之前的待赛赛事；
+    - ``stale_upcoming``：落盘仍为 upcoming 但已不属于 verified_future 的记录
+      （含未知开赛时间与已过开赛时刻两种），绝不把过期记录当作未来赛事；
+    - ``latest_market_event_date``：仍有有效盘口覆盖的最新比赛日。
+    源侧的在线状态见既有 ``source_health``；本块只描述**已落盘数据**的时效。
+    """
+    from utils.market_coverage import has_usable_market_odds
+    from utils.match_identity import is_kickoff_time_known
+
+    now = get_beijing_now()
+    per_sport = {}
+    for sport in ("football", "basketball"):
+        sub = [m for m in daily_loader.get_all_matches() if m.get("sport") == sport]
+        upcoming = [m for m in sub if m.get("status") == "upcoming"]
+        verified = [
+            m
+            for m in upcoming
+            if is_kickoff_time_known(m)
+            and (kick := daily_loader.get_match_datetime(m))
+            and now < kick
+        ]
+        market_dates = sorted(
+            {m.get("date") for m in sub if has_usable_market_odds(m) and m.get("date")},
+            reverse=True,
+        )
+        per_sport[sport] = {
+            "stored_upcoming_count": len(upcoming),
+            "verified_future_count": len(verified),
+            "stale_upcoming_count": len(upcoming) - len(verified),
+            "latest_market_event_date": market_dates[0] if market_dates else None,
+        }
+    return {
+        "generated_at": now.isoformat(),
+        "per_sport": per_sport,
+        "note": "刷新完成不等于源覆盖新鲜；源侧在线状态见 source_health",
+    }
 
 
 def _runtime_capability() -> dict:
@@ -376,6 +417,7 @@ def api_status():
             "team_pool": strength_stats(),
             "today_stats": get_daily_stats(),
             "source_health": build_source_health(),
+            "freshness": _freshness_summary(),
             "runtime": _runtime_capability(),
             "frontend_build_identity": _frontend_build_identity(),
         }
@@ -945,6 +987,107 @@ def api_history():
         sport = None
     matches = get_matches_by_date("all", sport)
     return jsonify(build_history_view_data(matches, sport=sport))
+
+
+@app.route("/api/evaluation-summary")
+def api_evaluation_summary():
+    """只读：既有不可变评估样本的模型质量摘要。
+
+    指标计算完全复用 ``utils.classification_evaluation`` / ``utils.calibration_evaluation``
+    的强制约定（概率源 ``model_probabilities``、多分类 Brier、足球三分类 / 篮球二分类），
+    不在此另立第二套口径。市场基线只在**同一样本**上比较双方 argmax 与 Brier；
+    原始赔率缺失的样本不参与（如实标注样本数），绝不重建赛后赔率。
+    """
+    from utils.classification_evaluation import (
+        build_classification_summaries,
+        classes_for_sport,
+        validate_row,
+    )
+    from utils.calibration_evaluation import build_calibration_summaries
+    from utils.evaluation_rows import get_all_evaluation_rows
+
+    rows = get_all_evaluation_rows()
+
+    classification = build_classification_summaries(rows)
+    calibration = build_calibration_summaries(rows)
+    ece_by_key = {
+        (s["sport"], s["model_name"], s["model_version"]): s["macro_expected_calibration_error"]
+        for s in calibration
+    }
+
+    def market_baseline(rows, sport):
+        classes = classes_for_sport(sport)
+        same = []
+        for r in rows:
+            if r.get("sport") != sport:
+                continue
+            imp = r.get("market_implied_probabilities") or {}
+            if all(isinstance(imp.get(c), (int, float)) and imp.get(c) > 0 for c in classes):
+                same.append(r)
+        if not same:
+            return {"status": "MARKET_BASELINE_NOT_AVAILABLE", "same_fixture_samples": 0}
+        model_correct = market_correct = 0
+        model_brier = market_brier = 0.0
+        for r in same:
+            _classes, probs, actual = validate_row(r)
+            p_model = dict(zip(_classes, probs))
+            imp = r["market_implied_probabilities"]
+            total = sum(float(imp[c]) for c in classes)
+            p_market = {c: float(imp[c]) / total for c in classes}
+            model_correct += max(p_model, key=lambda c: p_model[c]) == actual
+            market_correct += max(p_market, key=lambda c: p_market[c]) == actual
+            model_brier += sum((p_model[c] - (1.0 if c == actual else 0.0)) ** 2 for c in classes)
+            market_brier += sum((p_market[c] - (1.0 if c == actual else 0.0)) ** 2 for c in classes)
+        n = len(same)
+        return {
+            "status": "VERIFIED",
+            "same_fixture_samples": n,
+            "model_direction_accuracy": model_correct / n,
+            "market_direction_accuracy": market_correct / n,
+            "model_brier": model_brier / n,
+            "market_brier": market_brier / n,
+        }
+
+    date_range = {}
+    for r in rows:
+        key = (r.get("sport"), r.get("model_name"), r.get("model_version"))
+        gen = r.get("prediction_generated_at") or ""
+        lo, hi = date_range.get(key, (gen, gen))
+        date_range[key] = (min(lo, gen), max(hi, gen))
+
+    models = []
+    for s in classification:
+        key = (s["sport"], s["model_name"], s["model_version"])
+        lo, hi = date_range.get(key, ("", ""))
+        models.append(
+            {
+                "sport": s["sport"],
+                "model_name": s["model_name"],
+                "model_version": s["model_version"],
+                "sample_count": s["sample_count"],
+                "accuracy": s["accuracy"],
+                "brier_score": s["brier_score"],
+                "multiclass_log_loss": s["multiclass_log_loss"],
+                "macro_expected_calibration_error": ece_by_key.get(key),
+                "snapshot_date_from": lo,
+                "snapshot_date_to": hi,
+                "market_baseline": market_baseline(rows, s["sport"]),
+            }
+        )
+
+    return jsonify(
+        {
+            "generated_at": get_beijing_now().isoformat(),
+            "probability_source": "model_probabilities",
+            "convention": {
+                "brier": "多分类 Brier = mean(sum_k (p_k - y_k)^2)；足球三分类、篮球二分类，"
+                "两者口径不同，不得跨运动比较",
+                "logloss": "自然对数，epsilon=1e-15 仅裁剪",
+                "note": "模型估计的价值不是已验证的盈利能力；小样本不构成模型优劣结论",
+            },
+            "models": models,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

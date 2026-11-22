@@ -16,6 +16,18 @@
   color: var(--text-muted);
 }
 
+.tagUnset {
+  background: var(--bg-overlay);
+  color: var(--warn, #d9a13c);
+  border: 1px solid var(--warn, #d9a13c);
+}
+
+.tagUnverified {
+  background: var(--bg-overlay);
+  color: var(--text-faint);
+  border: 1px dashed var(--border-strong);
+}
+
 .tagDone {
   background: var(--bg-overlay);
   color: var(--text-faint);

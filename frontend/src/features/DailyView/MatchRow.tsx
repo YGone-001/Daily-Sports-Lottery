@@ -136,7 +136,11 @@ export const MatchRow: React.FC<MatchRowProps> = ({ match }) => {
 
       {/* 状态与悬念 */}
       <span className={styles.mrStatus}>
-        <StatusTag status={match.status} />
+        <StatusTag
+          status={match.status}
+          kickoffTimeKnown={match.kickoff_time_known}
+          matchDate={match.date}
+        />
         {match.prediction?.suspense && !isFinished && (
           <SuspenseStars
             stars={match.prediction.suspense.stars}

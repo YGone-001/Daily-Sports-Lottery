@@ -170,6 +170,13 @@
     border-left-color: var(--accent);
 }
 
+.freshnessLine {
+    margin: -6px 0 16px;
+    font-size: var(--fs-2xs);
+    color: var(--text-muted);
+    line-height: 1.6;
+}
+
 .leagueStream {
     display: flex;
     flex-direction: column;

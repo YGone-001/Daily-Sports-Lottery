@@ -30,13 +30,21 @@ const OUTCOME_LABELS: Record<NonNullable<SettlementRecord['actual_outcome']>, st
   away_win: '客胜',
 };
 
-function SnapshotCard({ snapshots }: { snapshots: MatchSnapshot[] }) {
+function SnapshotCard({
+  snapshots,
+  isLoading,
+}: {
+  snapshots: MatchSnapshot[];
+  isLoading: boolean;
+}) {
   return (
     <div className={`${styles.dataCard} ${styles.span2}`}>
       <h3 className={styles.dcTitle}>
         <Icon name="list" />赛前预测快照（不可变历史）
       </h3>
-      {snapshots.length === 0 ? (
+      {isLoading ? (
+        <p className={styles.noteFaint}>正在加载快照记录…</p>
+      ) : snapshots.length === 0 ? (
         <p className={styles.noteFaint}>
           暂无赛前预测快照：该场未在开赛前捕获预测（可能因开赛时间未知、当时无可用盘口，或赛事开赛后才被收录）。这里只显示真实留存的快照，不会重建历史。
         </p>
@@ -68,13 +76,21 @@ function SnapshotCard({ snapshots }: { snapshots: MatchSnapshot[] }) {
   );
 }
 
-function SettlementsCard({ settlements }: { settlements: SettlementRecord[] }) {
+function SettlementsCard({
+  settlements,
+  isLoading,
+}: {
+  settlements: SettlementRecord[];
+  isLoading: boolean;
+}) {
   return (
     <div className={`${styles.dataCard} ${styles.span2}`}>
       <h3 className={styles.dcTitle}>
         <Icon name="coins" />结算记录（源确认赛果）
       </h3>
-      {settlements.length === 0 ? (
+      {isLoading ? (
+        <p className={styles.noteFaint}>正在加载结算记录…</p>
+      ) : settlements.length === 0 ? (
         <p className={styles.noteFaint}>
           暂无结算记录：等待官方赛果确认。仅因时间流逝推导的状态不会触发结算。
         </p>
@@ -121,8 +137,8 @@ export const MatchDetail: React.FC = () => {
   const { id = '' } = useParams<{ id: string }>();
   const { data: match, isLoading, isError } = useMatch(id);
   const { data: oddsHistory = [] } = useMatchOddsHistory(id);
-  const { data: snapshots = [] } = useMatchSnapshots(id);
-  const { data: settlements = [] } = useMatchSettlements(id);
+  const { data: snapshots = [], isLoading: snapshotsLoading } = useMatchSnapshots(id);
+  const { data: settlements = [], isLoading: settlementsLoading } = useMatchSettlements(id);
 
   if (isLoading) {
     return (
@@ -200,7 +216,11 @@ export const MatchDetail: React.FC = () => {
           <span className={styles.dhLeague}>{match.league}</span>
           {match.round && <span>{match.round}</span>}
           <span className="mono">{kickoffLabel}</span>
-          <StatusTag status={match.status} />
+          <StatusTag
+            status={match.status}
+            kickoffTimeKnown={match.kickoff_time_known}
+            matchDate={match.date}
+          />
         </div>
 
         <div className={styles.dhMatchup}>
@@ -557,10 +577,10 @@ export const MatchDetail: React.FC = () => {
         </div>
 
         {/* 赛前预测快照（不可变） */}
-        <SnapshotCard snapshots={snapshots} />
+        <SnapshotCard snapshots={snapshots} isLoading={snapshotsLoading} />
 
         {/* 结算记录 */}
-        <SettlementsCard settlements={settlements} />
+        <SettlementsCard settlements={settlements} isLoading={settlementsLoading} />
 
         {/* 实力情报与模型输入 */}
         {p?.key_info && (

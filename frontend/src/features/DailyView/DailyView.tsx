@@ -215,6 +215,23 @@ export const DailyView: React.FC = () => {
         </div>
       )}
 
+      {/* 数据新鲜度（Workstream B）：刷新完成 ≠ 源覆盖新鲜；过期待赛必须可见 */}
+      {status?.freshness?.per_sport && (
+        <p className={styles.freshnessLine}>
+          {Object.entries(status.freshness.per_sport)
+            .map(([sport, f]) => {
+              const label = sport === 'football' ? '足球' : '篮球';
+              const parts = [`${label}：未来已核实 ${f.verified_future_count} 场`];
+              if (f.stale_upcoming_count > 0)
+                parts.push(`待核实/过期 ${f.stale_upcoming_count} 场`);
+              if (f.latest_market_event_date)
+                parts.push(`最新盘口日 ${f.latest_market_event_date.slice(5)}`);
+              return parts.join(' · ');
+            })
+            .join(' ｜ ')}
+        </p>
+      )}
+
       {/* 同步结果反馈：服务端拒绝/未授权/忙碌/网络失败都必须显式可见 */}
       {refreshError && (
         <div className={styles.refreshNotice} role="alert">

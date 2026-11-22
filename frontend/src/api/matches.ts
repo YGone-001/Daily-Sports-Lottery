@@ -13,7 +13,13 @@ import type {
   DatesResponse,
   SystemStatus,
   RefreshResult,
+  EvaluationSummary,
 } from '@/types/match'
+
+/** 只读：既有不可变评估样本的模型质量摘要（与 /history 证据视图互补）。 */
+export async function fetchEvaluationSummary(): Promise<EvaluationSummary> {
+  return apiClient.get<EvaluationSummary>('/api/evaluation-summary')
+}
 
 /**
  * 获取赛事列表

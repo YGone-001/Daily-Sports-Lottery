@@ -131,7 +131,18 @@ ALLOWED_PATHS = frozenset((
     "frontend/src/features/DailyView/refreshMessages.ts",
     "frontend/src/features/DailyView/refreshMessages.test.ts",
     "frontend/src/features/MatchDetail/MatchDetail.tsx",
-    "tests/test_multisport_refresh_integration.py"))
+    "tests/test_multisport_refresh_integration.py",
+    # real-data acceptance diagnostics and user-facing status honesty
+    "frontend/src/components/StatusTag/StatusTag.tsx",
+    "frontend/src/components/StatusTag/StatusTag.module.css",
+    "frontend/src/components/StatusTag/presentStatus.ts",
+    "frontend/src/components/StatusTag/presentStatus.test.ts",
+    "frontend/src/features/DailyView/MatchRow.tsx",
+    "frontend/src/features/HistoryView/HistoryView.tsx",
+    "frontend/src/features/HistoryView/HistoryView.module.css",
+    "frontend/src/api/matches.ts",
+    "frontend/src/hooks/useMatches.ts",
+    "tests/test_product_acceptance_surfaces.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

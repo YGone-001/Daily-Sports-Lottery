@@ -130,6 +130,48 @@
     margin-top: 2px;
 }
 
+.evalPanel {
+    margin-top: 20px;
+    padding: 16px 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elev);
+    overflow-x: auto;
+}
+
+.evalTitle {
+    font-size: var(--fs-sm);
+    font-weight: 700;
+    margin-bottom: 10px;
+    color: var(--text-primary);
+}
+
+.evalTable {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--fs-xs);
+}
+
+.evalTable th,
+.evalTable td {
+    text-align: left;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.evalTable th {
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.evalNote {
+    margin-top: 10px;
+    font-size: var(--fs-2xs);
+    color: var(--text-muted);
+    line-height: 1.6;
+}
+
 @media (max-width: 860px) {
     .historyRow {
         grid-template-columns: 1fr auto;
