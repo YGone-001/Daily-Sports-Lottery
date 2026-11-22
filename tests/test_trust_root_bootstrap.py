@@ -124,7 +124,14 @@ ALLOWED_PATHS = frozenset((
     "tests/test_nba_competition_and_prospective.py",
     # current-season window certification and immutable prospective shadow capture
     "tools/nba_shadow_capture.py",
-    "tests/test_nba_prospective_shadow_capture.py"))
+    "tests/test_nba_prospective_shadow_capture.py",
+    # default-deny local UI refresh and product evidence surfaces
+    "README.md",
+    "frontend/src/features/DailyView/DailyView.module.css",
+    "frontend/src/features/DailyView/refreshMessages.ts",
+    "frontend/src/features/DailyView/refreshMessages.test.ts",
+    "frontend/src/features/MatchDetail/MatchDetail.tsx",
+    "tests/test_multisport_refresh_integration.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

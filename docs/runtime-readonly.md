@@ -2,10 +2,13 @@
 
 ## 默认启动
 
-应用默认 `RUNTIME_WRITES_ENABLED=false`、`BACKGROUND_REFRESH_ENABLED=false`，提供商网络默认关闭。
+应用默认 `RUNTIME_WRITES_ENABLED=false`、`BACKGROUND_REFRESH_ENABLED=false`、
+`LOCAL_UI_REFRESH_ENABLED=false`，提供商网络默认关闭（`DSL_ENABLE_NBA_SCHEDULE_NETWORK`
+只认显式环境变量，不再从本地 UI 开关或凭据存在推导）。
 必须另获操作者启动许可才可在真实主机运行 `python app.py`；本文不是启动授权。
 安全只读配置使用 `DSL_RUNTIME_WRITES_ENABLED=false`、`DSL_BACKGROUND_REFRESH_ENABLED=false`、
-`DSL_ENABLE_NBA_SCHEDULE_NETWORK=false`。DEBUG=False 或 Werkzeug 子进程都不会自动获得写权限。
+`DSL_LOCAL_UI_REFRESH_ENABLED=false`、`DSL_ENABLE_NBA_SCHEDULE_NETWORK=false`。
+DEBUG=False 或 Werkzeug 子进程都不会自动获得写权限。
 
 ## GET 与既有数据
 
@@ -16,16 +19,18 @@
 
 ## 显式 POST
 
-`POST /api/refresh` 必须同时满足：
+`POST /api/refresh` 默认拒绝。**主写开关是总门**：`DSL_RUNTIME_WRITES_ENABLED` 未显式为 true 时，
+任何请求（包括本地回环 + 浏览器头）都返回 403 `RUNTIME_WRITES_DISABLED`——
+回环地址与 `X-Requested-With` / `Sec-Fetch-Site` / Referer / Origin 等浏览器可伪造头不构成操作者授权。
 
-| 配置或请求 | 要求 |
-| --- | --- |
-| `DSL_RUNTIME_WRITES_ENABLED` | 显式 true |
-| `DSL_RUNTIME_WRITE_TOKEN` | 服务端安全环境配置的非空操作者令牌 |
-| `X-Refresh-Token` | 请求头与服务端令牌恒定时间比较匹配 |
+主写开关开启后仍分两路：
+
+| 通道 | 要求 | 拒绝码 |
+| --- | --- | --- |
+| 程序化调用（默认通道） | 服务端非空 `DSL_RUNTIME_WRITE_TOKEN` 且请求头 `X-Refresh-Token` 恒定时间匹配 | 403 `REFRESH_AUTHORIZATION_REQUIRED` |
+| 本地 Web UI 通道（免令牌） | `DSL_LOCAL_UI_REFRESH_ENABLED=true` **且**主写开关开启**且**回环地址**且**同源上下文头**，四者同时成立 | 不满足任一即退回令牌校验 |
 
 缺写开关或令牌均返回 403，忙时仍返回 409。没有令牌回显，不把令牌放进 URL、报告、源码或浏览器构建产物。
-前端调用使用 POST。在本地回环场景下，系统通过 `DSL_LOCAL_UI_REFRESH_ENABLED=true` 允许本地 Web UI 客户端携带同源上下文或 `X-Requested-With` 触发同步；只读生产部署或外部远程调用仍受到写开关与令牌严格保护。
 授权操作由操作者经受控客户端携带请求头执行。配置写能力**不等于**对真实运行库操作的独立批准。
 后台刷新还必须显式启用 `DSL_BACKGROUND_REFRESH_ENABLED=true`，默认保持关闭；reloader 判定仅防重复线程。
 

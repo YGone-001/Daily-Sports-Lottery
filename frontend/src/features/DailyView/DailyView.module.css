@@ -140,6 +140,36 @@
     cursor: wait;
 }
 
+.refreshNotice {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--danger, #e5484d);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elev);
+    font-size: var(--fs-xs);
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.refreshNoticeIcon {
+    flex-shrink: 0;
+    color: var(--danger, #e5484d);
+}
+
+.refreshNoticeText {
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+}
+
+.refreshNoticeInfo {
+    border-left-color: var(--accent);
+}
+
 .leagueStream {
     display: flex;
     flex-direction: column;

@@ -216,6 +216,14 @@ export interface DatesResponse {
 }
 
 // 系统状态（对应 /api/status）
+export interface RuntimeCapability {
+  runtime_writes_enabled: boolean
+  background_refresh_enabled: boolean
+  local_ui_refresh_enabled: boolean
+  /** 主写开关与本地 UI 开关同时开启时，界面同步才可用（不含任何令牌信息）。 */
+  refresh_available_via_ui: boolean
+}
+
 export interface SystemStatus {
   meta: Meta
   dates: string[]
@@ -225,6 +233,11 @@ export interface SystemStatus {
     calibrated: number
   }
   today_stats: DailyStats
+  runtime?: RuntimeCapability
+  frontend_build_identity?: {
+    index_sha256: string
+    entry_asset: string | null
+  } | null
 }
 
 export type HistoryEvidenceStatus =

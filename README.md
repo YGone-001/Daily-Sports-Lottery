@@ -264,7 +264,16 @@ python3 app.py
 http://127.0.0.1:5000
 ```
 
-启动后会自动拉起**后台抓取线程**（默认每 30 分钟刷新一次竞彩赛程与赔率）。
+启动后默认**只读**：不启动后台抓取、不允许 HTTP 触发刷新（刷新按钮会明确显示「同步未启用」）。
+如需启用能力，须显式设置环境变量（能力开启 ≠ 操作者批准，详见 `docs/runtime-readonly.md`）：
+
+```bash
+# 后台抓取线程（默认每 30 分钟刷新一次竞彩赛程与赔率）：
+DSL_BACKGROUND_REFRESH_ENABLED=true
+# 本地 Web UI 同步（需与主写开关同时开启）：
+DSL_RUNTIME_WRITES_ENABLED=true DSL_LOCAL_UI_REFRESH_ENABLED=true
+# 程序化刷新调用：另需非空 DSL_RUNTIME_WRITE_TOKEN，请求头 X-Refresh-Token 匹配
+```
 
 ### 后台常驻运行（可选）
 
@@ -326,8 +335,8 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 | GET | `/api/match/<id>/settlements` | 该场结算记录（只读，无记录返回空列表） |
 | GET | `/api/dates` | 可用日期与联赛列表 |
 | GET | `/api/strategy?sport=` | 策略推荐（价值盘口 + 串关） |
-| GET/POST | `/api/refresh` | 手动触发一次抓取 |
-| GET | `/api/status` | 系统状态（元信息、日期、球队库、当日统计） |
+| POST | `/api/refresh` | 手动触发一次抓取（默认拒绝：需显式开启运行时写开关；本地 UI 通道另需本地开关，程序化调用需刷新令牌） |
+| GET | `/api/status` | 系统状态（元信息、日期、球队库、当日统计、源诊断、运行时能力与前端构建标识） |
 
 ## 市场覆盖准入
 

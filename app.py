@@ -89,6 +89,44 @@ def _frontend_index():
     return send_from_directory(_FRONTEND_DIST, "index.html")
 
 
+def _frontend_build_identity() -> dict | None:
+    """
+    只读：报告当前 dist 产物的身份，用于核对「运行中的前端」与「源码构建」是否一致
+    （部署版本 ≠ 提交版本，AGENTS.md §4.8）。绝不返回令牌或凭据。
+    """
+    index_path = _FRONTEND_DIST / "index.html"
+    if not index_path.is_file():
+        return None
+    try:
+        import hashlib
+        import re
+
+        raw = index_path.read_bytes()
+        match = re.search(r"(?:src|href)=\"(/assets/[^\"]+)\"", raw.decode("utf-8", "ignore"))
+        return {
+            "index_sha256": hashlib.sha256(raw).hexdigest()[:16],
+            "entry_asset": match.group(1) if match else None,
+        }
+    except OSError:
+        return None
+
+
+def _runtime_capability() -> dict:
+    """
+    只读：暴露当前进程的刷新能力（不含任何令牌或凭据）。
+    「软件能力」不等于操作者批准（AGENTS.md §4.35）；这里只报告开关状态，
+    让前端能把「同步未启用 / 未授权」与「网络故障」分开陈述。
+    """
+    runtime_writes = bool(app.config.get("RUNTIME_WRITES_ENABLED", False))
+    local_ui = bool(app.config.get("LOCAL_UI_REFRESH_ENABLED", False))
+    return {
+        "runtime_writes_enabled": runtime_writes,
+        "background_refresh_enabled": bool(app.config.get("BACKGROUND_REFRESH_ENABLED", False)),
+        "local_ui_refresh_enabled": local_ui,
+        "refresh_available_via_ui": runtime_writes and local_ui,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 页面路由
 # ---------------------------------------------------------------------------
@@ -285,18 +323,25 @@ def api_strategy():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
+    # 默认拒绝（AGENTS.md §4.35）：主写开关关闭时，一切刷新请求都被拒绝——
+    # 回环地址与浏览器可伪造的头（X-Requested-With / Sec-Fetch-Site / Referer / Origin）
+    # 本身不构成操作者授权。本地 UI 同步只有在主写开关与本地 UI 开关**同时**被
+    # 显式开启、且请求确为回环同源上下文时才可用；其余调用方必须携带刷新令牌。
+    runtime_writes = app.config.get("RUNTIME_WRITES_ENABLED", False)
     is_loopback = request.remote_addr in ("127.0.0.1", "::1", "localhost")
-    local_ui_allowed = (
-        app.config.get("LOCAL_UI_REFRESH_ENABLED", False)
-        and is_loopback
-        and (
-            bool(request.headers.get("X-Requested-With"))
-            or (request.headers.get("Sec-Fetch-Site") in ("same-origin", "same-site"))
-            or bool(request.referrer and ("127.0.0.1" in request.referrer or "localhost" in request.referrer))
-            or bool(request.origin and ("127.0.0.1" in request.origin or "localhost" in request.origin))
-        )
+    same_origin_context = (
+        bool(request.headers.get("X-Requested-With"))
+        or (request.headers.get("Sec-Fetch-Site") in ("same-origin", "same-site"))
+        or bool(request.referrer and ("127.0.0.1" in request.referrer or "localhost" in request.referrer))
+        or bool(request.origin and ("127.0.0.1" in request.origin or "localhost" in request.origin))
     )
-    if not (app.config.get("RUNTIME_WRITES_ENABLED", False) or local_ui_allowed):
+    local_ui_allowed = (
+        runtime_writes
+        and app.config.get("LOCAL_UI_REFRESH_ENABLED", False)
+        and is_loopback
+        and same_origin_context
+    )
+    if not runtime_writes:
         return jsonify({"error": "RUNTIME_WRITES_DISABLED"}), 403
     if not local_ui_allowed:
         expected = app.config.get("RUNTIME_WRITE_TOKEN") or ""
@@ -331,6 +376,8 @@ def api_status():
             "team_pool": strength_stats(),
             "today_stats": get_daily_stats(),
             "source_health": build_source_health(),
+            "runtime": _runtime_capability(),
+            "frontend_build_identity": _frontend_build_identity(),
         }
     )
 

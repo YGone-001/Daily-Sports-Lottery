@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { useMatches, useDates, useRefresh } from '@/hooks';
+import { useMatches, useDates, useRefresh, useStatus } from '@/hooks';
 import type { Match } from '@/types/match';
 import { SportFilter } from '@/components/SportFilter';
 import { EmptyState } from '@/components/EmptyState';
@@ -8,6 +8,7 @@ import { Skeleton } from '@/components/Skeleton';
 import { Icon } from '@/components/Icon';
 import { MatchRow } from './MatchRow';
 import { availableDatesFor, resolveDisplayDate, shouldClearDate } from './dateSelection';
+import { describeRefreshError } from './refreshMessages';
 import styles from './DailyView.module.css';
 
 interface LeagueGroup {
@@ -37,6 +38,12 @@ export const DailyView: React.FC = () => {
   } = useMatches(displayDate, currentSport);
 
   const refreshMutation = useRefresh();
+  const { data: status } = useStatus();
+  // 运行时能力由 /api/status 报告：主写开关 + 本地 UI 开关同时开启时界面同步才可用。
+  // 状态缺失（请求失败）时不猜测：按钮保持可点，点击后的 403 会由错误横幅明确陈述。
+  const refreshAvailable = status?.runtime
+    ? status.runtime.refresh_available_via_ui
+    : undefined;
 
   const handleSportChange = (sport: string) => {
     setSearchParams((prev) => {
@@ -65,6 +72,12 @@ export const DailyView: React.FC = () => {
   const handleRefresh = () => {
     refreshMutation.mutate();
   };
+
+  // 同步结果必须可见：拒绝 / 未授权 / 忙 / 网络失败各自有明确的中文说明，
+  // 不得让按钮在失败后悄悄回到空闲状态（AGENTS.md §4.35、需求 §D.2）。
+  const refreshError = refreshMutation.isError
+    ? describeRefreshError(refreshMutation.error)
+    : null;
 
   // 统计指标计算
   const stats = useMemo(() => {
@@ -174,13 +187,41 @@ export const DailyView: React.FC = () => {
             type="button"
             className={`${styles.btnRefresh} ${refreshMutation.isPending ? styles.busy : ''}`}
             onClick={handleRefresh}
-            disabled={refreshMutation.isPending}
+            disabled={refreshMutation.isPending || refreshAvailable === false}
             aria-live="polite"
+            title={
+              refreshAvailable === false
+                ? '当前部署为只读模式，界面同步未启用'
+                : undefined
+            }
           >
-            {refreshMutation.isPending ? '⟳ 同步中...' : '⟳ 同步数据'}
+            {refreshMutation.isPending
+              ? '⟳ 同步中...'
+              : refreshAvailable === false
+                ? '⟳ 同步未启用'
+                : '⟳ 同步数据'}
           </button>
         </div>
       </div>
+
+      {/* 同步能力提示：只读部署下按钮明确标示禁用，而不是点击后静默失败 */}
+      {refreshAvailable === false && !refreshMutation.isError && (
+        <div className={`${styles.refreshNotice} ${styles.refreshNoticeInfo}`} role="status">
+          <span className={styles.refreshNoticeIcon}>◈</span>
+          <span className={styles.refreshNoticeText}>
+            同步功能未启用：当前部署为只读模式。如需从界面同步，需在服务端显式开启运行时写开关与本地界面开关（见
+            docs/runtime-readonly.md）。
+          </span>
+        </div>
+      )}
+
+      {/* 同步结果反馈：服务端拒绝/未授权/忙碌/网络失败都必须显式可见 */}
+      {refreshError && (
+        <div className={styles.refreshNotice} role="alert">
+          <span className={styles.refreshNoticeIcon}>⚠</span>
+          <span className={styles.refreshNoticeText}>{refreshError}</span>
+        </div>
+      )}
 
       {/* 状态反馈：加载骨架屏 / 错误 / 列表 / 空状态 */}
       {isLoading ? (

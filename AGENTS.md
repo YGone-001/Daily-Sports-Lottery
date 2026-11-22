@@ -1105,8 +1105,17 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 ### 4.35 Flask 只读启动与 HTTP 写边界
 
 - **取代旧 GET 物化说明**：所有页面/API GET/HEAD 不新建快照、不写球队库；请求局部只读档案上下文不得污染共享缓存。正常 refresh 仍负责赛前持久化，模型数学不变。
-- **默认关闭**：`DSL_RUNTIME_WRITES_ENABLED=false`、`DSL_BACKGROUND_REFRESH_ENABLED=false`；DEBUG=False/reloader 不能替代显式启用，后台线程须同时满足两个开关。
-- **POST 受控**：GET refresh 返回 405；POST 必须写开关开启、服务端非空 `DSL_RUNTIME_WRITE_TOKEN` 和 `X-Refresh-Token` 匹配，缺一返回 403。令牌不得进入 URL、日志、报告或前端产物。
+- **默认全部关闭**：`DSL_RUNTIME_WRITES_ENABLED=false`、`DSL_BACKGROUND_REFRESH_ENABLED=false`、
+  `DSL_LOCAL_UI_REFRESH_ENABLED=false`；DEBUG=False/reloader 不能替代显式启用，后台线程须同时满足两个开关。
+- **POST 受控（主写开关总门）**：GET refresh 返回 405；POST 一律先要求
+  `DSL_RUNTIME_WRITES_ENABLED=true`，否则 403 `RUNTIME_WRITES_DISABLED`——回环地址与
+  `X-Requested-With` / `Sec-Fetch-Site` / Referer / Origin 等浏览器可伪造头**不构成**操作者授权。
+  通过校验后仍分两路：程序化调用必须携带与服务端非空 `DSL_RUNTIME_WRITE_TOKEN` 恒定时间匹配的
+  `X-Refresh-Token`（否则 403 `REFRESH_AUTHORIZATION_REQUIRED`）；本地 Web UI 通道只在
+  **主写开关与 `DSL_LOCAL_UI_REFRESH_ENABLED` 同时显式开启**且回环同源上下文成立时免令牌，
+  浏览器 bundle 与 URL 参数不得携带持久化凭据。令牌不得进入 URL、日志、报告或前端产物。
+- **提供商网络只认显式开关**：`DSL_ENABLE_NBA_SCHEDULE_NETWORK` 仅取显式环境变量，默认 false；
+  不得从「本地 UI 开关 + 凭据存在」推导授权（环境变量组合不能替代操作者批准）。
 - **软件能力不等于操作批准**：真实启动、提供商只读请求、一次真实广域刷新分别授权；旧停止许可不授权重启。广域 refresh 可影响全部七库，不能借单场批准执行。
 - **修改源码前先查运行实例、reloader、计划任务与刷新代标记**；未经许可不停止/启动进程。真实库变动须停止写能力操作并披露，不回滚、不修数、不抹除历史事件。
 - 详见 `docs/runtime-readonly.md`；旧设备证据仍只报 NOT_AVAILABLE，Canonical 归并仍 NO-GO。

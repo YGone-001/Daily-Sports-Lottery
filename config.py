@@ -130,8 +130,13 @@ DEFAULT_LEAGUE_ELO = 1600
 RUNTIME_WRITES_ENABLED = os.environ.get("DSL_RUNTIME_WRITES_ENABLED", "false").lower() in ("true", "1", "yes")
 BACKGROUND_REFRESH_ENABLED = os.environ.get("DSL_BACKGROUND_REFRESH_ENABLED", "false").lower() in ("true", "1", "yes")
 RUNTIME_WRITE_TOKEN = os.environ.get("DSL_RUNTIME_WRITE_TOKEN", "")
-LOCAL_UI_REFRESH_ENABLED = os.environ.get("DSL_LOCAL_UI_REFRESH_ENABLED", "true").lower() in ("true", "1", "yes")
+# 本地 Web UI 同步**默认拒绝**（与主写开关同一基线）：回环地址与浏览器可伪造的
+# 请求头本身不构成操作者授权；只有在主写开关与本地 UI 开关**同时**被显式开启时，
+# 回环浏览器上下文才允许触发同步（app.api_refresh 的合取判定）。
+LOCAL_UI_REFRESH_ENABLED = os.environ.get("DSL_LOCAL_UI_REFRESH_ENABLED", "false").lower() in ("true", "1", "yes")
+# 第三方赛程提供商网络默认拒绝：只认显式的 DSL_ENABLE_NBA_SCHEDULE_NETWORK，
+# 不再从「本地 UI 开关 + 凭据存在」推导授权（环境变量组合不能替代操作者批准）。
 ENABLE_NBA_SCHEDULE_NETWORK = os.environ.get(
     "DSL_ENABLE_NBA_SCHEDULE_NETWORK",
-    "true" if os.environ.get("DSL_LOCAL_UI_REFRESH_ENABLED", "true").lower() in ("true", "1", "yes") and os.environ.get("DSL_BDL_API_KEY") else "false",
+    "false",
 ).lower() in ("true", "1", "yes")
