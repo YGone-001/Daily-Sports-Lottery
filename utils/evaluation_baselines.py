@@ -7,9 +7,10 @@
 
 边界与防泄漏
 ------------
-- 扩展历史频率基线：对每行只使用 ``kickoff_at`` **严格早于**该行开赛时刻的**同组**
-  评估行（时间升序累积），首行退化为均匀分布（Laplace α=1 平滑）——
-  绝不使用最终赛季频率回填历史行。
+- 扩展历史频率基线（因果口径，Phase 5-A 修正）：一个历史结果影响后续预测的
+  唯一准入条件是 ``prior_result_known_at (settled_at) < current prediction_generated_at``；
+  settled_at 缺失/畸形/naive 的结果不进入因果历史；同一开赛时刻互不泄漏；
+  输入顺序无关。绝不使用最终赛季频率回填历史行，也绝不从 kickoff 推断可得性。
 - 固定先验基线：足球 (home, draw, away) = (0.45, 0.25, 0.30)、篮球 (0.55, 0.45)，
   为**文档化的通用先验假设**（非本队列拟合值）。
 - 市场基线：仅在调用方显式给定的行上计算（调用方负责市场证据有效性），
@@ -19,6 +20,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
 from utils.classification_evaluation import classes_for_sport, validate_row
@@ -65,49 +67,126 @@ def uniform_baseline(rows: Iterable[dict]) -> dict:
 
 
 def expanding_frequency_baseline(rows: Iterable[dict]) -> dict:
-    """扩展历史频率基线（防泄漏）：仅用开赛时刻严格早于当前行的观测更新频率。
+    """因果扩展频率基线（Phase 5-A Workstream A 修正后的口径）。
 
-    行按 ``kickoff_at`` 升序处理；频率带 Laplace α=1 平滑（首行 ≈ 均匀）。
-    返回逐行概率与三项指标；无开赛时刻的行按输入顺序处理并在结果中如实计数。
+    一个历史结果要影响后续预测，必须证明**结果在预测时刻已可得**：
+
+        prior_result_known_at (settled_at) < current prediction_generated_at
+
+    - ``settled_at`` 是保守的「应用已知」边界（结算创建时刻；结果实际可得更早，
+      因此只会**少**用先验，不会泄漏）。``materialized_at`` 是评估物化时刻，
+      **不得**当作赛果观测时刻使用。
+    - ``settled_at`` 缺失/畸形/naive → 该行结果**不进入**因果频率历史（该行仍被评分）。
+    - ``prediction_generated_at`` 缺失/畸形/naive → 该行无法建立因果时间线，
+      以均匀先验评分并如实计数。
+    - 同一开赛时刻的多场比赛互不泄漏（排序只按可得时刻与预测时刻，不按 kickoff）；
+      输入顺序无关（内部按 (prediction_generated_at, evaluation_id) 确定性排序）。
     """
-    rows = [r for r in rows if r.get("kickoff_at")]
-    rows = sorted(rows, key=lambda r: (r["kickoff_at"], r.get("evaluation_id") or ""))
+    rows = list(rows)
     if not rows:
         return {"n": 0}
-    classes, _first, _a = _probs_for_row(rows[0])
+
+    parsed = []
+    for r in rows:
+        classes, probs, actual = validate_row(r)
+        gen = _parse_aware_dt(r.get("prediction_generated_at"))
+        settled = _parse_aware_dt(r.get("settled_at"))
+        parsed.append({
+            "row": r,
+            "classes": classes,
+            "model_probabilities": dict(zip(classes, probs)),
+            "actual": actual,
+            "generated_at": gen,
+            "settled_at": settled,
+            "evaluation_id": r.get("evaluation_id") or "",
+        })
+
     k = len(classes)
+    sentinel_max = datetime.max.replace(tzinfo=timezone.utc)
+
+    # 评分时间线：按预测时刻排序（缺失者排最后，仅以均匀先验评分——
+    # 预测时刻未知时无法建立「当时已知什么」的因果视图）。
+    scored = sorted(
+        parsed,
+        key=lambda e: (
+            e["generated_at"] is None,
+            e["generated_at"] or sentinel_max,
+            e["evaluation_id"],
+        ),
+    )
+    # 可贡献的因果历史：按 settled_at 排序的有效结算行
+    contributors = sorted(
+        [e for e in parsed if e["settled_at"] is not None],
+        key=lambda e: (e["settled_at"], e["evaluation_id"]),
+    )
+
     counts = {c: 0 for c in classes}
     total = 0
+    contributor_index = 0
     brier = 0.0
     logloss = 0.0
     correct = 0.0
     per_row = []
-    for r in rows:
-        _c, _p, actual = _probs_for_row(r)
-        denom = total + k  # Laplace α=1
-        p = {c: (counts[c] + 1) / denom for c in classes}
-        brier += sum((p[c] - (1.0 if c == actual else 0.0)) ** 2 for c in classes)
-        logloss += -math.log(max(p[actual], 1e-15))
+    rows_without_valid_generated_at = 0
+    for e in scored:
+        if e["generated_at"] is None:
+            # 预测时刻未知：无法建立因果视图 → 均匀先验（不计入任何先验观测）
+            rows_without_valid_generated_at += 1
+            p = {c: 1.0 / k for c in classes}
+            prior_count = None
+        else:
+            # 指针推进：把 settled_at < 当前预测时刻 的结果纳入因果历史
+            while (
+                contributor_index < len(contributors)
+                and contributors[contributor_index]["settled_at"] < e["generated_at"]
+            ):
+                counts[contributors[contributor_index]["actual"]] += 1
+                total += 1
+                contributor_index += 1
+            denom = total + k  # Laplace α=1
+            p = {c: (counts[c] + 1) / denom for c in classes}
+            prior_count = total
+        brier += sum((p[c] - (1.0 if c == e["actual"] else 0.0)) ** 2 for c in classes)
+        logloss += -math.log(max(p[e["actual"]], 1e-15))
         pred = max(classes, key=lambda c: p[c])
-        correct += pred == actual
+        correct += pred == e["actual"]
         per_row.append({
-            "evaluation_id": r.get("evaluation_id"),
-            "kickoff_at": r["kickoff_at"],
-            "prior_observation_count": total,
+            "evaluation_id": e["evaluation_id"],
+            "prediction_generated_at": e["row"].get("prediction_generated_at"),
+            "settled_at": e["row"].get("settled_at"),
+            "prior_observation_count": prior_count,
             "probabilities": p,
             "predicted": pred,
-            "correct": pred == actual,
+            "correct": pred == e["actual"],
         })
-        counts[actual] += 1
-        total += 1
     n = len(rows)
+    contributors_excluded = sum(1 for e in parsed if e["settled_at"] is None)
     return {
         "n": n,
         "direction_accuracy": correct / n,
         "multiclass_brier": brier / n,
         "log_loss": logloss / n,
+        "causal_accounting": {
+            "boundary_rule": "settled_at < prediction_generated_at",
+            "contributors_used": total,
+            "contributors_excluded_invalid_or_missing_settled_at": contributors_excluded,
+            "rows_scored_without_valid_generated_at": rows_without_valid_generated_at,
+        },
         "per_row": per_row,
     }
+
+
+def _parse_aware_dt(value) -> "datetime | None":
+    """解析 ISO 时间；naive（无时区）或非法 → None（失败关闭）。"""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt
 
 
 def fixed_prior_baseline(rows: Iterable[dict]) -> dict:

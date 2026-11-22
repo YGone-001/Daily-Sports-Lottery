@@ -350,29 +350,186 @@ def test_unverified_market_not_promoted(isolated_app):
         assert m["market_baseline"]["market_source_identity"] != "MARKET_SOURCE_IDENTITY_VERIFIED"
 
 
-def test_expanding_baseline_no_historical_result_leakage():
-    """NO_HISTORICAL_RESULT_LEAKAGE：扩展频率基线只使用严格早于当前行的观测。"""
+def _causal_row(evaluation_id, *, outcome="home_win", generated_at=None, settled_at=None,
+                kickoff_at="2030-01-01T20:00:00+08:00", **kw):
+    row = _eval_row(evaluation_id, outcome=outcome, **kw)
+    row["prediction_generated_at"] = generated_at
+    row["settled_at"] = settled_at
+    row["kickoff_at"] = kickoff_at
+    return row
+
+
+def test_expanding_baseline_same_kickoff_fixtures_no_leakage():
+    """SAME_KICKOFF_FIXTURES_NO_LEAKAGE：同开赛时刻的多场互不泄漏。"""
     from utils.evaluation_baselines import expanding_frequency_baseline
 
     rows = [
-        _eval_row("lk-1", outcome="away_win"),
-        _eval_row("lk-2", outcome="home_win"),
-        _eval_row("lk-3", outcome="home_win"),
+        _causal_row("sk-1", outcome="home_win",
+                    generated_at="2030-01-01T12:00:00+08:00",
+                    settled_at="2030-01-01T23:00:00+08:00",
+                    kickoff_at="2030-01-01T20:00:00+08:00"),
+        _causal_row("sk-2", outcome="home_win",
+                    generated_at="2030-01-01T12:30:00+08:00",
+                    settled_at="2030-01-01T23:00:00+08:00",
+                    kickoff_at="2030-01-01T20:00:00+08:00"),
     ]
-    # 各行 kickoff 依次递增；若存在泄漏，首行概率会被后两行的主胜"污染"
-    rows[0]["kickoff_at"] = "2030-01-01T20:00:00+08:00"
-    rows[1]["kickoff_at"] = "2030-01-02T20:00:00+08:00"
-    rows[2]["kickoff_at"] = "2030-01-03T20:00:00+08:00"
-
     result = expanding_frequency_baseline(rows)
-    per_row = result["per_row"]
-    # 首行：0 个先验观测 → Laplace 均匀（对后续结果完全无知）
-    assert per_row[0]["prior_observation_count"] == 0
-    assert per_row[0]["probabilities"] == {"home_win": 1 / 3, "draw": 1 / 3, "away_win": 1 / 3}
-    # 末行：恰好 2 个先验观测（不含自身结果）
-    assert per_row[2]["prior_observation_count"] == 2
-    # 第二行只见过 lk-1 的 away_win：主胜概率 = 1/4 而非被后行主胜推高
-    assert abs(per_row[1]["probabilities"]["home_win"] - 0.25) < 1e-9
+    per = {p["evaluation_id"]: p for p in result["per_row"]}
+    # sk-2 的预测（12:30）早于 sk-1 的结果可得时刻（23:00）→ 不得继承 sk-1 结果
+    assert per["sk-2"]["prior_observation_count"] == 0
+    assert per["sk-2"]["probabilities"] == {"home_win": 1 / 3, "draw": 1 / 3, "away_win": 1 / 3}
+
+
+def test_expanding_baseline_earlier_kickoff_still_unsettled_excluded():
+    """EARLIER_KICKOFF_STILL_UNSETTLED：更早开赛但未结算 → 不进入因果历史。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _causal_row("ek-1", outcome="away_win",
+                    generated_at="2030-01-01T08:00:00+08:00",
+                    settled_at=None,  # 未结算：结果可得性无法建立
+                    kickoff_at="2030-01-01T10:00:00+08:00"),
+        _causal_row("ek-2", outcome="home_win",
+                    generated_at="2030-01-05T12:00:00+08:00",
+                    settled_at="2030-01-05T23:00:00+08:00",
+                    kickoff_at="2030-01-05T20:00:00+08:00"),
+    ]
+    result = expanding_frequency_baseline(rows)
+    per = {p["evaluation_id"]: p for p in result["per_row"]}
+    # ek-1 虽然更早开赛，但没有可信的「结果已可得」边界 → 不计入 ek-2 的先验
+    assert per["ek-2"]["prior_observation_count"] == 0
+    assert result["causal_accounting"]["contributors_excluded_invalid_or_missing_settled_at"] == 1
+
+
+def test_expanding_baseline_prior_result_known_before_prediction():
+    """PRIOR_RESULT_KNOWN_BEFORE_PREDICTION：结果可得早于预测 → 正常进入因果历史。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _causal_row("pr-1", outcome="away_win",
+                    generated_at="2030-01-01T08:00:00+08:00",
+                    settled_at="2030-01-01T23:00:00+08:00"),
+        _causal_row("pr-2", outcome="home_win",
+                    generated_at="2030-01-02T12:00:00+08:00",
+                    settled_at="2030-01-02T23:00:00+08:00"),
+    ]
+    result = expanding_frequency_baseline(rows)
+    per = {p["evaluation_id"]: p for p in result["per_row"]}
+    # pr-2 预测时 pr-1 已结算（23:00 < 次日 12:00）→ 客胜计入先验
+    assert per["pr-2"]["prior_observation_count"] == 1
+    assert abs(per["pr-2"]["probabilities"]["away_win"] - (1 + 1) / 4) < 1e-9
+
+
+def test_expanding_baseline_result_settled_after_prediction_excluded():
+    """RESULT_SETTLED_AFTER_PREDICTION：结算晚于预测 → 不进入先验（含自身）。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _causal_row("sa-1", outcome="home_win",
+                    generated_at="2030-01-01T12:00:00+08:00",
+                    settled_at="2030-01-02T23:00:00+08:00"),
+    ]
+    result = expanding_frequency_baseline(rows)
+    # 自身结算在预测之后：先验仍为均匀
+    assert result["per_row"][0]["prior_observation_count"] == 0
+    assert result["causal_accounting"]["contributors_used"] == 0
+
+
+def test_expanding_baseline_missing_settlement_timestamp():
+    """MISSING_SETTLEMENT_TIMESTAMP：缺 settled_at 的结果不进入因果历史。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _causal_row("ms-1", outcome="home_win",
+                    generated_at="2030-01-01T08:00:00+08:00",
+                    settled_at=None),
+        _causal_row("ms-2", outcome="home_win",
+                    generated_at="2030-01-02T12:00:00+08:00",
+                    settled_at="2030-01-02T23:00:00+08:00"),
+    ]
+    result = expanding_frequency_baseline(rows)
+    per = {p["evaluation_id"]: p for p in result["per_row"]}
+    assert per["ms-2"]["prior_observation_count"] == 0
+    assert result["causal_accounting"]["contributors_excluded_invalid_or_missing_settled_at"] == 1
+
+
+def test_expanding_baseline_invalid_or_naive_timestamps():
+    """INVALID_OR_NAIVE_TIMESTAMP：畸形/naive 时间戳一律失败关闭。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _causal_row("iv-1", outcome="home_win",
+                    generated_at="2030-01-01T08:00:00+08:00",
+                    settled_at="2030-01-01T23:00:00"),  # naive → 无效
+        _causal_row("iv-2", outcome="home_win",
+                    generated_at="2030-01-02T12:00:00+08:00",
+                    settled_at="not-a-date"),
+        _causal_row("iv-3", outcome="away_win",
+                    generated_at="2030-01-03T12:00:00+08:00",
+                    settled_at="2030-01-03T23:00:00+08:00"),
+    ]
+    result = expanding_frequency_baseline(rows)
+    per = {p["evaluation_id"]: p for p in result["per_row"]}
+    # iv-1/iv-2 的结果不可用 → iv-3 的先验观测为 0
+    assert per["iv-3"]["prior_observation_count"] == 0
+    assert result["causal_accounting"]["contributors_excluded_invalid_or_missing_settled_at"] == 2
+
+
+def test_expanding_baseline_first_fixture_uniform_prior():
+    """FIRST_FIXTURE_UNIFORM_PRIOR：首行（无先验）为均匀分布。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [_causal_row("ff-1", outcome="home_win",
+                        generated_at="2030-01-01T12:00:00+08:00",
+                        settled_at="2030-01-02T23:00:00+08:00")]
+    result = expanding_frequency_baseline(rows)
+    assert result["per_row"][0]["probabilities"] == {
+        "home_win": 1 / 3, "draw": 1 / 3, "away_win": 1 / 3,
+    }
+
+
+def test_expanding_baseline_input_order_invariance():
+    """INPUT_ORDER_INVARIANCE：结果与输入顺序无关。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _causal_row("io-1", outcome="home_win",
+                    generated_at="2030-01-01T12:00:00+08:00",
+                    settled_at="2030-01-01T23:00:00+08:00"),
+        _causal_row("io-2", outcome="away_win",
+                    generated_at="2030-01-02T12:00:00+08:00",
+                    settled_at="2030-01-02T23:00:00+08:00"),
+        _causal_row("io-3", outcome="draw",
+                    generated_at="2030-01-03T12:00:00+08:00",
+                    settled_at="2030-01-03T23:00:00+08:00"),
+    ]
+    forward = expanding_frequency_baseline(rows)
+    reversed_result = expanding_frequency_baseline(list(reversed(rows)))
+    assert forward["direction_accuracy"] == reversed_result["direction_accuracy"]
+    assert forward["multiclass_brier"] == reversed_result["multiclass_brier"]
+    assert forward["log_loss"] == reversed_result["log_loss"]
+    assert [p["probabilities"] for p in forward["per_row"]] == [
+        p["probabilities"] for p in reversed_result["per_row"]
+    ]
+
+
+def test_expanding_baseline_same_model_cohort_only():
+    """SAME_MODEL_COHORT_ONLY：基线消费的是调用方给定的同组行（不做跨组混合判定）。"""
+    from utils.evaluation_baselines import expanding_frequency_baseline
+
+    rows = [
+        _causal_row("co-1", outcome="home_win",
+                    generated_at="2030-01-01T12:00:00+08:00",
+                    settled_at="2030-01-01T23:00:00+08:00"),
+        _causal_row("co-2", outcome="away_win", model_version="football-shadow-x",
+                    generated_at="2030-01-02T12:00:00+08:00",
+                    settled_at="2030-01-02T23:00:00+08:00"),
+    ]
+    # 函数按调用方给定行集计算；调用方（评估摘要/报告脚本）负责同组过滤。
+    # 传入两行即计两行——此处锁定该契约，防止未来悄悄引入隐式过滤。
+    result = expanding_frequency_baseline(rows)
+    assert result["n"] == 2
+    assert result["causal_accounting"]["contributors_used"] == 1  # co-1 结算早于 co-2 预测
 
 
 def test_baseline_class_integrity_uniform_values():
