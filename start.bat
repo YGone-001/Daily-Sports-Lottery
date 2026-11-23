@@ -7,6 +7,10 @@ chcp 65001 >nul
 cd /d "%~dp0"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUNBUFFERED=1"
+REM 显式开启本地 Web UI 同步（默认只读，见 docs/runtime-readonly.md）：
+REM 主写开关 + 本地界面开关必须同时为 true，页面同步按钮才可用。
+set "DSL_RUNTIME_WRITES_ENABLED=true"
+set "DSL_LOCAL_UI_REFRESH_ENABLED=true"
 
 echo ============================================================
 echo   每日实时体彩预测终端 (Daily Sports Lottery Terminal)
