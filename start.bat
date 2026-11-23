@@ -7,10 +7,18 @@ chcp 65001 >nul
 cd /d "%~dp0"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUNBUFFERED=1"
-REM 显式开启本地 Web UI 同步（默认只读，见 docs/runtime-readonly.md）：
-REM 主写开关 + 本地界面开关必须同时为 true，页面同步按钮才可用。
-set "DSL_RUNTIME_WRITES_ENABLED=true"
-set "DSL_LOCAL_UI_REFRESH_ENABLED=true"
+
+REM 默认只读启动：不因「启动了应用」而静默开启生产写入（见 docs/runtime-readonly.md）。
+REM 只有显式 `start.bat --refresh` 才同时开启主写开关与本地界面同步开关。
+set "REFRESH_MODE="
+if /I "%~1"=="--refresh" set "REFRESH_MODE=1"
+if defined REFRESH_MODE (
+    set "DSL_RUNTIME_WRITES_ENABLED=true"
+    set "DSL_LOCAL_UI_REFRESH_ENABLED=true"
+) else (
+    set "DSL_RUNTIME_WRITES_ENABLED=false"
+    set "DSL_LOCAL_UI_REFRESH_ENABLED=false"
+)
 
 echo ============================================================
 echo   每日实时体彩预测终端 (Daily Sports Lottery Terminal)
@@ -51,11 +59,21 @@ if errorlevel 1 (
     echo [2/4] Python 依赖已就绪
 )
 
-REM ---- 3. 首次抓取赛事数据 ----
+REM ---- 3. 首次抓取赛事数据（只允许在显式 --refresh 下执行） ----
 if not exist "data\daily_matches.json" (
-    echo [3/4] 首次运行，正在抓取赛事数据...
-    "%PY%" -m utils.scraper
-    if errorlevel 1 goto PYTHON_ERROR
+    if defined REFRESH_MODE (
+        echo [3/4] 首次运行，正在抓取赛事数据...
+        "%PY%" -m utils.scraper
+        if errorlevel 1 goto PYTHON_ERROR
+    ) else (
+        echo.
+        echo [3/4] 未找到 data\daily_matches.json，且本次为只读启动。
+        echo        只读启动不会抓取数据，也不会写入任何生产存储。
+        echo        请先运行: start.bat --refresh
+        echo.
+        pause
+        exit /b 1
+    )
 ) else (
     echo [3/4] 赛事数据已就绪
 )
@@ -99,6 +117,11 @@ if defined SERVE_FRONTEND (
     echo   - Web 界面: http://127.0.0.1:5000 ^(旧模板^)
 )
 echo   - API 接口: http://127.0.0.1:5000/api
+if defined REFRESH_MODE (
+    echo   - 运行模式: 本地界面同步可用 ^(本次显式 --refresh^)
+) else (
+    echo   - 运行模式: 只读 ^(同步按钮不可用；需要刷新请用 start.bat --refresh^)
+)
 echo   - 按 Ctrl+C 可停止服务
 echo ============================================================
 echo.

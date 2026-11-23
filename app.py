@@ -182,17 +182,53 @@ def _freshness_summary() -> dict:
 
 def _runtime_capability() -> dict:
     """
-    只读：暴露当前进程的刷新能力（不含任何令牌或凭据）。
+    只读：暴露当前进程的刷新能力与最近一次刷新状态（不含任何令牌或凭据）。
     「软件能力」不等于操作者批准（AGENTS.md §4.35）；这里只报告开关状态，
     让前端能把「同步未启用 / 未授权」与「网络故障」分开陈述。
+
+    ``mode`` 是**能力**（后端权威）；``operating_state`` 是操作者视角的五态
+    （READ_ONLY_APPLICATION / LOCAL_REFRESH_AVAILABLE / REFRESH_IN_PROGRESS /
+    REFRESH_COMPLETED / REFRESH_FAILED），二者均不可由前端请求头推导。
     """
+    from utils import refresh_state
+
     runtime_writes = bool(app.config.get("RUNTIME_WRITES_ENABLED", False))
     local_ui = bool(app.config.get("LOCAL_UI_REFRESH_ENABLED", False))
+    mode = (
+        "READ_ONLY_APPLICATION"
+        if not runtime_writes
+        else "LOCAL_REFRESH_AVAILABLE" if local_ui else "TOKEN_REQUIRED"
+    )
+
+    inspected = refresh_state.inspect_state(config.DATA_DIR)
+    marker = inspected.get("state") if isinstance(inspected.get("state"), dict) else {}
+    status = marker.get("status")
+    if status == refresh_state.STATUS_IN_PROGRESS:
+        operating_state = "REFRESH_IN_PROGRESS"
+    elif status == refresh_state.STATUS_FAILED:
+        operating_state = "REFRESH_FAILED"
+    elif status == refresh_state.STATUS_COMPLETED:
+        operating_state = "REFRESH_COMPLETED"
+    else:
+        operating_state = mode
+
     return {
         "runtime_writes_enabled": runtime_writes,
         "background_refresh_enabled": bool(app.config.get("BACKGROUND_REFRESH_ENABLED", False)),
         "local_ui_refresh_enabled": local_ui,
         "refresh_available_via_ui": runtime_writes and local_ui,
+        "mode": mode,
+        "operating_state": operating_state,
+        "last_refresh": {
+            "status": status,
+            "generation": marker.get("generation"),
+            "started_at": marker.get("started_at"),
+            "finished_at": marker.get("finished_at"),
+            "error": marker.get("error"),
+            "marker_error": inspected.get("error"),
+            # 标记只回答「上一代刷新走到哪一步」，不是七库事务保证。
+            "advisory": True,
+        },
     }
 
 
@@ -464,6 +500,10 @@ def build_source_health() -> dict:
     """
     from utils.fetcher_500 import source_diagnostics, is_nba_league
     from utils.market_coverage import has_usable_market_odds
+    from utils.result_delivery import (
+        build_basketball_result_delivery,
+        summarize_result_delivery,
+    )
 
     diagnostics = source_diagnostics()
     now = get_beijing_now()
@@ -502,6 +542,11 @@ def build_source_health() -> dict:
         "nba_dates": sorted({m.get("date") for m in nba if m.get("date")}, reverse=True)[:7],
         "coverage": build_nba_coverage(nba, get_meta().get("last_refresh")),
         "pregame_readiness": build_nba_pregame_readiness(nba),
+        # pending 篮球目标「为什么没有赛果」的只读分类；观测是进程内状态，
+        # 空观测只能读作不可判定，不能读作零缺口。
+        "result_delivery": summarize_result_delivery(
+            build_basketball_result_delivery(basketball)
+        ),
     }
 
 

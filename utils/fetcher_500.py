@@ -724,6 +724,7 @@ def fetch_finished_matches(date: str | None = None) -> list[dict]:
             return []
 
         _record_diag("wanchang", "ok" if rows else "empty", rows=len(rows))
+        _record_observation("wanchang", rows)
         return rows
 
     return _cached(key, CACHE_TTL, loader)

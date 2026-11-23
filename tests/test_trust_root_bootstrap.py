@@ -150,7 +150,13 @@ ALLOWED_PATHS = frozenset((
     "utils/history_evidence.py",
     "tests/test_historical_lifecycle_presentation.py",
     # evaluation baselines and market provenance status separation
-    "utils/evaluation_baselines.py"))
+    "utils/evaluation_baselines.py",
+    # basketball result delivery diagnosis and isolated confirmed-result closure
+    "utils/result_delivery.py",
+    "tools/basketball_result_delivery.py",
+    "tests/test_basketball_result_delivery.py",
+    "tests/test_runtime_refresh_authority.py",
+    "tests/test_nba_result_closure_acceptance.py"))
 
 
 @pytest.fixture(scope="session", autouse=True)

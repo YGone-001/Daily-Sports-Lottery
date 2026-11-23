@@ -7,6 +7,16 @@
 它不联网、不调用广域刷新。输入为已经获准获取的 NBA 官方比赛页与 BDL Games 原始响应。
 自动交叉核对不是 `HUMAN_REVIEWED`，也不授权 Canonical 归并。
 
+## 先诊断投递缺口，再绑定
+
+`python -m tools.basketball_result_delivery --data-dir data`（或 `/api/status.source_health.result_delivery`）
+只读列出「有待结算赛前预测但尚无赛果」的赛事，并标明缺哪类证据；不联网、不写库。
+NBA 目标只有在 `kickoff_provenance` 已含唯一 `balldontlie_nba_games` 赛事 ID
+（`SCHEDULE_PROVIDER_VERIFIED`）时才进入
+`NBA_RESULT_PATH_PRIOR_BINDING`；否则为 `PRIOR_PROVIDER_BINDING_REQUIRED`，
+工具不会凭彩票编号或队名相似补造赛事 ID。诊断通过后，仍按下方绑定契约准备
+官方页与 BDL 原始响应，再走 preview / execute 两段批准。
+
 ## 绑定契约
 
 必须有已保存且唯一的 BDL 赛程赛事 ID，Canonical / 历史快照 / 两个源的球队 ID

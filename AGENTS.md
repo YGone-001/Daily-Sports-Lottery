@@ -1107,6 +1107,16 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 - **取代旧 GET 物化说明**：所有页面/API GET/HEAD 不新建快照、不写球队库；请求局部只读档案上下文不得污染共享缓存。正常 refresh 仍负责赛前持久化，模型数学不变。
 - **默认全部关闭**：`DSL_RUNTIME_WRITES_ENABLED=false`、`DSL_BACKGROUND_REFRESH_ENABLED=false`、
   `DSL_LOCAL_UI_REFRESH_ENABLED=false`；DEBUG=False/reloader 不能替代显式启用，后台线程须同时满足两个开关。
+- **启动器默认只读、`--refresh` 才激活**：`start.bat` / `start.sh` 必须把两个开关**显式设为 false**，
+  `start.bat --refresh` / `./start.sh --refresh` 只为本次启动同时置为 true；未知参数只提示、不激活；
+  首次缺 `data/daily_matches.json` 时只有 `--refresh` 才执行 `python -m utils.scraper`，
+  只读启动以非零退出并给出可操作提示；脚本**从不**设置 `DSL_BACKGROUND_REFRESH_ENABLED`。
+  该行为由 `tests/test_runtime_refresh_authority.py` 在沙箱中真实执行启动脚本回归，改动须同步测试。
+- **操作状态由后端派生**：`/api/status.runtime` 是权威来源，`mode` 为
+  `READ_ONLY_APPLICATION` / `LOCAL_REFRESH_AVAILABLE` / `TOKEN_REQUIRED`，
+  `operating_state` 另含 `REFRESH_IN_PROGRESS` / `REFRESH_COMPLETED` / `REFRESH_FAILED`
+  （来自 `.refresh_state.json`）。前端按钮与轮询只呈现后端结论，不是授权边界；
+  `REFRESH_COMPLETED` 不等于七库事务快照。
 - **POST 受控（主写开关总门）**：GET refresh 返回 405；POST 一律先要求
   `DSL_RUNTIME_WRITES_ENABLED=true`，否则 403 `RUNTIME_WRITES_DISABLED`——回环地址与
   `X-Requested-With` / `Sec-Fetch-Site` / Referer / Origin 等浏览器可伪造头**不构成**操作者授权。
@@ -1297,6 +1307,42 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   不得为累积样本创建周期性生产任务。
 - **红线不变**：V1 数学与 `config.MODEL_VERSIONS`、`same_event()`、Canonical 身份、彩票编号、
   七个受保护存储均不改；V2 不升级生产；Canonical 归并 `NO-GO`。详见 `docs/nba-model-v2-shadow.md` 第九章。
+
+---
+
+### 4.41 篮球赛果投递诊断、来源缺失分类与 NBA 证据请求
+
+- **唯一篮球完场来源是 `live_basketball` 即时列表**：赛事离开该列表后不存在篮球完场源；
+  `wanchang` 解析器固定产出足球记录。generic 完赛源 `ok` **不**证明篮球目标被覆盖，
+  `generic_finished_source_scope = FOOTBALL_ONLY` 时必须明确提出，不得用源健康总标志掩盖缺口。
+- **投递状态七类互斥**（`utils.result_delivery.RESULT_DELIVERY_STATUSES`）：
+  `NO_SOURCE_OBSERVATION` / `SOURCE_REQUEST_FAILED` / `SOURCE_RETURNED_EMPTY` /
+  `SOURCE_FIXTURE_NOT_PRESENT` / `SOURCE_RECORD_PARSED_BUT_NOT_MATCHED` /
+  `SOURCE_RETURNED_NON_FINAL_RESULT` / `SOURCE_RETURNED_CONFIRMED_FINAL_RESULT`。
+  识别目标行只按既有 `same_event()`；跨源候选证据（`classify_cross_source_candidate`）只是
+  **诊断**，`authoritative` / `is_approval` 恒为 false，不授权身份、赔率合并、入住或结算。
+- **pending 选择口径**：仅统计有未结算赛前快照、且未 `is_finalized_match` 的篮球赛事；
+  原因分为 `STORED_LIVE_WITHOUT_FINAL_RESULT` / `FINAL_RECORD_WITHOUT_VALID_SCORE` /
+  `KICKOFF_PASSED_WITHOUT_FINAL_RESULT` / `UNKNOWN_KICKOFF_PAST_DATE` 等；
+  开赛未到记 `not_yet_due`，无 pending 快照单独计数，**不得**与"缺口"混同。
+- **NBA 结果路径必须先有既有提供商绑定**：`kickoff_provenance` 必须为
+  `balldontlie_nba_games` + `SCHEDULE_PROVIDER_VERIFIED` + 唯一 `kickoff_source_event_id` +
+  UTC 开赛一致；否则 `result_path = PRIOR_PROVIDER_BINDING_REQUIRED`
+  （`evidence_request.state`），**不得**凭彩票编号、队名相似或推断补齐赛事 ID。
+  绑定成立但未取回证据时 `AWAITING_EXTERNAL_CONFIRMED_RESULT_EVIDENCE`；证据请求列出
+  NBA 官方页与 BDL Final/分节要求，且恒 `evidence_authorization = NOT_GRANTED`、
+  `network_requests_performed = 0`。取得证据后仍走 §4.36/§4.37 的 preview + 独立 execute，
+  **不得**在诊断模块内结算。
+- **非 NBA 篮球不得套用 NBA 路径**：无已批准的竞赛兼容赛果源时
+  `result_path.state = SOURCE_NOT_AVAILABLE`、`reason = NO_APPROVED_COMPETITION_COMPATIBLE_RESULT_SOURCE`、
+  `nba_path_applicable = false`；`tools.nba_confirmed_result.bind_result` 必须以
+  `PRIOR_PROVIDER_BINDING_REQUIRED` 拒绝，不得放宽验证器让非 NBA 赛事通过。
+- **只读与输出边界**：`python -m tools.basketball_result_delivery --data-dir <DIR>` 仅消费本地存储与
+  进程内源观测，恒报 `writes_performed = 0`；输出路径落在 `DATA_DIR` 内一律拒绝；
+  `/api/status.source_health.result_delivery` 只给摘要（`sample_targets`、`truncated`），
+  完整目标清单留在 CLI 报告。缺少观测时如实报 `NO_SOURCE_OBSERVATION`，不得编造 status。
+- **真实闭环仍需单独授权**：诊断通过不等于真实赛果已获取；外部证据请求、真实绑定与生产写入
+  各自需要独立批准，未获授权时 `REAL_NBA_POSTGAME_CLOSURE` 保持 BLOCKED。
 
 ---
 

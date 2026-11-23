@@ -132,7 +132,7 @@ worldCup/
 
 > **关于 `data/`**：目录下所有 `*.json` 都是抓取器生成的可再生数据，
 > 已加入 `.gitignore`。`git clone` 后没有这些文件也能启动，
-> 执行一次 `python -m utils.scraper` 即可重建（首次启动会自动执行）。
+> 执行一次 `python -m utils.scraper` 即可重建（一键启动脚本需显式 `--refresh` 才会执行）。
 
 
 ## 启动方式
@@ -147,8 +147,11 @@ worldCup/
 
 1. 定位 Python（优先 `.venv`，其次内置环境，最后 `PATH`）
 2. 检查依赖，缺失则自动 `pip install -r requirements.txt`
-3. 首次运行自动抓取赛事数据
+3. **显式 `start.bat --refresh` 时**才抓取缺失的赛事数据
 4. 启动服务并输出访问地址
+
+默认启动是**只读**的：不会因为「启动了应用」而静默开启生产写入。
+本机有能力同步时请用 `start.bat --refresh`，它只对本次启动开启主写与本地界面同步开关。
 
 **方式 B：手动**
 
@@ -221,7 +224,8 @@ chmod +x start.sh      # 首次需赋执行权限
 ./start.sh
 ```
 
-脚本会自动：创建 `.venv` → 安装依赖 → 首次抓取数据 → 启动服务。
+脚本会自动：创建 `.venv` → 安装依赖 → 启动服务；首次数据抓取只在
+`./start.sh --refresh` 时执行（默认只读启动不会写任何生产存储）。
 
 **方式 B：手动（Bash）**
 
@@ -264,8 +268,20 @@ python3 app.py
 http://127.0.0.1:5000
 ```
 
-启动后默认**只读**：不启动后台抓取、不允许 HTTP 触发刷新（刷新按钮会明确显示「同步未启用」）。
-如需启用能力，须显式设置环境变量（能力开启 ≠ 操作者批准，详见 `docs/runtime-readonly.md`）：
+启动后默认**只读**：不启动后台抓取、不允许 HTTP 触发刷新。
+后端 `/api/status.runtime` 是权威的运行能力来源，操作者界面区分五种状态：
+
+| `operating_state` | 含义 |
+| --- | --- |
+| `READ_ONLY_APPLICATION` | 只读运行；界面不提供同步，启动应用不会自动写生产数据 |
+| `LOCAL_REFRESH_AVAILABLE` | 主写与本地界面开关均已显式开启，界面同步可用 |
+| `REFRESH_IN_PROGRESS` | 刷新标记为进行中；界面轮询状态，完成后自动更新 |
+| `REFRESH_COMPLETED` | 最近一次刷新完成（顾问性标记，不代表七个库是事务快照） |
+| `REFRESH_FAILED` | 最近一次刷新失败；显示记录的失败原因 |
+
+> 浏览器请求头、回环地址与前端按钮都不是授权边界；`token_required` 表示程序化刷新需要
+> `X-Refresh-Token`。如需启用能力，须显式设置环境变量（能力开启 ≠ 操作者批准，详见
+> `docs/runtime-readonly.md`）：
 
 ```bash
 # 后台抓取线程（默认每 30 分钟刷新一次竞彩赛程与赔率）：
@@ -313,6 +329,18 @@ $env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
 ```
 
 完整变量列表见下方 [配置说明](#配置说明)。
+
+## 篮球赛果投递诊断（只读）
+
+`python -m tools.basketball_result_delivery --data-dir data` 只读回答「pending 篮球比赛为什么
+没有赛果」，把源观测分为七类：无观测 / 请求失败 / 源返回空 / 源未列出该赛事 /
+记录已解析但未匹配 / 非终场结果 / 已确认终场结果。NBA 目标同时给出是否需要先补
+`balldontlie_nba_games` 赛程绑定与官方终场证据；非 NBA 联赛（如德篮甲）如实报告
+`SOURCE_NOT_AVAILABLE`，不会借用 NBA 路径。`/api/status.source_health.result_delivery`
+提供同一结论的摘要。
+
+绑定与结算复用既有入口 `python -m tools.nba_confirmed_result`（见
+[docs/nba-confirmed-result.md](docs/nba-confirmed-result.md)），不另建引擎。
 
 ## 页面入口
 

@@ -170,6 +170,26 @@
     border-left-color: var(--accent);
 }
 
+.refreshNoticeInfo .refreshNoticeIcon {
+    color: var(--accent);
+}
+
+.refreshNoticeSuccess {
+    border-left-color: var(--state-ok);
+}
+
+.refreshNoticeSuccess .refreshNoticeIcon {
+    color: var(--state-ok);
+}
+
+.refreshNoticeProgress {
+    border-left-color: var(--signal-value);
+}
+
+.refreshNoticeProgress .refreshNoticeIcon {
+    color: var(--signal-value);
+}
+
 .freshnessLine {
     margin: -6px 0 16px;
     font-size: var(--fs-2xs);

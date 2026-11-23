@@ -9,6 +9,67 @@
  */
 
 import { ApiClientError } from '@/api/client'
+import type { OperatingState, RuntimeCapability } from '@/types/match'
+
+export interface OperatingNotice {
+  state: OperatingState
+  tone: 'info' | 'success' | 'warning' | 'error' | 'progress'
+  text: string
+}
+
+/**
+ * 把后端权威的运行状态翻译成可见提示。
+ *
+ * - 后端是权限判定的唯一来源：`mode` / `operating_state` 都由 `/api/status` 给出，
+ *   浏览器请求头或按钮状态不构成授权。
+ * - `LOCAL_REFRESH_AVAILABLE` 不需要常驻提示（按钮本身已表明可用）。
+ * - 刷新标记只是**顾问性**观测，`REFRESH_COMPLETED` 不代表七库事务快照。
+ */
+export function describeOperatingState(runtime?: RuntimeCapability): OperatingNotice | null {
+  if (!runtime) return null
+  const state = runtime.operating_state
+  if (!state) return null
+  const last = runtime.last_refresh
+  const generation =
+    typeof last?.generation === 'number' ? `第 ${last.generation} 代` : '上一次刷新'
+  const finished = last?.finished_at ? `，完成于 ${last.finished_at}` : ''
+
+  switch (state) {
+    case 'REFRESH_IN_PROGRESS':
+      return {
+        state,
+        tone: 'progress',
+        text: '同步正在进行：完成后页面会自动更新，请勿重复提交。',
+      }
+    case 'REFRESH_FAILED':
+      return {
+        state,
+        tone: 'error',
+        text: `上次同步失败（${generation}）：${last?.error || '原因未记录'}。请检查服务端日志后重试。`,
+      }
+    case 'REFRESH_COMPLETED':
+      return {
+        state,
+        tone: 'success',
+        text: `同步已完成（${generation}${finished}）。刷新标记是顾问性观测，不代表七个库是事务快照。`,
+      }
+    case 'READ_ONLY_APPLICATION':
+      return {
+        state,
+        tone: 'info',
+        text: '只读运行：启动应用不会自动写入生产数据，界面同步未启用。需要同步请使用 --refresh 启动。',
+      }
+    case 'TOKEN_REQUIRED':
+      return {
+        state,
+        tone: 'info',
+        text: '主写开关已开启，但本地界面同步未启用：界面不提供同步按钮，程序化刷新需要有效的刷新令牌。',
+      }
+    case 'LOCAL_REFRESH_AVAILABLE':
+    default:
+      return null
+  }
+}
 
 export function describeRefreshError(error: unknown): string {
   if (error instanceof ApiClientError) {

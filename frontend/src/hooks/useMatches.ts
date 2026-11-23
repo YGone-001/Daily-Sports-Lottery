@@ -130,6 +130,11 @@ export function useStatus() {
     queryKey: matchKeys.status,
     queryFn: fetchStatus,
     staleTime: 2 * 60 * 1000, // 2 分钟
+    // 刷新进行中时轮询后端权威状态：完成/失败由刷新标记决定，前端不自行猜测。
+    refetchInterval: (query) =>
+      query.state.data?.runtime?.operating_state === 'REFRESH_IN_PROGRESS'
+        ? 5000
+        : false,
   })
 }
 

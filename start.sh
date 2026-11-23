@@ -5,10 +5,23 @@
 set -e
 cd "$(dirname "$0")"
 
-# 显式开启本地 Web UI 同步（默认只读，见 docs/runtime-readonly.md）：
-# 主写开关 + 本地界面开关必须同时为 true，页面同步按钮才可用。
-export DSL_RUNTIME_WRITES_ENABLED=true
-export DSL_LOCAL_UI_REFRESH_ENABLED=true
+# 默认只读启动：不因「启动了应用」而静默开启生产写入（见 docs/runtime-readonly.md）。
+# 只有显式 `./start.sh --refresh` 才同时开启主写开关与本地界面同步开关。
+REFRESH_MODE=""
+for arg in "$@"; do
+    case "$arg" in
+        --refresh) REFRESH_MODE=1 ;;
+        *) echo "[警告] 未知参数: $arg（可用: --refresh）" ;;
+    esac
+done
+
+if [ -n "$REFRESH_MODE" ]; then
+    export DSL_RUNTIME_WRITES_ENABLED=true
+    export DSL_LOCAL_UI_REFRESH_ENABLED=true
+else
+    export DSL_RUNTIME_WRITES_ENABLED=false
+    export DSL_LOCAL_UI_REFRESH_ENABLED=false
+fi
 
 echo "============================================================"
 echo "  每日实时体彩预测终端 (Daily Sports Lottery Terminal)"
@@ -59,10 +72,17 @@ else
     echo "[2/4] Python 依赖已就绪"
 fi
 
-# ---- 3. 首次抓取数据 ----
+# ---- 3. 首次抓取数据（只允许在显式 --refresh 下执行） ----
 if [ ! -f "data/daily_matches.json" ]; then
-    echo "[3/4] 首次运行，抓取赛事数据..."
-    "$PY" -m utils.scraper
+    if [ -n "$REFRESH_MODE" ]; then
+        echo "[3/4] 首次运行，抓取赛事数据..."
+        "$PY" -m utils.scraper
+    else
+        echo "[3/4] 未找到 data/daily_matches.json，且本次为只读启动。"
+        echo "       只读启动不会抓取数据，也不会写入任何生产存储。"
+        echo "       请先运行: ./start.sh --refresh"
+        exit 1
+    fi
 else
     echo "[3/4] 赛事数据已就绪"
 fi
@@ -95,6 +115,11 @@ else
 echo "  ► Web 界面: http://127.0.0.1:5000 (旧模板)"
 fi
 echo "  ► API 接口: http://127.0.0.1:5000/api"
+if [ -n "$REFRESH_MODE" ]; then
+echo "  ► 运行模式: 本地界面同步可用 (本次显式 --refresh)"
+else
+echo "  ► 运行模式: 只读 (同步按钮不可用；需要刷新请用 ./start.sh --refresh)"
+fi
 echo "  ► 按 Ctrl+C 可停止全部服务"
 echo "============================================================"
 echo

@@ -10,6 +10,32 @@
 `DSL_LOCAL_UI_REFRESH_ENABLED=false`、`DSL_ENABLE_NBA_SCHEDULE_NETWORK=false`。
 DEBUG=False 或 Werkzeug 子进程都不会自动获得写权限。
 
+## 启动脚本与显式激活
+
+`start.bat` / `start.sh` 默认只读：二者都会把主写开关与本地界面开关**显式设为 false**，
+不会因为「启动了应用」而静默开启生产写入。只有显式 `start.bat --refresh` 或
+`./start.sh --refresh` 才为**本次启动**同时开启这两个开关；未知参数只提示、不激活。
+
+首次缺少 `data/daily_matches.json` 时，脚本只有在显式 `--refresh` 下才执行
+`python -m utils.scraper`；只读启动会打印可操作提示并以非零退出，不会自动抓取。
+脚本从不设置 `DSL_BACKGROUND_REFRESH_ENABLED`；后台刷新仍须单独显式配置。
+
+## 操作者可见的运行状态
+
+后端 `/api/status.runtime` 是权威来源（前端按钮与请求头都不是授权边界），暴露
+`mode`（`READ_ONLY_APPLICATION` / `LOCAL_REFRESH_AVAILABLE` / `TOKEN_REQUIRED`）、
+`operating_state` 与 `last_refresh`（状态、代号、起止时间、错误、标记错误）。
+
+| `operating_state` | 来源 |
+| --- | --- |
+| `READ_ONLY_APPLICATION` | 主写开关关闭 |
+| `LOCAL_REFRESH_AVAILABLE` | 主写 + 本地界面开关同时开启 |
+| `TOKEN_REQUIRED` | 主写开启但本地界面同步关闭（程序化调用需令牌） |
+| `REFRESH_IN_PROGRESS` / `REFRESH_COMPLETED` / `REFRESH_FAILED` | 刷新代标记（`.refresh_state.json`）的当前状态 |
+
+刷新标记是**顾问性观测**：`REFRESH_COMPLETED` 不代表七个库是事务快照；所有状态都不替代
+操作者批准。界面在 `REFRESH_IN_PROGRESS` 期间轮询状态，完成后自动更新。
+
 ## GET 与既有数据
 
 所有 GET/HEAD 页面和 API 仅呈现数据、计算临时视图，不再调用 `ensure_snapshot()`。

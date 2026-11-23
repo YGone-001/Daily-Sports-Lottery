@@ -216,12 +216,40 @@ export interface DatesResponse {
 }
 
 // 系统状态（对应 /api/status）
+export type RuntimeMode =
+  | 'READ_ONLY_APPLICATION'
+  | 'LOCAL_REFRESH_AVAILABLE'
+  | 'TOKEN_REQUIRED'
+
+/** 操作者视角的状态：由后端刷新标记推导，前端不得自行推断权限。 */
+export type OperatingState =
+  | 'READ_ONLY_APPLICATION'
+  | 'LOCAL_REFRESH_AVAILABLE'
+  | 'TOKEN_REQUIRED'
+  | 'REFRESH_IN_PROGRESS'
+  | 'REFRESH_COMPLETED'
+  | 'REFRESH_FAILED'
+
+export interface LastRefreshState {
+  status: string | null
+  generation: number | null
+  started_at: string | null
+  finished_at: string | null
+  error: string | null
+  marker_error: string | null
+  /** 标记只回答「上一代刷新走到哪一步」，不是七库事务保证。 */
+  advisory: boolean
+}
+
 export interface RuntimeCapability {
   runtime_writes_enabled: boolean
   background_refresh_enabled: boolean
   local_ui_refresh_enabled: boolean
   /** 主写开关与本地 UI 开关同时开启时，界面同步才可用（不含任何令牌信息）。 */
   refresh_available_via_ui: boolean
+  mode?: RuntimeMode
+  operating_state?: OperatingState
+  last_refresh?: LastRefreshState
 }
 
 export interface SystemStatus {

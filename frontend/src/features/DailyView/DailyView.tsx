@@ -8,7 +8,7 @@ import { Skeleton } from '@/components/Skeleton';
 import { Icon } from '@/components/Icon';
 import { MatchRow } from './MatchRow';
 import { availableDatesFor, resolveDisplayDate, shouldClearDate } from './dateSelection';
-import { describeRefreshError } from './refreshMessages';
+import { describeOperatingState, describeRefreshError } from './refreshMessages';
 import styles from './DailyView.module.css';
 
 interface LeagueGroup {
@@ -44,6 +44,10 @@ export const DailyView: React.FC = () => {
   const refreshAvailable = status?.runtime
     ? status.runtime.refresh_available_via_ui
     : undefined;
+  // 后端是运行状态的权威：正在进行/已完成/失败/只读均由其刷新标记推导。
+  const operatingNotice = describeOperatingState(status?.runtime);
+  const refreshInProgress =
+    refreshMutation.isPending || status?.runtime?.operating_state === 'REFRESH_IN_PROGRESS';
 
   const handleSportChange = (sport: string) => {
     setSearchParams((prev) => {
@@ -185,17 +189,19 @@ export const DailyView: React.FC = () => {
         <div className={`${styles.filterGroup} ${styles.filterActions}`}>
           <button
             type="button"
-            className={`${styles.btnRefresh} ${refreshMutation.isPending ? styles.busy : ''}`}
+            className={`${styles.btnRefresh} ${refreshInProgress ? styles.busy : ''}`}
             onClick={handleRefresh}
-            disabled={refreshMutation.isPending || refreshAvailable === false}
+            disabled={refreshInProgress || refreshAvailable === false}
             aria-live="polite"
             title={
               refreshAvailable === false
                 ? '当前部署为只读模式，界面同步未启用'
-                : undefined
+                : refreshInProgress
+                  ? '同步正在进行'
+                  : undefined
             }
           >
-            {refreshMutation.isPending
+            {refreshInProgress
               ? '⟳ 同步中...'
               : refreshAvailable === false
                 ? '⟳ 同步未启用'
@@ -204,14 +210,27 @@ export const DailyView: React.FC = () => {
         </div>
       </div>
 
-      {/* 同步能力提示：只读部署下按钮明确标示禁用，而不是点击后静默失败 */}
-      {refreshAvailable === false && !refreshMutation.isError && (
-        <div className={`${styles.refreshNotice} ${styles.refreshNoticeInfo}`} role="status">
-          <span className={styles.refreshNoticeIcon}>◈</span>
-          <span className={styles.refreshNoticeText}>
-            同步功能未启用：当前部署为只读模式。如需从界面同步，需在服务端显式开启运行时写开关与本地界面开关（见
-            docs/runtime-readonly.md）。
+      {/* 运行状态提示：只读 / 需要令牌 / 同步进行中 / 已完成 / 失败都必须可区分，
+          且均由后端 /api/status 的权威状态推导 */}
+      {operatingNotice && !refreshError && (
+        <div
+          className={`${styles.refreshNotice} ${
+            operatingNotice.tone === 'success'
+              ? styles.refreshNoticeSuccess
+              : operatingNotice.tone === 'progress'
+                ? styles.refreshNoticeProgress
+                : styles.refreshNoticeInfo
+          }`}
+          role="status"
+        >
+          <span className={styles.refreshNoticeIcon}>
+            {operatingNotice.tone === 'success'
+              ? '✓'
+              : operatingNotice.tone === 'progress'
+                ? '⟳'
+                : '◈'}
           </span>
+          <span className={styles.refreshNoticeText}>{operatingNotice.text}</span>
         </div>
       )}
 
