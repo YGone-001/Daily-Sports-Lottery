@@ -127,6 +127,9 @@ ALLOWED_PATHS = frozenset((
     "tests/test_nba_prospective_shadow_capture.py",
     # default-deny local UI refresh and product evidence surfaces
     "README.md",
+    # launchers explicitly enable the local ui sync switches documented in README
+    "start.bat",
+    "start.sh",
     "frontend/src/features/DailyView/DailyView.module.css",
     "frontend/src/features/DailyView/refreshMessages.ts",
     "frontend/src/features/DailyView/refreshMessages.test.ts",
