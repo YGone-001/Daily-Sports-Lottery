@@ -46,7 +46,7 @@ def _inside(path: Path, root: Path) -> bool:
 def _next_action(target: dict) -> str:
     delivery = (target.get("result_delivery") or {}).get("status")
     if delivery == "SOURCE_RETURNED_CONFIRMED_FINAL_RESULT":
-        return "EXISTING_CONTROLLED_REFRESH_CAN_SETTLE"
+        return "SOURCE_REPORTED_FINAL_INDEPENDENT_CONFIRMATION_REQUIRED"
     if delivery == "SOURCE_RECORD_PARSED_BUT_NOT_MATCHED":
         return "RESOLVE_IDENTITY_EVIDENCE"
     if target.get("is_nba"):
@@ -78,20 +78,21 @@ def _markdown(report: dict) -> str:
         "",
         "## NBA 待处理目标",
         "",
-        "| 比赛 ID | 日期 | 联赛 | 待处理原因 | 投递类别 | 提供商绑定 | 下一步 |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| 比赛 ID | 日期 | 联赛 | 待处理原因 | 投递类别 | 验证等级 | 提供商绑定 | 下一步 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for target in report.get("targets") or []:
         if not target.get("is_nba"):
             continue
         binding = target.get("provider_binding") or {}
         lines.append(
-            "| `{id}` | {date} | {league} | `{reason}` | `{delivery}` | `{binding}` | `{action}` |".format(
+            "| `{id}` | {date} | {league} | `{reason}` | `{delivery}` | `{verification}` | `{binding}` | `{action}` |".format(
                 id=target.get("match_id"),
                 date=target.get("date"),
                 league=target.get("league"),
                 reason=target.get("pending_reason"),
                 delivery=(target.get("result_delivery") or {}).get("status"),
+                verification=target.get("verification_class"),
                 binding=binding.get("state"),
                 action=_next_action(target),
             )

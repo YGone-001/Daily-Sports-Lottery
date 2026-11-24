@@ -1109,9 +1109,11 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   `DSL_LOCAL_UI_REFRESH_ENABLED=false`；DEBUG=False/reloader 不能替代显式启用，后台线程须同时满足两个开关。
 - **启动器默认只读、`--refresh` 才激活**：`start.bat` / `start.sh` 必须把两个开关**显式设为 false**，
   `start.bat --refresh` / `./start.sh --refresh` 只为本次启动同时置为 true；未知参数只提示、不激活；
-  首次缺 `data/daily_matches.json` 时只有 `--refresh` 才执行 `python -m utils.scraper`，
-  只读启动以非零退出并给出可操作提示；脚本**从不**设置 `DSL_BACKGROUND_REFRESH_ENABLED`。
-  该行为由 `tests/test_runtime_refresh_authority.py` 在沙箱中真实执行启动脚本回归，改动须同步测试。
+  该激活是**持续到进程结束**的写能力，**不是**一次性生产批准，进程内每次 `POST /api/refresh`
+  仍需操作者当下授权；首次缺 `data/daily_matches.json` 时只有 `--refresh` 才执行
+  `python -m utils.scraper`，只读启动以非零退出并给出可操作提示；脚本**从不**设置
+  `DSL_BACKGROUND_REFRESH_ENABLED`。该行为由 `tests/test_runtime_refresh_authority.py`
+  在沙箱中真实执行启动脚本回归，改动须同步测试。
 - **操作状态由后端派生**：`/api/status.runtime` 是权威来源，`mode` 为
   `READ_ONLY_APPLICATION` / `LOCAL_REFRESH_AVAILABLE` / `TOKEN_REQUIRED`，
   `operating_state` 另含 `REFRESH_IN_PROGRESS` / `REFRESH_COMPLETED` / `REFRESH_FAILED`
@@ -1343,6 +1345,12 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   完整目标清单留在 CLI 报告。缺少观测时如实报 `NO_SOURCE_OBSERVATION`，不得编造 status。
 - **真实闭环仍需单独授权**：诊断通过不等于真实赛果已获取；外部证据请求、真实绑定与生产写入
   各自需要独立批准，未获授权时 `REAL_NBA_POSTGAME_CLOSURE` 保持 BLOCKED。
+- **赛果验证等级不得混称**：`SOURCE_RETURNED_CONFIRMED_FINAL_RESULT` 只对应
+  `SOURCE_REPORTED_FINAL`（单一即时源报告），**不得**表述为
+  `INDEPENDENT_OFFICIAL_RESULT_VERIFIED` 或 `FULL_TWO_SOURCE_RESULT_VERIFIED`；
+  后两者只能来自 §4.36 / §4.37 的 NBA 官方页 + BDL 严格双源核对。
+  文档中的绑定状态同样不得互换：已绑定 → `AWAITING_EXTERNAL_CONFIRMED_RESULT_EVIDENCE`；
+  未绑定 → `PRIOR_PROVIDER_BINDING_REQUIRED`。
 
 ---
 

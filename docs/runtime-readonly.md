@@ -16,6 +16,11 @@ DEBUG=False 或 Werkzeug 子进程都不会自动获得写权限。
 不会因为「启动了应用」而静默开启生产写入。只有显式 `start.bat --refresh` 或
 `./start.sh --refresh` 才为**本次启动**同时开启这两个开关；未知参数只提示、不激活。
 
+> `--refresh` 开启的是**持续到该应用进程结束**的写能力，**不是**一次性生产批准。
+> 该进程内每一次 `POST /api/refresh` 仍是一次独立的真实刷新，需要操作者当下的明确授权；
+> 关闭进程或重新以只读方式启动即撤销该能力。不得把「上次用 `--refresh` 启动过」
+> 当作本轮刷新的批准。
+
 首次缺少 `data/daily_matches.json` 时，脚本只有在显式 `--refresh` 下才执行
 `python -m utils.scraper`；只读启动会打印可操作提示并以非零退出，不会自动抓取。
 脚本从不设置 `DSL_BACKGROUND_REFRESH_ENABLED`；后台刷新仍须单独显式配置。
@@ -59,6 +64,19 @@ DEBUG=False 或 Werkzeug 子进程都不会自动获得写权限。
 缺写开关或令牌均返回 403，忙时仍返回 409。没有令牌回显，不把令牌放进 URL、报告、源码或浏览器构建产物。
 授权操作由操作者经受控客户端携带请求头执行。配置写能力**不等于**对真实运行库操作的独立批准。
 后台刷新还必须显式启用 `DSL_BACKGROUND_REFRESH_ENABLED=true`，默认保持关闭；reloader 判定仅防重复线程。
+
+## 赛果验证等级（产品语言）
+
+运行状态与赛果验证是两个维度。赛果语言只允许以下三档，**不得**互相代称：
+
+| 等级 | 含义 | 来源 |
+| --- | --- | --- |
+| `SOURCE_REPORTED_FINAL` | 单一即时源报告终场（对应 `SOURCE_RETURNED_CONFIRMED_FINAL_RESULT`） | `live_basketball` 即时列表 |
+| `INDEPENDENT_OFFICIAL_RESULT_VERIFIED` | 独立核验的终场 | NBA 官方页 + BDL 严格双源核对（`tools.nba_confirmed_result`） |
+| `FULL_TWO_SOURCE_RESULT_VERIFIED` | 独立核验之外，彩票源终场比分也一致 | 上述双源 + 同一比分 |
+
+`SOURCE_RETURNED_CONFIRMED_FINAL_RESULT` **不是**独立官方核验，**不得**用它替代
+`INDEPENDENT_OFFICIAL_RESULT_VERIFIED`，也**不得**据此绕过 preview / execute 两段批准。
 
 ## 一次正常刷新的影响
 

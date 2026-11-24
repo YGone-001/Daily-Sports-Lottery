@@ -11,11 +11,19 @@
 
 `python -m tools.basketball_result_delivery --data-dir data`（或 `/api/status.source_health.result_delivery`）
 只读列出「有待结算赛前预测但尚无赛果」的赛事，并标明缺哪类证据；不联网、不写库。
-NBA 目标只有在 `kickoff_provenance` 已含唯一 `balldontlie_nba_games` 赛事 ID
-（`SCHEDULE_PROVIDER_VERIFIED`）时才进入
-`NBA_RESULT_PATH_PRIOR_BINDING`；否则为 `PRIOR_PROVIDER_BINDING_REQUIRED`，
-工具不会凭彩票编号或队名相似补造赛事 ID。诊断通过后，仍按下方绑定契约准备
+NBA 目标按既有 BDL 绑定状态分两条互斥路径，**不得**混用：
+
+| `kickoff_provenance` 状态 | `result_path.state` | 含义 |
+| --- | --- | --- |
+| 已含唯一 `balldontlie_nba_games` 赛事 ID 且 `SCHEDULE_PROVIDER_VERIFIED` | `AWAITING_EXTERNAL_CONFIRMED_RESULT_EVIDENCE` | 身份已绑定，只缺获准取得的官方页与 BDL 终场证据 |
+| 缺失或不完整 | `PRIOR_PROVIDER_BINDING_REQUIRED` | 连提供商身份都未建立，必须先具备绑定 |
+
+工具不会凭彩票编号或队名相似补造赛事 ID。身份已绑定的目标仍需按下方绑定契约准备
 官方页与 BDL 原始响应，再走 preview / execute 两段批准。
+`SOURCE_RETURNED_CONFIRMED_FINAL_RESULT` 是单一即时源报告终场，只对应
+`SOURCE_REPORTED_FINAL`，**不是** `INDEPENDENT_OFFICIAL_RESULT_VERIFIED`；只有通过下方
+NBA 官方页 + BDL 严格双源核对才可声称独立核验（两者比分也与彩票源一致时才达到
+`FULL_TWO_SOURCE_RESULT_VERIFIED`）。
 
 ## 绑定契约
 

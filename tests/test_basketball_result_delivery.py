@@ -44,6 +44,10 @@ from utils.result_delivery import (
     NBA_RESULT_PATH_PRIOR_BINDING,
     NON_NBA_RESULT_PATH,
     NO_SOURCE_OBSERVATION,
+    RESULT_VERIFICATION_FULL_TWO_SOURCE,
+    RESULT_VERIFICATION_INDEPENDENT,
+    RESULT_VERIFICATION_NOT_VERIFIED,
+    RESULT_VERIFICATION_SOURCE_REPORTED,
     SOURCE_FIXTURE_NOT_PRESENT,
     SOURCE_RECORD_PARSED_BUT_NOT_MATCHED,
     SOURCE_REQUEST_FAILED,
@@ -51,6 +55,7 @@ from utils.result_delivery import (
     SOURCE_RETURNED_EMPTY,
     SOURCE_RETURNED_NON_FINAL_RESULT,
     build_basketball_result_delivery,
+    classify_result_verification,
     classify_target_result_delivery,
     summarize_result_delivery,
 )
@@ -215,6 +220,59 @@ def test_rd_07_single_consistent_final_result_is_delivered():
     assert delivery["status"] == SOURCE_RETURNED_CONFIRMED_FINAL_RESULT
     assert delivery["final_score"] == [110, 104]
     assert delivery["matched_row_count"] == 1
+
+
+def test_rd_07b_source_reported_final_is_not_independent_official_verification():
+    """单一即时源报告只给 SOURCE_REPORTED_FINAL，独立核验必须另有官方 + BDL 证据。"""
+    row = live_row(status="finished", score={"ft": [110, 104]}, jczq_no=NBA_NO)
+    snap = snapshot(NBA_ID)
+    report = build_basketball_result_delivery(
+        [nba_target()],
+        {"snapshots": {snap["snapshot_id"]: snap}},
+        {"settlements": {}},
+        observations([row]),
+        now=AFTER_KICKOFF,
+    )
+    target = report["targets"][0]
+    assert target["result_delivery"]["status"] == SOURCE_RETURNED_CONFIRMED_FINAL_RESULT
+    assert target["verification_class"] == RESULT_VERIFICATION_SOURCE_REPORTED
+    assert target["verification_class"] != RESULT_VERIFICATION_INDEPENDENT
+    assert report["stored_final_result_verification_counts"][RESULT_VERIFICATION_INDEPENDENT] == 0
+
+    official = {
+        "id": "500j-2030-05-16-7313",
+        "sport": "basketball",
+        "league": "NBA",
+        "date": NBA_DATE,
+        "home": "洛杉矶湖人",
+        "away": "金州勇士",
+        "status": "finished",
+        "score": {"ft": [110, 104]},
+        "result_provenance": {
+            "provider": "nba_official_game_page",
+            "nba_official_game_id": "0022600153",
+            "balldontlie_game_id": "21718162",
+        },
+    }
+    assert classify_result_verification(official) == RESULT_VERIFICATION_INDEPENDENT
+    assert classify_result_verification(
+        official,
+        {"status": SOURCE_RETURNED_CONFIRMED_FINAL_RESULT, "final_score": [110, 104]},
+    ) == RESULT_VERIFICATION_FULL_TWO_SOURCE
+    assert classify_result_verification(
+        official,
+        {"status": SOURCE_RETURNED_CONFIRMED_FINAL_RESULT, "final_score": [111, 104]},
+    ) == RESULT_VERIFICATION_INDEPENDENT
+    assert classify_result_verification({"status": "upcoming"}) == RESULT_VERIFICATION_NOT_VERIFIED
+
+    with_official = build_basketball_result_delivery(
+        [official, nba_target()],
+        {"snapshots": {snap["snapshot_id"]: snap}},
+        {"settlements": {}},
+        observations([row]),
+        now=AFTER_KICKOFF,
+    )
+    assert with_official["stored_final_result_verification_counts"][RESULT_VERIFICATION_INDEPENDENT] == 1
 
 
 # ---------------------------------------------------------------------------

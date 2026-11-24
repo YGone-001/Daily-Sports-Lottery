@@ -46,6 +46,22 @@ RESULT_DELIVERY_STATUSES = (
 BASKETBALL_RESULT_SOURCE = "live_basketball"
 GENERIC_FINISHED_SOURCE = "wanchang"
 
+#: 赛果验证等级（产品语言）。三档互不等价，**不得**互相代称。
+#: - ``SOURCE_REPORTED_FINAL``：单一即时源报告终场，**不是**独立核验。
+#: - ``INDEPENDENT_OFFICIAL_RESULT_VERIFIED``：NBA 官方页与 BDL 严格核对后的终场。
+#: - ``FULL_TWO_SOURCE_RESULT_VERIFIED``：在独立核验之外，彩票源终场比分也一致。
+RESULT_VERIFICATION_NOT_VERIFIED = "NOT_VERIFIED"
+RESULT_VERIFICATION_SOURCE_REPORTED = "SOURCE_REPORTED_FINAL"
+RESULT_VERIFICATION_INDEPENDENT = "INDEPENDENT_OFFICIAL_RESULT_VERIFIED"
+RESULT_VERIFICATION_FULL_TWO_SOURCE = "FULL_TWO_SOURCE_RESULT_VERIFIED"
+
+RESULT_VERIFICATION_CLASSES = (
+    RESULT_VERIFICATION_NOT_VERIFIED,
+    RESULT_VERIFICATION_SOURCE_REPORTED,
+    RESULT_VERIFICATION_INDEPENDENT,
+    RESULT_VERIFICATION_FULL_TWO_SOURCE,
+)
+
 BDL_PROVIDER = "balldontlie_nba_games"
 BDL_BINDING_ESTABLISHED = "BDL_PROVIDER_BINDING_ESTABLISHED"
 BDL_BINDING_INCOMPLETE = "BDL_PROVIDER_BINDING_INCOMPLETE"
@@ -328,6 +344,37 @@ def _non_nba_result_path(match: Mapping[str, Any]) -> dict:
     }
 
 
+def classify_result_verification(
+    match: Mapping[str, Any],
+    delivery: Mapping[str, Any] | None = None,
+) -> str:
+    """把「已有终场证据」映射到唯一的验证等级；单一即时源报告永远不是独立核验。"""
+    provenance = match.get("result_provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    official_id = provenance.get("nba_official_game_id")
+    official_verified = (
+        provenance.get("provider") == "nba_official_game_page"
+        and isinstance(official_id, str)
+        and bool(official_id.strip())
+        and provenance.get("balldontlie_game_id") not in (None, "")
+    )
+    final_score = (delivery or {}).get("final_score")
+    source_reported = (
+        (delivery or {}).get("status") == SOURCE_RETURNED_CONFIRMED_FINAL_RESULT
+        and isinstance(final_score, (list, tuple))
+        and len(final_score) >= 2
+    )
+    if official_verified:
+        score = match.get("score")
+        ft = score.get("ft") if isinstance(score, Mapping) else None
+        if source_reported and isinstance(ft, (list, tuple)) and list(ft[:2]) == list(final_score[:2]):
+            return RESULT_VERIFICATION_FULL_TWO_SOURCE
+        return RESULT_VERIFICATION_INDEPENDENT
+    if source_reported:
+        return RESULT_VERIFICATION_SOURCE_REPORTED
+    return RESULT_VERIFICATION_NOT_VERIFIED
+
+
 def _pending_reason(match: Mapping[str, Any], now: datetime) -> str | None:
     status = str(match.get("status") or "").strip().lower()
     if status == "live":
@@ -490,6 +537,7 @@ def build_basketball_result_delivery(
             "pending_snapshot_count": len(pending_snapshots),
             "is_nba": nba,
             "result_delivery": delivery,
+            "verification_class": classify_result_verification(match, delivery),
         }
         if nba:
             target["provider_binding"] = binding
@@ -503,6 +551,13 @@ def build_basketball_result_delivery(
     observation_summary = _observation_summary(source_observations, scope=observation_scope)
     nba_targets = [target for target in targets if target["is_nba"]]
     non_nba_targets = [target for target in targets if not target["is_nba"]]
+    # 已落盘终场的验证等级分布：只有独立核验过的终场才算 INDEPENDENT_*，
+    # 单一源报告过的 pending 目标已在 target.verification_class 中单独标注。
+    stored_final_verification_counts = {name: 0 for name in RESULT_VERIFICATION_CLASSES}
+    for match in matches:
+        if (isinstance(match, Mapping) and match.get("sport") == "basketball"
+                and is_finalized_match(dict(match))):
+            stored_final_verification_counts[classify_result_verification(match)] += 1
     return {
         "generated_at": clock.isoformat(),
         "scope": "READ_ONLY_DIAGNOSTIC",
@@ -514,6 +569,7 @@ def build_basketball_result_delivery(
         "non_nba_pending": len(non_nba_targets),
         "status_counts": counts,
         "confirmed_final_result_targets": counts[SOURCE_RETURNED_CONFIRMED_FINAL_RESULT],
+        "stored_final_result_verification_counts": stored_final_verification_counts,
         "finalized_without_settlement": finalized_unsettled,
         "not_yet_due": not_yet_due,
         "basketball_matches_without_pending_snapshot": no_pending_snapshot,
@@ -531,6 +587,8 @@ def build_basketball_result_delivery(
         "notes": [
             "live_basketball 是唯一篮球赛果来源；赛事离开即时列表后不存在篮球完场源。",
             "wanchang 解析器固定产出足球记录，不投递篮球赛果。",
+            "SOURCE_RETURNED_CONFIRMED_FINAL_RESULT 只是 SOURCE_REPORTED_FINAL，不是独立官方核验。",
+            "INDEPENDENT_OFFICIAL_RESULT_VERIFIED 只来自 NBA 官方页与 BDL 的严格双源核对。",
             "跨源候选证据只是诊断，不授权身份、赔率合并、入住或结算。",
             "外部 NBA 证据未获授权时，真实赛后闭环保持 BLOCKED。",
         ],
@@ -550,6 +608,7 @@ def summarize_result_delivery(report: Mapping[str, Any], *, sample_limit: int = 
                 "is_nba": target.get("is_nba"),
                 "pending_reason": target.get("pending_reason"),
                 "result_delivery_status": (target.get("result_delivery") or {}).get("status"),
+                "verification_class": target.get("verification_class"),
                 "result_path": (target.get("result_path") or {}).get("state")
                 if isinstance(target.get("result_path"), Mapping)
                 else target.get("result_path"),
@@ -564,6 +623,7 @@ def summarize_result_delivery(report: Mapping[str, Any], *, sample_limit: int = 
         "non_nba_pending": report.get("non_nba_pending"),
         "status_counts": report.get("status_counts"),
         "confirmed_final_result_targets": report.get("confirmed_final_result_targets"),
+        "stored_final_result_verification_counts": report.get("stored_final_result_verification_counts"),
         "finalized_without_settlement": report.get("finalized_without_settlement"),
         "not_yet_due": report.get("not_yet_due"),
         "nba_pending_with_provider_binding": report.get("nba_pending_with_provider_binding"),
