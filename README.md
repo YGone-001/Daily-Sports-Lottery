@@ -1,1149 +1,491 @@
 # 每日实时体彩预测终端 (Daily Sports-Lottery Terminal)
 
-一个基于 Flask 的**每日竞彩预测系统**。从 500.com 自动抓取中国体彩竞彩赛程与赔率，
-覆盖**竞彩足球 + 竞彩篮球**，用 Elo 强度 + 泊松/Dixon-Coles（足球）与正态得分分布（篮球）
-模型输出胜平负概率、最可能比分、大小球倾向、悬念指数，并结合 **EV / Fractional Kelly**
-扫描正期望值（价值）盘口与最优串关组合。
+> 面向竞彩足球与竞彩篮球的本地预测、历史留存与模型评估终端。
 
-> 说明：本项目输出的是模型视角下的概率估计与模拟结果，不代表确定预测，也不构成投注建议。
+[![CI](https://github.com/YGone-001/Daily-Sports-Lottery/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/YGone-001/Daily-Sports-Lottery/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.10%2B%20%7C%203.12-3776AB?logo=python&logoColor=white)
+![Flask](https://img.shields.io/badge/Flask-3.1.1-000000?logo=flask&logoColor=white)
+![React](https://img.shields.io/badge/React-18%20%2B%20Vite%206-61DAFB?logo=react&logoColor=black)
+![License](https://img.shields.io/badge/License-MIT-green)
 
-## 主要功能
+项目从公开赛程源抓取**有真实盘口覆盖**的竞彩赛事，用 Elo 实力先验与统计学比分模型输出
+胜平负概率、比分分布、大小球倾向与价值盘口；同时把「赛前预测」固化为不可变历史记录，
+并在赛后用真实终场比分完成结算与可复现的模型评估。
 
-- **每日自动抓取**：后台守护线程每 30 分钟从 500.com 拉取竞彩赛程与赔率，热更新本地数据。
-- **足篮双模型**：
-  - 足球 —— Elo → 期望进球 → **泊松 + Dixon-Coles 低比分修正** → 胜平负 / 比分 / 大小球。
-  - 篮球 —— Elo → 预期得分 → **正态分布**建模分差与总分 → 胜负 / 让分 / 大小分。
-- **市场盘口对撞**：模型概率与庄家赔率隐含概率按权重融合，自动嗅探正 EV 的「🔥 价值」盘口。
-- **智能策略舱**：扫描全盘价值漏洞，用组合数学生成「二串一 / 三串一 / 四串一」最优组合。
-- **动态凯利仓位计算器**：滑动本金条，用 Fractional Kelly (1/4) 算出最佳注码与预期回报。
-- **六维战力雷达**：单场详情页提供基于 Chart.js 的攻防战力多维对比雷达图。
-- **历史复盘**：已完赛比赛展示「预测 vs 实际」，统计命中率，滚动校准球队 Elo。
-- **动态球队实力库**：任意球队池自动匹配 Elo（联赛锚点 + 排名 + 结果滚动校准），无需外部 API。
+技术上是一个 **Flask + 本地 JSON 存储** 的单机应用，前端为 **React 18 + TypeScript + Vite**：
+启动脚本构建前端后设置 `SERVE_FRONTEND=1`，由 Flask 托管 `frontend/dist`；未构建或未设置时
+回退 Jinja 模板界面。应用**默认只读**：启动本身不会抓取、不会写入任何生产存储，
+真实刷新必须由操作者显式开启并触发。
 
-## 技术栈
+> 本项目输出的是模型视角下的概率估计，不构成投注建议。
 
-- Python 3.10+
-- Flask 3.x
-- Requests（HTTP 抓取）
-- Jinja2 模板 + Chart.js（雷达图）
-- 本地 JSON 数据（`data/*.json`）
+## ✨ 核心特性
 
-## 数据源架构
+- **有盘口才跟踪**：市场准入以「完整可用盘口」为唯一判据，不设联赛白名单；被准入后保持生命周期连续。
+- **足篮双模型**：足球为 Elo → 期望进球 → 泊松 + Dixon-Coles；篮球为 Elo → 预期得分 → 正态分差与总分。
+- **市场对撞与价值扫描**：模型概率与去水后的市场隐含概率按权重融合，并输出 EV / Fractional Kelly。
+- **不可变预测历史**：每场比赛 × 每个模型版本仅一条赛前快照，`snapshot_id` 确定性可复现。
+- **赛后闭环**：赔率历史 → 预测快照 → 结算（快照 × 终场比分）→ 评估样本，四层数据只追加、不改写。
+- **可复现评估**：Accuracy / Brier / LogLoss、10 分箱校准与 ECE、按时间窗的 Temporal Evaluation。
+- **NBA 专用链路**：BALLDONTLIE 赛程时间补全、受控赛果绑定预览/执行、只读赛果投递诊断。
+- **安全默认值**：默认只读、跨进程刷新锁、代标记、七库摘要比对；生产修复需要 Ed25519 授权。
 
-系统采用**双源互补**策略，全部走 HTTP 直出，**无需浏览器渲染**：
+## 🏗️ 架构总览
 
-| 数据源 | 地址 | 提供 |
+```mermaid
+flowchart LR
+    subgraph Client["客户端"]
+        SPA["React SPA<br/>frontend/dist"]
+        TPL["Jinja 模板<br/>回退界面"]
+    end
+
+    subgraph App["应用层 (app.py)"]
+        Routes["页面 + JSON API"]
+        Runtime["/api/status 运行状态"]
+    end
+
+    subgraph Pipeline["刷新管线 (utils.scraper)"]
+        Fetch["500.com 适配器<br/>即时 / 赔率 / 完场"]
+        Identity["身份预检 + 市场准入"]
+        BDL["BDL 赛程补全<br/>可选，默认关闭"]
+        History["快照 / 结算 / 评估"]
+    end
+
+    subgraph Store["受保护存储 (data/*.json)"]
+        Canon["daily_matches.json"]
+        Immutable["六个不可变历史库"]
+    end
+
+    subgraph Ops["离线运维工具 (tools/)"]
+        Diag["只读诊断"]
+        Bind["NBA 赛果绑定<br/>preview / execute"]
+    end
+
+    Lock["刷新锁 + 代标记"]
+
+    SPA -->|HTTP /api| Routes
+    TPL --> Routes
+    Routes --> Runtime
+    Routes -->|只读查询| Canon
+    Routes -->|只读查询| Immutable
+    Fetch --> Identity
+    Identity --> BDL
+    BDL --> History
+    History -->|原子写入| Canon
+    History -->|原子写入| Immutable
+    Lock -.-> Fetch
+    Diag -->|只读| Canon
+    Diag -->|只读| Immutable
+    Bind -->|预览 / 受控写入| Canon
+    Bind -->|受控追加| Immutable
+```
+
+| 边界 | 关键实现 | 职责 |
 | --- | --- | --- |
-| 即时比分（足球） | `live.500.com/` → `weekfixture.php` → `2h1.php`（按序尝试） | 赛程、**开赛时间**、实时比分、竞彩编号（有则用） |
-| 即时比分（篮球） | `live.500.com/lq.php`（内联 `matchList` / `oddsList`，并支持表格行兜底） | 赛程、开赛时间、竞彩官方赔率 |
-| 竞彩赔率 | `trade.500.com/static/public/{lot}/newxml/pl/pl_{play}_2.xml` | 胜平负 / 让分 / 大小分盘口 |
-| 完场比分 | `live.500.com/wanchang.php` | 历史赛果（用于 Elo 校准与复盘） |
+| Web 应用 | [app.py](app.py) | 页面路由、JSON API、运行能力状态；不触发抓取 |
+| 抓取与合并 | [utils/scraper.py](utils/scraper.py) | 多源抓取、身份预检、准入、合并、快照、结算、评估 |
+| 数据源适配 | [utils/fetcher_500.py](utils/fetcher_500.py) | 500.com 即时比分 / 赔率 XML / 完场解析与健康诊断 |
+| 身份与生命周期 | [utils/ingestion_identity.py](utils/ingestion_identity.py)、[utils/match_identity.py](utils/match_identity.py)、[utils/match_lifecycle.py](utils/match_lifecycle.py) | 跨源同事件判定、终态保护、冲突 fail-closed |
+| 预测历史 | [utils/prediction_snapshots.py](utils/prediction_snapshots.py)、[utils/odds_snapshots.py](utils/odds_snapshots.py) | 不可变赛前快照与赔率时序观察 |
+| 结算与评估 | [utils/settlements.py](utils/settlements.py)、[utils/evaluation_rows.py](utils/evaluation_rows.py) | 快照 × 赛果关联、评估样本物化 |
+| 模型 | [models/](models) | 足球泊松模型、篮球得分模型、价值与串关策略 |
+| NBA 集成 | [utils/nba_schedule.py](utils/nba_schedule.py)、[tools/nba_confirmed_result.py](tools/nba_confirmed_result.py) | 赛程时间补全、严格赛果绑定与结算入口 |
+| 运行时安全 | [utils/concurrency.py](utils/concurrency.py)、[utils/refresh_state.py](utils/refresh_state.py) | 跨进程锁、代标记、七库摘要一致性 |
 
-事件与赔率通过 **竞彩编号**（如 `3001`）精确合并；当来源不再提供编号时，
-退化为 `utils.match_identity.same_event` 的 `(sport, date, home, away)` 主客队对匹配。
+### 数据来源
 
-### 来源兼容性与容错
+| 来源 | 提供 | 适配器 |
+| --- | --- | --- |
+| 500.com 即时比分（足球 / 篮球） | 赛程、开赛时间、状态、实时比分、竞彩编号 | `fetcher_500.fetch_live_matches` / `fetch_live_basketball` |
+| 500.com 竞彩赔率 XML | 胜平负、让分、大小分 | `fetcher_500.fetch_jczq_xml` |
+| 500.com 完场（`wanchang`） | 足球历史赛果（用于 Elo 校准与复盘） | `fetcher_500.fetch_finished_matches` |
+| BALLDONTLIE Games API | NBA 赛程、时间、终场证据 | `utils/nba_schedule.py`、`utils/nba_history.py` |
+| NBA 官方比赛页 | 官方终场身份、比分、逐节数据 | `tools/nba_confirmed_result.py` |
 
-500.com 的前端会改版，适配器因此按「**布局容错 + 候选页回退**」设计：
+事件与赔率优先按竞彩编号合并；缺编号时退化为既有的 `same_event()` 主客队对匹配，
+不做队名别名或模糊推断。
 
-- **候选页回退**：足球即时比分依次尝试 `live.500.com/`、`weekfixture.php`、`2h1.php`，
-  任一页面可用即可；单个页面 404/500/超时不会影响其他页面。
-- **两种布局并存**：
-  - 新版页面行带 `gy="联赛,主队,客队"`，**列数与列序可变**，队名与联赛以 `gy` 为权威来源；
-  - 旧版页面无 `gy`，沿用固定列索引 + `mainName` / `clientName` 解析。
-- **字段定位基于模式而非下标**：开赛时间在行文本中按 `MM-DD HH:MM` 定位；
-  全场比分优先取 `class="pk"` 单元格（避免误取半场比分）。
-- **HTML 实体解码**：`&nbsp;` 等实体在剥离标签时统一解码，避免
-  `10-01&nbsp;22:25` 这类时间戳解析失败。
-- **防御式解析**：缺字段 / 空行 / 多余列只计入 `parser_errors`，**绝不产出缺字段的非法比赛**。
-- **不伪造市场信息**：即时比分源不提供赔率时 `odds = None`；
-  赔率源只有在真的给出价格时才写入 `home_win` / `draw` / `away_win`，
-  没有默认值、估算值、占位值或拷贝值。
-- **市场准入不变**：没有可用盘口覆盖 → 不进入 canonical 集合 → 不产生预测快照。
+## 📈 数据生命周期
 
-### 数据源健康诊断
+| 层 | 存储 | 身份 | 写入约束 | 读取入口 |
+| --- | --- | --- | --- | --- |
+| 赛前预测快照 | `prediction_snapshots.json` | `sha256(match_id \| slot \| model_version)` | 每场每版本仅一条；仅 `upcoming` 且开赛前 | `/api/match/<id>/snapshots` |
+| 赛前赔率历史 | `odds_snapshots.json` | 每次观察独立记录 | 仅赛前；仅抑制连续重复 | `/api/match/<id>/odds-history` |
+| 结算 | `settlements.json` | `sha256("settlement\|" + snapshot_id)` | 只消费既有快照 × 有效终场比分 | `/api/match/<id>/settlements` |
+| 评估样本 | `evaluation_rows.json` | `sha256("evaluation\|" + snapshot_id + "\|" + settlement_id)` | 只拼装既有快照与结算，不重跑模型 | `/api/evaluation-summary` |
 
-`utils.fetcher_500.source_diagnostics()` 返回最近一次各源的结构化状态，
-可区分四种情况（`unavailable` / `empty` / `ok`，外加每源的 `parser_errors` 计数）：
+四层都只追加、不改写既有记录；身份不稳定或指纹冲突时显式拒绝，而不是静默覆盖。
 
-```text
-[500fetcher] jczq_odds_football: status=empty rows=0 parser_errors=0
-             reachable but no matches on sale
+## 🔄 一次显式刷新如何发生
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as 操作者
+    participant API as Flask API
+    participant Lock as 刷新锁
+    participant Src as 数据源
+    participant Store as 本地 JSON 存储
+
+    Op->>API: POST /api/refresh（写能力已显式开启）
+    API->>Lock: acquire_refresh_lock()
+    Lock-->>API: 租约（单写者）
+    API->>Src: 抓取即时比分 / 赔率 / 完场
+    Src-->>API: 原始行（可能为空、失败或不含目标）
+    API->>API: 身份预检 → 市场准入 → 合并
+    API->>API: BDL 赛程补全（可选）
+    API->>Store: 追加赔率历史 / 预测快照 / 结算 / 评估
+    API->>Store: 原子写 daily_matches.json
+    API->>Lock: 写代标记并释放
+    API-->>Op: 本次刷新统计
 ```
 
-`utils.scraper.refresh` 返回的 `sources` 字段同时给出各源行数，
-因此刷新结果可以区分「源不可达」「源可达但为空」「解析失败」「无可用赔率」。
+关键时序约束：
 
-> 竞彩赔率 XML 端点在无在售赛事时返回 `<xml></xml>`（HTTP 200，0 场），
-> 这是「源可达但为空」，不是故障；此时不会有任何赛事被准入。
-> 曾尝试的 `trade.500.com/jczq` 页面为纯 AJAX、`www.500.com` 上的同名 XML 为 2019 年陈旧数据，
-> 均已弃用；上面的端点才是当前可用的权威来源。
+- **预测快照在 Elo 校准之后**生成，使用的是本轮刷新时刻已知的最新实力。
+- **快照只对 `upcoming` 且开赛时间权威已知、`now < kickoff` 的比赛创建**；`live` / `finished` 一律拒绝，绝不倒填。
+- **结算只接受显式 `finished` 且 `score.ft` 为严格整数比分的记录**；时间流逝本身不产生结算。
+- **七个 JSON 不是事务**：每个文件原子替换，跨文件一致性由刷新代标记提供顾问性判断。
 
-## 项目结构
+## 🧠 模型语义要点
 
-```text
-worldCup/
-├── app.py                         # Flask 入口：页面路由 + JSON API + 后台抓取线程
-├── config.py                      # 运行配置、数据源、足球/篮球模型参数
-├── start.bat                      # Windows 一键启动脚本
-├── start.sh                       # Linux / macOS 一键启动脚本
-├── requirements.txt
-├── requirements-dev.txt           # 开发/测试依赖（pytest）
-├── pytest.ini
-├── .gitignore
-├── data/                          # ⚠️ 运行时数据，不提交（可由抓取器重建）
-│   ├── daily_matches.json         #   每日赛事（抓取器写入）
-│   ├── team_strength.json         #   动态球队实力库（Elo）
-│   ├── calibrated.json            #   已用于 Elo 校准的比赛 ID
-│   ├── prediction_snapshots.json  #   赛前预测快照（不可变历史记录）
-│   ├── odds_snapshots.json        #   赛前赔率历史（时序观察记录）
-│   ├── settlements.json           #   结算记录（预测快照 × 最终赛果）
-│   └── evaluation_rows.json       #   评估样本（预测快照 × 结算）
-├── models/
-│   ├── poisson_model.py           # 泊松 + Dixon-Coles 比分矩阵
-│   ├── predictor.py               # 预测主入口（足球）+ 赔率融合 + EV/Kelly
-│   ├── basketball_model.py        # 篮球正态得分模型
-│   └── strategy.py                # 价值投注扫描 + 串关组合
-├── utils/
-│   ├── match_identity.py         # 跨源赛事身份与对账辅助（强编号优先、开赛时间解耦）
-│   ├── match_lifecycle.py        # 完赛终态判定与生命周期冲突保护（终态不可逆、增量合并）
-│   ├── fetcher_500.py             # 500.com 抓取适配器（4 个数据源）
-│   ├── scraper.py                 # 抓取调度：多源合并 + Elo 校准 + 落盘
-│   ├── daily_loader.py            # 统一数据层 + 比赛日逻辑 + 查询
-│   ├── team_strength.py           # 动态 Elo 实力库
-│   ├── atomic_json.py             # 原子 JSON 落盘（临时文件 + fsync + replace）
-│   ├── prediction_snapshots.py    # 赛前快照：身份、时序门禁、幂等、不可变
-│   ├── odds_snapshots.py          # 赛前赔率历史：规范化、指纹、连续重复抑制
-│   ├── settlements.py             # 结算：快照×赛果关联、结果指纹、冲突保护
-│   ├── evaluation_rows.py         # 评估样本：快照×结算拼接、溯源校验、源指纹
-│   ├── classification_evaluation.py  # 分类评估：accuracy / Brier / LogLoss（纯计算，不落盘）
-│   ├── calibration_evaluation.py  # 校准诊断：分箱可靠性 / ECE（纯计算，不落盘）
-│   ├── dixon_coles_fitting.py     # 离线 rho 拟合：时间加权 Dixon-Coles 诊断（纯计算，不落盘）
-│   ├── dixon_coles_walkforward.py # 走查验证：无泄漏的时序外样本 rho 检验（纯计算，不落盘）
-│   ├── dixon_coles_counterfactual.py # 反事实 W/D/L：三策略 Brier / LogLoss 验证（纯计算，不落盘）
-│   ├── market_coverage.py         # 市场准入：可用盘口覆盖判定（唯一权威定义）
-│   └── temporal_evaluation.py     # 时序评估：固定回看窗口的分类/校准摘要（纯计算，不落盘）
-├── tests/                         # pytest 测试（快照行为 / 抓取器集成 / 只读 API）
-├── templates/                     # base / index / match / strategy / history
-└── static/
-    ├── css/style.css              # 「数据终端 × 金融看板」风格，明暗双主题
-    └── js/app.js                  # 进度条动画、手动同步
-```
+- **足球**：Elo 提供整体实力先验，攻防评分由历史场均进/失球**独立**推导并做小样本收缩；
+  期望进球 → 泊松比分矩阵（`dixon_coles_rho = -0.15`）→ 胜平负，再按 `odds_weight = 0.20`
+  与市场隐含概率融合。EV / Kelly 始终使用**融合前**的模型概率。
+- **篮球**：Elo 差 × 尺度（200 Elo ≈ 10 分）+ 主场优势（`2.5` 分，单位是比分差）得到预期分差；
+  分差与总分用正态分布建模。`model_probabilities` 是**融合前**的主客胜负概率，
+  `display_probabilities` 才是展示概率。
+- **确定性冷启动**：未知球队的初始 Elo 由 `league|name` 的 SHA-256 映射到 `[-60, 60]`，
+  跨进程、跨 `PYTHONHASHSEED`、跨机器一致；不使用 Python 内置 `hash()`。
+- **按运动独立版本**：只改足球时只提升足球版本，篮球版本保持不动，避免把未改动的运动
+  错误并入新版本分组。
+- **版本化历史不迁移**：`football-coldstart-1`、`basketball-margin-1` 等既有快照、结算与
+  评估样本保持不可变；已开赛赛事不会被追溯补建新版本快照。
 
-> **关于 `data/`**：目录下所有 `*.json` 都是抓取器生成的可再生数据，
-> 已加入 `.gitignore`。`git clone` 后没有这些文件也能启动，
-> 执行一次 `python -m utils.scraper` 即可重建（一键启动脚本需显式 `--refresh` 才会执行）。
+## 🧩 能力矩阵
 
+| 领域 | 能力 | 实现 / 证据 | 状态 |
+| --- | --- | --- | --- |
+| 数据接入 | 竞彩足球 / 篮球即时比分、赔率 XML、完场解析 | `utils/fetcher_500.py` | Implemented |
+| 身份治理 | 跨源同事件判定、强编号冲突 fail-closed | `utils/ingestion_identity.py`、`utils/source_identity.py` | Implemented |
+| 市场准入 | 完整盘口才准入；已跟踪事件保持连续 | `utils/market_coverage.py` | Implemented |
+| 预测 | 足球泊松 + Dixon-Coles；篮球正态分差 | `models/` | Implemented |
+| 历史留存 | 赛前快照、赔率历史、结算、评估样本 | `utils/*_snapshots.py`、`utils/settlements.py`、`utils/evaluation_rows.py` | Implemented |
+| 评估 | 分类指标、校准诊断、时序窗口摘要 | `utils/classification_evaluation.py` 等 | Implemented（只读计算） |
+| 运营证据 | 采集就绪、Gate 与完整性摘要 | `utils/evidence_status.py` | Implemented（只读） |
+| NBA 赛程 | BALLDONTLIE 时间补全 | `utils/nba_schedule.py` | Implemented（网络需显式开启） |
+| NBA 赛果 | 官方页 + BDL 严格双源绑定 | `tools/nba_confirmed_result.py` | Implemented（真实执行需操作者批准） |
+| NBA 诊断 | 赛果投递七类状态、证据请求 | `tools/basketball_result_delivery.py` | Implemented（只读） |
+| NBA V2 | 影子实力模型与前瞻捕获 | `models/basketball_model_v2.py` | Experimental（不提升生产） |
+| Canonical 治理 | 映射提案、重复评审、修复预览 | `utils/mapping_governance.py`、`tools/*repair*.py` | Partial（生产写入未授权） |
+| 运行时激活 | 离线信任链、影子激活审计 | `utils/runtime_activation_*.py` | Partial（隔离实现） |
 
-## 启动方式
+## 🛠️ 技术栈
 
-> 环境要求：**Python 3.10+**，依赖仅 `flask` + `requests`（无需 API Key、无需浏览器）。
+| 层 | 技术 |
+| --- | --- |
+| 后端 | Python 3.10+（CI 固定 3.12）、Flask 3.1.1、Requests 2.32.3 |
+| 前端 | React 18、TypeScript 5.7、Vite 6、TanStack Query、Recharts、Vitest |
+| 存储 | 本地 JSON（原子写 + 跨进程锁） |
+| 测试 | pytest 9.1.1（88 个测试模块） |
+| CI | GitHub Actions：Ubuntu + Windows × Python 3.12 |
+| 授权 | Ed25519（`cryptography`）用于生产 Canonical 修复授权校验 |
 
-### Windows
+## 🚀 快速开始
 
-**方式 A：一键启动（推荐）**
+### 前置条件
 
-双击项目根目录的 `start.bat`，脚本会自动完成：
+- Python 3.10+（CI 与推荐环境为 3.12）
+- 可选：Node.js + npm（用于构建 React 前端；缺失时自动使用旧模板界面）
+- 无需外部数据库；数据保存在本地 `data/*.json`
 
-1. 定位 Python（优先 `.venv`，其次内置环境，最后 `PATH`）
-2. 检查依赖，缺失则自动 `pip install -r requirements.txt`
-3. **显式 `start.bat --refresh` 时**才抓取缺失的赛事数据
-4. 启动服务并输出访问地址
-
-默认启动是**只读**的：不会因为「启动了应用」而静默开启生产写入。
-本机有能力同步时请用 `start.bat --refresh`，它只对本次启动开启主写与本地界面同步开关。
-
-**方式 B：手动**
-
-先在任意终端创建虚拟环境：
+### 推荐路径（Windows）
 
 ```powershell
-cd C:\path\to\worldCup
+# 默认只读启动
+.\start.bat
+
+# 首次运行，或需要从界面触发同步时
+.\start.bat --refresh
+```
+
+> PowerShell 不会从当前目录直接加载脚本，必须写 `.\start.bat`。
+
+`start.bat` 会定位 Python、创建/复用 `.venv`、安装依赖、构建前端（检测到 npm 时），
+然后启动服务。**只有 `--refresh` 才会**为本次启动开启写能力并允许首次抓取。
+
+### 推荐路径（Linux / macOS）
+
+```bash
+chmod +x start.sh
+./start.sh            # 只读启动
+./start.sh --refresh  # 本次启动开启写能力与首轮抓取
+```
+
+### 手动路径
+
+```powershell
 python -m venv .venv
-```
-
-然后**按你实际使用的终端**，选下面其中一种。
-
-#### PowerShell
-
-> ⚠️ **PowerShell 默认禁止运行 `.ps1` 脚本**（执行策略为 `Restricted`），直接激活会报：
->
-> ```text
-> .\.venv\Scripts\Activate.ps1 : 无法加载文件 ...\Activate.ps1，因为在此系统上禁止运行脚本。
-> ```
->
-> 这**不是本项目的问题**——任何 Python 项目在默认设置的 Windows 上用 PowerShell
-> 激活虚拟环境都会遇到同样的拦截。下面两种做法任选其一即可。
-
-**做法 ①：不激活，直接调用虚拟环境里的 `python`（最省事）**
-
-`python.exe` 是程序而非脚本，不受执行策略限制：
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m utils.scraper
+.\.venv\Scripts\python.exe -m utils.scraper   # 显式抓取并写入 data/
 .\.venv\Scripts\python.exe app.py
 ```
 
-**做法 ②：先放行执行策略，再正常激活**
-
-```powershell
-# 仅对当前窗口生效，关掉窗口即自动恢复（推荐，不改系统设置）
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-
-# 或者：仅对当前用户永久放行。本地脚本可运行，从网上下载的脚本仍需签名
-# Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python -m utils.scraper
-python app.py
-```
-
-#### CMD
-
-CMD 不受 PowerShell 执行策略限制，直接激活即可：
-
-```cmd
-.\.venv\Scripts\activate.bat
-pip install -r requirements.txt
-python -m utils.scraper
-python app.py
-```
-
-> 也可以直接运行方式 A 的 `start.bat`：它内部直接调用 `.venv\Scripts\python.exe`，
-> 完全跳过「激活」这一步，因此在 PowerShell 与 CMD 下都不会被拦截。
-
-### Linux / macOS
-
-**方式 A：一键启动（推荐）**
-
 ```bash
-cd /path/to/worldCup
-chmod +x start.sh      # 首次需赋执行权限
-./start.sh
-```
-
-脚本会自动：创建 `.venv` → 安装依赖 → 启动服务；首次数据抓取只在
-`./start.sh --refresh` 时执行（默认只读启动不会写任何生产存储）。
-
-**方式 B：手动（Bash）**
-
-```bash
-cd /path/to/worldCup
-
-# 1) 创建并激活虚拟环境
+# Linux / macOS
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 2) 安装依赖
 pip install -r requirements.txt
-
-# 3) 首次抓取数据
 python -m utils.scraper
-
-# 4) 启动服务
 python app.py
 ```
 
-**方式 C：不用虚拟环境（快速试用）**
+> 手动 `python app.py` 默认使用 Jinja 模板界面。若要托管 React 产物，先执行
+> `cd frontend && npm ci && npm run build`，并在启动前设置 `SERVE_FRONTEND=1`。
 
-```bash
-cd /path/to/worldCup
-pip3 install -r requirements.txt
-python3 -m utils.scraper
-python3 app.py
-```
-
-> 部分发行版需先装 venv 模块：
-> - Debian/Ubuntu：`sudo apt install python3-venv`
-> - CentOS/RHEL：`sudo yum install python3`
-> - macOS：`brew install python3`
-
-### 访问
-
-两种系统均访问：
+### 验证与访问
 
 ```text
 http://127.0.0.1:5000
 ```
 
-启动后默认**只读**：不启动后台抓取、不允许 HTTP 触发刷新。
-后端 `/api/status.runtime` 是权威的运行能力来源，操作者界面区分五种状态：
+只读健康检查：
 
-| `operating_state` | 含义 |
+```bash
+curl http://127.0.0.1:5000/api/status
+```
+
+关注 `runtime.mode`：
+
+| `mode` | 含义 |
 | --- | --- |
-| `READ_ONLY_APPLICATION` | 只读运行；界面不提供同步，启动应用不会自动写生产数据 |
-| `LOCAL_REFRESH_AVAILABLE` | 主写与本地界面开关均已显式开启，界面同步可用 |
-| `REFRESH_IN_PROGRESS` | 刷新标记为进行中；界面轮询状态，完成后自动更新 |
-| `REFRESH_COMPLETED` | 最近一次刷新完成（顾问性标记，不代表七个库是事务快照） |
-| `REFRESH_FAILED` | 最近一次刷新失败；显示记录的失败原因 |
+| `READ_ONLY_APPLICATION` | 默认只读；页面不提供同步 |
+| `LOCAL_REFRESH_AVAILABLE` | 主写开关 + 本地 UI 开关同时开启，按钮可同步 |
+| `TOKEN_REQUIRED` | 主写开启但本地 UI 关闭；程序化调用需 `X-Refresh-Token` |
 
-> 浏览器请求头、回环地址与前端按钮都不是授权边界；`token_required` 表示程序化刷新需要
-> `X-Refresh-Token`。如需启用能力，须显式设置环境变量（能力开启 ≠ 操作者批准，详见
-> `docs/runtime-readonly.md`）：
+> Windows 本机已实际执行 `.\start.bat --refresh` 并访问 `/api/status` 验证。
+> Linux/macOS 启动脚本为源码核对路径，未在本次会话执行。
 
-```bash
-# 后台抓取线程（默认每 30 分钟刷新一次竞彩赛程与赔率）：
-DSL_BACKGROUND_REFRESH_ENABLED=true
-# 本地 Web UI 同步（需与主写开关同时开启）：
-DSL_RUNTIME_WRITES_ENABLED=true DSL_LOCAL_UI_REFRESH_ENABLED=true
-# 程序化刷新调用：另需非空 DSL_RUNTIME_WRITE_TOKEN，请求头 X-Refresh-Token 匹配
-```
-
-### 后台常驻运行（可选）
-
-Linux 下如需长期后台运行：
+### 前端开发
 
 ```bash
-# 用 nohup 后台运行并记录日志
-nohup python app.py > app.log 2>&1 &
-
-# 停止
-pkill -f app.py
+cd frontend
+npm ci
+npm run dev     # Vite :3000，/api 代理到 :5000
+npm run build   # 产出 frontend/dist，由 Flask 托管
+npm test        # Vitest
+npm run lint    # tsc --noEmit
 ```
 
-生产环境建议用 WSGI 服务器：
+## ⚙️ 配置
 
-```bash
-pip install gunicorn
-gunicorn app:app --bind 0.0.0.0:5000 --workers 1
-```
+配置来自环境变量与仓库根目录的可选 `.env`（`config.py` 以 `setdefault` 方式加载，不覆盖已有环境变量）。
 
-> **注意**：后台抓取线程在多 worker 下会重复启动，建议 `--workers 1`，
-> 或改用独立进程 / cron 定时执行 `python -m utils.scraper`，Web 进程只读数据。
-
-### 自定义端口 / 监听地址
-
-Linux / macOS：
-
-```bash
-HOST=0.0.0.0 PORT=8000 DEBUG=false SCRAPE_INTERVAL_SECONDS=900 ./start.sh
-# 或直接：HOST=0.0.0.0 PORT=8000 DEBUG=false python3 app.py
-```
-
-Windows PowerShell：
-
-```powershell
-$env:HOST="0.0.0.0"; $env:PORT="8000"; $env:DEBUG="false"; python app.py
-```
-
-完整变量列表见下方 [配置说明](#配置说明)。
-
-## 篮球赛果投递诊断（只读）
-
-`python -m tools.basketball_result_delivery --data-dir data` 只读回答「pending 篮球比赛为什么
-没有赛果」，把源观测分为七类：无观测 / 请求失败 / 源返回空 / 源未列出该赛事 /
-记录已解析但未匹配 / 非终场结果 / 已确认终场结果。NBA 目标同时给出是否需要先补
-`balldontlie_nba_games` 赛程绑定与官方终场证据；非 NBA 联赛（如德篮甲）如实报告
-`SOURCE_NOT_AVAILABLE`，不会借用 NBA 路径。`/api/status.source_health.result_delivery`
-提供同一结论的摘要。
-
-绑定与结算复用既有入口 `python -m tools.nba_confirmed_result`（见
-[docs/nba-confirmed-result.md](docs/nba-confirmed-result.md)），不另建引擎。
-
-## 页面入口
-
-| 页面 | 地址 | 说明 |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| 今日赛事 | `/` | 按联赛分组的赛事卡片、概率条、价值标签；支持足球/篮球与日期筛选 |
-| 比赛详情 | `/match/<match_id>` | 概率卡片、比分预测、赔率表、凯利计算器、六维雷达 |
-| 智能策略 | `/strategy` | 价值盘口清单 + 二/三/四串一推荐 + 本金滑条 |
-| 历史复盘 | `/history` | 完赛的「预测 vs 实际」对照与命中率 |
+| `HOST` | `127.0.0.1` | 监听地址 |
+| `PORT` | `5000` | 服务端口 |
+| `DEBUG` | `true` | 调试模式；生产建议 `false` |
+| `SCRAPE_INTERVAL_SECONDS` | `1800` | 后台刷新间隔（仅后台刷新开启时生效） |
+| `MATCHDAY_CUTOFF_HOUR` | `6` | 逻辑比赛日切割点（北京时间） |
+| `DATA_CACHE_TTL_SECONDS` | `300` | 数据缓存 TTL |
+| `ODDS_WEIGHT` | `0.20` | 市场隐含概率融合权重 |
+| `FETCH_500_LIVE` | `true` | 是否启用 500.com 抓取 |
+| `FETCH_500_TIMEOUT` | `20` | 抓取超时（秒） |
+| `DSL_RUNTIME_WRITES_ENABLED` | `false` | 主写开关；关闭时一切刷新 403 |
+| `DSL_LOCAL_UI_REFRESH_ENABLED` | `false` | 本地界面同步开关（需与主写同时开启） |
+| `DSL_RUNTIME_WRITE_TOKEN` | 空 | 程序化刷新令牌；请求头 `X-Refresh-Token` |
+| `DSL_BACKGROUND_REFRESH_ENABLED` | `false` | 后台刷新线程；启动脚本从不开启 |
+| `DSL_ENABLE_NBA_SCHEDULE_NETWORK` | `false` | BALLDONTLIE 网络访问开关 |
+| `DSL_BDL_API_KEY` | 无 | BDL 凭据；也可由根目录 `.DSL_BDL_API_KEY` 本地文件提供 |
+| `DSL_BDL_PACING_INTERVAL` | `12.1` | BDL 请求最小间隔（秒，只能调大） |
+| `DSL_EVIDENCE_DIR` | `~/.daily-sports-lottery/evidence` | 人工证据目录（仓库内路径会被拒绝） |
+| `SERVE_FRONTEND` | 启动脚本设为 `1` | 存在 `frontend/dist` 时由 Flask 托管 SPA |
 
-## API 接口
+> 凭据只放在环境变量或本地未跟踪文件中；**不要**提交 `.env` 或 `.DSL_BDL_API_KEY`。
 
-| 方法 | 地址 | 说明 |
-| --- | --- | --- |
-| GET | `/api/today?sport=` | 逻辑比赛日赛事（含预测） |
-| GET | `/api/matches?date=&sport=` | 按日期/类别查询赛事 |
-| GET | `/api/match/<id>` | 单场详情 |
-| GET | `/api/match/<id>/snapshots` | 该场已固化的赛前预测快照（只读，无记录返回空列表） |
-| GET | `/api/match/<id>/odds-history` | 该场已捕获的赛前赔率历史，最早在前（只读，无记录返回空列表） |
-| GET | `/api/match/<id>/settlements` | 该场结算记录（只读，无记录返回空列表） |
-| GET | `/api/dates` | 可用日期与联赛列表 |
-| GET | `/api/strategy?sport=` | 策略推荐（价值盘口 + 串关） |
-| POST | `/api/refresh` | 手动触发一次抓取（默认拒绝：需显式开启运行时写开关；本地 UI 通道另需本地开关，程序化调用需刷新令牌） |
-| GET | `/api/status` | 系统状态（元信息、日期、球队库、当日统计、源诊断、运行时能力与前端构建标识） |
-
-## 市场覆盖准入
-
-本应用是**体育盘口预测系统**，跟踪的是**有真实盘口覆盖**的比赛，
-而不是全球记分板上的每一场。准入判定发生在**数据入口 / canonical 集合边界**，
-不是模板层的装饰性过滤。
-
-- **判定依据是市场证据，不是名气**：小联赛只要真有完整盘口就是相关赛事；
-  知名联赛若当前集成的数据源给不出可用盘口，则尚未成为被跟踪的市场事件。
-  **没有**联赛白名单 / 黑名单 / 球队热度规则。
-- **完整盘口才算覆盖**：
-  - 足球：完整 1X2（`home_win` + `draw` + `away_win`），或完整大小球
-    （`total_line` + `over` + `under`，兼容 `over_2_5` + `under_2_5`）。
-  - 篮球：完整胜负（`home_win` + `away_win`），或完整大小分
-    （`total_line` + `over` + `under`）。
-- **价格校验**：价格必须是数值型（bool 不算）、有限（非 NaN / Infinity）且 **> 1.0**。
-  仅有 `matchnum` / `jczq_no` / `total_line` / `handicap_line`，或只有单边、
-  或空字典 / None 填充，都**不构成**覆盖。不做字符串到价格的静默转换。
-- **准入标记**：被准入的比赛会带上 `market_tracked = true`，
-  含义是「该比赛因观察到有效盘口覆盖而被纳入应用」。不会写入 `market_tracked = false`。
-- **一旦准入即持续跟踪**：已跟踪比赛后续即使盘口源临时缺供（`odds = None`），
-  仍保留在 canonical 集合中、保持 `market_tracked = true`、保留最后已知盘口，
-  并继续接受状态 / 比分更新，直到完赛、结算与评估。
-- **新比赛必须有覆盖**：首次观察到的比赛若没有可用盘口，则不进入 canonical 日常集合，
-  也不会产生任何下游历史（预测快照 / 赔率历史 / 结算 / 评估样本）。
-- **历史集合迁移**：既有 `daily_matches.json` 中无标记且无可用盘口的历史行会在下一次
-  正常刷新时被移出 canonical 集合；无标记但自带可用盘口的历史行会被升级为
-  `market_tracked = true` 并保留。**历史不可变存储**
-  （`prediction_snapshots.json` / `odds_snapshots.json` / `settlements.json` /
-  `evaluation_rows.json`）一律不受影响，不做追溯性清理。
-- **赔率源与 live 源对账**：广域即时比分源仍照常抓取（开赛时间 / 状态 / 比分），
-  但广域可见性不再等于准入。赔率行先按竞彩编号（缺失时按 日期 + 主队）挂载到 live 行；
-  未挂载但自带可用盘口的赔率行会作为**兜底候选**保留，不会因为一次匹配失败就丢弃有效市场事件。
-  挂载成功的事件不会再产生第二条 00:00 兜底记录。
-- **当前数据源不变**：仍然只使用仓库已集成的 500.com 派生数据源，未新增任何外部盘口提供方。
-  准入判定保持通用，未来接入其他赔率源时同一判据依然适用。
-
-## 跨源赛事对账与开赛时间语义
-
-为了保证从盘口源（XML）率先发现、后续由即时比分源（Live）补齐赛程信息的赛事生命周期连续性，系统统一了跨源赛事身份与时间语义：
-
-- **开赛时间不是事件身份的一部分**：跨源比对时，开赛时间不参与判等。
-- **赛事身份强编号优先**：当记录包含竞彩赛事编号时，强事件身份为 `(sport, date, normalized_competition_number)`。
-  双方均有赛事编号但冲突时不予合并，且绝不退化为主客队匹配。
-- **主客队对精确退化**：仅当一方或双方缺少赛事编号时，退化为 `(sport, date, home, away)` 精确匹配。
-  本系统未实现任何球队别名、队名模糊匹配、大小写或繁简转换。
-- **盘口源开赛时间为占位符**：竞彩 XML 盘口源直出的 `time = "00:00"` 标记为 `kickoff_time_known = false`，
-  表示实际开赛时间尚未权威获知，而非午夜 00:00 开球。此时保持 `upcoming` 状态，不推导为 `live` 或 `finished`。
-- **真实午夜开球区分**：权威赛程源给出的 `time = "00:00"` 会明确带有 `kickoff_time_known = true`，正常解析为午夜开球。
-- **已有 canonical ID 绝对保持**：当既有已跟踪记录与新接入源行对账合并时，已持久化的 canonical `id` 永远保留，
-  绝不被新数据源的 ID 覆盖，确保所有历史快照、结算与评估样本的谱系完整。
-- **权威排期升级占位符**：当带有真实开赛时间的 Live 行到来时，升级时间字段并将 `kickoff_time_known` 设为 `true`；
-  后续若再次抓取到占位符 00:00，绝不降级或覆盖已知真实时间。
-- **市场源中断时的连续性**：已准入的赛事即使在随后的刷新中遭遇市场数据源故障或无赔率，
-  依然作为已跟踪事件通过准入，保留最后已知的有效盘口，并持续接受排期、比分与状态更新。
-- **赛前预测快照等待权威时间**：在 `kickoff_time_known = false`（即真实开赛时间未知）时，
-  门禁系统拒绝创建新的赛前预测快照；待权威开赛时间已知且赛事仍未开赛时方可生成快照。历史既有快照保持可读不可变。
-- **赔率历史允许赛前未知时间观察**：未开赛且盘口有效的占位符记录允许记录赔率时序观察，其 `kickoff_at` 记录为 `None`，不伪造时间。
-- **模型版本保持不变**：本改动为数据工程与跨源对账基础设施，不改动模型数学算法，`config.MODEL_VERSIONS` 保持不变。
-
-## 完赛结果终态与生命周期保护
-
-为了防止自动刷新抓取时偶发的时序紊乱、网络抖动或不同数据源短暂的非同步状态将已完赛比赛降级，系统对已具有有效全场比分的完赛记录建立了终态保护与冲突检测机制：
-
-- **终态标准（Finalized Invariant）**：当 canonical 赛事的状态为 `status == "finished"` 且包含有效的全场最终比分（`score.ft` 为大于等于 0 的整数列表 `[home, away]`，严格排除布尔值、浮点数或非数值类型）时，该比赛即进入不可逆终态。
-- **统一最终比分契约**：`utils.match_lifecycle.valid_full_time_score(...)` 是全场终场比分有效性的**唯一权威裁决**。所有把比分当作**最终事实结果**消费的自动流程——canonical 终态判定、Elo 校准（`utils.scraper._calibrate_from_finished`）、结算创建（`utils.settlements.extract_final_score`）、评估样本物化——都复用**同一套语义**（`score.ft` 为 list/tuple 且长度 >= 2，前两位为非负**精确整数**，严格排除 `bool` / `float` / `str`），不存在第二套竞争性的比分有效性规则。
-  因此畸形结果（`["2","1"]`、`[2.0, 1]`、`[True, 1]`、`[-1, 0]`）不会写入 `calibrated.json`、不会改动任何球队实力字段、不会创建结算、也不会物化评估样本；且已通过校验的整数**不做数值强转**（不把 `"2"` / `2.0` 归一为 `2`）。畸形 `finished` 记录保持**可修复**：后续合法权威结果到达时由正常合并替换并建立终态。
-- **修复按有效性质量判定，不受 Python 数值相等影响**：`2.0 == 2`、`True == 1`、`False == 0`，因此只比较值相等会漏掉「畸形 → 严格有效」的表示升级。未终态比赛的比分合并规则为：**严格有效的 incoming 比分无条件替换畸形/缺失的既有比分**（如 `[2.0, 1] → [2, 1]`、`[True, 1] → [1, 1]`、`[2, False] → [2, 0]`），双方有效性同级时仍按值是否变化更新。该修复会使持久化表示变化，故该次刷新 `updated` 计入 1；已终态比赛的幂等 / 冲突语义完全不变。
-- **自动刷新绝不回退终态**：终态比赛绝不会被后续抓取行重新置为 `live` 或 `upcoming`，也绝不允许用即时/中间比分、缺失比分或占位元数据覆盖已有权威终态结果。
-- **重复刷新幂等且计入 0 变更**：当刷新获取到与既有终态完全一致的权威完赛数据时，系统直接视作幂等无操作，`updated` 计数器不增加（`updated == 0`），不会产生冗余的二次写盘，且绝对不触发重复的 Elo 校准、结算或评估样本追加。
-- **比分冲突安全隔离**：若后续抓取行传入与既有权威终态全场比分不一致的数据（如已被记录为 2-1 的完赛结果收到 2-2 的抓取行），系统会引发 `MatchLifecycleConflict`（原因标识为 `conflicting_final_score`），记录结构化告警日志并安全保留既有权威终态比分，绝不静默破坏已存数据，且不中断同批次其它赛事的正常刷新。
-- **非终态赛程保持正常流转**：未完赛赛事（`upcoming` 与 `live`）在权威源驱动下保持正常的生命周期流转（如由 `upcoming` 推进至 `live`、`live` 推进至 `finished`），且权威源对赛事因故延期等异常情况进行的排期调整（如由 `live` 回到 `upcoming`）可正常被系统采纳。终态保护仅作用于已完赛的权威结果，而非全局单向递增的状态锁。
-- **模型版本严格保持不变**：此改动属于数据工程与赛事生命周期稳定性基础设施，不包含任何模型数学变更，`config.MODEL_VERSIONS` 保持不变。
-
-## 赛前预测快照
-
-应用页面的预测仍然是**实时重算**的；快照是一条**独立、不可变**的历史记录，用于
-保留「开赛前模型此刻相信什么」，为后续无泄漏的结算与回测提供依据。
-
-- **自动捕获**：由后台抓取线程在每次 `refresh` 中自动固化，**不依赖用户打开任何页面或 API**
-  （`/`、`/match/<id>`、`/api/today`、`/api/matches`、`/api/match/<id>` 都不需要被访问）。
-  页面/API 路由同样会调用同一套幂等逻辑，但历史记录的存续不再依赖它们。
-- **捕获顺序**：抓取 → **市场准入（只保留有盘口覆盖的比赛）** → 合并 canonical 比赛
-  → 记录赔率历史 → **用本轮新完赛结果校准 Elo**
-  → **捕获预测快照** → **结算已完赛比赛** → **物化评估样本** → 落盘 `daily_matches.json`。
-  预测快照在 Elo 校准**之后**生成，因此使用的是当前刷新时刻已知的最新实力。
-- **资格**：只有**未开赛**（`upcoming`）的比赛才会获得新快照；
-  进行中（`live`）与已完赛（`finished`）不会新建，但**已有快照始终可读**。
-- **唯一性**：每场比赛 × 每个模型版本仅一条 canonical 赛前快照。
-  它是该比赛/模型版本的**首个**赛前预测记录，不是时间序列，也不代表「收盘预测」。
-- **不可变性**：一旦写入，后续的盘口变化、Elo 更新、页面访问、抓取刷新或比赛开赛/完赛，
-  都不会改写既有快照。
-- **无需盘口**：未开赛比赛即使当时没有盘口也会生成快照，此时市场区块为空；不会虚构赔率。
-- **身份**：`snapshot_id = sha256(match_id | slot | model_version)`，确定性且可复现。
-- **存储**：`data/prediction_snapshots.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建）。
-- **落盘**：原子写入（临时文件 + `fsync` + `os.replace`），并以进程内锁保护并发读改写；
-  抓取线程与 HTTP 路由并发时仍只会落盘一条 canonical 快照。
-- **模型版本**：足球与篮球**各自独立**的当前版本，取值见 `config.MODEL_VERSIONS`，
-  随每条快照一同落盘。详见「运动专属模型版本」。
-- **抓取统计**：`/api/refresh` 返回的 `prediction_snapshots_added` 表示该次刷新**实际新增**的
-  快照条数（既有快照、live/finished 比赛、失败的预测都不计入）。
-
-快照字段涵盖比赛标识、开赛时间、生成时间、模型名称与版本、双方 Elo、
-模型概率、展示概率、期望值（EV/Kelly）、市场赔率与隐含概率，以及按运动类型保留的比分/得分数据
-（足球 `expected_goals` / `top_scores` / `goals_prediction`；篮球 `expected_home_points` /
-`expected_away_points` / `expected_total` / `spread` / `over_line` / `over_prob` / `under_prob`）。
-
-## 运动专属模型版本
-
-足球与篮球拥有**各自独立**的当前模型版本，权威配置在 `config.py`：
+模型版本由 `config.MODEL_VERSIONS` 显式维护：
 
 ```python
 MODEL_VERSIONS = {
     "football": "football-coldstart-1",
     "basketball": "basketball-margin-1",
 }
-
-MODEL_VERSION = "baseline-1"   # 仅作无运动上下文时的兼容回退
+MODEL_VERSION = "baseline-1"   # 无运动上下文时的兼容回退
 ```
 
-- **两个运动都曾提升到 `*-coldstart-1`**：因为未知球队的冷启动 Elo 由内置
-  `hash()` 改为确定性 SHA-256（见「未知球队冷启动确定性」），
-  **足球与篮球共用的 `_estimate_elo()` 都受影响**，因此两个运动的版本都必须提升，
-  否则同一 `model_version` 会在改动前后对应不同的冷启动预测语义。
-- **篮球曾提升到 `basketball-modelprob-1`**：因为篮球 `model_probabilities` 的**语义**
-  被修正为「主客独赢盘融合前」的模型概率（见「篮球概率语义」）。
-  同一 `model_version` 标签在改动前后含义不同会污染评估分组，
-  因此必须提升版本；历史 `basketball-coldstart-1` 快照保持不可变、不被迁移。
-- **篮球再次提升到 `basketball-margin-1`**：因为 `basketball_home_advantage` 的**单位**
-  被修正为「篮球比分差」（见「篮球预期分差与主场优势」）——配置 `2.5` 原先只产生约
-  0.62 分预期分差，现在真正产生 2.5 分。预期分差公式变化同样必须提升版本。
-  历史 `basketball-coldstart-1` / `basketball-modelprob-1` 快照与评估样本均不可变、不迁移。
-- **按运动独立提升版本**：只改足球模型时只需提升 `football` 的版本，篮球保持不动，反之亦然。
-  这样不会把未改动的那个运动的预测错误地归入新版本，避免污染按
-  `(sport, model_name, model_version)` 分组的快照 / 结算 / 评估样本 /
-  Accuracy / Brier / LogLoss / ECE 比较。
-- **解析优先级**：显式传入的 `model_version` > 该运动当前配置的版本 > 全局兼容回退
-  `config.MODEL_VERSION`（仅在没有运动上下文时使用，且不臆造版本号）。
-  显式版本始终优先，历史版本 / 测试 / 多版本对比不受配置影响。
-- **快照身份不变**：`snapshot_id = sha256(match_id | prematch | model_version)` 未改动，
-  也没有把运动加入哈希；因此历史 ID 依然可复现。
-- **版本提升后的行为**：仍处于未开赛的比赛，若其当前版本已变化，
-  可在保留旧版本快照不变的前提下新增一条新版本快照
-  （同一场比赛 × 不同模型版本各自一条 canonical 快照，这是为将来受控的模型对比准备的）；
-  已开赛（`live` / `finished`）的比赛不会被追溯补建新版本快照——赛前时间门禁仍然权威。
-- **历史 `baseline-1` 快照不可变**：它们仍是权威的历史基线预测，用于与新版本对比，
-  不会被改写或迁移。
-- **下游自动跟随**：结算、评估样本、分类评估、校准诊断都沿用快照中记录的
-  `model_name` / `model_version`，因此新版本会自然成为独立分组，无需改动任何公式。
-- **版本号是人工维护的显式标识**：不从 Git SHA / 文件哈希 / 时间戳等自动推断。
+版本号是人工维护的显式标识，不从 Git SHA、文件哈希或时间戳推断。
 
-## 篮球概率语义
+### 部署提示
 
-篮球的 `model_probabilities` 与 `probabilities` 现在与足球保持**同一语义分工**：
+- WSGI 入口对象为 `app:app`；生产建议 `DEBUG=false` 并置于 gunicorn / uWSGI 之后。
+- **多 worker 下不要启用后台刷新线程**：会重复启动。需要定时抓取时，用独立进程或计划任务
+  执行 `python -m utils.scraper`，Web 进程只读数据。
+- `data/` 需要可写；`frontend/dist` 由启动脚本构建后托管（否则回退模板）。
+- 生产写能力仍受 `DSL_RUNTIME_WRITES_ENABLED` 等开关约束；部署配置不等于操作者批准。
 
-| 字段 | 含义 |
+## 📁 项目结构
+
+```text
+Daily-Sports-Lottery/
+├── app.py                    # Flask 入口：页面、JSON API、/api/status 运行状态
+├── config.py                 # 环境变量、数据文件、模型版本与参数
+├── start.bat / start.sh      # 默认只读启动；--refresh 显式开启写能力
+├── requirements.txt          # 运行时依赖（Flask / Requests / cryptography）
+├── requirements-dev.txt      # 测试依赖（pytest）
+├── pytest.ini
+├── AGENTS.md                 # 仓库硬约束与治理规则（贡献前必读）
+├── LICENSE                   # MIT
+├── data/                     # 运行时数据（*.json 由抓取器生成，不提交）
+├── models/
+│   ├── poisson_model.py      # 足球泊松 + Dixon-Coles 比分矩阵
+│   ├── predictor.py          # 足球预测、赔率融合、EV / Kelly
+│   ├── basketball_model.py   # 篮球正态得分与分差模型
+│   ├── basketball_model_v2.py# 隔离影子模型（不提升生产）
+│   └── strategy.py           # 价值扫描与串关组合
+├── utils/
+│   ├── fetcher_500.py        # 500.com 源适配与健康诊断
+│   ├── scraper.py            # 刷新管线：抓取 → 准入 → 合并 → 快照 → 结算 → 评估
+│   ├── ingestion_identity.py # Canonical 摄取身份预检（fail closed）
+│   ├── match_identity.py     # 跨源同事件判定与开赛时间语义
+│   ├── match_lifecycle.py    # 终态保护与比分有效性唯一裁决
+│   ├── market_coverage.py    # 市场准入判据
+│   ├── prediction_snapshots.py / odds_snapshots.py
+│   ├── settlements.py / evaluation_rows.py
+│   ├── classification_evaluation.py / calibration_evaluation.py / temporal_evaluation.py
+│   ├── nba_schedule.py       # BALLDONTLIE 时间补全与 30 队映射
+│   ├── result_delivery.py    # 篮球赛果投递七类诊断
+│   ├── concurrency.py / refresh_state.py   # 跨进程锁与代标记
+│   └── ...                   # 证据、治理、影子模型、生命周期等模块
+├── tools/                    # 离线 CLI：诊断、评审、预览、修复、校验
+├── tests/                    # 88 个 pytest 模块（以临时存储为主）
+├── frontend/                 # React + TypeScript + Vite 前端源码与测试
+├── templates/ static/        # Jinja 回退界面
+├── docs/                     # 运行、来源身份、NBA、治理与安全文档
+└── reports/                  # 本机报告/证据（Git 本地排除，不提交）
+```
+
+## 🔌 页面与接口
+
+### 页面
+
+| 路径 | 说明 |
 | --- | --- |
-| `model_probabilities` | 主客独赢盘融合**前**的模型胜负概率（`home_win` / `away_win`，`draw = 0`） |
-| `probabilities` | 融合**后**的展示概率 |
-| `market.implied_probabilities` | 主客独赢盘去水后的市场隐含概率 |
+| `/` | 每日赛事：分组卡片、概率条、价值标签、运动与日期筛选 |
+| `/match/<match_id>` | 单场详情：概率、比分分布、赔率、凯利计算器、雷达图 |
+| `/strategy` | 价值盘口与二/三/四串一组合 |
+| `/history` | 完赛复盘：历史预测与实际结果对照 |
 
-- **模型概率绝不被融合改写**：`model_home` / `model_away` 在由得分差分布得出后即冻结，
-  只有展示用的 `p_home` / `p_away` 会被 `odds_weight` 加权融合。
-- **融合公式保持既有实现**：
-  `display = model * (1 - weight) + market * weight`，随后沿用既有归一化；
-  `weight = config.MODEL_CONFIG["odds_weight"]`（默认 `0.20`）**未改动**。
-- **无有效盘口时 `probabilities == model_probabilities`**（同一取整约定）。
-- **EV / Kelly 一律使用融合前的模型概率**与市场价格比较：
-  `EV = model_probability * odds - 1`，仓位用既有 Fractional Kelly。
-  若改用已含市场概率的展示概率，等于让市场与自身比较。
-  `value_threshold` 与 `kelly_fraction` 均**未改动**。
-- **篮球并非完全不依赖市场信息**：大小分（`total_line` / `over` / `under`）对
-  `base_total` 与 `p_over` 的既有条件化行为**保持不变**；本改动只隔离「主客独赢盘融合」。
-- **未改动的篮球行为**：`expected_points`、`basketball_base_total` / `basketball_base_total_cba`、
-  `basketball_pace`、`basketball_score_std`、`basketball_home_advantage`、`basketball_elo_scale`、
-  总分线处理、大小分与 20% 校准、`spread`、`top_scores`、`suspense` 全部保持原样。
-- **足球语义未变**：`predict_football` 的数学与上述分工均保持不变。
-- **模型版本**：篮球当前版本为 `basketball-margin-1`；足球仍为 `football-coldstart-1`；
-  全局回退仍为 `baseline-1`。
-- **历史兼容**：`basketball-coldstart-1` / `basketball-modelprob-1` 的快照与评估样本
-  **不可变、不迁移**；已开赛（`live` / `finished`）的比赛不会被追溯补建新版本快照。
-- **评估分组**：分类评估、校准诊断与时序评估会自然把
-  `basketball-coldstart-1` / `basketball-modelprob-1` / `basketball-margin-1`
-  作为**独立分组**处理，彼此不做自动对比、不产生胜者标签。
+### JSON API
 
-## 篮球预期分差与主场优势
-
-`MODEL_CONFIG["basketball_home_advantage"]` 的单位是 **篮球比分差（points）**，
-表示「主队相对客队获得的预期净胜分加成」——不是 Elo 分、不是百分比、不是任意乘数。
-
-```python
-"basketball_home_advantage": 2.5,   # 主队 +2.5 分预期分差
-"basketball_elo_scale": 200.0,      # 200 分 Elo 差 ≈ 10 分预期分差
-```
-
-单队预期得分按**对称分差**计算：
-
-```text
-elo_margin   = (elo_self - elo_opp) / basketball_elo_scale * 10
-venue_margin = +basketball_home_advantage   （主队）
-               -basketball_home_advantage   （客队）
-points       = base_total / 2 + (elo_margin + venue_margin) / 2
-```
-
-因此主客对的预期分差恒为：
-
-```text
-expected_margin
-    = (home_elo - away_elo) / basketball_elo_scale * 10
-      + basketball_home_advantage
-```
-
-- **默认值 `2.5` 就是 +2.5 分预期分差**（相等 Elo：主 108.75 / 客 106.25，总分 215）。
-  这是一个**配置基线假设**，并未从项目数据统计拟合，也不宣称最优或已被验证。
-- **Elo 尺度含义不变**：`basketball_elo_scale = 200` 仍表示 200 分 Elo 差 ≈ 10 分预期分差
-  （`+200 Elo / 0 主场优势 -> +10.0`；`+200 Elo + 2.5 -> +12.5`，`-200 Elo + 2.5 -> -7.5`）。
-- **总分基准保持**：`pace = 1.0` 且无外部总分线时，
-  `expected_home_points + expected_away_points == basketball_base_total`
-  （NBA `215.0` / CBA `205.0`）；主场优势只是对称地把分数从客队移给主队（各 `±1.25`）。
-- **总分线不改变分差**：`total_line` 只改变总分基准，主客预期分差仍由
-  「Elo 差 + 主场优势」决定（相同球队下 `210.5` 与 `230.5` 的总分线给出同样的 `+2.5` 分差）。
-- **`spread` 自然跟随**：`spread_line` 仍派生自 `diff = exp_home - exp_away`，
-  相等 Elo 默认结果为 `diff ≈ +2.5`、`spread ≈ -2.5`（负号＝主队让分）。
-- **胜负概率不变公式**：仍由既有正态 CDF 消费修正后的 `diff` 自然得出，未做概率重校准。
-- **`pace` 未改动**（仍为 `1.0`），本改动不涉及节奏模型重设计。
-
-## 未知球队冷启动确定性
-
-未知球队的初始 Elo 扰动已从 Python 内置 `hash()` 改为**确定性 SHA-256 映射**：
-
-```python
-raw    = f"{league}|{name}".encode("utf-8")
-digest = hashlib.sha256(raw).digest()
-bucket = int.from_bytes(digest[:8], "big") % 121
-offset = bucket - 60          # 范围 [-60, 60]
-```
-
-- **为什么必须改**：Python 的字符串 `hash()` 默认按进程加盐，同一输入在不同进程 /
-  不同 `PYTHONHASHSEED` 下会得到不同结果。那会让首次出现的球队拿到不同的初始 Elo、
-  攻防先验、期望进球、胜平负概率与预测快照内容——在开始积累不可变历史评估数据前不可接受。
-- **不变量**：同联赛 + 同队名 + 同代码配置 = 同冷启动 Elo，
-  跨进程重启、跨 `PYTHONHASHSEED`、跨机器、跨独立运行时存储都成立。
-- **只替换哈希原语**：payload 仍是 `league|name`，**未**加入 sport / rank / 日期 / 版本，
-  也**未**新增任何队名归一化（不做 Unicode 规范化、大小写折叠、繁简转换、别名解析）。
-- **冷启动优先级不变**：① 联赛锚点命中 → 直接用锚点 Elo（不叠加扰动）；
-  ② 提供了有效名次 → 沿用既有名次公式（不叠加扰动）；③ 两者都没有 → 才应用确定性扰动。
-- **既有档案不迁移**：`team_strength.json` 中已存在的球队**不重算**初始 Elo——
-  它们可能已经历过真实比赛更新，重建冷启动值会破坏状态。无批量迁移、无迁移脚本。
-  足球档案的攻防**懒刷新**（由既有 Elo 与累计进失球推导攻防）保持原样。
-- **新档案可复现**：两个干净的独立存储用相同参数创建同一未知球队，会得到完全一致的档案。
-- **版本影响**：因为 `_estimate_elo()` 由足球与篮球共用，两个运动的当前版本都提升为
-  `football-coldstart-1` / `basketball-coldstart-1`；历史 `football-ad-1` 与 `baseline-1`
-  产物保持不可变。本改动只影响首次出现的未知球队，不修改任何预测公式。
-
-## 足球攻防独立化
-
-足球的 `attack_rating` 与 `defense_rating` 现在是**真正独立的两个维度**：
-
-- **Elo 只提供整体实力先验**（`elo_to_attack` / `elo_to_defense`）。
-- **历史场均进球**提供攻击证据；**历史场均失球**提供防守证据，两者互不依赖。
-  因此「强攻弱守」与「弱攻强守」可以在同一 Elo 下被区分表达。
-- **小样本向先验收缩**：`evidence_weight = N / (N + football_strength_prior_matches)`，
-  `N` 为累计场次。新球队（`N = 0`）尚无自身进失球证据，此时两个维度等于 Elo 先验（允许相等）。
-- **评分尺度不变**：仍为 `0.25 ~ 0.95`，`0.50` 近似中性；
-  进攻越强 `attack_rating` 越高，防守越强 `defense_rating` 越高。
-  既有 `expected_goals(attack, defense_opponent, base_rate)` 契约保持兼容。
-- **既有档案懒升级**：历史 `team_strength.json` 中由旧的「Elo 单一映射」生成的足球档案，
-  会在被 `get_team_profile(...)` 读取时按新公式从既有 Elo 与累计进失球重算并落盘；
-  只改攻防两个字段，`elo_rating` / 战绩 / 进失球累计等一律不动，重复读取幂等。
-- **结果更新顺序**：先更新 Elo → 再累计战绩与进失球 → **然后**由更新后的累计证据推导攻防，
-  因此本轮比赛会被反映到新维度里。
-- **未改动的部分**：泊松比分矩阵、Dixon-Coles `rho`、`max_goals`、赔率融合、EV / Kelly
-  全部保持原样；篮球行为与 `MODEL_VERSIONS["basketball"]` 均未变化。
-- **不做拟合**：这两个参数是显式的基础常量，尚未从历史数据拟合，也不做时间衰减 /
-  对手强度加权 / 主客场拆分——后续再单独处理。
-
-## 赛前赔率历史
-
-`daily_matches.json` 中每场比赛只保留**最新**盘口（`match["odds"]` 会被新值覆盖）。
-赔率历史是一份**附加的**时序层，用于保留盘口随时间的每一次变动。
-
-- **捕获方式**：由后台抓取线程在每次 `refresh` 中**自动捕获**，不依赖用户打开页面。
-  流程为：抓取盘口 → 合并到 canonical 比赛记录 → 以该记录的比赛 `id` 捕获变化的赛前盘口 → 落盘。
-- **去重规则**：仅抑制**连续重复**——只有与该场「最新一条」规范化盘口相同才跳过。
-  因此 `A → B → A` 会保留 3 条，市场来回波动可被完整重建。
-- **时序门禁**：只记录**赛前**盘口。未开赛（`upcoming`）允许写入；
-  进行中（`live`）与已完赛（`finished`）拒绝新写入，但既有历史始终可读。
-  不会把滚球盘口混入赛前历史。
-- **规范化与指纹**：先剔除空值（`None` / 空字符串）并按稳定键序排列，再用
-  `sha256(json.dumps(..., sort_keys=True))` 生成指纹，与字典顺序无关。
-- **不可变**：每次观察写入独立记录，历史记录不会被后续盘口覆盖。
-- **存储**：`data/odds_snapshots.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建）。
-- **字段**：`snapshot_id`、`match_id`、`sport`、`league`、`home_team`、`away_team`、
-  `match_date`、`match_time`、`kickoff_at`、`captured_at`、`source`、`jczq_no`、
-  `odds`、`odds_fingerprint`。`odds` 只保留数据源实际提供的字段
-  （足球含 `draw`，篮球没有则不写入），不虚构缺失值。
-- **抓取统计**：`/api/refresh` 返回的 `odds_snapshots_added` 表示该次刷新**实际新增**的
-  历史观察条数；盘口未变的一次刷新为 `0`。
-
-## 结算
-
-结算把一条**已存在的、不可变的赛前预测快照**与其**最终观测到的比赛结果**关联起来。
-它只回答「这条历史预测对应的最终结果是什么」，**不计算任何模型表现指标**
-（命中率 / Brier / LogLoss / ROI / CLV / 校准误差），也不是货币派彩结算。
-
-- **自动结算**：由后台抓取线程在每次 `refresh` 中自动完成，
-  顺序为「… → 捕获预测快照 → **结算已完赛比赛** → 落盘」。
-- **前提是快照已存在**：只有**开赛前确实存在**预测快照的比赛才会被结算。
-  完结比赛若没有历史预测快照则跳过，**绝不**回溯生成预测或伪造历史快照。
-- **资格**：仅 `finished` 且 `score.ft` 为完整双方比分时可结算；
-  `upcoming` / `live`、缺少比分、半场比分、非数值比分一律不结算。
-- **时间戳校验**：`prediction_generated_at <= kickoff_at` 才被视为有效的赛前证据。
-- **唯一性**：一条预测快照至多一条 canonical 结算。
-  结算身份只由 `snapshot_id` 决定（不含比分），因此上游结果变化会被识别为**冲突**，
-  而不会悄悄产生第二条结算。
-- **不可变性**：同一结果重复观测只返回既有记录（不重写 `settled_at` / 比分 / 结果指纹）。
-- **结果冲突保护**：上游若对同一快照给出不同最终比分，记录告警（含比赛 ID、快照 ID、
-  既有比分、新到比分）并保持既有结算不变；不自动判断哪个比分正确。
-- **存储**：`data/settlements.json`（运行时生成，已被 `.gitignore` 忽略，文件缺失时惰性创建，
-  原子写入 + 进程内锁保护）。
-- **抓取统计**：`/api/refresh` 返回的 `settlements_added` 表示该次刷新**实际新增**的结算条数
-  （既有结算、无快照的完赛比赛、live/upcoming、无效比分与冲突都不计入）。
-
-## 评估样本
-
-评估样本把两份**已存在的、不可变的**历史记录拼成一行确定性数据：
-
-```text
-预测快照（开赛前模型实际预测了什么）
-        +
-结算（最终实际发生了什么）
-        ↓
-评估样本行
-```
-
-它是后续模型表现计算的输入数据集，**本层只做数据装配，不计算任何指标**。
-
-- **只消费历史记录**：全部字段逐字复制自权威历史记录——预测类字段来自快照，
-  结果类字段来自结算。**不读当前球队实力、不读当前盘口、不读当前比赛状态、
-  不重跑模型**（不调用 `predict_match` / `enrich_match`）。
-- **不重建历史**：只有「一条预测快照 + 该快照对应的结算」同时存在才生成评估样本；
-  缺失任一方一律跳过。完赛但没有历史预测的比赛不会产生评估样本。
-- **自动物化**：由后台抓取线程在每次 `refresh` 中完成，
-  顺序为「… → 结算已完赛比赛 → **物化评估样本** → 落盘」。
-- **回填**：不限于本轮新建的结算。既有结算若缺少评估样本（例如本层上线前就已存在），
-  下一次正常刷新会补齐。
-- **唯一性**：一条 (快照, 结算) 组合至多一条评估样本；
-  `evaluation_id = sha256("evaluation|" + snapshot_id + "|" + settlement_id)`。
-- **溯源校验**：物化前校验结算与快照确实指向同一条历史预测
-  （`snapshot_id`、`match_id`、`model_name`、`model_version`、
-  `prediction_generated_at`、`kickoff_at` 必须一致），
-  并要求 `prediction_generated_at <= kickoff_at`。任一项不符则拒绝物化，不静默归一化。
-- **源指纹与完整性保护**：`source_fingerprint` 由该行源内容规范化后取 SHA-256。
-  同一 `evaluation_id` 且同一指纹 = 正常幂等重放（返回既有样本）；
-  同一 `evaluation_id` 但指纹变化 = 源内容完整性冲突，既有样本保持不变。
-- **不可变性**：重放不会改写 `materialized_at`、概率、Elo、盘口、比分或结果。
-- **不含结论与指标**：不写入 `predicted_outcome` / `correct` / `hit` /
-  `accuracy` / `Brier` / `LogLoss` / `ROI` / `CLV` 等任何字段。
-- **存储**：`data/evaluation_rows.json`（运行时生成，已被 `.gitignore` 忽略，
-  文件缺失时惰性创建，原子写入 + 进程内锁保护）。
-- **抓取统计**：`/api/refresh` 返回的 `evaluation_rows_added` 表示该次刷新**实际新增**的
-  评估样本条数（既有样本、无结算的快照、无历史预测的完赛比赛、无效拼接、完整性冲突与失败都不计入）。
-- **读取方式**：本层只提供服务层查询函数（`get_evaluation_row` /
-  `get_evaluation_row_for_snapshot` / `get_evaluation_rows_for_match` /
-  `get_all_evaluation_rows`），暂不暴露 HTTP 接口。
-
-## 分类评估
-
-在不可变评估样本之上计算**纯分类指标**：`sample_count`、`accuracy`、
-`brier_score`、`multiclass_log_loss`。
-
-- **只消费评估样本**：输入是 `data/evaluation_rows.json`。
-  不读 `daily_matches.json` / `prediction_snapshots.json` / `settlements.json` /
-  球队实力 / 当前 Elo / 当前盘口，也不调用 `predict_match` / `enrich_match`。
-- **纯计算、不落盘**：指标由既有评估样本确定性推导，**不新增**任何运行时指标文件
-  （没有 `classification_metrics.json` / `backtest_results.json` / `model_scores.json`）。
-  计算函数接收行数据作为输入，可独立测试；`evaluate_all_classification()` 只是
-  「读取 + 计算」的便捷入口。
-- **概率来源唯一**：一律使用 `evaluation_row["model_probabilities"]`。
-  不使用 `display_probabilities`、`market_implied_probabilities`、`market_odds`、
-  `expected_values`，不做任何概率融合。
-- **历史量纲是百分点**：历史 schema 中概率为 `0..100` 的整数百分点
-  （`53` 表示 `0.53`）。**不做** `[0,1]` 与 `[0,100]` 的自动判别，
-  `0.60/0.20/0.20` 这类小数在历史 schema 下属畸形数据，会被显式拒绝。
-- **取整重归一化**：独立取整后必需类别总和可能是 `99 / 100 / 101`，
-  接受该区间并**重归一化到精确的 1.0**；总和落在区间外（如 `90`）直接拒绝，
-  不会静默归一化畸形分布。
-- **足球三分类**：类别顺序固定为 `home_win` / `draw` / `away_win`。
-- **篮球二分类**：类别顺序固定为 `home_win` / `away_win`。
-  模型可能写入的兼容字段 `draw = 0` 会被忽略；若 `draw` 非零，
-  说明有实质概率质量会被丢弃，按畸形数据拒绝。篮球事实结果为平局同样拒绝，
-  不虚构胜者。
-- **分组独立**：按 `(sport, model_name, model_version)` 分别计算，
-  **不产生**跨运动的混合指标，也不混合不同模型版本。
-- **确定性顺序**：摘要按 `sport` / `model_name` / `model_version` 字典序返回，
-  不按指标优劣排序、不做模型排名。
-- **空输入**：`build_classification_summaries([])` 返回 `[]`，不伪造零值摘要；
-  直接对空分组求值会抛出显式错误。
-- **严格校验**：畸形行不会被静默跳过，一律抛出 `ClassificationEvaluationError`
-  （reason 如 `duplicate_evaluation_id` / `unsupported_sport` / `missing_probability` /
-  `invalid_probability` / `invalid_probability_total` / `invalid_actual_outcome` /
-  `nonzero_basketball_draw_probability` / `mixed_group`）。
-
-### 指标定义
-
-```text
-sample_count          = 该 (sport, model_name, model_version) 组内有效且唯一的评估样本数
-                        （每个 evaluation_id 只计一次；重复 evaluation_id 直接报错）
-
-predicted class       = argmax(归一化后的 model_probabilities)
-                        并列时取固定类别顺序中靠前者
-accuracy              = 正确数 / sample_count        （返回 0.0..1.0，不是百分数）
-
-brier_score           = mean( sum_k (p_k - y_k)^2 )
-                        多分类 Brier，**不**再按类别数除一次
-
-multiclass_log_loss   = mean( -ln(p_actual) )         （自然对数）
-                        仅取对数时用 epsilon = 1e-15 裁剪，不修改已存储的分布
-```
-
-指标以原始浮点数返回，不做取整、不格式化为字符串、不转百分比；
-展示层取整属于后续 UI/API 工作。本层**尚未**通过 UI 或 HTTP API 暴露。
-
-## 概率校准诊断
-
-分类指标回答「预测对不对 / 概率好不好」，校准诊断回答另一个问题：
-
-> 当历史模型给某个结果分配了概率 `p` 时，该结果实际发生了多频繁？
-
-- **只消费评估样本**：输入是 `data/evaluation_rows.json`，走既有查询层。
-  不读 `daily_matches.json` / `prediction_snapshots.json` / `settlements.json` /
-  当前 Elo / 当前盘口，也不调用 `predict_match` / `enrich_match`。
-- **只评估 `model_probabilities`**：不使用 `display_probabilities` /
-  `market_implied_probabilities` / `market_odds` / `expected_values`，不做概率融合。
-- **纯诊断、不落盘、不改概率**：不生成 `calibration.json` 之类的文件，
-  不修改任何评估样本，**不产出校准后的概率**（无 Platt / temperature / isotonic 等重映射）。
-- **类别空间分开**：足球 `home_win` / `draw` / `away_win` 三分类；
-  篮球 `home_win` / `away_win` 二分类，兼容字段 `draw = 0` 不会成为第三个校准类别。
-- **按类别 one-vs-rest**：每条评估样本对每个必需类别贡献一个
-  `(预测概率 p_k, 观测结果 y_k)` 二元观测；校准按类别分别计算。
-- **固定 10 个等宽分箱**：`[0.0,0.1) … [0.8,0.9) [0.9,1.0]`，
-  分箱方式 `index = min(int(p * 10), 9)`（最后一箱包含 `1.0`）。不做自适应 / 分位数分箱。
-- **分组与排序**：按 `(sport, model_name, model_version)` 独立诊断，
-  按该键字典序返回；不混合运动或模型版本，不按 ECE 排名。
-- **校验复用**：概率值 / 概率总和 / 篮球 draw / 实际结果的校验与
-  分类评估完全一致（同一套 `ClassificationEvaluationError`），
-  因此畸形历史行不会被静默丢弃或给出第二套解释。
-- **本层尚未**通过 UI 或 HTTP API 暴露；`utils/scraper.py` 未接入校准诊断。
-
-### 诊断定义
-
-每个分箱 `b`：
-
-```text
-count                     = 落入该箱的观测数
-mean_predicted_probability = 箱内预测概率均值（置信度）
-observed_frequency         = 箱内观测结果均值（实际发生频率）
-calibration_gap            = |mean_predicted_probability - observed_frequency|
-```
-
-空箱的上述三项均为 `None`（不使用 NaN）。
-
-```text
-ECE_class = Σ_b (n_b / N) * |mean_probability_b - observed_frequency_b|
-```
-
-其中 `N` 为该组评估样本数，`n_b` 为该类别在箱 `b` 的观测数；空箱贡献 0。
-因为每条有效样本都会为每个必需类别提供一个概率，所以每个类别都有 `Σ_b n_b == N`。
-
-```text
-macro_expected_calibration_error = mean(ECE_class across required classes)
-```
-
-足球除以 3，篮球除以 2。这只是诊断性汇总，**不用于排名或择优**。
-
-诊断结果以原始浮点数返回（例如 `0.06327`，而不是 `"6.33%"`），不做取整、不格式化。
-
-## Dixon-Coles rho 拟合（离线诊断）
-
-在不可变评估样本之上做**离线**拟合，回答：
-
-> 给定历史足球模型在开赛前**实际产出**的期望进球，哪个 Dixon-Coles 低比分相关系数
-> `rho` 能让时间加权的历史负对数似然最小？
-
-- **只消费评估样本**：使用 `expected_score_data.expected_goals.home/away`（历史 λ / μ）、
-  `final_score.home/away`、`kickoff_at`、`sport` / `model_name` / `model_version`。
-  **不重建历史 λ**（不调用 `predict_match` / `expected_goals` / `enrich_match`），
-  不读当前 Elo / 当前攻防评分 / 当前盘口。
-- **仅足球**：篮球分组会被上层构建器直接跳过；对篮球行直接调用分组拟合会显式报错。
-- **按模型版本分组**：`(sport, model_name, model_version)` 各自独立拟合，
-  绝不跨版本混合（不同版本的 λ 不同，需要各自的诊断）。
-- **低比分修正与线上模型完全一致**：
-  `0-0 → 1 - λμρ`、`0-1 → 1 + λρ`、`1-0 → 1 + μρ`、`1-1 → 1 - ρ`、其他 `→ 1`。
-- **似然只在实际比分上求值**：`P = Poisson(x|λ) · Poisson(y|μ) · tau`，
-  拟合期间不对完整比分矩阵做重归一化。
-- **时间加权**：默认半衰期 `180` 天，`weight = exp(-ln2 · age_days / 180)`。
-  基准时间取**该分组内最晚的 `kickoff_at`**，不使用当前时钟——因此同一批历史数据
-  无论哪天拟合结果都完全相同。
-- **拟合目标**：加权负对数似然之和 `Σ_i weight_i · -ln(P_i)`（**不**按样本数取平均）。
-- **候选网格**：默认 `[-0.25, 0.25]`、步长 `0.005`（整数索引构造，避免浮点漂移）。
-  某个候选只要在任一观测上使低比分修正 `<= 0` 或非有限，就**整体剔除**，不做部分拟合、不裁剪。
-- **确定性并列裁决**：加权 NLL 最小 → `|rho|` 更小 → 数值更小。
-- **诊断输出**：`sample_count`、`low_score_sample_count`、`reference_kickoff_at`、
-  `half_life_days`、`effective_sample_weight`、`rho_grid`（含候选数与有效候选数）、
-  `fitted_rho`、`weighted_nll`、`rho_zero_weighted_nll`、
-  `weighted_nll_improvement_vs_zero`。其中 `rho = 0` 即独立泊松基线。
-- **不落盘、不部署**：不生成任何拟合结果文件，不修改 `config.py`，
-  **不把拟合结果应用到线上预测**。
-- **线上模型不变**：`config.MODEL_CONFIG["dixon_coles_rho"]` 仍为 `-0.15`；
-  足球与篮球的模型版本由 `config.MODEL_VERSIONS` 决定，本层不做任何版本变更。
-  如果运行期自动重拟合，同一个 `model_version` 的含义会随时间漂移，破坏既有的
-  版本化历史对比体系——因此拟合与部署必须分离，后续由独立的部署任务决定是否采用。
-
-## Dixon-Coles 走查验证（无泄漏时序检验）
-
-上面的拟合是**样本内**工具；它不能作为部署依据。本层补上无泄漏的时序检验，回答：
-
-> 如果 `rho` 只用「目标比赛开赛**之前**已经完赛」的比赛拟合，
-> 它给未来比赛打出的分数似然，与当前固定 `rho`、以及独立泊松相比如何？
-
-- **严格过去训练**：对开赛时间 `T` 的目标，训练集严格为 `kickoff_at < T`
-  （**严格小于**，不是 `<=`）。同一时刻开赛的多场比赛构成一个**目标桶**，
-  彼此不互相训练；桶内所有行共用同一个「仅由更早行」拟合出的 `rho`。
-- **扩张窗口**：每个桶的训练集 = 所有严格更早的行（不丢弃旧数据、不用固定滚动窗口）。
-  训练拟合仍沿用 `180` 天半衰期，由既有拟合器控制近期影响力。
-- **目标权重恒为 1.0**：时间衰减只属于训练拟合，未来测试观测不打折。
-- **三个对照**：每条目标观测都用「走查拟合 rho / 当前线上固定 rho / `rho = 0`」分别打分。
-  固定对照默认取 `config.MODEL_CONFIG["dixon_coles_rho"]`（当前 `-0.15`），
-  也可显式传参覆盖（仅测试用，不改配置）。
-- **预热**：`min_train_rows`（默认 `20`）以下的桶不拟合、不打分，计入 `warmup_skipped_count`。
-  这是透明的预热规则，不是置信度评级。预热后无可用目标的组返回
-  `evaluation_count = 0`、`target_bucket_count = 0`，聚合指标为 `None`（不是 NaN）。
-- **分组**：按 `(sport, model_name, model_version)` 独立验证；训练数据绝不跨版本。
-  仅支持足球，篮球不产生走查摘要。
-- **完整性**：分组之前先对**全部**输入行做 `evaluation_id` 全局重复检测，
-  同一 ID 即使篡改 `model_version` 也无法逃避检测；同一组内混用 aware / naive
-  时间戳会显式报 `inconsistent_kickoff_timezone`。
-- **输出**：每个目标桶的 `rho_path` 条目（`target_kickoff_at` / `train_count` /
-  `test_count` / `training_reference_kickoff_at` / `fitted_rho` /
-  三项 `*_test_nll`），以及聚合的样本数、预热跳过数、评估数、桶数、
-  三项总 / 平均 NLL 与 `nll_improvement_vs_fixed` / `nll_improvement_vs_zero`。
-- **只做分数似然诊断**：不计算反事实的胜平负 / Brier / 分类 LogLoss / Accuracy / ECE，
-  不选生产 rho、不做排名、不落盘、不接入 refresh。
-- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`；模型版本由
-  `config.MODEL_VERSIONS` 决定，本层不做任何版本变更。
-
-## Dixon-Coles 反事实 W/D/L 验证
-
-把上面的走查验证从「比分似然」扩展到「比赛结果概率质量」：对每场合格目标比赛，
-用**开赛前冻结的历史期望进球**重建胜平负概率，再用 **多分类 Brier** 与
-**多分类 LogLoss** 与真实结果比较。
-
-- **概率重建路径**（不重写模型数学）：
-  `历史 λ_home / λ_away` → `models.poisson_model.score_matrix(λh, λa, rho=rho)`
-  → `win_draw_loss(...)` → 未四舍五入的 `(home_win, draw, away_win)`。
-  `max_goals`、泊松 PMF、矩阵归一化、Dixon-Coles tau 全部沿用既有实现，未做任何改动。
-- **只比较 rho**：三种策略之间 λ、比分矩阵实现、比分上限、归一化、W/D/L 聚合、
-  实际结果完全一致 —— 因此隔离出的正是 Dixon-Coles 的 rho。
-  三种策略：**走查拟合 rho**（仅用严格更早比赛拟合）、**当前固定 rho**（默认 `-0.15`，
-  可显式覆盖，不改配置）、**rho = 0**（独立泊松）。
-- **不使用市场概率**：不读 `market_odds` / `market_implied_probabilities` /
-  `display_probabilities` / `expected_values`，也不做市场融合。
-- **不使用已存的四舍五入概率**：不从 `evaluation_row["model_probabilities"]` 反推替代
-  rho 的概率——那是整数百分点，只对应历史模型当时实际使用的那个 rho。
-- **时序完全复用**：合格目标集合、rho 路径、预热计数、版本隔离、同刻分桶、
-  严格 `kickoff < T`、全局重复 ID 检测全部来自同一套走查时序
-  （`build_walk_forward_plan` / `build_walk_forward_fits`），不存在第二套时序实现。
-- **实际结果一致性**：由比分推导 `home_win / draw / away_win`；若行内 `actual_outcome`
-  与比分冲突则显式报错，不静默偏向任一字段。
-- **指标定义**：Brier = `Σ_k (p_k - y_k)^2`（**不**再按类别数除一次）；
-  LogLoss = `-ln(p_actual)`（自然对数，仅在对数求值时用 `1e-15` 裁剪，与分类评估同一常数）。
-  **不含 Accuracy、不含 ECE**。
-- **输出**：每个合格桶的三策略 Brier / LogLoss 合计与 rho 路径；以及聚合的
-  样本数、预热跳过数、评估数、桶数、三策略总/平均 Brier 与 LogLoss，
-  以及 `brier_improvement_vs_*` / `log_loss_improvement_vs_*`（正 = 走查序列损失更低，
-  仅为描述性差值）。无合格目标时所有 total / mean / improvement 均为 `None`（不是 NaN）。
-- **不落盘、不排名、不部署**：不生成任何结果文件，不选生产 rho、不给评级、
-  不接入 refresh、不改 `models/predictor.py`。
-- **线上模型不变**：`dixon_coles_rho` 仍为 `-0.15`；模型版本由
-  `config.MODEL_VERSIONS` 决定，本层不做任何版本变更。
-
-## 时序模型评估（Temporal Evaluation）
-
-在不可变评估样本之上，回答「**某一条精确的 `(sport, model_name, model_version)` 谱系，
-它在最近的固定回看时间窗内表现如何，与它的全部可用历史相比如何**」。
-
-- **只消费不可变评估样本**：输入是 `data/evaluation_rows.json`，经既有查询层读取；
-  不读 `daily_matches.json` / `prediction_snapshots.json` / `settlements.json` / 球队实力 /
-  当前盘口，也不调用 `predict_match` / `enrich_match` 重建历史概率。
-- **时间坐标是历史 `kickoff_at`**（比赛开球时刻），不是 `prediction_generated_at` /
-  `settled_at` / `materialized_at`。
-- **不使用系统时钟**：参考时间 `reference_kickoff_at` = 该组内**最大的 kickoff_at**。
-  因此同一批不可变样本，任何时候、任何机器上求值结果完全一致。
-- **默认回看窗口为 30 / 90 / 180 天，外加全部历史**；窗口有意重叠、相互嵌套，
-  是诊断而非统计上独立的队列。
-- **窗口下边界包含**：恰好 N 天前的比赛属于该窗口，再早一秒则不属于；
-  边界按绝对瞬时比较（不按时间戳字符串比较）。
-- **指标复用既有评估器**：`utils.classification_evaluation`（`sample_count` / `accuracy` /
-  多分类 Brier / 多分类 LogLoss）与 `utils.calibration_evaluation`（10 分箱 one-vs-rest，
-  `macro ECE` 与逐类别 ECE）。时序层只做**组合与打包**，不重新实现任何公式。
-- **概率来源仍是 `model_probabilities`**（历史 0..100 百分点）；不使用
-  `display_probabilities` / `market_implied_probabilities` / `market_odds` / `expected_values`。
-- **输出包含样本量**：`all_time` 与每个窗口都给出 `sample_count`、
-  `first_sample_kickoff_at` / `last_sample_kickoff_at`，以及上列指标；
-  不设最小样本门槛、不做置信度评级。
-- **不排名、不推荐**：不输出 best / worst / rank / winner，也不自动判定新版本更好；
-  不同模型版本往往覆盖不同历史区间，本层只并列事实摘要，不做跨版本增量比较。
-- **不落盘**：所有摘要在内存中派生，不生成 `temporal_evaluation.json` 之类文件。
-- **模型版本不变**：本层是只读诊断，不触碰预测模型、`config.MODEL_VERSIONS` 与
-  Dixon-Coles 诊断栈，也不接入抓取刷新流程。
-
-```python
-from utils.temporal_evaluation import evaluate_all_temporal
-
-summaries = evaluate_all_temporal()          # 默认 30 / 90 / 180 天 + all-time
-```
-
-数值一致性契约：指标在**规范时序**（先 `kickoff_at` 绝对瞬时、再 `evaluation_id`）上求值，
-因此 `all_time` 与每个窗口的结果，等于既有分类 / 校准评估器作用于**同一时序**的输出；
-且输出与调用方传入的行顺序无关。
-
-## 生产证据状态（Production Evidence Status）
-
-`utils/evidence_status.py` 是一个**只读**运营模块，把「证据积累到什么程度」变成可度量的事实，
-避免反复编写一次性巡检脚本。它**不改变任何预测行为**，也不写入任何存储。
-
-- **只读**：不写入 / 不改写任何运行时存储，也不直接重写 JSON。
-- **数据来源**：`daily_matches` / `prediction_snapshots` / `odds_snapshots` / `settlements` /
-  `evaluation_rows`（经既有查询层读取）。
-- **确定性**：按 `(sport, model_name, model_version)` 字典序输出，与调用顺序无关。
-- **不重算指标**：分类 / 校准 / 时序诊断直接复用
-  `utils.classification_evaluation` / `utils.calibration_evaluation` /
-  `utils.temporal_evaluation`，不在此模块重新实现 Accuracy / Brier / LogLoss / ECE / 时序窗口。
-- **不合并版本**：当前版本（`config.MODEL_VERSIONS`）与历史版本分开报告。
-- **零数据安全**：存储为空时返回事实性零计数，不抛异常、不伪造指标。
-
-```python
-from utils.evidence_status import build_evidence_status, get_evidence_status
-
-status = get_evidence_status()      # 读取运行时存储
-# 或直接运行：python -m utils.evidence_status
-```
-
-输出字段（概念等价）：
-
-```text
-models[]            sport / model_name / model_version / prediction_snapshots /
-                    settlements / evaluation_rows /
-                    matched_snapshot_odds_matches / gate
-historical_models[] 历史版本单独分组（不参与采集就绪判定）
-integrity           duplicate_snapshots / duplicate_settlements / duplicate_evaluation_rows /
-                    unsettled_eligible_snapshots /
-                    finished_without_evaluation =
-                        finished_without_evaluation_no_eligible_snapshot
-                      + finished_without_evaluation_had_eligible_snapshot /
-                    settlements_without_evaluation
-collection_ready / collection_evidence / pipeline_integrity / evidence_review_ready
-diagnostics         既有评估器的紧凑摘要（无评估样本时为 None）
-```
-
-**采集就绪（`collection_ready`）必须为「同场」证据**：要求至少一场比赛**同时**拥有
-「当前版本预测快照」与「盘口快照」（按 `match_id` 取交集）。因此：
-
-- 预测快照属比赛 A、盘口快照属比赛 B（跨场）→ **不**就绪；
-- 仅有预测快照、或仅有盘口快照 → **不**就绪；
-- 仅有**历史版本**快照（即使有同场盘口）→ **不**就绪（只认 `config.MODEL_VERSIONS` 的当前版本）。
-
-`collection_evidence` 给出事实计数：`prediction_snapshots`（当前版本）、`odds_snapshots`、
-以及 `matched_snapshot_odds_matches`（同场匹配数）。**不**声称所有盘口快照都产生了预测快照
-（例如 `kickoff_time_known = false` 的候选只有盘口快照、没有预测快照）。
-
-**证据门禁**（每个模型版本；运营阈值，**不是**统计显著性判断）：
-
-```text
-0..29     -> 未达 Gate A（gate = "R" 当且仅当该模型存在同场「当前版本预测快照 × 盘口快照」证据，
-                          否则 "none"）
-30..99    -> Gate A
-100..299  -> Gate B
-300+      -> Gate C
-```
-
-**Gate R 是按模型、按当前版本判定的采集就绪**：篮球不会因为足球证明了采集就绪而获得 R；
-仅有预测快照而无同场盘口、或仅有盘口而无当前预测快照，均为 `none`。
-Gate A/B/C 仅由真实评估样本数决定，阈值不变。
-
-`collection_ready` **仅**依据真实「同场」快照 / 盘口管道证据，绝不由评估样本数量推断；
-`evidence_review_ready` 仅在某个当前版本达到 Gate B 或 Gate C 时为 `True`。
-
-**完赛但无评估样本的分类基于「资格」而非「快照是否存在」**：对每场已终态且没有评估样本的
-canonical 比赛，判定其是否存在**合格赛前快照**（复用既有 `utils.settlements.is_valid_prematch`）：
-
-```text
-finished_without_evaluation
-  = finished_without_evaluation_no_eligible_snapshot   # 零快照，或快照均不合格 —— 预期，不影响完整性
-  + finished_without_evaluation_had_eligible_snapshot  # 有合格快照却无评估 —— 下游问题，integrity = false
-```
-
-即：仅「存在快照但**无一合格**」与「有合格快照」才是权威区分；字面上的快照存在与否只是
-信息性子计数 `finished_without_evaluation_never_snapshot`。
-
-## 配置说明
-
-### 环境变量
-
-| 变量 | 默认值 | 说明 |
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | 监听地址（对外暴露用 `0.0.0.0`） |
-| `PORT` | `5000` | 服务端口 |
-| `DEBUG` | `true` | 调试模式，生产环境设为 `false`（关闭后后台线程单进程启动） |
-| `SCRAPE_INTERVAL_SECONDS` | `1800` | 后台抓取间隔（秒） |
-| `MATCHDAY_CUTOFF_HOUR` | `6` | 逻辑比赛日切割点（北京时间，凌晨归前一天） |
-| `ODDS_WEIGHT` | `0.20` | 赔率隐含概率融合权重 |
-| `DATA_CACHE_TTL_SECONDS` | `300` | 数据缓存时间 |
-| `FETCH_500_LIVE` | `true` | 是否启用 500.com 抓取 |
-| `FETCH_500_TIMEOUT` | `20` | 抓取超时（秒） |
+| GET | `/api/today` | 逻辑比赛日赛事（含预测） |
+| GET | `/api/matches?date=&sport=` | 按日期/运动查询 |
+| GET | `/api/match/<id>` | 单场详情 |
+| GET | `/api/match/<id>/snapshots` | 不可变赛前预测快照 |
+| GET | `/api/match/<id>/odds-history` | 赛前赔率历史 |
+| GET | `/api/match/<id>/settlements` | 结算记录 |
+| GET | `/api/dates` | 可用日期与联赛（含 `dates_by_sport`） |
+| GET | `/api/strategy?sport=` | 价值盘口与串关 |
+| GET | `/api/history?sport=` | 历史证据视图（只读） |
+| GET | `/api/evaluation-summary` | 评估样本指标摘要（只读） |
+| GET | `/api/status` | 元信息、源健康、覆盖、运行能力、前端构建标识 |
+| POST | `/api/refresh` | 显式刷新；默认 403，需写开关 + 本地开关或令牌 |
 
-### 模型参数
+### 离线 CLI
 
-集中在 `config.py` 的 `MODEL_CONFIG`：
+| 命令 | 用途 |
+| --- | --- |
+| `python -m tools.basketball_result_delivery --data-dir data` | 只读诊断篮球 pending 为什么没有赛果 |
+| `python -m utils.evidence_status` | 只读输出预测/结算/评估的采集就绪、Gate 与完整性摘要 |
+| `python -m tools.nba_confirmed_result ...` | NBA 官方页 + BDL 严格绑定预览；`--execute` 需单独批准 |
+| `python -m tools.nba_model_comparison --dataset <assembled.json>` | V1 / V2 只读对比与走查回测 |
+| `python -m tools.nba_shadow_capture ...` | 前瞻影子快照（只写本机 `reports/`） |
+| `python -m tools.nba_human_review_workbench ...` | NBA 人工复核工作台（离线） |
+| `python -m tools.real_sports_duplicate_review generate --data-dir data` | 重复赛事评审与 Canonical 归并**预览** |
+| `python -m tools.production_canonical_repair ...` | 生产 Canonical 修复（需 Ed25519 授权，默认拒绝） |
 
-- 足球：`base_goals_per_match`、`home_advantage_elo`、`attack_sensitivity`、`dixon_coles_rho`、`value_threshold`
-- 足球攻防：`football_strength_prior_matches`（先验收缩等效样本量，默认 5.0）、
-  `football_goal_signal_scale`（场均进/失球偏离基准时的评分灵敏度，默认 0.20）
-- 篮球：`basketball_base_total`、`basketball_home_advantage`、`basketball_elo_scale`、`basketball_score_std`
-- 资金：`kelly_fraction`（默认 1/4 Kelly）
+## 🛡️ 运行时安全与数据不变量
 
-## 模型说明
+- **默认只读**：`start.bat` / `start.sh` 显式关闭写开关；只有 `--refresh` 为本次进程开启。
+  `--refresh` 是持续到进程结束的能力，不是一次性生产批准；每次 `POST /api/refresh` 仍是独立刷新。
+- **七个受保护存储**：`daily_matches.json`、`team_strength.json`、`calibrated.json`、
+  `prediction_snapshots.json`、`odds_snapshots.json`、`settlements.json`、`evaluation_rows.json`。
+  正常刷新只按既有契约写入；只读诊断与测试必须字节不变。
+- **历史不可变**：`snapshot_id` / `settlement_id` / `evaluation_id` 不可改写；同一快照只允许一条结算。
+- **禁止追溯预测**：只有开赛前、且权威开赛时间已知的 `upcoming` 赛事才创建快照。
+- **市场准入**：首次出现的赛事必须满足完整可用盘口；已跟踪赛事不因临时缺盘口被删除。
+- **终场契约**：`score.ft` 必须是前两位非负**精确整数**；`2.0` / `True` / `"2"` 一律不算有效终场。
+- **NBA 结果分级**：`SOURCE_REPORTED_FINAL`（单一即时源）≠
+  `INDEPENDENT_OFFICIAL_RESULT_VERIFIED`（NBA 官方 + BDL）≠
+  `FULL_TWO_SOURCE_RESULT_VERIFIED`（两者比分也与彩票源一致）。
+- **Canonical 归并 NO-GO**：只提供只读预览与人工评审，不自动选择存活 ID、不自动合并。
+- **生产修复**：必须 Ed25519 签名授权；仓库与工作区不保存生产私钥。
 
-**足球**：Elo 提供整体实力先验，攻防评分由历史场均进/失球**独立**推导
-（见「足球攻防独立化」）→ Elo 差 → 双方期望进球 λ → 泊松比分矩阵（含 Dixon-Coles 低比分修正 ρ=−0.15）
-→ 胜平负概率 → 与市场隐含概率按 `ODDS_WEIGHT` 融合 → EV / Kelly。
+详见 [docs/runtime-readonly.md](docs/runtime-readonly.md) 与 [AGENTS.md](AGENTS.md)。
 
-**篮球**：Elo 差 → 双方预期得分 → 分差正态分布 → 胜负概率；总分用正态分布建模，
-盘口总分线（`yszf`）优先于联赛基准。
-
-**价值判断**：`EV = 模型概率 × 赔率 − 1`，`EV > value_threshold (5%)` 判定为价值盘口；
-仓位用 Fractional Kelly 计算。
-
-## 部署说明
-
-- WSGI 入口对象为 `app:app`。
-- 静态文件 `static/`，模板 `templates/`。
-- **多进程部署时后台抓取线程会重复启动**，建议用独立进程跑
-  `python -m utils.scraper` 做定时抓取（cron / 计划任务），Web 进程只读数据。
-- 生产环境建议 `DEBUG=false` 并置于 gunicorn/uwsgi 之后。
-- `data/` 目录需可写（抓取器需要落盘）。
-
-### 版本控制说明
-
-`.gitignore` 已排除以下内容，**无需提交到远端仓库**：
-
-| 类别 | 内容 | 原因 |
-| --- | --- | --- |
-| Python 产物 | `__pycache__/`、`*.pyc` | 编译缓存，本地生成 |
-| 虚拟环境 | `.venv/`、`venv/` | 体积大，可重建 |
-| 运行时数据 | `data/*.json` | 抓取器生成，每次刷新覆盖，可自动重建 |
-| 密钥配置 | `.env` | 含敏感信息 |
-| 日志临时 | `*.log`、`*.tmp`、`*.bak`、`*.corrupt` | 运行时产物 |
-| 编辑器/系统 | `.idea/`、`.vscode/`、`.DS_Store` | 个人环境差异 |
-| AI 工作区 | `.workbuddy-ai/` | 本地助手记忆，与项目运行无关 |
-| 历史备份 | `_legacy_backup/` | 改造前旧文件 |
-
-克隆仓库后，`data/` 为空是正常的 —— 首次启动会自动抓取填充。
-
-## 测试
+## 🧪 开发与测试
 
 ```bash
-pip install -r requirements-dev.txt   # 安装 pytest
-python -m compileall .
-pytest -q
+pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
-测试在临时目录中运行，不会读写真实的 `data/`。
+常用聚焦回归：
 
-## License
+```bash
+python -m pytest -q tests/test_prediction_snapshots.py tests/test_settlements.py tests/test_evaluation_rows.py
+python -m pytest -q tests/test_basketball_result_delivery.py tests/test_nba_confirmed_result.py
+python -m pytest -q tests/test_runtime_refresh_authority.py tests/test_readonly_runtime.py
+```
 
-MIT License，详见 `LICENSE`。
+测试以 `tmp_path` 下的合成七存储为主；涉及本机私有数据集的用例在数据缺失时按既有策略跳过，
+且不写入仓库 `data/`。前端测试与构建在 `frontend/` 下执行。
 
-## 注意事项
+CI（[.github/workflows/ci.yml](.github/workflows/ci.yml)）在 `develop` 的 push / PR 上运行四个 job：
 
-- 数据来自公开网页抓取，若 500.com 改版可能导致解析失效，需更新 `utils/fetcher_500.py`。
-- 仅供研究与娱乐，**不构成任何投注建议**，请理性对待。
+| Job | 系统 | 角色 |
+| --- | --- | --- |
+| Offline pytest suite | Windows / Python 3.12 | **阻断门** |
+| Isolated Canonical repair lifecycle | Windows / Python 3.12 | **阻断门** |
+| Offline pytest suite | Ubuntu / Python 3.12 | 顾问信号 |
+| Isolated Canonical repair lifecycle | Ubuntu / Python 3.12 | 顾问信号 |
+
+Windows 是强制门禁：Ubuntu 使用 `continue-on-error`，Linux 环境差异不得掩盖 Windows 回归。
+
+## 📚 文档索引
+
+| 文档 | 内容 |
+| --- | --- |
+| [runtime-readonly.md](docs/runtime-readonly.md) | 只读启动、显式刷新、POST 授权与赛果验证等级 |
+| [ingestion-identity-preflight.md](docs/ingestion-identity-preflight.md) | Canonical 摄取身份预检与 fail-closed 契约 |
+| [source-identity-provenance.md](docs/source-identity-provenance.md) | 源身份、编号形态与跨源冲突分类 |
+| [nba-schedule-provider.md](docs/nba-schedule-provider.md) | BALLDONTLIE 接入、分页、频控与时间补全 |
+| [nba-confirmed-result.md](docs/nba-confirmed-result.md) | NBA 赛果绑定：预览、执行批准与加时防护 |
+| [nba-model-v2-shadow.md](docs/nba-model-v2-shadow.md) | NBA 影子模型 V2、历史窗口与评估边界 |
+| [canonical-mapping-governance.md](docs/canonical-mapping-governance.md) | 映射提案、Ed25519 批准与账本治理 |
+| [duplicate-review-workflow.md](docs/duplicate-review-workflow.md) | 重复赛事人工评审与归并预览 |
+| [staging-canonical-repair.md](docs/staging-canonical-repair.md) | 受控历史 Canonical 投影迁移 |
+| [production-canonical-repair.md](docs/production-canonical-repair.md) | 生产修复运行手册与审计要求 |
+| [runtime-activation-architecture.md](docs/runtime-activation-architecture.md) | 运行期激活架构（仅设计） |
+| [runtime-mapping-readiness.md](docs/runtime-mapping-readiness.md) | 运行期映射就绪度（未激活） |
+
+> 未单独成文的行为契约（快照 / 赔率 / 结算 / 评估、分类 / 校准 / Dixon-Coles 诊断）
+> 以对应模块 docstring 与 `tests/` 为权威；README 只保留入口级摘要。
+
+## ⚠️ 已知边界
+
+- **500.com 前端改版风险**：解析器采用候选页回退与模式定位，但源结构变化仍可能需要更新
+  [utils/fetcher_500.py](utils/fetcher_500.py)。
+- **篮球完场源有限**：赛季/联赛结束后即时列表不再提供赛果；非 NBA 篮球在缺少获准的
+  竞赛兼容结果源时保持 `SOURCE_NOT_AVAILABLE`。
+- **NBA 赛程网络默认关闭**：开启 `DSL_ENABLE_NBA_SCHEDULE_NETWORK` 且配置凭据后，
+  刷新才会请求 BALLDONTLIE；BDL Free 层限 5 请求/分钟。
+- **历史身份缺口不会自动修复**：缺少既有提供商绑定的历史 NBA 记录不会被回溯补造；
+  修复需独立治理流程。
+- **仅供研究与娱乐**：不构成投注建议，不提供任何收益保证。
+
+## 📄 License
+
+MIT License，详见 [LICENSE](LICENSE)。
