@@ -1354,6 +1354,42 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.42 可复用 NBA 赛果证据工作流
+
+- **唯一入口与默认离线**：`python -m tools.nba_result_workflow` 提供
+  `select` / `plan` / `acquire` / `preview` / `run`；除 `acquire`/`run` 的显式
+  `--allow-network` 外，**不得**发起任何外部请求。`select`、`plan`、`preview`
+  必须只读、离线、零写入运行库。
+- **网络授权是每次显式的范围**：`--allow-network` 必须与
+  `--max-requests`、`--max-targets`、`--allowed-provider`、`--max-cost` 一起使用；
+  默认 `max_requests=0` 即 `NETWORK_AUTHORIZATION_REQUIRED`。软件开关不是操作者批准；
+  一次批准不得延伸到新的目标集合或新的时间窗。
+- **请求控制**：无自动重试；BDL 起始间隔 ≥ 12.1 秒，官方页 ≥ 1 秒；不访问付费端点、
+  不订阅、不注册、不超授权成本；`--max-cost` 必须为 0 或经单独批准。
+- **证据留存**：原始官方页 HTML、BDL 原始 JSON、赛程发现页原始 HTML 及其 SHA-256
+  必须保存到 `reports/result-evidence/`（或显式外部目录）；清单必须记录 provider、
+  endpoint、`started_at`、`observed_at`、HTTP 状态、字节数、SHA-256、目标 match id、
+  provider game id 与代码 SHA。**不得**保存凭据，也不得把证据写入 `data/`。
+- **校验只复用既有验证器**：逐目标校验必须调用
+  `tools.nba_confirmed_result.bind_result`（官方页 + BDL + 快照 + 主客 + 开球 +
+  逐节对账），**不得**另建第二套结算/验证器。批量预览必须调用
+  `preview_batch`，拒绝目标必须保留精确原因且不得静默进入 accepted 集。
+- **缓存只复用已验证证据**：命中缓存必须校验 manifest 状态、快照摘要、BDL 赛事 ID
+  与原始文件 SHA-256；任一不符即重新获取（在授权预算内）或失败关闭。陈旧预览由
+  既有 `execute` 的代号/七库摘要/预览摘要校验拒绝。
+- **执行仍只有一条路径**：工作流只产出 `preview-targets.json` 与 `preview.json`；
+  真实写入必须另获批准并使用 `tools.nba_confirmed_result --execute`，
+  仅允许 `daily_matches.json` / `settlements.json` / `evaluation_rows.json`，
+  其余四库字节不变；不得自动执行部分批次。
+- **联赛边界**：非 NBA 篮球（WNBA、德篮甲、欧篮联、西篮甲、巴西 LDB 等）不得使用
+  NBA 官方/BDL 工具；足球 `wanchang` 是独立结果源，历史抓取需单独授权。
+- **不作为后台任务**：不得新增调度器、常驻后台刷新或无人值守写入；
+  每日流程由操作者按 `docs/daily-operations.md` 显式执行。
+- **回归**：`tests/test_nba_result_workflow.py` 覆盖离线默认、预算/频控、凭据不泄露、
+  官方 game id 发现、证据留存、加时对账、身份拒绝、批量预览、缓存复用与陈旧运行拒绝。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程

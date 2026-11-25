@@ -28,6 +28,7 @@
 - **赛后闭环**：赔率历史 → 预测快照 → 结算（快照 × 终场比分）→ 评估样本，四层数据只追加、不改写。
 - **可复现评估**：Accuracy / Brier / LogLoss、10 分箱校准与 ECE、按时间窗的 Temporal Evaluation。
 - **NBA 专用链路**：BALLDONTLIE 赛程时间补全、受控赛果绑定预览/执行、只读赛果投递诊断。
+- **可复用赛果工作流**：目标选择 → 有界请求计划 → 官方/BDL 证据采集 → 离线校验 → 严格批量预览，默认离线。
 - **安全默认值**：默认只读、跨进程刷新锁、代标记、七库摘要比对；生产修复需要 Ed25519 授权。
 
 ## 🏗️ 架构总览
@@ -90,6 +91,7 @@ flowchart LR
 | 结算与评估 | [utils/settlements.py](utils/settlements.py)、[utils/evaluation_rows.py](utils/evaluation_rows.py) | 快照 × 赛果关联、评估样本物化 |
 | 模型 | [models/](models) | 足球泊松模型、篮球得分模型、价值与串关策略 |
 | NBA 集成 | [utils/nba_schedule.py](utils/nba_schedule.py)、[tools/nba_confirmed_result.py](tools/nba_confirmed_result.py) | 赛程时间补全、严格赛果绑定与结算入口 |
+| 赛果证据工作流 | [utils/nba_result_evidence.py](utils/nba_result_evidence.py)、[tools/nba_result_workflow.py](tools/nba_result_workflow.py) | 目标选择、有界请求、证据留存、离线校验与批量预览 |
 | 运行时安全 | [utils/concurrency.py](utils/concurrency.py)、[utils/refresh_state.py](utils/refresh_state.py) | 跨进程锁、代标记、七库摘要一致性 |
 
 ### 数据来源
@@ -175,6 +177,7 @@ sequenceDiagram
 | 运营证据 | 采集就绪、Gate 与完整性摘要 | `utils/evidence_status.py` | Implemented（只读） |
 | NBA 赛程 | BALLDONTLIE 时间补全 | `utils/nba_schedule.py` | Implemented（网络需显式开启） |
 | NBA 赛果 | 官方页 + BDL 严格双源绑定 | `tools/nba_confirmed_result.py` | Implemented（真实执行需操作者批准） |
+| 赛果工作流 | 目标选择、有界请求、证据留存、批量预览 | `tools/nba_result_workflow.py` | Implemented（默认离线，网络需显式授权） |
 | NBA 诊断 | 赛果投递七类状态、证据请求 | `tools/basketball_result_delivery.py` | Implemented（只读） |
 | NBA V2 | 影子实力模型与前瞻捕获 | `models/basketball_model_v2.py` | Experimental（不提升生产） |
 | Canonical 治理 | 映射提案、重复评审、修复预览 | `utils/mapping_governance.py`、`tools/*repair*.py` | Partial（生产写入未授权） |
@@ -277,6 +280,26 @@ npm test        # Vitest
 npm run lint    # tsc --noEmit
 ```
 
+## 🗓️ 每日运营
+
+默认离线、只读；真实网络采集与真实写入分别授权。
+
+```powershell
+# 1) 查看 pending 赛果（只读）
+python -m tools.basketball_result_delivery --data-dir data
+
+# 2) 选择有 BDL 绑定的 NBA 目标（只读）
+python -m tools.nba_result_workflow select --data-dir data --max-targets 3
+
+# 3) 有界证据采集 + 离线校验 + 严格批量预览（需网络授权，不执行）
+python -m tools.nba_result_workflow run --data-dir data --allow-network --max-requests 7
+
+# 4) 单独批准后，才用既有入口执行
+python -m tools.nba_confirmed_result --targets-file reports/result-evidence/preview-targets.json ...
+```
+
+完整命令、证据目录、频控与失败处理见 [docs/daily-operations.md](docs/daily-operations.md)。
+
 ## ⚙️ 配置
 
 配置来自环境变量与仓库根目录的可选 `.env`（`config.py` 以 `setdefault` 方式加载，不覆盖已有环境变量）。
@@ -354,6 +377,7 @@ Daily-Sports-Lottery/
 │   ├── settlements.py / evaluation_rows.py
 │   ├── classification_evaluation.py / calibration_evaluation.py / temporal_evaluation.py
 │   ├── nba_schedule.py       # BALLDONTLIE 时间补全与 30 队映射
+│   ├── nba_result_evidence.py# 目标选择、有界计划、证据校验与清单
 │   ├── result_delivery.py    # 篮球赛果投递七类诊断
 │   ├── concurrency.py / refresh_state.py   # 跨进程锁与代标记
 │   └── ...                   # 证据、治理、影子模型、生命周期等模块
@@ -400,6 +424,8 @@ Daily-Sports-Lottery/
 | `python -m tools.basketball_result_delivery --data-dir data` | 只读诊断篮球 pending 为什么没有赛果 |
 | `python -m utils.evidence_status` | 只读输出预测/结算/评估的采集就绪、Gate 与完整性摘要 |
 | `python -m tools.nba_confirmed_result ...` | NBA 官方页 + BDL 严格绑定预览；`--execute` 需单独批准 |
+| `python -m tools.nba_result_workflow select --data-dir data` | 复用式选择 pending NBA 目标并分类原因 |
+| `python -m tools.nba_result_workflow run --data-dir data --allow-network --max-requests 7` | 有界采集证据 → 校验 → 严格批量预览（不执行） |
 | `python -m tools.nba_model_comparison --dataset <assembled.json>` | V1 / V2 只读对比与走查回测 |
 | `python -m tools.nba_shadow_capture ...` | 前瞻影子快照（只写本机 `reports/`） |
 | `python -m tools.nba_human_review_workbench ...` | NBA 人工复核工作台（离线） |
@@ -459,6 +485,7 @@ Windows 是强制门禁：Ubuntu 使用 `continue-on-error`，Linux 环境差异
 | 文档 | 内容 |
 | --- | --- |
 | [runtime-readonly.md](docs/runtime-readonly.md) | 只读启动、显式刷新、POST 授权与赛果验证等级 |
+| [daily-operations.md](docs/daily-operations.md) | 每日赛程、赛前快照、赛果证据采集、预览与执行命令序列 |
 | [ingestion-identity-preflight.md](docs/ingestion-identity-preflight.md) | Canonical 摄取身份预检与 fail-closed 契约 |
 | [source-identity-provenance.md](docs/source-identity-provenance.md) | 源身份、编号形态与跨源冲突分类 |
 | [nba-schedule-provider.md](docs/nba-schedule-provider.md) | BALLDONTLIE 接入、分页、频控与时间补全 |

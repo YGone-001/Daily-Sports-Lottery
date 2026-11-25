@@ -156,7 +156,12 @@ ALLOWED_PATHS = frozenset((
     "tools/basketball_result_delivery.py",
     "tests/test_basketball_result_delivery.py",
     "tests/test_runtime_refresh_authority.py",
-    "tests/test_nba_result_closure_acceptance.py"))
+    "tests/test_nba_result_closure_acceptance.py",
+    # reusable nba result-evidence workflow and daily operations
+    "utils/nba_result_evidence.py",
+    "tools/nba_result_workflow.py",
+    "tests/test_nba_result_workflow.py",
+    "docs/daily-operations.md"))
 
 
 @pytest.fixture(scope="session", autouse=True)

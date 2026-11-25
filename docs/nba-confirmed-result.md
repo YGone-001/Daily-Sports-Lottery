@@ -25,6 +25,16 @@ NBA 目标按既有 BDL 绑定状态分两条互斥路径，**不得**混用：
 NBA 官方页 + BDL 严格双源核对才可声称独立核验（两者比分也与彩票源一致时才达到
 `FULL_TWO_SOURCE_RESULT_VERIFIED`）。
 
+## 可复用证据工作流
+
+`python -m tools.nba_result_workflow` 把「选择目标 → 有界请求计划 → 采集官方/BDL 证据 →
+离线校验 → 本文件的严格批量预览」串成可重复流程。默认离线；只有显式
+`--allow-network --max-requests N` 才会联网。原始响应与清单写入 `reports/result-evidence/`，
+包含赛程发现页原始 HTML（修正了历史运行未保留该页的缺口），不写凭据、不写运行库。
+
+完整每日命令序列见 [daily-operations.md](daily-operations.md)。执行仍只走本文件的
+`tools.nba_confirmed_result --execute`，不新增第二条写路径。
+
 ## 绑定契约
 
 必须有已保存且唯一的 BDL 赛程赛事 ID，Canonical / 历史快照 / 两个源的球队 ID
