@@ -40,6 +40,16 @@ from utils.nba_result_evidence import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVIDENCE_DIR = ROOT / "reports" / "result-evidence"
 BJ = timezone(timedelta(hours=8))
+PROTECTED_STORE_NAMES = (
+    "daily_matches.json",
+    config.PREDICTION_SNAPSHOT_FILE,
+    "odds_snapshots.json",
+    config.SETTLEMENT_FILE,
+    config.EVALUATION_ROW_FILE,
+    "team_strength.json",
+    "calibrated.json",
+    ".refresh_state.json",
+)
 
 EXIT_OK = 0
 EXIT_BLOCKED = 2
@@ -59,9 +69,8 @@ def _read_json(path: Path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
-def _write_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+def _resolved(path: Path) -> Path:
+    return Path(os.path.realpath(os.path.abspath(str(path))))
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -71,6 +80,70 @@ def _inside(path: Path, root: Path) -> bool:
             os.path.normcase(os.path.realpath(root))
     except ValueError:
         return False
+
+
+def _credential_path() -> Path:
+    return _resolved(ROOT / ".DSL_BDL_API_KEY")
+
+
+def _same_as_protected_file(path: Path, data_dir: Path) -> bool:
+    if not path.exists():
+        return False
+    for name in PROTECTED_STORE_NAMES:
+        candidate = data_dir / name
+        if candidate.exists():
+            try:
+                if os.path.samefile(path, candidate):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _assert_safe_write(path: Path, data_dir: Path) -> None:
+    if path.is_symlink():
+        raise SystemExit("refusing to write through a symlink")
+    if _inside(path, data_dir) or _same_as_protected_file(path, data_dir):
+        raise SystemExit("refusing to write a caller-controlled path inside DATA_DIR")
+    if _resolved(path) == _credential_path():
+        raise SystemExit("refusing to write the credential file")
+
+
+def _write_json(path: Path, value, data_dir: Path | None = None) -> None:
+    _assert_safe_write(path, Path(data_dir or config.DATA_DIR))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_bytes(path: Path, value: bytes, data_dir: Path | None = None) -> None:
+    _assert_safe_write(path, Path(data_dir or config.DATA_DIR))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(value)
+
+
+def _assert_safe_evidence_dir(evidence_dir: Path, data_dir: Path) -> None:
+    if _inside(evidence_dir, data_dir):
+        raise SystemExit("evidence directory must not resolve inside DATA_DIR")
+    if not evidence_dir.exists():
+        return
+    for item in evidence_dir.rglob("*"):
+        if (item.is_symlink() or item.is_file()) and (
+                _inside(item, data_dir) or _same_as_protected_file(item, data_dir)):
+            raise SystemExit("evidence path resolves into DATA_DIR; refusing to reuse it")
+
+
+def _assert_safe_output(output: Path, data_dir: Path, evidence_dir: Path) -> None:
+    if _inside(output, data_dir) or _same_as_protected_file(output, data_dir):
+        raise SystemExit("--output must not resolve inside DATA_DIR")
+    if _resolved(output) == _credential_path():
+        raise SystemExit("--output must not overwrite the credential file")
+    if _inside(output, evidence_dir):
+        relative = _resolved(output).relative_to(_resolved(evidence_dir)).as_posix()
+        reserved = relative in {"manifest.json", "preview.json", "preview-targets.json",
+                                "preview-status.json"}
+        reserved = reserved or relative.startswith(("runs/", "nba-official/", "balldontlie/"))
+        if reserved:
+            raise SystemExit("--output must not overwrite retained evidence or preview inputs")
 
 
 def _code_sha() -> str:
@@ -87,6 +160,10 @@ def _load_credential() -> str | None:
         if path.is_file():
             key = path.read_text(encoding="utf-8").strip()
     return key or None
+
+
+def _contains_credential(content: bytes, credential: str | None) -> bool:
+    return bool(credential) and credential.encode() in content
 
 
 def _session() -> requests.Session:
@@ -156,21 +233,52 @@ def load_manifest(evidence_dir: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _valid_cache(entry: dict | None, target: dict) -> bool:
-    if not isinstance(entry, dict) or entry.get("status") != "VALIDATED":
-        return False
+def _parse_aware(value) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _cache_rejection_reason(entry: dict | None, target: dict) -> str | None:
+    if not isinstance(entry, dict):
+        return "CACHE_METADATA_MISSING"
+    if entry.get("status") != "VALIDATED":
+        return "CACHE_NOT_VALIDATED"
     if entry.get("snapshot_digest") != target.get("snapshot_digest"):
-        return False
+        return "CACHE_SNAPSHOT_CHANGED"
     if str(entry.get("bdl_game_id")) != str(target.get("bdl_game_id")):
-        return False
-    for key in ("official_path", "bdl_path", "observed_at", "source_reference"):
+        return "CACHE_PROVIDER_IDENTITY_CHANGED"
+    for key in ("official_path", "bdl_path", "official_game_id", "official_sha256",
+                "bdl_sha256", "source_reference", "source_observed_at",
+                "official_observed_at", "bdl_observed_at", "home_code", "away_code"):
         if not entry.get(key):
-            return False
+            return "CACHE_METADATA_MISSING"
+    if entry.get("credential_scanned") is not True:
+        return "CACHE_CREDENTIAL_SCAN_MISSING"
+    if _parse_aware(entry["source_observed_at"]) is None:
+        return "CACHE_OBSERVATION_TIME_MISSING"
+    expected = evidence.official_page_url(target, str(entry["official_game_id"]))
+    if entry["source_reference"] != expected:
+        return "CACHE_SOURCE_REFERENCE_MISMATCH"
     for path_key, hash_key in (("official_path", "official_sha256"), ("bdl_path", "bdl_sha256")):
         path = Path(entry[path_key])
         if not path.is_file() or _sha(path.read_bytes()) != entry.get(hash_key):
-            return False
-    return True
+            return "CACHE_RESPONSE_MODIFIED"
+    return None
+
+
+def _cached_target_view(entry: dict) -> dict:
+    return {
+        "match_id": entry.get("match_id"),
+        "snapshot_digest": entry.get("snapshot_digest"),
+        "bdl_game_id": entry.get("bdl_game_id"),
+        "home_code": entry.get("home_code"),
+        "away_code": entry.get("away_code"),
+    }
 
 
 def _load_targets(target_ids, max_targets, now=None) -> dict:
@@ -180,10 +288,12 @@ def _load_targets(target_ids, max_targets, now=None) -> dict:
 def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, max_requests: int,
                  allowed_providers: list[str], max_cost: float, official_game_ids: dict[str, str],
                  pacing_seconds: float, session=None, credential: str | None = None,
-                 timeout: float = 25.0) -> dict:
+                 timeout: float = 25.0, data_dir: Path | None = None) -> dict:
+    data_dir = Path(data_dir or config.DATA_DIR)
+    _assert_safe_evidence_dir(evidence_dir, data_dir)
     targets = [t for t in selection.get("targets") or [] if t.get("selection_status") == STATUS_ELIGIBLE]
     created = _now_iso()
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     manifest = load_manifest(evidence_dir)
     cached = manifest.get("targets") if isinstance(manifest.get("targets"), dict) else {}
 
@@ -191,19 +301,57 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
     rejected: list[dict] = [dict(r) for r in selection.get("rejected") or []]
     requests_log: list[dict] = []
     cache_hits = 0
+    cache_rejections: list[dict] = []
     needs_network: list[dict] = []
-
-    for target in targets:
-        entry = cached.get(target["match_id"])
-        if _valid_cache(entry, target):
-            cache_hits += 1
-            accepted.append(dict(entry))
-        else:
-            needs_network.append(target)
 
     if not targets:
         return {"status": "BLOCKED", "reason": "NO_ELIGIBLE_TARGETS", "requests_performed": 0,
                 "cache_hits": 0, "accepted": [], "rejected": rejected, "evidence_dir": str(evidence_dir)}
+
+    for target in targets:
+        entry = cached.get(target["match_id"])
+        if entry is None:
+            bdl_existing = evidence_dir / "balldontlie" / f"bdl-{target['bdl_game_id']}.response"
+            if bdl_existing.exists():
+                cache_rejections.append({"match_id": target["match_id"],
+                                         "reason": "UNTRUSTED_EXISTING_EVIDENCE"})
+            else:
+                needs_network.append(target)
+            continue
+        reason = _cache_rejection_reason(entry, target)
+        if reason:
+            cache_rejections.append({"match_id": target["match_id"], "reason": reason})
+            continue
+        official_path = Path(entry["official_path"])
+        bdl_path = Path(entry["bdl_path"])
+        if credential and (_contains_credential(official_path.read_bytes(), credential)
+                           or _contains_credential(bdl_path.read_bytes(), credential)):
+            cache_rejections.append({"match_id": target["match_id"],
+                                     "reason": "CREDENTIAL_LEAK_DETECTED_IN_CACHE"})
+            continue
+        validation = evidence.validate_target_evidence(
+            target, official_path, bdl_path,
+            observed_at=entry["source_observed_at"], source_reference=entry["source_reference"],
+        )
+        if not validation.get("qualified"):
+            cache_rejections.append({"match_id": target["match_id"],
+                                     "reason": f"CACHE_VALIDATION_FAILED:{validation.get('reason')}"})
+            continue
+        cache_hits += 1
+        accepted.append({**entry, "cache_reused_at": created,
+                         "evidence_validated_at": _now_iso(), "validation": validation})
+
+    if cache_rejections:
+        return {
+            "status": "BLOCKED",
+            "reason": "CACHE_INTEGRITY_FAILURE",
+            "cache_rejections": cache_rejections,
+            "requests_performed": 0,
+            "cache_hits": cache_hits,
+            "accepted": accepted,
+            "rejected": rejected + cache_rejections,
+            "evidence_dir": str(evidence_dir),
+        }
 
     if needs_network and not allow_network:
         return {
@@ -251,24 +399,24 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
             by_date.setdefault(str(target.get("official_discovery_date")), []).append(target)
         for date, date_targets in sorted(by_date.items()):
             url = f"https://www.nba.com/games?date={date}"
-            raw_path = nba_dir / f"nba-discovery-{date}.response"
-            if raw_path.is_file():
-                content = raw_path.read_bytes()
-                requests_log.append({"provider": PROVIDER_OFFICIAL, "endpoint": url,
-                                     "cache_hit": True, "response_sha256": _sha(content),
-                                     "response_size": len(content), "target_match_ids": [t["match_id"] for t in date_targets]})
-            else:
-                content, entry = _get(session, url, {"User-Agent": "Mozilla/5.0"}, timeout=timeout,
-                                      counter=counter, pacer=official_pacer, provider=PROVIDER_OFFICIAL,
-                                      target_ids=[t["match_id"] for t in date_targets])
-                requests_log.append(entry)
-                if content is None:
-                    return {"status": "BLOCKED", "reason": "OFFICIAL_DISCOVERY_FETCH_FAILED",
-                            "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                            "accepted": accepted, "rejected": rejected + [{"selection_status": "OFFICIAL_DISCOVERY_FETCH_FAILED",
-                                                                            "match_id": t["match_id"]} for t in date_targets],
-                            "evidence_dir": str(evidence_dir)}
-                raw_path.write_bytes(content)
+            content, entry = _get(session, url, {"User-Agent": "Mozilla/5.0"}, timeout=timeout,
+                                  counter=counter, pacer=official_pacer, provider=PROVIDER_OFFICIAL,
+                                  target_ids=[t["match_id"] for t in date_targets])
+            requests_log.append(entry)
+            if content is None:
+                return {"status": "BLOCKED", "reason": "OFFICIAL_DISCOVERY_FETCH_FAILED",
+                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
+                        "accepted": accepted,
+                        "rejected": rejected + [{"selection_status": "OFFICIAL_DISCOVERY_FETCH_FAILED",
+                                                 "match_id": t["match_id"]} for t in date_targets],
+                        "evidence_dir": str(evidence_dir)}
+            if _contains_credential(content, credential):
+                return {"status": "BLOCKED", "reason": "CREDENTIAL_LEAK_DETECTED",
+                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
+                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+            raw_path = nba_dir / f"nba-discovery-{date}-{run_id}.response"
+            _write_bytes(raw_path, content, data_dir)
+            entry["evidence_path"] = str(raw_path)
             parsed = evidence.parse_discovery_page(content)
             mapping, unresolved = evidence.resolve_official_game_ids(parsed, date_targets)
             official_ids.update(mapping)
@@ -283,53 +431,60 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
                                      "reason": "OFFICIAL_GAME_ID_UNRESOLVED"})
                 continue
             official_path = nba_dir / f"nba-game-{gid}.response"
-            if official_path.is_file():
-                official_content = official_path.read_bytes()
-                official_entry = {"provider": PROVIDER_OFFICIAL, "cache_hit": True,
-                                  "response_sha256": _sha(official_content), "response_size": len(official_content),
-                                  "target_match_ids": [mid]}
-            else:
-                url = evidence.official_page_url(target, gid)
-                official_content, official_entry = _get(
-                    session, url, {"User-Agent": "Mozilla/5.0"}, timeout=timeout,
-                    counter=counter, pacer=official_pacer, provider=PROVIDER_OFFICIAL, target_ids=[mid])
-                requests_log.append(official_entry)
-                if official_content is None:
-                    rejected.append({"match_id": mid, "selection_status": "OFFICIAL_PAGE_FETCH_FAILED",
-                                     "reason": "OFFICIAL_PAGE_FETCH_FAILED"})
-                    continue
-                official_path.write_bytes(official_content)
-            if credential and credential.encode() in official_content:
+            if official_path.exists() or official_path.is_symlink():
+                return {"status": "BLOCKED", "reason": "UNTRUSTED_EXISTING_EVIDENCE",
+                        "detail": "official response exists without a valid cache entry",
+                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
+                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+            url = evidence.official_page_url(target, gid)
+            official_content, official_entry = _get(
+                session, url, {"User-Agent": "Mozilla/5.0"}, timeout=timeout,
+                counter=counter, pacer=official_pacer, provider=PROVIDER_OFFICIAL, target_ids=[mid])
+            requests_log.append(official_entry)
+            if official_content is None:
+                rejected.append({"match_id": mid, "selection_status": "OFFICIAL_PAGE_FETCH_FAILED",
+                                 "reason": "OFFICIAL_PAGE_FETCH_FAILED"})
+                continue
+            if _contains_credential(official_content, credential):
                 return {"status": "BLOCKED", "reason": "CREDENTIAL_LEAK_DETECTED",
                         "requests_performed": counter["requests"], "cache_hits": cache_hits,
                         "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+            _write_bytes(official_path, official_content, data_dir)
+            official_entry["evidence_path"] = str(official_path)
 
             bdl_path = bdl_dir / f"bdl-{target['bdl_game_id']}.response"
-            if bdl_path.is_file():
-                bdl_content = bdl_path.read_bytes()
-                bdl_entry = {"provider": PROVIDER_BDL, "cache_hit": True,
-                             "response_sha256": _sha(bdl_content), "response_size": len(bdl_content),
-                             "target_match_ids": [mid]}
-            else:
-                url = f"https://api.balldontlie.io/v1/games/{target['bdl_game_id']}"
-                bdl_content, bdl_entry = _get(
-                    session, url, {"Authorization": credential or ""}, timeout=timeout,
-                    counter=counter, pacer=bdl_pacer, provider=PROVIDER_BDL, target_ids=[mid])
-                requests_log.append(bdl_entry)
-                if bdl_content is None:
-                    rejected.append({"match_id": mid, "selection_status": "BDL_FETCH_FAILED",
-                                     "reason": "BDL_FETCH_FAILED"})
-                    continue
-                bdl_path.write_bytes(bdl_content)
-            if credential and credential.encode() in bdl_content:
+            if bdl_path.exists() or bdl_path.is_symlink():
+                return {"status": "BLOCKED", "reason": "UNTRUSTED_EXISTING_EVIDENCE",
+                        "detail": "BDL response exists without a valid cache entry",
+                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
+                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+            url = f"https://api.balldontlie.io/v1/games/{target['bdl_game_id']}"
+            bdl_content, bdl_entry = _get(
+                session, url, {"Authorization": credential or ""}, timeout=timeout,
+                counter=counter, pacer=bdl_pacer, provider=PROVIDER_BDL, target_ids=[mid])
+            requests_log.append(bdl_entry)
+            if bdl_content is None:
+                rejected.append({"match_id": mid, "selection_status": "BDL_FETCH_FAILED",
+                                 "reason": "BDL_FETCH_FAILED"})
+                continue
+            if _contains_credential(bdl_content, credential):
                 return {"status": "BLOCKED", "reason": "CREDENTIAL_LEAK_DETECTED",
                         "requests_performed": counter["requests"], "cache_hits": cache_hits,
                         "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+            _write_bytes(bdl_path, bdl_content, data_dir)
+            bdl_entry["evidence_path"] = str(bdl_path)
 
-            observed_at = bdl_entry.get("observed_at") or official_entry.get("observed_at") or _now_iso()
+            official_observed = _parse_aware(official_entry.get("observed_at"))
+            bdl_observed = _parse_aware(bdl_entry.get("observed_at"))
+            if official_observed is None or bdl_observed is None:
+                return {"status": "BLOCKED", "reason": "EVIDENCE_OBSERVATION_TIME_MISSING",
+                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
+                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+            source_observed_at = max(official_observed, bdl_observed).isoformat()
             source_reference = evidence.official_page_url(target, gid)
             validation = evidence.validate_target_evidence(
-                target, official_path, bdl_path, observed_at=observed_at, source_reference=source_reference,
+                target, official_path, bdl_path, observed_at=source_observed_at,
+                source_reference=source_reference,
             )
             entry = {
                 "match_id": mid,
@@ -337,11 +492,18 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
                 "snapshot_digest": target["snapshot_digest"],
                 "bdl_game_id": target["bdl_game_id"],
                 "official_game_id": gid,
+                "home_code": target["home_code"],
+                "away_code": target["away_code"],
                 "official_path": str(official_path),
                 "bdl_path": str(bdl_path),
                 "official_sha256": _sha(official_path.read_bytes()),
                 "bdl_sha256": _sha(bdl_path.read_bytes()),
-                "observed_at": observed_at,
+                "official_observed_at": official_observed.isoformat(),
+                "bdl_observed_at": bdl_observed.isoformat(),
+                "source_observed_at": source_observed_at,
+                "cache_reused_at": None,
+                "evidence_validated_at": _now_iso(),
+                "credential_scanned": bool(credential),
                 "source_reference": source_reference,
                 "status": "VALIDATED" if validation.get("qualified") else "REJECTED",
                 "validation": validation,
@@ -366,6 +528,7 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
         "evidence_dir": str(evidence_dir),
         "requests_performed": counter["requests"],
         "cache_hits": cache_hits,
+        "cache_rejections": cache_rejections,
         "requests": requests_log,
         "targets": {entry["match_id"]: entry for entry in accepted},
         "accepted": [entry["match_id"] for entry in accepted],
@@ -378,50 +541,90 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
             "bdl_pacing_seconds": max(BDL_PACING_SECONDS, pacing_seconds),
         },
     }
-    _write_json(_manifest_path(evidence_dir), result)
-    _write_json(evidence_dir / "runs" / f"{run_id}.json", result)
+    _write_json(_manifest_path(evidence_dir), result, data_dir)
+    _write_json(evidence_dir / "runs" / f"{run_id}.json", result, data_dir)
     preview_targets = [evidence.target_for_preview(entry) for entry in accepted]
-    _write_json(evidence_dir / "preview-targets.json", preview_targets)
+    _write_json(evidence_dir / "preview-targets.json", preview_targets, data_dir)
     return result
 
 
-def _run_preview(evidence_dir: Path, data_dir: Path | None = None) -> dict:
+def _run_preview(evidence_dir: Path, data_dir: Path | None = None,
+                 target_ids: list[str] | None = None, credential: str | None = None) -> dict:
     from tools.nba_confirmed_result import _official_game, preview_batch
 
+    data_dir = Path(data_dir or config.DATA_DIR)
+    _assert_safe_evidence_dir(evidence_dir, data_dir)
     manifest = load_manifest(evidence_dir)
+    accepted_ids = [str(mid) for mid in (manifest.get("accepted") or [])]
+    if target_ids:
+        requested = list(dict.fromkeys(str(mid) for mid in target_ids))
+        if not set(requested).issubset(set(accepted_ids)):
+            return {"status": "BLOCKED", "reason": "PREVIEW_TARGET_SET_MISMATCH",
+                    "requested": requested, "manifest_accepted": accepted_ids, "preview": None}
+        accepted_ids = requested
+    if not accepted_ids:
+        return {"status": "BLOCKED", "reason": "NO_VALIDATED_EVIDENCE", "preview": None}
+
     entries = []
-    for entry in (manifest.get("targets") or {}).values():
-        if not _valid_cache(entry, entry):
+    invalid = []
+    for mid in accepted_ids:
+        entry = (manifest.get("targets") or {}).get(mid)
+        reason = _cache_rejection_reason(entry, _cached_target_view(entry or {}))
+        if reason:
+            invalid.append({"match_id": mid, "reason": reason})
+            continue
+        official_path, bdl_path = Path(entry["official_path"]), Path(entry["bdl_path"])
+        if credential and (_contains_credential(official_path.read_bytes(), credential)
+                           or _contains_credential(bdl_path.read_bytes(), credential)):
+            invalid.append({"match_id": mid, "reason": "CREDENTIAL_LEAK_DETECTED_IN_CACHE"})
+            continue
+        validation = evidence.validate_target_evidence(
+            entry, official_path, bdl_path,
+            observed_at=entry["source_observed_at"], source_reference=entry["source_reference"],
+        )
+        if not validation.get("qualified"):
+            invalid.append({"match_id": mid,
+                            "reason": f"EVIDENCE_VALIDATION_FAILED:{validation.get('reason')}"})
             continue
         official = _official_game(entry["official_path"])
         bdl_payload = _read_json(Path(entry["bdl_path"]))
         bdl = bdl_payload.get("data") if isinstance(bdl_payload, dict) else None
         if not isinstance(bdl, dict):
+            invalid.append({"match_id": mid, "reason": "EVIDENCE_SCHEMA_INCOMPATIBLE"})
             continue
         entries.append({
             "match_id": entry["match_id"],
             "snapshot_id": entry["snapshot_id"],
             "official": official,
             "bdl": bdl,
-            "observed_at": entry["observed_at"],
+            "observed_at": entry["source_observed_at"],
             "source_reference": entry["source_reference"],
         })
-    if not entries:
-        return {"status": "BLOCKED", "reason": "NO_VALIDATED_EVIDENCE", "preview": None}
+    if invalid:
+        return {"status": "BLOCKED", "reason": "INVALID_EVIDENCE", "invalid": invalid, "preview": None}
     try:
         plan = preview_batch(entries)
     except ValueError as exc:
         return {"status": "BLOCKED", "reason": str(exc), "preview": None}
-    _write_json(evidence_dir / "preview.json", plan)
-    return {
+    preview_generated_at = _now_iso()
+    _write_json(evidence_dir / "preview.json", plan, data_dir)
+    status = {
         "status": "PASS",
         "preview_sha256": plan.get("preview_sha256"),
+        "preview_generated_at": preview_generated_at,
         "generation": plan.get("generation"),
         "target_count": len(plan.get("targets") or []),
+        "accepted_targets": accepted_ids,
+        "source_observed_at": {mid: (manifest.get("targets") or {})[mid].get("source_observed_at")
+                               for mid in accepted_ids},
+        "write_scope": plan.get("write_scope"),
+    }
+    _write_json(evidence_dir / "preview-status.json", status, data_dir)
+    return {
+        **status,
         "targets": [{"match_id": t["match_id"], "snapshot_id": t["snapshot_id"],
                      "settlement_id": t["settlement_id"], "evaluation_id": t["evaluation_id"]}
                     for t in plan.get("targets") or []],
-        "write_scope": plan.get("write_scope"),
         "preview": plan,
     }
 
@@ -438,6 +641,20 @@ def _parse_official_ids(values: list[str] | None) -> dict[str, str]:
     return out
 
 
+def _parse_official_dates(values: list[str] | None) -> dict[str, str]:
+    out = {}
+    for value in values or []:
+        if "=" not in value:
+            raise SystemExit(f"--official-date expects MATCH_ID=YYYY-MM-DD, got {value!r}")
+        mid, date = value.split("=", 1)
+        try:
+            datetime.strptime(date.strip(), "%Y-%m-%d")
+        except ValueError as exc:
+            raise SystemExit(f"invalid official date: {value!r}") from exc
+        out[mid.strip()] = date.strip()
+    return out
+
+
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dir")
     parser.add_argument("--evidence-dir", default=str(DEFAULT_EVIDENCE_DIR))
@@ -448,6 +665,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allowed-provider", action="append", default=[])
     parser.add_argument("--max-cost", type=float, default=0)
     parser.add_argument("--official-game-id", action="append", default=[])
+    parser.add_argument("--official-date", action="append", default=[])
     parser.add_argument("--pacing-seconds", type=float, default=BDL_PACING_SECONDS)
     parser.add_argument("--output")
 
@@ -461,9 +679,9 @@ def _apply_data_dir(path: Path) -> None:
     config.DATA_DIR = str(path)
 
 
-def _emit(result: dict, output: str | None) -> None:
+def _emit(result: dict, output: str | None, data_dir: Path) -> None:
     if output:
-        _write_json(Path(output), result)
+        _write_json(Path(output), result, data_dir)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -479,18 +697,28 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--max-targets must be 1..{MAX_TARGETS_LIMIT}")
     if args.pacing_seconds < BDL_PACING_SECONDS:
         raise SystemExit(f"--pacing-seconds cannot be below {BDL_PACING_SECONDS}")
+    if len(args.target_match_id) > MAX_TARGETS_LIMIT:
+        raise SystemExit(f"--target-match-id cannot exceed {MAX_TARGETS_LIMIT} entries")
 
     data_dir = _data_dir(args.data_dir)
     evidence_dir = Path(args.evidence_dir).resolve()
-    if _inside(evidence_dir, data_dir):
-        raise SystemExit("evidence directory must not be inside DATA_DIR")
+    _assert_safe_evidence_dir(evidence_dir, data_dir)
+    if args.output:
+        _assert_safe_output(Path(args.output), data_dir, evidence_dir)
     _apply_data_dir(data_dir)
     official_ids = _parse_official_ids(args.official_game_id)
+    official_dates = _parse_official_dates(args.official_date)
     allowed = args.allowed_provider or [PROVIDER_OFFICIAL, PROVIDER_BDL]
 
     selection = _load_targets(args.target_match_id, args.max_targets)
+    if selection.get("status") == "REJECTED":
+        _emit(selection, args.output, data_dir)
+        return EXIT_BLOCKED
+    if official_dates:
+        selection["targets"] = evidence.apply_official_dates(selection.get("targets") or [], official_dates)
+
     if args.command == "select":
-        _emit(selection, args.output)
+        _emit(selection, args.output, data_dir)
         return EXIT_OK
 
     if args.command == "plan":
@@ -498,29 +726,35 @@ def main(argv: list[str] | None = None) -> int:
             selection["targets"], allow_network=args.allow_network, max_requests=args.max_requests,
             allowed_providers=allowed, max_cost=args.max_cost, official_game_ids=official_ids,
         )
-        _emit({"selection": selection, "plan": plan}, args.output)
+        _emit({"selection": selection, "plan": plan}, args.output, data_dir)
         return EXIT_OK if plan.get("status") in ("PLAN_READY", "NETWORK_AUTHORIZATION_REQUIRED") else EXIT_BLOCKED
 
     if args.command == "preview":
-        result = _run_preview(evidence_dir, data_dir)
-        _emit(result, args.output)
+        result = _run_preview(evidence_dir, data_dir,
+                              target_ids=list(dict.fromkeys(args.target_match_id)) or None,
+                              credential=_load_credential())
+        _emit(result, args.output, data_dir)
         return EXIT_OK if result["status"] == "PASS" else EXIT_PREVIEW_BLOCKED
 
     acquire_result = _run_acquire(
         selection, evidence_dir=evidence_dir, allow_network=args.allow_network,
         max_requests=args.max_requests, allowed_providers=allowed, max_cost=args.max_cost,
         official_game_ids=official_ids, pacing_seconds=args.pacing_seconds,
+        data_dir=data_dir,
     )
     if args.command == "acquire":
-        _emit(acquire_result, args.output)
+        _emit(acquire_result, args.output, data_dir)
         return EXIT_OK if acquire_result["status"] == "OK" else EXIT_BLOCKED
 
     if acquire_result["status"] != "OK":
         _emit({"acquisition": acquire_result, "preview": {"status": "NOT_EXECUTED",
-                                                          "reason": "ACQUISITION_NOT_OK"}}, args.output)
+                                                          "reason": "ACQUISITION_NOT_OK"}},
+              args.output, data_dir)
         return EXIT_BLOCKED
-    preview_result = _run_preview(evidence_dir, data_dir)
-    _emit({"acquisition": acquire_result, "preview": preview_result}, args.output)
+    preview_result = _run_preview(evidence_dir, data_dir,
+                                  target_ids=acquire_result.get("accepted"),
+                                  credential=_load_credential())
+    _emit({"acquisition": acquire_result, "preview": preview_result}, args.output, data_dir)
     return EXIT_OK if preview_result["status"] == "PASS" else EXIT_PREVIEW_BLOCKED
 
 

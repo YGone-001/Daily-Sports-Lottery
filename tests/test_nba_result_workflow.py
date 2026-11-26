@@ -1,7 +1,9 @@
 """Isolated tests for the reusable NBA result-evidence workflow."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -131,7 +133,10 @@ class FakeSession:
 
 @pytest.fixture
 def scene(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    evidence_dir = tmp_path / "evidence"
+    monkeypatch.setattr(config, "DATA_DIR", str(data_dir))
     match1 = _match("500j-2026-01-02-7312", code="ORL", home="奥兰多魔术", away="密尔沃基雄鹿",
                     number="7312", bdl_id=123, start_utc=UTC_1, kickoff_time="08:00")
     match2 = _match("500j-2026-01-02-7313", code="CHI", home="芝加哥公牛", away="亚特兰大老鹰",
@@ -160,16 +165,16 @@ def scene(tmp_path, monkeypatch):
                 None)
     matches = [match1, match2, unbound, football]
     snapshots = {snap1["snapshot_id"]: snap1, snap2["snapshot_id"]: snap2, snap3["snapshot_id"]: snap3}
-    (tmp_path / "daily_matches.json").write_text(json.dumps({"matches": matches}), encoding="utf-8")
-    (tmp_path / config.PREDICTION_SNAPSHOT_FILE).write_text(json.dumps({"snapshots": snapshots}), encoding="utf-8")
-    (tmp_path / config.SETTLEMENT_FILE).write_text(json.dumps({"settlements": {}}), encoding="utf-8")
-    (tmp_path / config.EVALUATION_ROW_FILE).write_text(json.dumps({"rows": {}}), encoding="utf-8")
-    (tmp_path / "odds_snapshots.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "team_strength.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "calibrated.json").write_text("{}", encoding="utf-8")
+    (data_dir / "daily_matches.json").write_text(json.dumps({"matches": matches}), encoding="utf-8")
+    (data_dir / config.PREDICTION_SNAPSHOT_FILE).write_text(json.dumps({"snapshots": snapshots}), encoding="utf-8")
+    (data_dir / config.SETTLEMENT_FILE).write_text(json.dumps({"settlements": {}}), encoding="utf-8")
+    (data_dir / config.EVALUATION_ROW_FILE).write_text(json.dumps({"rows": {}}), encoding="utf-8")
+    (data_dir / "odds_snapshots.json").write_text("{}", encoding="utf-8")
+    (data_dir / "team_strength.json").write_text("{}", encoding="utf-8")
+    (data_dir / "calibrated.json").write_text("{}", encoding="utf-8")
     owner = refresh_state.owner_record("synthetic")
-    generation = refresh_state.begin(str(tmp_path), owner=owner)
-    refresh_state.complete(str(tmp_path), owner=owner, generation=generation, outcome="COMPLETED")
+    generation = refresh_state.begin(str(data_dir), owner=owner)
+    refresh_state.complete(str(data_dir), owner=owner, generation=generation, outcome="COMPLETED")
     clock = FakeClock()
     monkeypatch.setattr(workflow.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(workflow.time, "sleep", clock.sleep)
@@ -185,7 +190,8 @@ def scene(tmp_path, monkeypatch):
     }
     return {
         "matches": matches, "snapshots": snapshots, "official1": official1, "official2": official2,
-        "bdl1": bdl1, "bdl2": bdl2, "responses": responses, "data_dir": tmp_path, "clock": clock,
+        "bdl1": bdl1, "bdl2": bdl2, "responses": responses, "data_dir": data_dir,
+        "evidence_dir": evidence_dir, "clock": clock,
     }
 
 
@@ -198,7 +204,7 @@ def _acquire(scene, tmp_path, *, allow_network=True, max_requests=5, credential=
     clock = clock or scene["clock"]
     session = FakeSession(responses if responses is not None else scene["responses"], clock)
     result = workflow._run_acquire(
-        _selection(), evidence_dir=tmp_path / "evidence", allow_network=allow_network,
+        _selection(), evidence_dir=scene["evidence_dir"], allow_network=allow_network,
         max_requests=max_requests, allowed_providers=[evidence.PROVIDER_OFFICIAL, evidence.PROVIDER_BDL],
         max_cost=0, official_game_ids=official_ids or {}, pacing_seconds=12.1,
         session=session, credential=credential,
@@ -258,8 +264,8 @@ def test_acquire_discovers_retains_and_validates(scene, tmp_path):
     assert result["requests_performed"] == 5
     assert result["cache_hits"] == 0
     assert len(session.calls) == 5
-    evidence_dir = tmp_path / "evidence"
-    assert (evidence_dir / "nba-official/nba-discovery-2026-01-01.response").is_file()
+    evidence_dir = scene["evidence_dir"]
+    assert list((evidence_dir / "nba-official").glob("nba-discovery-2026-01-01*.response"))
     assert (evidence_dir / "nba-official/nba-game-0022600001.response").is_file()
     assert (evidence_dir / "balldontlie/bdl-123.response").is_file()
     manifest = json.loads((evidence_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -303,7 +309,7 @@ def test_rejected_target_is_excluded_and_preview_uses_only_accepted(scene, tmp_p
     assert any(r.get("match_id") == "500j-2026-01-02-7313" for r in result["rejected"])
     assert any("TEAM_ORIENTATION_MISMATCH" in str(r.get("reason")) for r in result["rejected"])
 
-    preview = workflow._run_preview(tmp_path / "evidence")
+    preview = workflow._run_preview(scene["evidence_dir"])
     assert preview["status"] == "PASS"
     assert preview["target_count"] == 1
 
@@ -311,15 +317,15 @@ def test_rejected_target_is_excluded_and_preview_uses_only_accepted(scene, tmp_p
 def test_preview_passes_then_rejects_inconsistent_runtime(scene, tmp_path):
     result, _, _ = _acquire(scene, tmp_path)
     assert result["status"] == "OK"
-    preview = workflow._run_preview(tmp_path / "evidence")
+    preview = workflow._run_preview(scene["evidence_dir"])
     assert preview["status"] == "PASS"
     assert preview["target_count"] == 2
     assert preview["preview_sha256"]
 
-    daily = json.loads((tmp_path / "daily_matches.json").read_text(encoding="utf-8"))
+    daily = json.loads((scene["data_dir"] / "daily_matches.json").read_text(encoding="utf-8"))
     daily["matches"][0]["unexpected"] = "drift"
-    (tmp_path / "daily_matches.json").write_text(json.dumps(daily), encoding="utf-8")
-    stale = workflow._run_preview(tmp_path / "evidence")
+    (scene["data_dir"] / "daily_matches.json").write_text(json.dumps(daily), encoding="utf-8")
+    stale = workflow._run_preview(scene["evidence_dir"])
     assert stale["status"] == "BLOCKED"
     assert "INCONSISTENT_RUNTIME" in str(stale["reason"])
 
@@ -375,3 +381,228 @@ def test_explicit_official_ids_skip_discovery(scene, tmp_path):
     assert result["status"] == "OK"
     assert result["requests_performed"] == 4
     assert not any("nba.com/games?date=" in url for url, _ in session.calls)
+
+
+def test_credential_not_in_stdout_or_stderr(scene, monkeypatch, capsys):
+    secret = "synthetic-stdout-secret"
+    responses = dict(scene["responses"])
+    responses["https://www.nba.com/games?date=2026-01-01"] += secret.encode()
+    clock = scene["clock"]
+    monkeypatch.setattr(workflow, "_session", lambda: FakeSession(responses, clock))
+    monkeypatch.setattr(workflow, "_load_credential", lambda: secret)
+    exit_code = workflow.main([
+        "acquire", "--data-dir", str(scene["data_dir"]),
+        "--evidence-dir", str(scene["evidence_dir"]),
+        "--max-targets", "2", "--allow-network", "--max-requests", "5",
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert secret not in captured.out
+    assert secret not in captured.err
+
+
+def _protected_hashes(data_dir: Path) -> dict[str, str]:
+    names = [
+        "daily_matches.json", config.PREDICTION_SNAPSHOT_FILE, "odds_snapshots.json",
+        config.SETTLEMENT_FILE, config.EVALUATION_ROW_FILE, "team_strength.json",
+        "calibrated.json", ".refresh_state.json",
+    ]
+    return {name: hashlib.sha256((data_dir / name).read_bytes()).hexdigest() for name in names}
+
+
+@pytest.mark.parametrize("command", ["select", "plan", "preview", "acquire", "run"])
+def test_output_inside_data_dir_rejected_for_every_command(scene, tmp_path, command):
+    before = _protected_hashes(scene["data_dir"])
+    target = scene["data_dir"] / "daily_matches.json"
+    with pytest.raises(SystemExit):
+        workflow.main([
+            command, "--data-dir", str(scene["data_dir"]),
+            "--evidence-dir", str(scene["evidence_dir"]),
+            "--max-targets", "1", "--output", str(target),
+        ])
+    assert _protected_hashes(scene["data_dir"]) == before
+
+
+def test_protected_path_alias_and_valid_report_output(scene, tmp_path):
+    before = _protected_hashes(scene["data_dir"])
+    alias = scene["data_dir"] / "nested" / ".." / "daily_matches.json"
+    with pytest.raises(SystemExit):
+        workflow.main([
+            "select", "--data-dir", str(scene["data_dir"]),
+            "--evidence-dir", str(scene["evidence_dir"]),
+            "--output", str(alias),
+        ])
+    assert _protected_hashes(scene["data_dir"]) == before
+
+    hardlink = tmp_path / "hardlink.json"
+    try:
+        os.link(scene["data_dir"] / "daily_matches.json", hardlink)
+    except OSError:
+        hardlink = None
+    if hardlink is not None:
+        with pytest.raises(SystemExit):
+            workflow.main([
+                "select", "--data-dir", str(scene["data_dir"]),
+                "--evidence-dir", str(scene["evidence_dir"]),
+                "--output", str(hardlink),
+            ])
+        assert _protected_hashes(scene["data_dir"]) == before
+
+    output = tmp_path / "reports" / "selection.json"
+    assert workflow.main([
+        "select", "--data-dir", str(scene["data_dir"]),
+        "--evidence-dir", str(scene["evidence_dir"]),
+        "--max-targets", "1", "--output", str(output),
+    ]) == 0
+    assert output.is_file()
+    assert _protected_hashes(scene["data_dir"]) == before
+
+
+@pytest.mark.parametrize("source", ["discovery", "official", "bdl"])
+def test_credential_detected_before_persistence(scene, tmp_path, source, capsys):
+    secret = "synthetic-secret-value"
+    responses = dict(scene["responses"])
+    if source == "discovery":
+        responses["https://www.nba.com/games?date=2026-01-01"] += secret.encode()
+    elif source == "official":
+        responses["https://www.nba.com/game/mil-vs-orl-0022600001"] += secret.encode()
+    else:
+        responses["https://api.balldontlie.io/v1/games/123"] += secret.encode()
+    result, session, _ = _acquire(scene, tmp_path, responses=responses, credential=secret)
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "CREDENTIAL_LEAK_DETECTED"
+    evidence_dir = scene["evidence_dir"]
+    if source == "discovery":
+        assert not list((evidence_dir / "nba-official").glob("nba-discovery-*"))
+    elif source == "official":
+        assert not (evidence_dir / "nba-official/nba-game-0022600001.response").exists()
+    else:
+        assert not (evidence_dir / "balldontlie/bdl-123.response").exists()
+    assert not (evidence_dir / "manifest.json").exists()
+    for path in evidence_dir.rglob("*"):
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes()
+    assert secret not in json.dumps(result)
+
+
+def test_explicit_target_limit_and_duplicates(scene):
+    ids = ["500j-2026-01-02-7312", "500j-2026-01-02-7313", "500j-2026-01-02-7314"]
+    over = evidence.select_pending_targets(ids, max_targets=2, now=NOW)
+    assert over["status"] == "REJECTED"
+    assert over["reason"] == "TARGET_LIMIT_EXCEEDED"
+    assert over["targets"] == []
+    assert over["requested_count"] == 3
+
+    duplicates = evidence.select_pending_targets(
+        ["500j-2026-01-02-7312", "500j-2026-01-02-7312", "500j-2026-01-02-7313"],
+        max_targets=2, now=NOW,
+    )
+    assert duplicates["status"] == "OK"
+    assert duplicates["duplicates_removed"] == 1
+    assert len(duplicates["targets"]) == 2
+
+    exit_code = workflow.main([
+        "run", "--data-dir", str(scene["data_dir"]),
+        "--evidence-dir", str(scene["evidence_dir"]),
+        "--target-match-id", ids[0], "--target-match-id", ids[1],
+        "--target-match-id", ids[2], "--max-targets", "2",
+        "--allow-network", "--max-requests", "10",
+    ])
+    assert exit_code == 2
+
+
+def test_cache_retains_original_observation_time(scene, tmp_path):
+    first, _, _ = _acquire(scene, tmp_path)
+    assert first["status"] == "OK"
+    manifest = json.loads((scene["evidence_dir"] / "manifest.json").read_text(encoding="utf-8"))
+    entry = manifest["targets"]["500j-2026-01-02-7312"]
+    assert entry["source_observed_at"] == max(entry["official_observed_at"], entry["bdl_observed_at"])
+    assert entry["cache_reused_at"] is None
+    original = entry["source_observed_at"]
+
+    second, session, _ = _acquire(scene, tmp_path, credential="", responses={})
+    assert second["status"] == "OK"
+    assert second["requests_performed"] == 0
+    reused = json.loads((scene["evidence_dir"] / "manifest.json").read_text(encoding="utf-8"))[
+        "targets"]["500j-2026-01-02-7312"]
+    assert reused["source_observed_at"] == original
+    assert reused["cache_reused_at"] is not None
+    assert session.calls == []
+
+
+def test_cache_integrity_rejections(scene, tmp_path):
+    first, _, _ = _acquire(scene, tmp_path)
+    assert first["status"] == "OK"
+    manifest_path = scene["evidence_dir"] / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = manifest["targets"]["500j-2026-01-02-7312"]
+    assert workflow._cache_rejection_reason(entry, {
+        "snapshot_digest": "changed", "bdl_game_id": entry["bdl_game_id"],
+        "home_code": entry["home_code"], "away_code": entry["away_code"],
+    }) == "CACHE_SNAPSHOT_CHANGED"
+    assert workflow._cache_rejection_reason(entry, {
+        "snapshot_digest": entry["snapshot_digest"], "bdl_game_id": "999",
+        "home_code": entry["home_code"], "away_code": entry["away_code"],
+    }) == "CACHE_PROVIDER_IDENTITY_CHANGED"
+
+    entry.pop("source_observed_at")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    blocked, session, _ = _acquire(scene, tmp_path, credential="", responses={})
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["reason"] == "CACHE_INTEGRITY_FAILURE"
+    assert blocked["requests_performed"] == 0
+    assert session.calls == []
+
+
+def test_cache_modified_response_rejected(scene, tmp_path):
+    first, _, _ = _acquire(scene, tmp_path)
+    assert first["status"] == "OK"
+    official = scene["evidence_dir"] / "nba-official/nba-game-0022600001.response"
+    official.write_bytes(official.read_bytes() + b"\n")
+    blocked, _, _ = _acquire(scene, tmp_path, credential="", responses={})
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["reason"] == "CACHE_INTEGRITY_FAILURE"
+    assert any(item["reason"] == "CACHE_RESPONSE_MODIFIED" for item in blocked["cache_rejections"])
+
+
+def test_unrelated_manifest_target_not_previewed(scene, tmp_path):
+    result, _, _ = _acquire(scene, tmp_path)
+    assert result["status"] == "OK"
+    manifest_path = scene["evidence_dir"] / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["targets"]["unrelated-target"] = dict(
+        next(iter(manifest["targets"].values())), match_id="unrelated-target")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    preview = workflow._run_preview(scene["evidence_dir"])
+    assert preview["status"] == "PASS"
+    assert preview["target_count"] == 2
+    one = workflow._run_preview(scene["evidence_dir"], target_ids=["500j-2026-01-02-7312"])
+    assert one["status"] == "PASS"
+    assert one["target_count"] == 1
+    mismatch = workflow._run_preview(scene["evidence_dir"], target_ids=["missing"])
+    assert mismatch["status"] == "BLOCKED"
+    assert mismatch["reason"] == "PREVIEW_TARGET_SET_MISMATCH"
+
+
+def test_official_discovery_date_boundaries_and_override(scene):
+    utc = timezone.utc
+    safe_midnight = evidence.official_discovery_date_info(datetime(2026, 11, 23, 0, 0, tzinfo=utc), "2026-11-23")
+    assert safe_midnight["status"] == "SAFE"
+    assert safe_midnight["date"] == "2026-11-22"
+    assert "2026-11-23" in safe_midnight["candidates"]
+
+    assert evidence.official_discovery_date_info(datetime(2026, 11, 23, 7, 59, tzinfo=utc), "2026-11-23")["status"] == "SAFE"
+    assert evidence.official_discovery_date_info(datetime(2026, 11, 23, 8, 0, tzinfo=utc), "2026-11-23")["status"] == "AMBIGUOUS"
+    assert evidence.official_discovery_date_info(datetime(2026, 11, 23, 15, 59, tzinfo=utc), "2026-11-23")["status"] == "AMBIGUOUS"
+    assert evidence.official_discovery_date_info(datetime(2026, 11, 23, 16, 0, tzinfo=utc), "2026-11-23")["status"] == "SAFE"
+
+    target = {
+        "match_id": "x", "selection_status": evidence.STATUS_ELIGIBLE,
+        "official_discovery_date": "2026-11-22", "official_discovery_date_status": "AMBIGUOUS",
+    }
+    blocked = evidence.build_request_plan([target], allow_network=True, max_requests=10)
+    assert blocked["status"] == "OFFICIAL_DATE_AMBIGUOUS"
+    overridden = evidence.apply_official_dates([target], {"x": "2026-11-22"})
+    assert overridden[0]["official_discovery_date_status"] == "SAFE"
+    ready = evidence.build_request_plan(overridden, allow_network=True, max_requests=10)
+    assert ready["status"] == "PLAN_READY"

@@ -54,6 +54,8 @@
 ```
 
 只选择「有待结算赛前快照 + 既有唯一 BDL 绑定 + 开球已过」的 NBA 赛事。
+显式 `--target-match-id` 与自动选择受同一个 `--max-targets` 约束；超限会在任何
+网络请求前以 `TARGET_LIMIT_EXCEEDED` 拒绝，重复 ID 会去重并记录。
 输出包含：
 
 - `targets`：本次可进入证据采集的目标；
@@ -92,9 +94,18 @@
 - BDL 频率：起始间隔至少 12.1 秒；官方页至少 1 秒。
 - 无自动重试；不访问付费端点；不订阅；不注册；`--max-cost 0`。
 - 凭据只从环境变量 `DSL_BDL_API_KEY` 或本地 `.DSL_BDL_API_KEY` 读取，不写入证据。
+- 所有响应在落盘前检查是否含凭据；命中即失败关闭，不保留污染字节、不输出凭据。
 - 原始响应保存到 `reports/result-evidence/nba-official/` 与
-  `reports/result-evidence/balldontlie/`，并写 `manifest.json`。
-- 已验证目标可被缓存复用；重复运行命中缓存时请求数为 0。
+  `reports/result-evidence/balldontlie/`，并写 `manifest.json`；发现页文件名含运行 ID，
+  不覆盖历史发现页。
+- 已验证目标可被缓存复用；缓存必须带原始 `source_observed_at` / 官方与 BDL 观测时间
+  及文件摘要，缺失或不一致时拒绝，不用当前时间代替。
+- 官方发现日默认取北京比赛日减一天；UTC 开球在 `08:00–16:00` 时标记
+  `AMBIGUOUS`，必须显式提供 `--official-date MATCH=YYYY-MM-DD` 或
+  `--official-game-id MATCH=GAMEID`，不会猜测或自动增加发现请求。
+- `--output` 与 `--evidence-dir` 不能解析到 `data/`、七个受保护存储、
+  `.refresh_state.json`、凭据文件或保留证据路径；相对路径、`..`、符号链接、
+  junction 与硬链接别名都会被拒绝。
 
 ### 2.6 严格批量预览（离线）
 

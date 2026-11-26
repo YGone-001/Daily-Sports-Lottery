@@ -1370,6 +1370,23 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   必须保存到 `reports/result-evidence/`（或显式外部目录）；清单必须记录 provider、
   endpoint、`started_at`、`observed_at`、HTTP 状态、字节数、SHA-256、目标 match id、
   provider game id 与代码 SHA。**不得**保存凭据，也不得把证据写入 `data/`。
+- **输出路径边界**：`--output`、`--evidence-dir` 及所有写入目标必须在任何操作前校验；
+  解析相对路径、`..`、符号链接、Windows junction 与硬链接别名；拒绝写入 `DATA_DIR`、
+  七个受保护存储、`.refresh_state.json`、凭据文件，以及会覆盖 `manifest.json` /
+  `preview.json` / `preview-targets.json` / `runs/` / 原始证据的保留路径。
+- **凭据先检查后落盘**：赛程发现页、官方比赛页、BDL 响应、缓存原始响应在持久化或
+  复用前必须检查是否含凭据；命中即失败关闭，不保留污染字节、不删除既有证据、
+  不在 stdout/stderr/异常文本/清单中输出凭据。不得用真实凭据做测试。
+- **目标数量边界一致**：自动选择与显式 `--target-match-id` 都必须受 `max_targets`
+  约束；显式集合超限必须在任何网络请求前以 `TARGET_LIMIT_EXCEEDED` 拒绝，
+  重复显式 ID 去重并记录；不得为提高上限而修改 `MAX_TARGETS_LIMIT`。
+- **缓存观测时间完整**：缓存必须保留原始 `source_observed_at`、`official_observed_at`、
+  `bdl_observed_at`、`cache_reused_at`、`evidence_validated_at` 与文件摘要；
+  缺失/不一致时拒绝缓存，**不得**用当前时间代替历史观测时间；不得静默覆盖已有原始证据。
+  预览必须使用当前选择的确切目标集，不得消费无关或陈旧 manifest 条目。
+- **官方发现日**：`BEIJING_MATCH_DATE_MINUS_ONE` 仅在 UTC 开球小时 `<08:00` 或
+  `>=16:00` 视为 `SAFE`；`08:00–16:00` 视为 `AMBIGUOUS`，必须由操作者显式
+  `--official-date` 或 `--official-game-id` 解析，不得猜测或静默增加发现请求。
 - **校验只复用既有验证器**：逐目标校验必须调用
   `tools.nba_confirmed_result.bind_result`（官方页 + BDL + 快照 + 主客 + 开球 +
   逐节对账），**不得**另建第二套结算/验证器。批量预览必须调用

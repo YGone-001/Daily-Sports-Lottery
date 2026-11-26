@@ -78,27 +78,71 @@ def _snapshot_for(match_id: str, snapshots: Mapping[str, dict], settled_snapshot
     return sorted(pool, key=lambda s: (str(s.get("generated_at") or ""), str(s.get("snapshot_id") or "")))[-1]
 
 
+def official_discovery_date_info(kickoff: datetime, match_date: Any) -> dict:
+    """Choose the NBA official scoreboard date, or mark it ambiguous.
+
+    NBA official scoreboards use the US local game date. For the normal NBA
+    evening window the Beijing match date is one day ahead, but games with a
+    UTC kickoff between 08:00 and 16:00 are near a date boundary. Those must
+    be resolved by an explicit operator-supplied official game id/date rather
+    than by guessing or by silently adding discovery requests.
+    """
+    try:
+        utc = kickoff.astimezone(timezone.utc) if kickoff.tzinfo else kickoff.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return {"date": None, "status": "UNKNOWN", "candidates": [], "source": "UNKNOWN"}
+    try:
+        beijing_minus_one = (datetime.strptime(str(match_date), "%Y-%m-%d").date()
+                             - timedelta(days=1)).isoformat()
+    except (TypeError, ValueError):
+        return {"date": None, "status": "AMBIGUOUS", "candidates": [],
+                "source": "INVALID_MATCH_DATE"}
+    candidates = sorted({
+        beijing_minus_one,
+        utc.date().isoformat(),
+        (utc.date() - timedelta(days=1)).isoformat(),
+    })
+    hour = utc.hour + utc.minute / 60.0
+    status = "SAFE" if (hour < 8.0 or hour >= 16.0) else "AMBIGUOUS"
+    return {
+        "date": beijing_minus_one,
+        "status": status,
+        "candidates": candidates,
+        "source": "BEIJING_MATCH_DATE_MINUS_ONE",
+        "utc_kickoff_hour": round(hour, 2),
+    }
+
+
+def apply_official_dates(targets: Iterable[Mapping], overrides: Mapping[str, str]) -> list[dict]:
+    """Apply explicit operator date overrides without expanding the request plan."""
+    out = []
+    for target in targets:
+        item = dict(target)
+        date = overrides.get(item["match_id"])
+        if date:
+            item["official_discovery_date"] = date
+            item["official_discovery_date_status"] = "SAFE"
+            item["official_discovery_date_source"] = "EXPLICIT_OPERATOR_OVERRIDE"
+        out.append(item)
+    return out
+
+
 def _target_from_match(match: Mapping, snapshot: Mapping, *, now: datetime) -> dict:
     kickoff = get_match_datetime(dict(match))
     prov = match.get("kickoff_provenance") or {}
-    # NBA official schedule dates are US local dates; for the usual US evening games
-    # the Beijing match date is one day ahead. An explicit official_game_id can bypass
-    # discovery when an operator has already verified the date.
-    try:
-        official_date = (datetime.strptime(str(match.get("date")), "%Y-%m-%d").date()
-                         - timedelta(days=1)).isoformat()
-        date_source = "BEIJING_MATCH_DATE_MINUS_ONE"
-    except (TypeError, ValueError):
-        official_date = kickoff.astimezone(timezone.utc).date().isoformat() if kickoff else None
-        date_source = "UTC_FALLBACK"
+    date_info = official_discovery_date_info(kickoff, match.get("date")) if kickoff else {
+        "date": None, "status": "UNKNOWN", "candidates": [], "source": "UNKNOWN",
+    }
     return {
         "match_id": str(match.get("id")),
         "league": match.get("league"),
         "match_date": match.get("date"),
         "kickoff_at": kickoff.isoformat() if kickoff else None,
         "kickoff_utc": kickoff.astimezone(timezone.utc).isoformat() if kickoff else None,
-        "official_discovery_date": official_date,
-        "official_discovery_date_source": date_source,
+        "official_discovery_date": date_info["date"],
+        "official_discovery_date_status": date_info["status"],
+        "official_discovery_date_candidates": date_info["candidates"],
+        "official_discovery_date_source": date_info["source"],
         "home": match.get("home"),
         "away": match.get("away"),
         "home_code": resolve_canonical_team_code(match.get("home")),
@@ -244,6 +288,25 @@ def select_pending_targets(target_ids: Sequence[str] | None = None, *, max_targe
                            now: datetime | None = None) -> dict:
     """Select eligible pending NBA targets; never contacts providers."""
     now = now or get_beijing_now()
+    requested_raw = list(target_ids) if target_ids else None
+    requested = list(dict.fromkeys(requested_raw)) if requested_raw else None
+    duplicates_removed = (len(requested_raw) - len(requested)) if requested_raw else 0
+    if requested is not None and len(requested) > max_targets:
+        return {
+            "status": "REJECTED",
+            "reason": "TARGET_LIMIT_EXCEEDED",
+            "generated_at": now.isoformat(),
+            "scope": "READ_ONLY_SELECTION",
+            "network_requests_performed": 0,
+            "max_targets": max_targets,
+            "requested_count": len(requested_raw),
+            "unique_requested_count": len(requested),
+            "duplicates_removed": duplicates_removed,
+            "targets": [],
+            "not_selected_eligible": [],
+            "rejected": [],
+            "queue": {},
+        }
     matches, snapshots, settlements = _load_state()
     report = build_basketball_result_delivery(
         matches, {"snapshots": snapshots}, {"settlements": settlements}, observations={}, now=now,
@@ -253,7 +316,6 @@ def select_pending_targets(target_ids: Sequence[str] | None = None, *, max_targe
                for m in matches if (m.get("kickoff_provenance") or {}).get("kickoff_source_event_id")]
     duplicate_ids = {gid for gid in bdl_ids if bdl_ids.count(gid) > 1}
 
-    requested = list(target_ids) if target_ids else None
     candidates = []
     for target in report.get("targets") or []:
         if not target.get("is_nba"):
@@ -301,10 +363,15 @@ def select_pending_targets(target_ids: Sequence[str] | None = None, *, max_targe
         return {k: v for k, v in target.items() if not k.startswith("_")}
 
     return {
+        "status": "OK",
+        "reason": None,
         "generated_at": now.isoformat(),
         "scope": "READ_ONLY_SELECTION",
         "network_requests_performed": 0,
         "max_targets": max_targets,
+        "requested_count": len(requested_raw) if requested_raw else None,
+        "unique_requested_count": len(requested) if requested is not None else None,
+        "duplicates_removed": duplicates_removed,
         "targets": [clean(t) for t in eligible],
         "not_selected_eligible": [clean(t) for t in not_selected],
         "rejected": [clean(t) for t in unique_rejected],
@@ -319,6 +386,8 @@ def build_request_plan(targets: Iterable[Mapping], *, allow_network: bool = Fals
     official_game_ids = dict(official_game_ids or {})
     providers = list(allowed_providers or SUPPORTED_PROVIDERS)
     missing_official = [t for t in targets if t["match_id"] not in official_game_ids]
+    ambiguous_dates = [t for t in missing_official
+                       if t.get("official_discovery_date_status") != "SAFE"]
     discovery_dates = sorted({str(t.get("official_discovery_date")) for t in missing_official
                               if t.get("official_discovery_date")})
     requests = len(discovery_dates) + len(targets) + len(targets)
@@ -326,6 +395,8 @@ def build_request_plan(targets: Iterable[Mapping], *, allow_network: bool = Fals
     reason = None
     if not targets:
         status, reason = "NO_ELIGIBLE_TARGETS", "NO_ELIGIBLE_TARGETS"
+    elif ambiguous_dates:
+        status, reason = "OFFICIAL_DATE_AMBIGUOUS", "OFFICIAL_DISCOVERY_DATE_REQUIRES_EXPLICIT_OVERRIDE"
     elif any(p not in SUPPORTED_PROVIDERS for p in providers) or set(providers) != set(SUPPORTED_PROVIDERS):
         status, reason = "PROVIDER_SCOPE_INCOMPLETE", "BOTH_NBA_OFFICIAL_AND_BDL_REQUIRED"
     elif max_cost < 0:
@@ -342,6 +413,10 @@ def build_request_plan(targets: Iterable[Mapping], *, allow_network: bool = Fals
         "targets": [t["match_id"] for t in targets],
         "discovery_dates": discovery_dates,
         "discovery_requests": len(discovery_dates),
+        "official_discovery_date_statuses": {
+            t["match_id"]: t.get("official_discovery_date_status") for t in targets
+        },
+        "ambiguous_discovery_targets": [t["match_id"] for t in ambiguous_dates],
         "official_page_requests": len(targets),
         "bdl_requests": len(targets),
         "requests_planned": requests,
@@ -469,6 +544,6 @@ def target_for_preview(entry: Mapping) -> dict:
         "snapshot_id": entry["snapshot_id"],
         "official_page": entry["official_path"],
         "bdl_response": entry["bdl_path"],
-        "observed_at": entry["observed_at"],
+        "observed_at": entry.get("source_observed_at") or entry.get("observed_at"),
         "source_reference": entry["source_reference"],
     }

@@ -31,6 +31,8 @@ NBA 官方页 + BDL 严格双源核对才可声称独立核验（两者比分也
 离线校验 → 本文件的严格批量预览」串成可重复流程。默认离线；只有显式
 `--allow-network --max-requests N` 才会联网。原始响应与清单写入 `reports/result-evidence/`，
 包含赛程发现页原始 HTML（修正了历史运行未保留该页的缺口），不写凭据、不写运行库。
+缓存复用要求原始观测时间与文件摘要一致；`--output` / `--evidence-dir` 不能解析到
+`data/`、受保护存储、凭据或保留证据路径。
 
 完整每日命令序列见 [daily-operations.md](daily-operations.md)。执行仍只走本文件的
 `tools.nba_confirmed_result --execute`，不新增第二条写路径。
