@@ -161,6 +161,10 @@ ALLOWED_PATHS = frozenset((
     "utils/nba_result_evidence.py",
     "tools/nba_result_workflow.py",
     "tests/test_nba_result_workflow.py",
+    "utils/football_result_history.py",
+    "tools/football_result_workflow.py",
+    "tests/test_football_result_history.py",
+    "tests/test_calibration_continuity.py",
     "docs/daily-operations.md"))
 
 

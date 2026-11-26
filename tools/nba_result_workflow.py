@@ -56,6 +56,10 @@ EXIT_BLOCKED = 2
 EXIT_REJECTED = 3
 EXIT_PREVIEW_BLOCKED = 4
 
+# 调度裕量：单调时钟的 12.1 秒下限在墙钟时间戳上可能出现毫秒级回摆
+# （真实批次曾观测到 12.096 秒）。额外裕量只放大间隔，不缩小既有下限。
+PACING_MARGIN_SECONDS = 0.25
+
 
 def _now_iso() -> str:
     return datetime.now(BJ).isoformat()
@@ -384,12 +388,32 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
 
     session = session or _session()
     counter = {"requests": 0, "max_requests": max_requests}
+    effective_bdl_pacing = max(BDL_PACING_SECONDS, pacing_seconds) + PACING_MARGIN_SECONDS
     official_pacer = _Pacer(max(OFFICIAL_PAGE_PACING_SECONDS, 0.0))
-    bdl_pacer = _Pacer(max(BDL_PACING_SECONDS, pacing_seconds))
+    bdl_pacer = _Pacer(effective_bdl_pacing)
     nba_dir = evidence_dir / "nba-official"
     bdl_dir = evidence_dir / "balldontlie"
     nba_dir.mkdir(parents=True, exist_ok=True)
     bdl_dir.mkdir(parents=True, exist_ok=True)
+
+    def blocked(reason: str, **extra) -> dict:
+        """Terminal failure result that still preserves sanitized request diagnostics."""
+        value = {
+            "status": "BLOCKED",
+            "reason": reason,
+            "run_id": run_id,
+            "generated_at": created,
+            "code_sha": _code_sha(),
+            "evidence_dir": str(evidence_dir),
+            "requests_performed": counter["requests"],
+            "cache_hits": cache_hits,
+            "requests": list(requests_log),
+            "accepted": list(accepted),
+            "rejected": list(rejected),
+        }
+        value.update(extra)
+        _write_json(evidence_dir / "runs" / f"{run_id}.json", value, data_dir)
+        return value
 
     try:
         official_ids = dict(official_game_ids)
@@ -404,16 +428,14 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
                                   target_ids=[t["match_id"] for t in date_targets])
             requests_log.append(entry)
             if content is None:
-                return {"status": "BLOCKED", "reason": "OFFICIAL_DISCOVERY_FETCH_FAILED",
-                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                        "accepted": accepted,
-                        "rejected": rejected + [{"selection_status": "OFFICIAL_DISCOVERY_FETCH_FAILED",
-                                                 "match_id": t["match_id"]} for t in date_targets],
-                        "evidence_dir": str(evidence_dir)}
+                return blocked(
+                    "OFFICIAL_DISCOVERY_FETCH_FAILED",
+                    first_request=dict(entry),
+                    rejected=rejected + [{"selection_status": "OFFICIAL_DISCOVERY_FETCH_FAILED",
+                                          "match_id": t["match_id"]} for t in date_targets],
+                )
             if _contains_credential(content, credential):
-                return {"status": "BLOCKED", "reason": "CREDENTIAL_LEAK_DETECTED",
-                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+                return blocked("CREDENTIAL_LEAK_DETECTED")
             raw_path = nba_dir / f"nba-discovery-{date}-{run_id}.response"
             _write_bytes(raw_path, content, data_dir)
             entry["evidence_path"] = str(raw_path)
@@ -432,10 +454,10 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
                 continue
             official_path = nba_dir / f"nba-game-{gid}.response"
             if official_path.exists() or official_path.is_symlink():
-                return {"status": "BLOCKED", "reason": "UNTRUSTED_EXISTING_EVIDENCE",
-                        "detail": "official response exists without a valid cache entry",
-                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+                return blocked(
+                    "UNTRUSTED_EXISTING_EVIDENCE",
+                    detail="official response exists without a valid cache entry",
+                )
             url = evidence.official_page_url(target, gid)
             official_content, official_entry = _get(
                 session, url, {"User-Agent": "Mozilla/5.0"}, timeout=timeout,
@@ -446,18 +468,16 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
                                  "reason": "OFFICIAL_PAGE_FETCH_FAILED"})
                 continue
             if _contains_credential(official_content, credential):
-                return {"status": "BLOCKED", "reason": "CREDENTIAL_LEAK_DETECTED",
-                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+                return blocked("CREDENTIAL_LEAK_DETECTED")
             _write_bytes(official_path, official_content, data_dir)
             official_entry["evidence_path"] = str(official_path)
 
             bdl_path = bdl_dir / f"bdl-{target['bdl_game_id']}.response"
             if bdl_path.exists() or bdl_path.is_symlink():
-                return {"status": "BLOCKED", "reason": "UNTRUSTED_EXISTING_EVIDENCE",
-                        "detail": "BDL response exists without a valid cache entry",
-                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+                return blocked(
+                    "UNTRUSTED_EXISTING_EVIDENCE",
+                    detail="BDL response exists without a valid cache entry",
+                )
             url = f"https://api.balldontlie.io/v1/games/{target['bdl_game_id']}"
             bdl_content, bdl_entry = _get(
                 session, url, {"Authorization": credential or ""}, timeout=timeout,
@@ -468,18 +488,14 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
                                  "reason": "BDL_FETCH_FAILED"})
                 continue
             if _contains_credential(bdl_content, credential):
-                return {"status": "BLOCKED", "reason": "CREDENTIAL_LEAK_DETECTED",
-                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+                return blocked("CREDENTIAL_LEAK_DETECTED")
             _write_bytes(bdl_path, bdl_content, data_dir)
             bdl_entry["evidence_path"] = str(bdl_path)
 
             official_observed = _parse_aware(official_entry.get("observed_at"))
             bdl_observed = _parse_aware(bdl_entry.get("observed_at"))
             if official_observed is None or bdl_observed is None:
-                return {"status": "BLOCKED", "reason": "EVIDENCE_OBSERVATION_TIME_MISSING",
-                        "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                        "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+                return blocked("EVIDENCE_OBSERVATION_TIME_MISSING")
             source_observed_at = max(official_observed, bdl_observed).isoformat()
             source_reference = evidence.official_page_url(target, gid)
             validation = evidence.validate_target_evidence(
@@ -515,9 +531,7 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
                 rejected.append({"match_id": mid, "selection_status": "EVIDENCE_REJECTED",
                                  "reason": validation.get("reason")})
     except _BudgetExceeded:
-        return {"status": "BLOCKED", "reason": "REQUEST_BUDGET_EXCEEDED",
-                "requests_performed": counter["requests"], "cache_hits": cache_hits,
-                "accepted": accepted, "rejected": rejected, "evidence_dir": str(evidence_dir)}
+        return blocked("REQUEST_BUDGET_EXCEEDED")
 
     result = {
         "status": "OK" if accepted else "BLOCKED",
@@ -539,6 +553,8 @@ def _run_acquire(selection: dict, *, evidence_dir: Path, allow_network: bool, ma
             "allowed_providers": allowed_providers,
             "max_cost_usd": max_cost,
             "bdl_pacing_seconds": max(BDL_PACING_SECONDS, pacing_seconds),
+            "effective_bdl_pacing_seconds": effective_bdl_pacing,
+            "pacing_margin_seconds": PACING_MARGIN_SECONDS,
         },
     }
     _write_json(_manifest_path(evidence_dir), result, data_dir)

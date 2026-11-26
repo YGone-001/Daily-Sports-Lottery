@@ -1366,6 +1366,13 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   一次批准不得延伸到新的目标集合或新的时间窗。
 - **请求控制**：无自动重试；BDL 起始间隔 ≥ 12.1 秒，官方页 ≥ 1 秒；不访问付费端点、
   不订阅、不注册、不超授权成本；`--max-cost` 必须为 0 或经单独批准。
+- **失败诊断必须留存**：一旦发起过请求，任何终止路径都必须保留 `requests`
+  （endpoint、`started_at`、`observed_at`、HTTP 状态或脱敏异常类型）与
+  `requests_performed`；发现页首次失败还必须给出 `first_request`，并写入
+  `runs/<run_id>.json`。不得只返回原因字符串，不得保留响应正文或凭据。
+- **调度裕量**：BDL pacing 使用单调时钟，并在 12.1 秒下限之上增加
+  `PACING_MARGIN_SECONDS = 0.25` 的调度裕量；报告必须同时给出名义下限与
+  `effective_bdl_pacing_seconds`。裕量只放大间隔，不得缩小既有下限。
 - **证据留存**：原始官方页 HTML、BDL 原始 JSON、赛程发现页原始 HTML 及其 SHA-256
   必须保存到 `reports/result-evidence/`（或显式外部目录）；清单必须记录 provider、
   endpoint、`started_at`、`observed_at`、HTTP 状态、字节数、SHA-256、目标 match id、
@@ -1404,6 +1411,37 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
   每日流程由操作者按 `docs/daily-operations.md` 显式执行。
 - **回归**：`tests/test_nba_result_workflow.py` 覆盖离线默认、预算/频控、凭据不泄露、
   官方 game id 发现、证据留存、加时对账、身份拒绝、批量预览、缓存复用与陈旧运行拒绝。
+
+---
+
+### 4.43 足球历史赛果复用入口
+
+- **唯一入口与默认离线**：`python -m tools.football_result_workflow` 提供
+  `select` / `acquire` / `preview` / `run`。`select` 与 `preview` 只读、离线、零写入；
+  `acquire` 必须显式 `--allow-network` 且同时给出 `--date` 与 `--max-requests`，
+  每个日期最多一次请求，无自动重试，`--max-cost` 恒为 0。
+- **复用既有源适配器**：采集只调用 `utils.fetcher_500.fetch_finished_matches(date)`，
+  不新建第二套 HTTP 抓取器；解析仍由既有 `_parse_wanchang` 完成。
+- **行位置 ID 不是 Canonical 身份**：`500w-...-<n>` 是行位置派生、跨批次不稳定，
+  **绝不**写入 Canonical ID、结算或评估引用。源行只能按
+  `(sport, date, home, away)` 精确匹配既有 Canonical 记录。
+- **主客反向不自动交换**：源行与 Canonical 恰好主客互换时只报
+  `ORIENTATION_CONFLICT`；不得交换 `home` / `away`、不得交换赔率、不得自动合并。
+- **歧义与冲突失败关闭**：同一队对匹配到多条 Canonical 记录时
+  `AMBIGUOUS_CANONICAL_MATCH`；重复源行、互相冲突的源比分、与既有终场比分冲突
+  分别拒绝并保留证据；不得任选一条继续。
+- **只读预览**：`preview` 只产出候选、拒绝原因、`settlement_id` / `evaluation_id`、
+  generation、七库摘要与 `preview_sha256`；不得写入任何受保护存储，不得调用
+  `settle_snapshot` 或物化评估。结算执行仍须另行授权，并复用既有生命周期、
+  结算与评估机制，不得另建足球结算引擎。
+- **证据边界**：获取的解析行与清单写入 `reports/football-result-evidence/` 或显式
+  外部目录，必须记录 provider、endpoint、`started_at`、`observed_at`、行数、
+  代码 SHA 与文件 SHA-256；不得写入 `data/`，不得保存凭据或响应正文中的密钥。
+- **非 NBA 篮球不适用**：本入口只处理足球；WNBA、德篮甲、欧篮联、西篮甲、
+  巴西 LDB 等不得套用本入口或 NBA 官方/BDL 工具。
+- **回归**：`tests/test_football_result_history.py` 覆盖精确匹配、反向拒绝、
+  歧义拒绝、无快照、已结算、重复/冲突源行、非终态/非法比分、只读预览与
+  无网络授权零请求。
 
 ---
 

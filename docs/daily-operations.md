@@ -153,6 +153,38 @@ curl.exe http://127.0.0.1:5000/api/evaluation-summary
 curl.exe http://127.0.0.1:5000/api/status
 ```
 
+### 2.9 足球历史赛果（离线选择 / 有界获取 / 只读预览）
+
+离线选择「已完赛、缺有效比分、但有合法赛前快照」的足球目标：
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.football_result_workflow select `
+  --data-dir data --max-targets 40 --output reports\football-selection.json
+```
+
+有界获取指定日期的完场页（需操作者单独批准网络；每个日期最多一次请求，无自动重试）：
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.football_result_workflow acquire `
+  --data-dir data --date 2026-10-29 --date 2026-11-01 `
+  --allow-network --max-requests 2
+```
+
+只读预览（不写七个受保护存储）：
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.football_result_workflow preview `
+  --data-dir data --evidence-dir reports\football-result-evidence
+```
+
+- 源行只按 `(sport, date, home, away)` 精确匹配 Canonical；`500w-...-<n>` 行位置
+  ID **不是** Canonical 身份，绝不写入结算或评估引用。
+- 主客反向只报 `ORIENTATION_CONFLICT`，不自动交换；同一队对多条 Canonical 记录
+  报 `AMBIGUOUS_CANONICAL_MATCH`；重复/冲突源比分拒绝。
+- 预览只输出候选、拒绝原因、`settlement_id` / `evaluation_id`、generation、
+  七库摘要与 `preview_sha256`。**本入口不执行写入**；后续结算必须另行授权并复用
+  既有生命周期/结算/评估机制。
+
 ## 3. 证据与缓存
 
 默认证据目录：`reports/result-evidence/`（Git 本地排除）。
@@ -177,7 +209,8 @@ reports/result-evidence/
 ## 4. 边界
 
 - **足球**：`wanchang` 是足球完场源；支持 `e=YYYY-MM-DD` 日期参数，但历史抓取需单独授权。
-  缺失比分不补造；历史盘口方向仍为 `PARTIAL`。
+  缺失比分不补造；历史盘口方向仍为 `PARTIAL`。`tools.football_result_workflow`
+  只做选择、有界获取与只读预览，不执行结算写入。
 - **非 NBA 篮球**：当前没有获准的竞赛兼容赛果源，保持 `SOURCE_NOT_AVAILABLE`；
   不得把 NBA 官方/BDL 工具用于 WNBA、德篮甲、欧篮联、西篮甲、巴西 LDB 等赛事。
 - **身份**：联赛编号、队名相似、同日时间接近都不是独立身份证据；不得自动归并

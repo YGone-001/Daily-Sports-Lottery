@@ -276,6 +276,49 @@ def test_acquire_discovers_retains_and_validates(scene, tmp_path):
             assert b"secret-key" not in path.read_bytes()
     bdl_calls = [t for url, t in session.calls if "api.balldontlie.io" in url]
     assert bdl_calls[1] - bdl_calls[0] >= 12.1
+    assert bdl_calls[1] - bdl_calls[0] >= 12.1 + workflow.PACING_MARGIN_SECONDS - 1e-9
+
+
+def test_acquire_failure_persists_sanitized_request_diagnostics(scene, tmp_path):
+    """早期发现页失败也必须保留请求诊断，而不是只返回一个原因字符串。"""
+    result, session, _ = _acquire(scene, tmp_path, responses={})
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "OFFICIAL_DISCOVERY_FETCH_FAILED"
+    assert result["requests_performed"] == 1
+    assert [url for url, _ in session.calls] == ["https://www.nba.com/games?date=2026-01-01"]
+    assert result["requests"][0]["http_status"] == 500
+    assert result["first_request"]["endpoint"] == "https://www.nba.com/games?date=2026-01-01"
+    run_path = scene["evidence_dir"] / "runs" / f"{result['run_id']}.json"
+    assert run_path.is_file()
+    persisted = json.loads(run_path.read_text(encoding="utf-8"))
+    assert persisted["reason"] == "OFFICIAL_DISCOVERY_FETCH_FAILED"
+    assert persisted["requests"][0]["http_status"] == 500
+    assert b"secret-key" not in run_path.read_bytes()
+
+
+def test_acquire_exception_diagnostics_are_sanitized(scene, tmp_path):
+    """异常只保留异常类型，不保留异常正文（可能含敏感信息）。"""
+    class RaisingSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(url)
+            raise RuntimeError("boom secret-key must not be persisted")
+
+    session = RaisingSession()
+    result = workflow._run_acquire(
+        _selection(), evidence_dir=scene["evidence_dir"], allow_network=True,
+        max_requests=5, allowed_providers=[evidence.PROVIDER_OFFICIAL, evidence.PROVIDER_BDL],
+        max_cost=0, official_game_ids={}, pacing_seconds=12.1,
+        session=session, credential="secret-key",
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "OFFICIAL_DISCOVERY_FETCH_FAILED"
+    assert result["requests"][0]["error_type"] == "RuntimeError"
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "boom" not in serialized
+    assert "secret-key" not in serialized
 
 
 def test_acquire_reuses_validated_cache(scene, tmp_path):
