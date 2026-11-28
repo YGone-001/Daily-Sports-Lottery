@@ -34,8 +34,16 @@ from utils.ingestion_identity import (
     validate_canonical_uniqueness,
     validate_ingestion_identity,
 )
+from utils.basketball_identity_evidence import (
+    classify_cross_source_candidate,
+    team_relation,
+    OUTCOME_AMBIGUOUS,
+    OUTCOME_CANDIDATE_SAME_EVENT,
+    RELATION_EXACT,
+    RELATION_NORMALIZED_EQUAL,
+)
 from utils.market_coverage import has_usable_market_odds
-from utils.match_identity import is_kickoff_time_known, same_event
+from utils.match_identity import competition_number_for_match, is_kickoff_time_known, same_event
 from utils.match_lifecycle import (
     MatchLifecycleConflict,
     is_finalized_match,
@@ -126,7 +134,11 @@ def _fill_missing_odds(target: dict, source: dict) -> bool:
     return changed
 
 
-def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[dict]]:
+def _attach_odds(
+    matches: list[dict],
+    odds_rows: list[dict],
+    diagnostics: dict | None = None,
+) -> tuple[int, list[dict]]:
     """
     把竞彩赔率挂到已有赛程上。
     优先级：
@@ -137,12 +149,41 @@ def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[
     合并口径（见 AGENTS.md §4.7）：**已有值优先，只补缺失键**。
     直播行自带胜负盘，XML 的 dxf 大小分因此可以补入；已有完整覆盖时不会有任何改动。
 
+    方向守卫（Phase 6-B）：盘口行自带主客队名；挂载前按 ``team_relation`` 复核
+    行主客与目标记录主客的关系：
+    - 两位一致（EXACT / NORMALIZED_EQUAL）→ 正常挂载；
+    - 两位**恰好互换**（主行=目标客、客行=目标主）→ **跳过整行**并计数
+      （``REVERSED_DIRECTIONAL_ODDS_NOT_ATTACHED``）：编号相等但主客互换的行
+      不得向任何方向的盘口键写入价格，更不得交换价格；
+    - 其余（拼写变体 / 无法判定）→ 保持既有挂载行为（编号是 provider 写下的
+      身份链路，变体不得独自否决挂载），但计入
+      ``variant_orientation_rows_attached`` 供只读审计。
+
+    ``diagnostics`` 为可选的调用方字典；传入时函数会就地写入：
+    ``reversed_orientation_rows_skipped``、``variant_orientation_rows_attached``、
+    ``reversed_rows`` / ``variant_rows``（有界证据列表：行 id、目标 id、队名关系）。
+
     返回 (被补充盘口的场次数, 被消费的赔率源行列表)。
-    被消费的行不再作为兜底候选，避免同一市场事件重复入册。
+    被消费的行不再作为兜底候选，避免同一市场事件重复入册；
+    被方向守卫跳过的行**不**标记为已消费，交由后续准入防线处置。
     """
     count = 0
     used: list[dict] = []
     used_ids: set[int] = set()
+
+    if diagnostics is None:
+        diagnostics = {}
+    diagnostics.setdefault("reversed_orientation_rows_skipped", 0)
+    diagnostics.setdefault("variant_orientation_rows_attached", 0)
+    diagnostics.setdefault("reversed_rows", [])
+    diagnostics.setdefault("variant_rows", [])
+
+    def _orientation_relations(m: dict, r: dict) -> tuple[str, str, str, str]:
+        home_direct = team_relation(m.get("home"), r.get("home"))
+        away_direct = team_relation(m.get("away"), r.get("away"))
+        home_rev = team_relation(m.get("home"), r.get("away"))
+        away_rev = team_relation(m.get("away"), r.get("home"))
+        return home_direct, away_direct, home_rev, away_rev
 
     for m in matches:
         # 同一场竞彩赛事会有**多个玩法行**（篮球 sf 胜负 + dxf 大小分；
@@ -157,6 +198,25 @@ def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[
         target = m.get("odds") if isinstance(m.get("odds"), dict) else {}
         touched = False
         for r in matched_rows:
+            home_direct, away_direct, home_rev, away_rev = _orientation_relations(m, r)
+            same_labels = (RELATION_EXACT, RELATION_NORMALIZED_EQUAL)
+            if home_rev in same_labels and away_rev in same_labels and not (
+                home_direct in same_labels and away_direct in same_labels
+            ):
+                # 主客恰好互换：任何方向的盘口键都不得写入，绝不交换价格。
+                diagnostics["reversed_orientation_rows_skipped"] += 1
+                if len(diagnostics["reversed_rows"]) < 50:
+                    diagnostics["reversed_rows"].append({
+                        "odds_row_id": r.get("id"),
+                        "target_id": m.get("id"),
+                        "odds_row_home": r.get("home"),
+                        "odds_row_away": r.get("away"),
+                        "target_home": m.get("home"),
+                        "target_away": m.get("away"),
+                        "reason": "REVERSED_DIRECTIONAL_ODDS_NOT_ATTACHED",
+                    })
+                continue
+
             source = r["odds"]
             if not target:
                 target.update(source)
@@ -166,6 +226,20 @@ def _attach_odds(matches: list[dict], odds_rows: list[dict]) -> tuple[int, list[
 
             used.append(r)
             used_ids.add(id(r))
+            if not (
+                home_direct in same_labels and away_direct in same_labels
+            ):
+                # 拼写变体 / 无法判定的方向：挂载保持既有行为（编号身份链路），
+                # 但显式留痕；不得据此断言任何别名等价。
+                diagnostics["variant_orientation_rows_attached"] += 1
+                if len(diagnostics["variant_rows"]) < 50:
+                    diagnostics["variant_rows"].append({
+                        "odds_row_id": r.get("id"),
+                        "target_id": m.get("id"),
+                        "home_relation": home_direct,
+                        "away_relation": away_direct,
+                        "reason": "VARIANT_ORIENTATION_ATTACHED_BY_NUMBER",
+                    })
             # 用赔率源的联赛名补全（更规范）
             if r.get("league") and not m.get("league"):
                 m["league"] = r["league"]
@@ -226,26 +300,100 @@ def _prepare_existing_market_universe(existing: list[dict]) -> tuple[list[dict],
     return kept, removed
 
 
+def _cross_source_duplicate_risk(candidate: dict, counterpart: dict) -> bool:
+    """
+    判定一条**首次出现**的候选是否与既有记录构成「跨源重复候选」。
+
+    复用既有候选级验证器 ``classify_cross_source_candidate``（绝不另建第二套
+    解释器）。触发条件从严（全部满足才触发）：
+
+    - 同运动、同日期、两队名可比（分类器内部保证）；
+    - 双方原始编号都能解释为可比较形态（``numbers_comparable``）；
+    - 两种书写形态解析到**同一个编码式编号**（``numbers_agree is True``）——
+      例如 ``6301``（编码式）与 ``周六301``（展示式）；
+    - 候选结论是 ``CANDIDATE_SAME_EVENT`` 或 ``AMBIGUOUS``。
+      ``CONTRADICTORY_EVIDENCE`` / ``CANDIDATE_DIFFERENT_EVENT`` 一律**不**触发
+      （编号互斥或队名互斥 = 真实不同事件，继续走既有准入）。
+
+    这里做的是**准入级 fail-closed**（拒绝制造第二条跟踪记录），不是归并：
+    既不删除、不改写、不选择存活 ID，也不改写 ``same_event()`` 语义。
+    ``1001`` vs ``2001`` 这类同日期同序号不同星期前缀的真实不同事件
+    （``numbers_agree is False``）永不触发。
+    """
+    evidence = classify_cross_source_candidate(candidate, counterpart)
+    if not evidence.numbers_comparable or evidence.numbers_agree is not True:
+        return False
+    return evidence.outcome in (OUTCOME_CANDIDATE_SAME_EVENT, OUTCOME_AMBIGUOUS)
+
+
 def _admit_market_candidates(
     candidates: list[dict],
     existing: list[dict],
+    diagnostics: dict | None = None,
 ) -> tuple[list[dict], int]:
     """
     市场准入：决定哪些候选可以进入 canonical 跟踪集合。
 
     - 已在跟踪集合中（same_event 命中已跟踪事件）-> 准入：接受状态 / 比分 / 开赛时间更新，
       即使本轮没有盘口（盘口源临时不可用时也必须保持生命周期连续性）。
-    - 首次出现的全新候选 -> 只有具备可用盘口覆盖才准入，并打上 market_tracked = True。
+    - 首次出现的全新候选 -> 只有具备可用盘口覆盖才准入，并打上 market_tracked = True；
+      且必须先通过**跨源重复候选守卫**（Phase 6-B）：与既有跟踪记录或本批已准入
+      候选构成「编号形态对应 + 候选级同事件/歧义」的候选一律拒绝准入
+      （不产生第二条跟踪记录、不产生重复预测机会；历史记录不受影响）。
     - 其余 -> 拒绝（不进入 canonical 集合，也不写入任何下游历史）。
+
+    ``diagnostics`` 为可选调用方字典；传入时就地写入
+    ``cross_source_duplicate_candidates_rejected`` 与有界的
+    ``cross_source_duplicate_evidence``（id、编号、结论、blockers）。
 
     返回 (准入列表, 拒绝条数)。
     """
     admitted: list[dict] = []
     rejected = 0
+    if diagnostics is None:
+        diagnostics = {}
+    diagnostics.setdefault("cross_source_duplicate_candidates_rejected", 0)
+    diagnostics.setdefault("cross_source_duplicate_evidence", [])
+
+    # 跨源重复守卫的廉价预索引：只对 (sport, date) 相同的对做分类器检查，
+    # 且仅当候选自带原始编号时才有触发可能。
+    by_key: dict[tuple[str, str], list[dict]] = {}
+    for ex in existing:
+        key = (str(ex.get("sport") or ""), str(ex.get("date") or ""))
+        by_key.setdefault(key, []).append(ex)
+
     for m in candidates:
         if any(same_event(m, ex) for ex in existing):
             admitted.append(m)
             continue
+        if competition_number_for_match(dict(m)) is not None:
+            counterpart_pool = by_key.get(
+                (str(m.get("sport") or ""), str(m.get("date") or "")), []
+            ) + [a for a in admitted if a.get("sport") == m.get("sport") and a.get("date") == m.get("date")]
+            duplicate_hit = None
+            for ex in counterpart_pool:
+                if _cross_source_duplicate_risk(m, ex):
+                    duplicate_hit = ex
+                    break
+            if duplicate_hit is not None:
+                rejected += 1
+                diagnostics["cross_source_duplicate_candidates_rejected"] += 1
+                if len(diagnostics["cross_source_duplicate_evidence"]) < 50:
+                    evidence = classify_cross_source_candidate(m, duplicate_hit)
+                    diagnostics["cross_source_duplicate_evidence"].append({
+                        "rejected_candidate_id": m.get("id"),
+                        "counterpart_id": duplicate_hit.get("id"),
+                        "sport": m.get("sport"),
+                        "date": m.get("date"),
+                        "candidate_number": competition_number_for_match(dict(m)),
+                        "counterpart_number": competition_number_for_match(dict(duplicate_hit)),
+                        "outcome": evidence.outcome,
+                        "numbers_agree": evidence.numbers_agree,
+                        "orientation": evidence.orientation,
+                        "blockers": list(evidence.blockers),
+                        "note": "CROSS_SOURCE_DUPLICATE_CANDIDATE_NOT_ADMITTED",
+                    })
+                continue
         if has_usable_market_odds(m):
             m["market_tracked"] = True
             admitted.append(m)
@@ -735,10 +883,16 @@ def _refresh_impl(verbose: bool = True) -> dict:
     # 2. 竞彩赔率（XML）—— 按「竞彩编号」挂载到赛程上；未挂载的留作兜底候选
     market_rows: list[dict] = []
     used_market_rows: list[dict] = []
+    attach_diagnostics: dict = {}
     for sport in ("football", "basketball"):
         try:
             rows = fetcher_500.fetch_jczq_xml(sport)
-            attached, used = _attach_odds(incoming, rows)
+            sport_diag: dict = {}
+            attached, used = _attach_odds(incoming, rows, diagnostics=sport_diag)
+            for key in ("reversed_orientation_rows_skipped", "variant_orientation_rows_attached"):
+                attach_diagnostics[key] = attach_diagnostics.get(key, 0) + sport_diag.get(key, 0)
+            attach_diagnostics.setdefault("reversed_rows", []).extend(sport_diag.get("reversed_rows", []))
+            attach_diagnostics.setdefault("variant_rows", []).extend(sport_diag.get("variant_rows", []))
             market_rows.extend(rows)
             used_market_rows.extend(used)
             result["sources"][f"jczq_odds_{sport}"] = len(rows)
@@ -746,6 +900,12 @@ def _refresh_impl(verbose: bool = True) -> dict:
                 print(f"  [竞彩赔率{sport}] {attached}/{len(rows)} 场已挂载盘口")
         except Exception as exc:  # noqa: BLE001
             result["sources"][f"jczq_odds_{sport}"] = f"error: {exc}"
+    if attach_diagnostics.get("reversed_orientation_rows_skipped"):
+        result["sources"]["odds_rows_skipped_reversed_orientation"] = attach_diagnostics["reversed_orientation_rows_skipped"]
+        result["reversed_orientation_odds_rows"] = attach_diagnostics["reversed_rows"]
+    if attach_diagnostics.get("variant_orientation_rows_attached"):
+        result["sources"]["odds_rows_attached_variant_orientation"] = attach_diagnostics["variant_orientation_rows_attached"]
+        result["variant_orientation_odds_rows"] = attach_diagnostics["variant_rows"]
 
     # 3. 未被挂载但自带可用盘口的赔率行 -> 兜底候选（同一市场事件不重复入册）
     result["sources"]["market_candidates"] = _append_unmatched_market_candidates(
@@ -777,10 +937,22 @@ def _refresh_impl(verbose: bool = True) -> dict:
     #     直接抛出 CanonicalIdentityCollisionError -> 整批拒绝、零持久化写入。
     validate_ingestion_identity(existing, incoming)
 
-    # 6. 市场准入：已跟踪比赛接受更新；新候选必须具备可用盘口覆盖
-    admitted, rejected = _admit_market_candidates(incoming, existing)
+    # 6. 市场准入：已跟踪比赛接受更新；新候选必须具备可用盘口覆盖，
+    #    且不得是既有跟踪事件的跨源重复候选（Phase 6-B 守卫，准入级 fail-closed）
+    admit_diagnostics: dict = {}
+    admitted, rejected = _admit_market_candidates(incoming, existing, diagnostics=admit_diagnostics)
     result["sources"]["market_tracked_removed"] = legacy_removed
     result["sources"]["market_rejected"] = rejected
+    if admit_diagnostics.get("cross_source_duplicate_candidates_rejected"):
+        result["sources"]["cross_source_duplicate_candidates_rejected"] = admit_diagnostics[
+            "cross_source_duplicate_candidates_rejected"
+        ]
+        result["cross_source_duplicate_evidence"] = admit_diagnostics["cross_source_duplicate_evidence"]
+        if verbose:
+            print(
+                f"  [跨源重复守卫] 拒绝 {admit_diagnostics['cross_source_duplicate_candidates_rejected']}"
+                " 条重复候选（候选级证据，不归并）"
+            )
 
     # 7. 合并为 canonical 跟踪集合（_merge 内部再次执行同一预检，属幂等附加防线）
     merged, added, updated = _merge(existing, admitted)

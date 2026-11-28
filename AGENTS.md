@@ -1445,6 +1445,51 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.44 跨源编号形态对应与准入级重复守卫
+
+- **观测结论（PARTIAL，绑定当时数据集）**：四位编码式编号（`6301`）的首位是星期
+  token，与展示式（`周六301`）解析到同一编码式。在 2026-11-29 的数据集上：
+  四位编号记录 437/437、展示式记录 131/131 符合 §4.13.3 分组日规则（开赛
+  ≤11:30 → 前一日 token；≥14:00 → 当日 token；(11:30, 14:00] 区间不可判定），
+  并观测到 123 对 `500j <d><rest>` 与 `500lq 周<d><rest>` 同日期共现（全部主客互换
+  或拼写变体）。**同日同序号不同前缀是真实不同事件**（实测 159 组，如
+  `1001` 与 `2001`）——**永不**对四位编号统一剥离首位，**永不**在运行时路径改写
+  `normalize_competition_number()`。形态对应是**候选级信号**，不是身份相等；
+  合并仍 `NO-GO`，取得官方编号规则文本前不得升级。
+- **准入级重复守卫（`utils.scraper._admit_market_candidates`）**：仅对**首次出现**
+  且自带原始编号的候选执行；复用既有 `classify_cross_source_candidate`
+  （不得另建第二套解释器）。触发条件从严且全部满足：同运动同日期、
+  `numbers_comparable`、`numbers_agree is True`、结论 ∈
+  {`CANDIDATE_SAME_EVENT`, `AMBIGUOUS`}。**`CONTRADICTORY_EVIDENCE` /
+  `CANDIDATE_DIFFERENT_EVENT` 永不触发**（编号互斥或队名互斥 = 真实不同事件，
+  继续走既有准入；`1001` vs `2001` 因此独立准入）。被拒候选零写入、留有界证据
+  （`cross_source_duplicate_candidates_rejected` / `cross_source_duplicate_evidence`）；
+  先到者存活（流水线顺序固定：直播行先于 XML 兜底候选）。**不归并、不删除、
+  不选存活 ID、不改写 `same_event()`、不触碰 `validate_ingestion_identity()`**。
+- **生命周期连续性不被守卫破坏**：已跟踪记录的更新路径（`same_event` 命中）在
+  守卫之前，已跟踪 XML 记录继续按既有方式更新；对侧源缺席时候选照常准入。
+- **方向性盘口守卫（`_attach_odds`）**：盘口行自带主客队名，挂载前按
+  `team_relation` 复核方向——两位**恰好互换** → 整行跳过
+  （`REVERSED_DIRECTIONAL_ODDS_NOT_ATTACHED`），任何方向的键都不得写入，
+  **绝不交换价格**；拼写变体/无法判定 → 保持既有挂载（编号是 provider 身份链路，
+  变体不得独自否决）并计 `VARIANT_ORIENTATION_ATTACHED_BY_NUMBER` 留痕，
+  **不得**据变体断言别名等价。大小分键只从方向关系成立的行补入。
+- **候选证据恒非批准**：守卫消费的分类器结论 `authoritative` / `is_approval` /
+  `authorizes_odds_merge` / `authorizes_event_admission` 恒为 `False`；
+  守卫拒绝 ≠ 人工裁决，真实身份裁定仍走既有治理流程。
+- **历史记录不受守卫追溯影响**：既有双记录（含 2026-11-29 的五对 NBA 候选）
+  原样保留；守卫只阻止**新**重复对的产生。
+- **回归**：`tests/test_cross_source_identity_guard.py` 覆盖
+  SOURCE_NUMBER_NAMESPACE_DISTINGUISHED / VERIFIED_CROSS_SOURCE_EVENT_MATCH /
+  UNVERIFIED_NUMBER_SUFFIX_REJECTED / REVERSED_TEAM_DIRECTION_DETECTED /
+  REVERSED_DIRECTIONAL_ODDS_NOT_ATTACHED / TOTAL_MARKET_ORIENTATION_PRESERVED /
+  AMBIGUOUS_ALIAS_FAILS_CLOSED / UNRELATED_SAME_NUMBER_EVENT_REJECTED /
+  DIFFERENT_SPORT_NEVER_MATCHES / DIFFERENT_DATE_BOUNDARY_HANDLED /
+  NO_DUPLICATE_PREDICTION_CAPTURE / NO_DUPLICATE_SETTLEMENT_OR_CALIBRATION /
+  EXISTING_CANONICAL_HISTORY_UNCHANGED 十三场景。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程
