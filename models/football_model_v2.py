@@ -157,18 +157,22 @@ def prepare_walk_forward_rows(eval_rows: Iterable[dict]) -> list[dict]:
 
 
 def walk_forward_v2(
-    prepared: Sequence[dict],
+    eval_rows: Sequence[dict],
     *,
     final_score_totals: dict[str, float] | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     """
     严格时序走查：对每行，先验只来自 ``settled_at < 当前行 prediction_generated_at``
     的**真实全场比分**（``final_score_totals[match_id]``）；同一行自身永远不在
     自己的先验里；输入顺序无关（内部按预测时刻排序）。
 
-    ``final_score_totals`` 映射 match_id -> 真实总进球（必须来自评估行的
-    ``final_score`` 字段，由调用方提供；缺失的行只作评分对象、不入先验）。
+    输入是**原始评估行**（内部调用 ``prepare_walk_forward_rows``，缺特征的行被
+    排除并计数——绝不补造特征）。``final_score_totals`` 映射 match_id -> 真实
+    总进球（必须来自评估行的 ``final_score`` 字段；缺失的行只作评分对象、不入先验）。
+
+    返回 (逐行走查结果, 被排除行数)。
     """
+    prepared, excluded = prepare_walk_forward_rows(eval_rows)
     ordered = sorted(prepared, key=lambda r: (r["prediction_generated_at"], r["match_id"]))
     # 以预测时刻为界维护"已结算历史"池
     history: list[dict] = []
@@ -205,4 +209,4 @@ def walk_forward_v2(
             entry["total_goals"] = float(total)
             settled_sorted.append((row["settled_at"], entry))
             settled_sorted.sort(key=lambda pair: pair[0])
-    return results
+    return results, excluded
