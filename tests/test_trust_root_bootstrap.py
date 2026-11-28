@@ -165,7 +165,13 @@ ALLOWED_PATHS = frozenset((
     "tools/football_result_workflow.py",
     "tests/test_football_result_history.py",
     "tests/test_calibration_continuity.py",
-    "docs/daily-operations.md"))
+    "docs/daily-operations.md",
+    # cross-source identity guard, status exposure and football v2 shadow
+    "tests/test_cross_source_identity_guard.py",
+    "tests/test_cross_source_status_exposure.py",
+    "tests/test_football_model_v2.py",
+    "models/football_model_v2.py",
+    "docs/football-v2-shadow.md"))
 
 
 @pytest.fixture(scope="session", autouse=True)
