@@ -78,6 +78,25 @@ def _assert_safe(path: Path, data_dir: Path) -> None:
     if os.path.normcase(os.path.realpath(path)) == \
             os.path.normcase(os.path.realpath(ROOT / ".DSL_BDL_API_KEY")):
         raise SystemExit("refusing to overwrite the credential file")
+    # 硬链接别名：同 inode 的既有受保护存储/凭据文件不得被覆写
+    if path.exists():
+        for name in PROTECTED_STORE_NAMES:
+            candidate = data_dir / name
+            if candidate.exists():
+                try:
+                    if os.path.samefile(path, candidate):
+                        raise SystemExit(
+                            f"refusing to overwrite a protected store via alias: {name}"
+                        )
+                except OSError:
+                    continue
+
+
+def _assert_no_credentials(text: str) -> None:
+    """凭据先检查后落盘：命中已知凭据形态即失败关闭，绝不写入。"""
+    for pattern in ("DSL_BDL_API_KEY", "Authorization:", "Bearer ", "api_key="):
+        if pattern in text:
+            raise SystemExit("refusing to persist credential-bearing content")
 
 
 def _write_json(path: Path, value, data_dir: Path) -> None:
@@ -123,9 +142,14 @@ def _selection(data_dir: Path, max_targets: int, match_ids: list[str]) -> dict:
 
 
 def _acquire(data_dir: Path, evidence_dir: Path, dates: list[str], *,
-             allow_network: bool, max_requests: int) -> dict:
+             allow_network: bool, max_requests: int,
+             match_ids: list[str] | None = None) -> dict:
     from utils import fetcher_500
-    from utils.football_result_history import evidence_endpoint, valid_date
+    from utils.football_result_history import (
+        evidence_endpoint,
+        valid_date,
+        PARSER_VERSION,
+    )
 
     invalid = [d for d in dates if not valid_date(d)]
     if invalid:
@@ -149,6 +173,22 @@ def _acquire(data_dir: Path, evidence_dir: Path, dates: list[str], *,
             "max_requests": max_requests,
             "requests_performed": 0,
         }
+    approved_targets = sorted({str(x).strip() for x in (match_ids or []) if str(x).strip()})
+    if len(approved_targets) > max_targets_cap(data_dir):
+        return {
+            "status": "BLOCKED",
+            "reason": "TARGET_LIMIT_EXCEEDED",
+            "approved_target_count": len(approved_targets),
+            "requests_performed": 0,
+        }
+    unknown = _unknown_target_ids(data_dir, approved_targets)
+    if unknown:
+        return {
+            "status": "BLOCKED",
+            "reason": "UNKNOWN_TARGET_MATCH_ID",
+            "unknown_target_match_ids": unknown,
+            "requests_performed": 0,
+        }
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     requests_log, all_rows = [], []
     evidence_files = []
@@ -161,17 +201,32 @@ def _acquire(data_dir: Path, evidence_dir: Path, dates: list[str], *,
             rows = []
             error_type = type(exc).__name__
         observed_at = _now_iso()
+        raw_meta = fetcher_500.last_wanchang_raw_observation()
         source_diag = (fetcher_500.source_diagnostics().get("wanchang") or {})
+        row_dates = sorted({str(r.get("date")) for r in rows if r.get("date")})
         entry = {
             "provider": "500_com_wanchang",
             "endpoint": evidence_endpoint(date),
             "date": date,
             "started_at": started_at,
             "observed_at": observed_at,
-            "http_status": None,
+            "http_status": raw_meta.get("http_status"),
             "source_status": source_diag.get("status"),
-            "error_type": error_type,
+            "error_type": raw_meta.get("error_type") or error_type,
             "row_count": len(rows),
+            "actual_request_started_at": raw_meta.get("request_started_at"),
+            "actual_response_observed_at": raw_meta.get("response_observed_at"),
+            "final_url": raw_meta.get("final_url"),
+            "redirect_count": raw_meta.get("redirect_count"),
+            "response_sha256": raw_meta.get("response_sha256"),
+            "response_byte_count": raw_meta.get("response_byte_count"),
+            "parser_version": PARSER_VERSION,
+            "parsed_row_count": len(rows),
+            "observed_date_window": {"min": row_dates[0] if row_dates else None,
+                                     "max": row_dates[-1] if row_dates else None,
+                                     "dates": row_dates[:10]},
+            "cache_note": "cache hits do not refresh observation timestamps; "
+                          "actual_request_* are the real fetch times",
         }
         requests_log.append(entry)
         rows_path = evidence_dir / f"football-finished-{date}-{run_id}.rows.json"
@@ -180,6 +235,13 @@ def _acquire(data_dir: Path, evidence_dir: Path, dates: list[str], *,
             "endpoint": entry["endpoint"],
             "date": date,
             "source_observed_at": observed_at,
+            "actual_request_started_at": raw_meta.get("request_started_at"),
+            "actual_response_observed_at": raw_meta.get("response_observed_at"),
+            "http_status": raw_meta.get("http_status"),
+            "response_sha256": raw_meta.get("response_sha256"),
+            "redirect_count": raw_meta.get("redirect_count"),
+            "parser_version": PARSER_VERSION,
+            "approved_target_match_ids": approved_targets,
             "code_sha": _code_sha(),
             "rows": rows,
         }
@@ -187,6 +249,17 @@ def _acquire(data_dir: Path, evidence_dir: Path, dates: list[str], *,
         entry["evidence_path"] = str(rows_path)
         entry["evidence_sha256"] = _sha(rows_path.read_bytes())
         evidence_files.append(str(rows_path))
+        raw_bytes = fetcher_500.wanchang_raw_response_bytes()
+        if raw_bytes:
+            raw_text = raw_bytes.decode("gb2312", errors="replace")
+            _assert_no_credentials(raw_text)
+            raw_path = evidence_dir / f"football-finished-{date}-{run_id}.raw.html"
+            _assert_safe(raw_path, data_dir)
+            raw_path.write_bytes(raw_bytes)
+            entry["raw_evidence_path"] = str(raw_path)
+            entry["raw_evidence_sha256"] = _sha(raw_bytes)
+        # 注意：raw 证据只登记在请求条目上，不进入 evidence_files —— 预览只消费
+        # *.rows.json 解析行文件，绝不把 HTML 当 JSON 解析。
         all_rows.extend(rows)
         if error_type:
             break
@@ -202,7 +275,10 @@ def _acquire(data_dir: Path, evidence_dir: Path, dates: list[str], *,
         "generated_at": _now_iso(),
         "code_sha": _code_sha(),
         "provider": "500_com_wanchang",
+        "parser_version": PARSER_VERSION,
         "requested_dates": dates,
+        "approved_target_match_ids": approved_targets,
+        "approved_target_count": len(approved_targets),
         "requests_performed": len(requests_log),
         "max_requests": max_requests,
         "expected_cost_usd": 0,
@@ -217,26 +293,92 @@ def _acquire(data_dir: Path, evidence_dir: Path, dates: list[str], *,
     return result
 
 
-def _preview(data_dir: Path, evidence_dir: Path, evidence_path: str | None) -> dict:
+def max_targets_cap(data_dir: Path) -> int:
+    """显式目标上限：与自动选择共用同一常量来源。"""
+    from utils.football_result_history import MAX_TARGETS_LIMIT
+    return MAX_TARGETS_LIMIT
+
+
+def _unknown_target_ids(data_dir: Path, target_ids: list[str]) -> list[str]:
+    if not target_ids:
+        return []
+    matches = _load_doc("daily_matches.json", data_dir).get("matches") or []
+    known = {str(m.get("id")) for m in matches if isinstance(m, dict)}
+    return [tid for tid in target_ids if tid not in known]
+
+
+def _preview(data_dir: Path, evidence_dir: Path, evidence_path: str | None,
+             match_ids: list[str] | None = None) -> dict:
     from utils.football_result_history import build_preview
 
+    manifest = None
+    manifest_path = evidence_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            value = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                manifest = value
+        except (OSError, ValueError):
+            manifest = None
+
+    approved_targets: set[str] | None = None
+    target_scope = "UNBOUND"
+    if match_ids:
+        approved_targets = {str(x).strip() for x in match_ids if str(x).strip()}
+        target_scope = "BOUND_EXPLICIT"
+    elif manifest and manifest.get("approved_target_match_ids"):
+        approved_targets = {str(x) for x in manifest["approved_target_match_ids"]}
+        target_scope = "BOUND_MANIFEST"
+
+    consumed: list[dict] = []
+    rows: list[dict] = []
+    observed = None
     if evidence_path:
         rows, observed = _load_rows(Path(evidence_path))
+        consumed.append({"path": evidence_path,
+                         "sha256": _sha(Path(evidence_path).read_bytes()),
+                         "verified_against_manifest": False})
+    elif manifest and manifest.get("evidence_files"):
+        # 只消费 manifest 登记的证据文件；逐文件复核 SHA-256，不静默吞下无关缓存
+        for path_str in manifest["evidence_files"]:
+            path = Path(path_str)
+            if not path.is_file():
+                return {"status": "BLOCKED", "reason": "EVIDENCE_FILE_MISSING",
+                        "missing_evidence_path": path_str, "preview": None}
+            digest = _sha(path.read_bytes())
+            registered = None
+            for req in manifest.get("requests") or []:
+                if req.get("evidence_path") == path_str:
+                    registered = req.get("evidence_sha256")
+                    break
+            if registered and registered != digest:
+                return {"status": "BLOCKED", "reason": "EVIDENCE_DIGEST_MISMATCH",
+                        "evidence_path": path_str, "preview": None}
+            part, part_observed = _load_rows(path)
+            rows.extend(part)
+            observed = max([x for x in (observed, part_observed) if x], default=None)
+            consumed.append({"path": path_str, "sha256": digest,
+                             "verified_against_manifest": bool(registered)})
     else:
-        rows, observed = [], None
         for path in sorted(evidence_dir.glob("*.rows.json")):
             part, part_observed = _load_rows(path)
             rows.extend(part)
             observed = max([x for x in (observed, part_observed) if x], default=None)
+            consumed.append({"path": str(path), "sha256": _sha(path.read_bytes()),
+                             "verified_against_manifest": False})
     if not rows:
         return {"status": "BLOCKED", "reason": "NO_EVIDENCE_ROWS", "preview": None}
-    preview = build_preview(rows, data_dir, source_observed_at=observed)
+    preview = build_preview(rows, data_dir, source_observed_at=observed,
+                            target_match_ids=approved_targets,
+                            consumed_evidence=consumed)
+    preview["target_scope"] = target_scope
     _write_json(evidence_dir / "preview.json", preview, data_dir)
     _write_json(evidence_dir / "preview-status.json", {
         "status": preview["status"],
         "preview_sha256": preview.get("preview_sha256"),
         "target_count": preview.get("target_count"),
         "target_match_ids": preview.get("target_match_ids"),
+        "target_scope": target_scope,
         "write_scope": preview.get("preview", {}).get("write_scope"),
         "network_requests": 0,
         "canonical_reconciliation": False,
@@ -283,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     if args.command == "preview":
-        result = _preview(data_dir, evidence_dir, args.evidence)
+        result = _preview(data_dir, evidence_dir, args.evidence, match_ids=args.match_id)
         _emit(result, args.output, data_dir)
         return EXIT_OK if result.get("status") == "PASS" else EXIT_PREVIEW_BLOCKED
 
@@ -291,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"status": "BLOCKED", "reason": "DATE_REQUIRED"}, args.output, data_dir)
         return EXIT_BLOCKED
     acquired = _acquire(data_dir, evidence_dir, dates, allow_network=args.allow_network,
-                        max_requests=args.max_requests)
+                        max_requests=args.max_requests, match_ids=args.match_id)
     if args.command == "acquire":
         _emit(acquired, args.output, data_dir)
         return EXIT_OK if acquired.get("status") == "OK" else EXIT_BLOCKED
@@ -301,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
                                                      "reason": "ACQUISITION_NOT_OK"}},
               args.output, data_dir)
         return EXIT_BLOCKED
-    preview = _preview(data_dir, evidence_dir, None)
+    preview = _preview(data_dir, evidence_dir, None, match_ids=args.match_id)
     _emit({"acquisition": acquired, "preview": preview}, args.output, data_dir)
     return EXIT_OK if preview.get("status") == "PASS" else EXIT_PREVIEW_BLOCKED
 

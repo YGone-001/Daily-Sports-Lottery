@@ -46,10 +46,11 @@ def _snap(match, *, generated="2026-01-02T10:00:00+08:00",
 
 
 def _source_row(match, *, score=(2, 1), status="finished", date=None,
-                home=None, away=None, row_id="500w-2026-01-02-0"):
+                home=None, away=None, row_id="500w-2026-01-02-0",
+                time_override=None, league_override=None):
     return {
-        "id": row_id, "sport": "football", "league": match.get("league"),
-        "date": date or match["date"], "time": "20:00",
+        "id": row_id, "sport": "football", "league": league_override or match.get("league"),
+        "date": date or match["date"], "time": time_override or "20:00",
         "kickoff_time_known": True, "status": status,
         "home": home if home is not None else match["home"],
         "away": away if away is not None else match["away"],
@@ -278,3 +279,203 @@ def test_cli_acquire_with_mock_retains_evidence_without_data_writes(base, tmp_pa
     assert (evidence_dir / "manifest.json").is_file()
     assert list(evidence_dir.glob("*.rows.json"))
     assert _hashes(data_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# Phase 6-B Workstream B：目标集绑定、严格证据门、原始证据留存
+# ---------------------------------------------------------------------------
+
+def test_out_of_scope_target_is_rejected_not_silently_kept(base):
+    data_dir, match, snap = base
+    source = _source_row(match)
+    result = history.match_source_rows(
+        [source], [match], {snap["snapshot_id"]: snap}, {},
+        target_match_ids={"500l-OTHER-ID"},
+    )
+    assert result["candidates"] == []
+    reasons = {r["reason"] for r in result["rejected"]}
+    assert history.STATUS_OUT_OF_SCOPE in reasons
+    in_scope = history.match_source_rows(
+        [source], [match], {snap["snapshot_id"]: snap}, {},
+        target_match_ids={match["id"]},
+    )
+    assert len(in_scope["candidates"]) == 1
+
+
+def test_prediction_must_be_strictly_before_kickoff(base):
+    data_dir, match, snap = base
+    source = _source_row(match)
+    equal_time = dict(snap, generated_at="2026-01-02T20:00:00+08:00")
+    result = history.match_source_rows(
+        [source], [match], {equal_time["snapshot_id"]: equal_time}, {})
+    assert result["candidates"] == []
+    assert history.STATUS_NOT_STRICTLY_PREGAME in {r["reason"] for r in result["rejected"]}
+
+    naive = dict(snap, generated_at="2026-01-02T10:00:00")  # naive -> fail closed
+    result2 = history.match_source_rows(
+        [source], [match], {naive["snapshot_id"]: naive}, {})
+    assert history.STATUS_NOT_STRICTLY_PREGAME in {r["reason"] for r in result2["rejected"]}
+
+    missing = dict(snap, kickoff_at=None)
+    result3 = history.match_source_rows(
+        [source], [match], {missing["snapshot_id"]: missing}, {})
+    # 快照侧缺 kickoff 时既有快照有效性门先拒绝（同样 fail closed）
+    assert {history.STATUS_NOT_STRICTLY_PREGAME, history.STATUS_NO_SNAPSHOT} & \
+        {r["reason"] for r in result3["rejected"]}
+
+
+def test_snapshot_identity_mismatch_is_rejected(base):
+    data_dir, match, snap = base
+    source = _source_row(match)
+    wrong_home = dict(snap, home_team="别的队")
+    result = history.match_source_rows(
+        [source], [match], {wrong_home["snapshot_id"]: wrong_home}, {})
+    assert history.STATUS_SNAPSHOT_IDENTITY in {r["reason"] for r in result["rejected"]}
+
+    wrong_sport = dict(snap, sport="basketball")
+    result2 = history.match_source_rows(
+        [source], [match], {wrong_sport["snapshot_id"]: wrong_sport}, {})
+    assert history.STATUS_SNAPSHOT_IDENTITY in {r["reason"] for r in result2["rejected"]}
+
+
+def test_source_kickoff_and_competition_evidence_required(base):
+    data_dir, match, snap = base
+    source = _source_row(match)
+    mismatched_time = _source_row(match, time_override="21:00")
+    result = history.match_source_rows(
+        [mismatched_time], [match], {snap["snapshot_id"]: snap}, {})
+    assert history.STATUS_KICKOFF_CONFLICT in {r["reason"] for r in result["rejected"]}
+
+    unknown_time = _source_row(match)
+    unknown_time["kickoff_time_known"] = False
+    result2 = history.match_source_rows(
+        [unknown_time], [match], {snap["snapshot_id"]: snap}, {})
+    assert history.STATUS_KICKOFF_UNAVAILABLE in {r["reason"] for r in result2["rejected"]}
+
+    other_league = _source_row(match, league_override="另一个联赛")
+    result3 = history.match_source_rows(
+        [other_league], [match], {snap["snapshot_id"]: snap}, {})
+    assert history.STATUS_COMPETITION_CONFLICT in {r["reason"] for r in result3["rejected"]}
+
+
+def test_preview_target_scope_is_explicit(base):
+    data_dir, match, snap = base
+    source = _source_row(match)
+    unbound = history.build_preview([source], data_dir)
+    assert unbound["preview"]["target_scope"] == "UNBOUND"
+    assert unbound["preview"]["approved_target_match_ids"] is None
+    bound = history.build_preview([source], data_dir,
+                                  target_match_ids={match["id"], "500l-OTHER"})
+    assert bound["preview"]["target_scope"] == "BOUND"
+    assert bound["preview"]["approved_target_match_ids"] == sorted({match["id"], "500l-OTHER"})
+    assert bound["preview"]["parser_version"] == history.PARSER_VERSION
+
+
+def test_preview_consumed_evidence_enters_digest(base):
+    data_dir, match, snap = base
+    source = _source_row(match)
+    plain = history.build_preview([source], data_dir)
+    with_evidence = history.build_preview(
+        [source], data_dir,
+        consumed_evidence=[{"path": "x.rows.json", "sha256": "ab" * 32,
+                            "verified_against_manifest": True}])
+    assert plain["preview_sha256"] != with_evidence["preview_sha256"]
+    assert with_evidence["preview"]["consumed_evidence"][0]["sha256"] == "ab" * 32
+
+
+def test_acquire_binds_targets_and_rejects_unknown_ids(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    match = _match("500l-2026-01-02-1001")
+    _write_stores(data_dir, [match])
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    result = cli._acquire(data_dir, evidence_dir, ["2026-01-02"],
+                          allow_network=False, max_requests=1,
+                          match_ids=["500l-DOES-NOT-EXIST"])
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "NETWORK_AUTHORIZATION_REQUIRED"
+    # 超预算前先拒绝网络，但显式目标超限在授权网络时必须拒绝
+    result2 = cli._acquire(data_dir, evidence_dir, ["2026-01-02"],
+                           allow_network=True, max_requests=1,
+                           match_ids=[f"500l-x-{i}" for i in range(50)])
+    assert result2["status"] == "BLOCKED"
+    assert result2["reason"] == "TARGET_LIMIT_EXCEEDED"
+
+
+def test_acquire_persists_raw_response_with_metadata(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    match = _match("500l-2026-01-02-1001")
+    _write_stores(data_dir, [match])
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    from utils import fetcher_500
+    fake_rows = [{
+        "id": "500w-0", "sport": "football", "league": "测试联赛", "round": "",
+        "date": "2026-01-02", "time": "20:00", "kickoff_time_known": True,
+        "status": "finished", "home": "主队", "away": "客队",
+        "score": {"ft": [2, 1]}, "odds": None,
+    }]
+    fake_raw = {
+        "requested_date": "2026-01-02",
+        "request_started_at": "2026-01-02T10:00:00+08:00",
+        "response_observed_at": "2026-01-02T10:00:01+08:00",
+        "http_status": 200, "error_type": None,
+        "final_url": "https://live.500.com/wanchang.php?e=2026-01-02",
+        "redirect_count": 0,
+        "response_sha256": "cd" * 32,
+        "response_byte_count": 11,
+        "response_bytes": b"<html>ok</html>",
+    }
+    monkeypatch.setattr(fetcher_500, "fetch_finished_matches", lambda date=None: fake_rows)
+    monkeypatch.setattr(fetcher_500, "last_wanchang_raw_observation", lambda: dict(fake_raw))
+    monkeypatch.setattr(fetcher_500, "wanchang_raw_response_bytes", lambda: fake_raw["response_bytes"])
+    monkeypatch.setattr(fetcher_500, "source_diagnostics",
+                        lambda: {"wanchang": {"status": "ok"}})
+
+    result = cli._acquire(data_dir, evidence_dir, ["2026-01-02"],
+                          allow_network=True, max_requests=1, match_ids=[match["id"]])
+    assert result["status"] == "OK"
+    entry = result["requests"][0]
+    for key in ("actual_request_started_at", "actual_response_observed_at", "http_status",
+                "response_sha256", "redirect_count", "parser_version", "observed_date_window"):
+        assert key in entry
+    assert entry["observed_date_window"]["min"] == "2026-01-02"
+    assert result["approved_target_match_ids"] == [match["id"]]
+    raw_path = Path(entry["raw_evidence_path"])
+    assert raw_path.is_file() and raw_path.read_bytes() == b"<html>ok</html>"
+
+    # 预览从 manifest 绑定目标集并复核证据摘要
+    preview = cli._preview(data_dir, evidence_dir, None)
+    assert preview["target_scope"] == "BOUND_MANIFEST"
+    assert preview["preview"]["target_scope"] == "BOUND"
+    assert preview["preview"]["consumed_evidence"][0]["verified_against_manifest"] is True
+
+
+def test_preview_fails_closed_on_evidence_digest_mismatch(tmp_path):
+    data_dir = tmp_path / "data"
+    match = _match("500l-2026-01-02-1001")
+    _write_stores(data_dir, [match])
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    manifest = {
+        "approved_target_match_ids": [match["id"]],
+        "evidence_files": [str(evidence_dir / "stub.rows.json")],
+        "requests": [{"evidence_path": str(evidence_dir / "stub.rows.json"),
+                      "evidence_sha256": "00" * 32}],
+    }
+    (evidence_dir / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8", )
+    (evidence_dir / "stub.rows.json").write_text('{"rows": [], "source_observed_at": null}',
+                                                 encoding="utf-8")
+    result = cli._preview(data_dir, evidence_dir, None)
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "EVIDENCE_DIGEST_MISMATCH"
+
+
+def test_fetcher_raw_observation_defaults_empty_and_is_read_only():
+    from utils import fetcher_500
+    snapshot_before = dict(fetcher_500._LAST_WANCHANG_RAW)
+    meta = fetcher_500.last_wanchang_raw_observation()
+    assert "response_bytes" not in meta
+    assert dict(fetcher_500._LAST_WANCHANG_RAW) == snapshot_before

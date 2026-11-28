@@ -19,6 +19,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
+from utils.basketball_identity_evidence import (
+    team_relation,
+    RELATION_EXACT,
+    RELATION_NORMALIZED_EQUAL,
+)
 from utils.daily_loader import get_match_datetime
 from utils.evaluation_rows import evaluation_id_for
 from utils.match_lifecycle import valid_full_time_score
@@ -49,6 +54,17 @@ STATUS_NO_SNAPSHOT = "NO_VALID_PREGAME_SNAPSHOT"
 STATUS_RESULT_CONFLICT = "RESULT_CONFLICT"
 STATUS_DUPLICATE_SOURCE = "DUPLICATE_SOURCE_ROW"
 STATUS_NOT_FOOTBALL = "NOT_FOOTBALL"
+# Phase 6-B：目标集绑定与更严格的赛前证据校验
+STATUS_OUT_OF_SCOPE = "OUT_OF_SCOPE_TARGET"
+STATUS_KICKOFF_CONFLICT = "KICKOFF_EVIDENCE_CONFLICT"
+STATUS_KICKOFF_UNAVAILABLE = "KICKOFF_EVIDENCE_UNAVAILABLE"
+STATUS_COMPETITION_CONFLICT = "COMPETITION_LABEL_CONFLICT"
+STATUS_SNAPSHOT_IDENTITY = "SNAPSHOT_IDENTITY_MISMATCH"
+STATUS_NOT_STRICTLY_PREGAME = "PREDICTION_NOT_STRICTLY_BEFORE_KICKOFF"
+#: 完场解析器版本：解析逻辑变更时递增，便于证据溯源。
+PARSER_VERSION = "wanchang-parser-1"
+#: 显式目标集合的数量上限（与自动选择共用；不为提高上限而修改此值）。
+MAX_TARGETS_LIMIT = 40
 
 
 def _load(name: str, data_dir: Path) -> dict:
@@ -168,8 +184,23 @@ def match_source_rows(
     matches: list[dict],
     snapshots: dict,
     settlements: dict,
+    target_match_ids: set[str] | None = None,
 ) -> dict:
-    """Match finished-feed rows to Canonical records and build settlement candidates."""
+    """Match finished-feed rows to Canonical records and build settlement candidates.
+
+    ``target_match_ids``（Phase 6-B）：授权目标集绑定。提供时，所有解析到目标集
+    之外的 Canonical 记录一律 ``OUT_OF_SCOPE_TARGET`` 拒绝——不扩大、不改写授权
+    范围。同时执行更严格的候选证据门：
+    - 源行联赛标签与 Canonical 联赛必须一致（变体一律拒绝，不断言别名）；
+    - 双方开赛时间必须可比且一致（任一侧未知 → ``KICKOFF_EVIDENCE_UNAVAILABLE``，
+      不一致 → ``KICKOFF_EVIDENCE_CONFLICT``）；
+    - 快照 sport / 主客队 / 联赛必须与 Canonical 一致
+      （``SNAPSHOT_IDENTITY_MISMATCH``）；
+    - ``prediction_generated_at < kickoff_at`` **严格**成立且两者均为带时区的
+      可解析时间（缺失 / naive / 相等都不通过；
+      ``PREDICTION_NOT_STRICTLY_BEFORE_KICKOFF``）。既有 ``is_valid_prematch``
+      的宽松语义仅作兼容，不再单独作为预览依据。
+    """
     exact, reverse = _team_index(matches)
     settled_snapshot_ids = {
         s.get("snapshot_id") for s in settlements.values() if isinstance(s, dict)
@@ -220,6 +251,11 @@ def match_source_rows(
             continue
         match = exact_matches[0]
         mid = str(match.get("id"))
+        if target_match_ids is not None and mid not in target_match_ids:
+            rejected.append({"source_row": row, "match_id": mid,
+                             "reason": STATUS_OUT_OF_SCOPE,
+                             "approved_target_count": len(target_match_ids)})
+            continue
         source_score = [int(row["score"]["ft"][0]), int(row["score"]["ft"][1])]
         if valid_full_time_score(match.get("score")):
             canonical_score = [int(match["score"]["ft"][0]), int(match["score"]["ft"][1])]
@@ -229,6 +265,29 @@ def match_source_rows(
                 continue
         if mid in settled_match_ids:
             rejected.append({"source_row": row, "match_id": mid, "reason": STATUS_ALREADY_SETTLED})
+            continue
+        # Phase 6-B：比赛（竞赛标签）与开赛证据必须可比且一致
+        league_rel = team_relation(row.get("league"), match.get("league"))
+        if league_rel not in (RELATION_EXACT, RELATION_NORMALIZED_EQUAL):
+            rejected.append({"source_row": row, "match_id": mid,
+                             "reason": STATUS_COMPETITION_CONFLICT,
+                             "league_relation": league_rel,
+                             "source_league": row.get("league"),
+                             "canonical_league": match.get("league")})
+            continue
+        row_kickoff = get_match_datetime(row) if row.get("kickoff_time_known") else None
+        canonical_kickoff = get_match_datetime(match)
+        if row_kickoff is None or canonical_kickoff is None:
+            rejected.append({"source_row": row, "match_id": mid,
+                             "reason": STATUS_KICKOFF_UNAVAILABLE,
+                             "source_time_known": bool(row.get("kickoff_time_known")),
+                             "canonical_time": match.get("time")})
+            continue
+        if row_kickoff != canonical_kickoff:
+            rejected.append({"source_row": row, "match_id": mid,
+                             "reason": STATUS_KICKOFF_CONFLICT,
+                             "source_kickoff": row_kickoff.isoformat(),
+                             "canonical_kickoff": canonical_kickoff.isoformat()})
             continue
         snaps = _valid_pregame_snapshots(match, snapshots)
         if not snaps:
@@ -241,6 +300,28 @@ def match_source_rows(
                 rejected.append({"source_row": row, "match_id": mid,
                                  "reason": STATUS_ALREADY_SETTLED,
                                  "snapshot_id": snapshot_id})
+                continue
+            # Phase 6-B：快照身份与严格赛前时序校验（不依赖宽松 is_valid_prematch）
+            identity_bad = (
+                snap.get("sport") != match.get("sport")
+                or snap.get("home_team") != match.get("home")
+                or snap.get("away_team") != match.get("away")
+                or team_relation(snap.get("league"), match.get("league"))
+                not in (RELATION_EXACT, RELATION_NORMALIZED_EQUAL)
+            )
+            generated = _parse_aware(snap.get("generated_at"))
+            kickoff = _parse_aware(snap.get("kickoff_at"))
+            if identity_bad:
+                rejected.append({"source_row": row, "match_id": mid,
+                                 "reason": STATUS_SNAPSHOT_IDENTITY,
+                                 "snapshot_id": snapshot_id})
+                continue
+            if generated is None or kickoff is None or not (generated < kickoff):
+                rejected.append({"source_row": row, "match_id": mid,
+                                 "reason": STATUS_NOT_STRICTLY_PREGAME,
+                                 "snapshot_id": snapshot_id,
+                                 "generated_at": snap.get("generated_at"),
+                                 "kickoff_at": snap.get("kickoff_at")})
                 continue
             home, away = source_score
             actual_outcome = "home_win" if home > away else ("draw" if home == away else "away_win")
@@ -260,6 +341,8 @@ def match_source_rows(
                 "current_status": match.get("status"),
                 "current_score": match.get("score"),
                 "already_final": valid_full_time_score(match.get("score")),
+                "prediction_generated_at": snap.get("generated_at"),
+                "kickoff_at": snap.get("kickoff_at"),
             })
     candidates.sort(key=lambda c: (c.get("source_date") or "", c["match_id"], c["snapshot_id"]))
     return {
@@ -278,9 +361,29 @@ def match_source_rows(
     }
 
 
+def _parse_aware(value) -> "datetime | None":
+    """解析 ISO 时间；naive（无时区）或非法一律 None（失败关闭）。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
 def build_preview(source_rows: list[dict], data_dir: Path, *,
-                  source_observed_at: str | None = None) -> dict:
-    """Build a deterministic, read-only settlement preview."""
+                  source_observed_at: str | None = None,
+                  target_match_ids: set[str] | None = None,
+                  consumed_evidence: list[dict] | None = None) -> dict:
+    """Build a deterministic, read-only settlement preview.
+
+    ``target_match_ids``：授权目标集绑定（BOUND / UNBOUND 显式陈述）；
+    ``consumed_evidence``：本次预览实际消费的证据文件及其 SHA-256（由调用方
+    按 manifest 校验后传入），进入 preview 摘要。
+    """
     data_dir = Path(data_dir)
     matches_doc = _load("daily_matches.json", data_dir)
     snap_doc = _load("prediction_snapshots.json", data_dir)
@@ -288,18 +391,23 @@ def build_preview(source_rows: list[dict], data_dir: Path, *,
     matches = matches_doc.get("matches") or []
     snapshots = snap_doc.get("snapshots") or {}
     settlements = settle_doc.get("settlements") or {}
-    matching = match_source_rows(source_rows, matches, snapshots, settlements)
+    matching = match_source_rows(source_rows, matches, snapshots, settlements,
+                                 target_match_ids=target_match_ids)
     marker = _load(".refresh_state.json", data_dir)
     generation = marker.get("generation")
     payload = {
         "preview": {
             "provider": PROVIDER,
+            "parser_version": PARSER_VERSION,
             "source_observed_at": source_observed_at,
             "generation": generation,
             "store_hashes": store_hashes(data_dir),
             "write_scope": list(WRITE_SCOPE),
             "network_requests": 0,
             "canonical_reconciliation": False,
+            "target_scope": "BOUND" if target_match_ids is not None else "UNBOUND",
+            "approved_target_match_ids": sorted(target_match_ids) if target_match_ids is not None else None,
+            "consumed_evidence": consumed_evidence or [],
             "candidates": matching["candidates"],
             "rejected": matching["rejected"],
             "counts": matching["counts"],

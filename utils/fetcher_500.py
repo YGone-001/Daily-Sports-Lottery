@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import time
@@ -698,11 +699,31 @@ def _parse_lq(html: str) -> tuple[list[dict], int]:
 # 数据源 2: live.500.com 完场比分 (SSR)
 # ---------------------------------------------------------------------------
 
+#: 最近一次 wanchang **真实 HTTP 响应**的原始观测（含原始字节）。
+#: 只保留最近一次；缓存命中不会调用 loader，因此其中的时间戳始终是
+#: 该响应真实发生抓取的时刻，不会被缓存命中刷新。
+_LAST_WANCHANG_RAW: dict = {}
+
+
+def last_wanchang_raw_observation() -> dict:
+    """返回最近一次 wanchang 原始观测元数据（不含响应字节）的只读拷贝。"""
+    raw = _LAST_WANCHANG_RAW or {}
+    return {k: v for k, v in raw.items() if k != "response_bytes"}
+
+
+def wanchang_raw_response_bytes() -> bytes | None:
+    """返回最近一次 wanchang 响应的原始字节（未经编码解码）；无则 None。"""
+    return _LAST_WANCHANG_RAW.get("response_bytes")
+
+
 def fetch_finished_matches(date: str | None = None) -> list[dict]:
     """
     抓取 500.com 完场比分页。
     date 形如 '2026-09-29'，None 表示页面默认（最近完赛）。
     返回标准化比赛列表。
+
+    同时把最近一次真实响应的原始字节与请求元数据留在
+    ``_LAST_WANCHANG_RAW``（供证据留存方持久化；缓存命中不刷新任何时间戳）。
     """
     key = f"wanchang:{date or 'default'}"
 
@@ -711,6 +732,7 @@ def fetch_finished_matches(date: str | None = None) -> list[dict]:
         params = {}
         if date:
             params["e"] = date
+        started_at = datetime.now(BEIJING_TZ).isoformat()
         try:
             resp = requests.get(
                 url, params=params, headers=REQUEST_HEADERS, timeout=20
@@ -721,8 +743,34 @@ def fetch_finished_matches(date: str | None = None) -> list[dict]:
         except Exception as exc:  # noqa: BLE001
             print(f"[500fetcher] wanchang 抓取失败: {exc}")
             _record_diag("wanchang", "unavailable", note=str(exc))
+            _LAST_WANCHANG_RAW.clear()
+            _LAST_WANCHANG_RAW.update({
+                "requested_date": date,
+                "request_started_at": started_at,
+                "response_observed_at": datetime.now(BEIJING_TZ).isoformat(),
+                "http_status": None,
+                "error_type": type(exc).__name__,
+                "final_url": None,
+                "redirect_count": None,
+                "response_sha256": None,
+                "response_byte_count": None,
+            })
             return []
 
+        body = resp.content if isinstance(resp.content, (bytes, bytearray)) else b""
+        _LAST_WANCHANG_RAW.clear()
+        _LAST_WANCHANG_RAW.update({
+            "requested_date": date,
+            "request_started_at": started_at,
+            "response_observed_at": datetime.now(BEIJING_TZ).isoformat(),
+            "http_status": getattr(resp, "status_code", None),
+            "error_type": None,
+            "final_url": getattr(resp, "url", None),
+            "redirect_count": len(getattr(resp, "history", []) or []),
+            "response_sha256": hashlib.sha256(bytes(body)).hexdigest(),
+            "response_byte_count": len(body),
+            "response_bytes": bytes(body),
+        })
         _record_diag("wanchang", "ok" if rows else "empty", rows=len(rows))
         _record_observation("wanchang", rows)
         return rows
