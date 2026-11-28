@@ -499,6 +499,7 @@ def build_source_health() -> dict:
       （AGENTS.md §4.26）：刷新标记成功**不**等价于源侧无缺口。
     """
     from utils.fetcher_500 import source_diagnostics, is_nba_league
+    from utils.basketball_identity_evidence import scan_cross_source_duplicate_candidates
     from utils.market_coverage import has_usable_market_odds
     from utils.result_delivery import (
         build_basketball_result_delivery,
@@ -546,6 +547,11 @@ def build_source_health() -> dict:
         # 空观测只能读作不可判定，不能读作零缺口。
         "result_delivery": summarize_result_delivery(
             build_basketball_result_delivery(basketball)
+        ),
+        # 跨源重复候选（候选级证据，绝不合并）：显式暴露未决身份问题，
+        # 不隐瞒，也不改写任何记录。
+        "cross_source_duplicate_candidates": scan_cross_source_duplicate_candidates(
+            daily_loader.get_all_matches()
         ),
     }
 

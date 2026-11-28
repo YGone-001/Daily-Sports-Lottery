@@ -515,6 +515,82 @@ class CrossSourceCandidateEvidence:
         return fingerprint(self.as_dict())
 
 
+def scan_cross_source_duplicate_candidates(
+    matches: Any,
+    *,
+    limit: int = 20,
+    max_group_size: int = 60,
+) -> dict:
+    """
+    只读扫描市场跟踪记录中的**跨源重复候选**（候选级证据，绝不是批准）。
+
+    - 仅对同运动、同日期、双方都带可解释编号的已跟踪记录做
+      ``classify_cross_source_candidate`` 检查（廉价预分组，避免 O(n²) 全量）；
+    - 触发条件与准入守卫一致：``numbers_comparable`` 且 ``numbers_agree is True``
+      且结论 ∈ {CANDIDATE_SAME_EVENT, AMBIGUOUS}；
+    - 输出恒带 ``authoritative=False`` / ``is_approval=False``，只用于状态暴露
+      （如 ``/api/status``），不合并、不改写、不删除任何记录。
+    """
+    from utils.match_identity import competition_number_for_match
+
+    by_key: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    skipped_large_groups = 0
+    if isinstance(matches, list):
+        for m in matches:
+            if not isinstance(m, Mapping):
+                continue
+            if m.get("market_tracked") is not True:
+                continue
+            if competition_number_for_match(dict(m)) is None:
+                continue
+            key = (str(m.get("sport") or ""), str(m.get("date") or ""))
+            by_key.setdefault(key, []).append(m)
+
+    candidates: list[dict[str, Any]] = []
+    truncated = False
+    for key in sorted(by_key):
+        group = by_key[key]
+        if len(group) < 2:
+            continue
+        if len(group) > max_group_size:
+            skipped_large_groups += 1
+            continue
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                evidence = classify_cross_source_candidate(group[i], group[j])
+                if not (evidence.numbers_comparable and evidence.numbers_agree is True):
+                    continue
+                if evidence.outcome not in (OUTCOME_CANDIDATE_SAME_EVENT, OUTCOME_AMBIGUOUS):
+                    continue
+                candidates.append({
+                    "left_id": evidence.left_canonical_id,
+                    "right_id": evidence.right_canonical_id,
+                    "sport": key[0],
+                    "date": key[1],
+                    "outcome": evidence.outcome,
+                    "orientation": evidence.orientation,
+                    "blockers": list(evidence.blockers)[:4],
+                    "authoritative": evidence.authoritative,
+                    "is_approval": evidence.is_approval,
+                    "note": "CANDIDATE_EVIDENCE_ONLY_NOT_MERGED",
+                })
+                if len(candidates) >= limit:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if truncated:
+            break
+    return {
+        "candidates": candidates,
+        "count": len(candidates),
+        "truncated": truncated,
+        "skipped_large_groups": skipped_large_groups,
+        "scope_note": "market-tracked records with interpretable numbers only; "
+                      "candidate-level evidence, never an approval",
+    }
+
+
 def _relation_pair(left: Mapping[str, Any], right: Mapping[str, Any]) -> tuple[str, str]:
     return (
         team_relation(left.get("home"), right.get("home")),

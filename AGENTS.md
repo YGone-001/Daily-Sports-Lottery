@@ -1490,6 +1490,61 @@ git log --format=%s | grep -nEi '(^|[^A-Za-z0-9])(phase|stage)[A-Za-z0-9]*([^A-Z
 
 ---
 
+### 4.45 足球历史证据门与跨源候选状态暴露
+
+- **目标集必须贯穿全程**：`tools.football_result_workflow` 的显式 `--match-id`
+  集合写入采集 manifest（`approved_target_match_ids`）并在预览阶段强制执行——
+  解析到目标集之外的候选一律 `OUT_OF_SCOPE_TARGET` 拒绝；显式集合超限
+  `TARGET_LIMIT_EXCEEDED`，未知 ID `UNKNOWN_TARGET_MATCH_ID`；预览 `target_scope`
+  显式陈述 `BOUND_MANIFEST` / `BOUND_EXPLICIT` / `UNBOUND`，**不得**用
+  "目标数相同"冒充同一目标集。
+- **预览只消费登记证据**：manifest 存在时逐文件复核 SHA-256（不符即
+  `EVIDENCE_DIGEST_MISMATCH` 失败关闭），不得静默吞下无关缓存行文件。
+- **严格候选证据门**（`utils.football_result_history.match_source_rows`）：
+  源行联赛与 Canonical 联赛必须一致（变体拒绝，不断言别名）；双方开赛时间
+  必须可比且一致（`KICKOFF_EVIDENCE_UNAVAILABLE` / `KICKOFF_EVIDENCE_CONFLICT`）；
+  快照 sport/主客队/联赛必须一致（`SNAPSHOT_IDENTITY_MISMATCH`）；
+  `prediction_generated_at < kickoff_at` **严格**成立且两者为带时区可解析时间
+  （`PREDICTION_NOT_STRICTLY_BEFORE_KICKOFF`）。既有宽松
+  `is_valid_prematch()` 不再单独作为预览依据（生产结算语义不变）。
+- **原始证据留存**：`fetch_finished_matches` 现在保留最近一次真实响应的原始
+  字节与请求元数据（`last_wanchang_raw_observation` / `wanchang_raw_response_bytes`）；
+  工作流把 `.raw.html` 与逐请求元数据（实际请求/响应时间、HTTP 状态、重定向数、
+  响应 SHA-256、解析器版本、观测日期窗口）写入证据目录。**缓存命中不得刷新
+  任何观测时间戳**；落盘前必须凭据扫描（命中即拒绝）；raw 文件不进入预览消费
+  清单（`evidence_files` 只含解析行文件）。
+- **输出路径硬链接守卫**：写路径与七个受保护存储或凭据文件同 inode
+  （`os.path.samefile`）即拒绝——符号链接守卫之外的新增防线。
+- **`500w` 行位置 ID 永不成为 Canonical 身份**（不变）。
+- **跨源重复候选必须可见**：`utils.basketball_identity_evidence.
+  scan_cross_source_duplicate_candidates` 只读扫描市场跟踪记录（廉价预分组、
+  有界输出），`/api/status` 的 `source_health.cross_source_duplicate_candidates`
+  暴露候选对；每条恒带 `authoritative=false` / `is_approval=false` /
+  `CANDIDATE_EVIDENCE_ONLY_NOT_MERGED`。暴露是诊断，**不是**合并、裁决或
+  生产授权；读取端点必须零写入。
+
+---
+
+### 4.46 足球 V2 影子候选隔离
+
+- **生产模型不变**：`football-coldstart-1` 与 `config.MODEL_VERSIONS` 不动；
+  生产路径（scraper / predictor）不 import `models.football_model_v2`。
+- **候选只有一件事**：因果联赛环境先验（严格 `settled_at < prediction_generated_at`
+  的真实全场比分；Laplace α=1；全局先验 2.7）等比重校已持久化的 λ 总量
+  （因子有界 [0.5, 2.0]），再复用生产比分矩阵与 Dixon-Coles 修正。
+  **零自由参数**（两个常数均为文档化值，不从队列拟合）；**零赔率输入**
+  （纯模型边界；市场信息属另一候选家族，不得混入后自称独立对比）。
+- **点时特征边界**：攻防评分未持久化——候选**不得**使用
+  `team_strength.json` 的现值重建历史输入；只允许评估行中已存在的特征。
+- **回溯走查 ≠ 前瞻验收**：`RETROSPECTIVE_WALK_FORWARD_RESEARCH` 永远不构成
+  前瞻对照；晋升（改 `config.MODEL_VERSIONS`）是显式操作者决定，必须满足
+  事前定义的晋升标准；"点估计略优、区间含 0"必须如实报为不显著
+  （`INCREMENTAL_VALUE = PRELIMINARY`），不得写成已验证改进。
+- 影子工件只写 `reports/` 或仓库外目录，不可变、不可回填；不得把 V2 概率
+  追加进生产预测快照或评估行。
+
+---
+
 ## 五、本地报告与交付顺序
 
 ### 5.1 报告只存在于本机，绝不进入远程
